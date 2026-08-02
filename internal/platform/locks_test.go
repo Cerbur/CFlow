@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -372,6 +373,46 @@ func TestLockSchemaExclusiveWhileSharedRejected(t *testing.T) {
 	if _, err := s.SchemaExclusive(ctx); err == nil {
 		t.Fatal("exclusive Schema lock acquired while the shared lock is held")
 	}
+}
+
+// TestLockSchemaSharedConcurrentAcquire asserts the shared Schema lock
+// registry stays consistent when many goroutines acquire and release the
+// same lock concurrently. The race exercises the post-flock re-entry
+// branch (a second acquirer whose flock succeeded after the first
+// registered) and must pass under -race.
+func TestLockSchemaSharedConcurrentAcquire(t *testing.T) {
+	s := newLockSet(t, nil)
+	ctx := context.Background()
+	const goroutines = 32
+	const iterations = 50
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				h, err := s.SchemaShared(ctx)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				h.Release()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent shared acquire failed: %v", err)
+	}
+	// Fully released: a fresh acquire works and the chains are clean.
+	h, err := s.SchemaShared(ctx)
+	requireNoError(t, err)
+	h.Release()
+	h2, err := s.ProjectWriter(ctx, "project-1")
+	requireNoError(t, err)
+	h2.Release()
 }
 
 // TestLockSchemaSharedReentrant asserts the shared Schema lock is

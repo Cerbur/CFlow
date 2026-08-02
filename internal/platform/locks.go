@@ -356,10 +356,10 @@ func (s *LockSet) acquire(ctx context.Context, kind LockKind, name string, mode 
 	if lf, ok := s.files[file]; ok {
 		if lf.shared && mode == modeShared {
 			lf.refs++
+			s.chains[gid] = append(s.chains[gid], kind)
 			s.mu.Unlock()
 			_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 			_ = f.Close()
-			s.chains[gid] = append(s.chains[gid], kind)
 			s.lease(kind, name, LeaseAcquired)
 			return &Hold{set: s, kind: kind, names: []string{name}, gid: gid, held: true}, nil
 		}
