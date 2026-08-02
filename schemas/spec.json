@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "cflow://schemas/spec.json",
+  "title": "Spec",
+  "description": "Body contract of one spec Artifact (PRD 约束 9). A Spec is the independently executable and reviewable definition of one unit of work; it must include depends_on, write_scope and acceptance, and it may reference deterministic Verification Commands only by command_id (never free argv).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "goal", "depends_on", "write_scope", "acceptance"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "goal": { "type": "string", "minLength": 1 },
+    "depends_on": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "write_scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "read_scope": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "locks": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verification_command_ids"],
+      "properties": {
+        "verification_command_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "review_required": { "type": "boolean" }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "budget": { "type": "number", "minimum": 0 }
+      }
+    },
+    "timeout_seconds": { "type": "integer", "minimum": 1 },
+    "max_retry": { "type": "integer", "minimum": 0 }
+  }
+}

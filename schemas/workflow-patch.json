@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "cflow://schemas/workflow-patch.json",
+  "title": "Workflow scheduling patch",
+  "description": "Body contract of a restricted scheduling Patch IR (design 11). A Patch may only reduce concurrency, choose already eligible routes, add non-approval Checkpoints, or tighten budgets; it can never delete acceptance nodes, weaken Spec dependencies, bypass Merge, raise hard budget ceilings, or introduce arbitrary commands. The Compiler validates Patch operations and rejects invalid patches without replacing the deterministic skeleton.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "operations"],
+  "properties": {
+    "schema": { "const": "cflow-workflow-patch-1" },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["op"],
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "reduce_concurrency",
+              "pin_route",
+              "add_checkpoint",
+              "tighten_budget"
+            ]
+          },
+          "node_id": { "type": "string", "minLength": 1 },
+          "max_parallel": { "type": "integer", "minimum": 1 },
+          "provider": { "type": "string", "minLength": 1 },
+          "budget": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

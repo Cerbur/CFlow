@@ -1,0 +1,122 @@
+# Provider protocol bindings (design 14.2). Embedded policy, immutable once
+# released. Each entry binds the Provider, Executable name/path policy,
+# Supported version range, Binary identity policy, Dialect ID and event
+# schema revision, Session ID event contract, Start/Resume capabilities,
+# Cancel behaviour, Budget behaviour, and Known incompatibilities.
+#
+# Every entry carries a revision; the Registry computes each entry's content
+# hash and the registry revision deterministically, so registry changes can
+# never mutate the meaning of an existing Session (design 14.5).
+#
+# OpenCode is listed only as disabled P1 metadata and cannot be selected.
+providers:
+  - name: fake
+    status: enabled
+    revision: "1.0.0"
+    executable:
+      name: "cflow-fake-agent"
+      path_policy: "in-process deterministic test adapter; never launched from PATH"
+    version_range: ">=1.0.0"
+    binary_identity_policy: "test-only adapter; binary identity not pin-verified"
+    dialect:
+      id: "cflow.dialect.fake.v1"
+      event_schema_revision: "1"
+    session_contract:
+      start_event: "session_started"
+      id_field: "session_id"
+      terminal_events: ["session_finished", "session_failed"]
+      conflict_rule: "every frame after session_started must carry the same session_id; conflicts and missing ids fail PROVIDER_PROTOCOL_VIOLATION"
+    start_capabilities:
+      - in_process
+      - structured_output
+      - session_id_on_start
+    resume_capabilities:
+      - in_process
+      - structured_output
+      - resume_by_session_id
+    cancel_behavior: "in-process two-phase cancel; controlled stop drains the event stream"
+    budget_behavior: "adapter has no budget concept; budgets are enforced by the runtime decision kernel"
+    known_incompatibilities: []
+
+  - name: codex
+    status: enabled
+    revision: "1.0.0"
+    executable:
+      name: "codex"
+      path_policy: "PATH-resolved at Execution Approval; absolute path and binary hash pinned, re-resolved before every start"
+    version_range: ">=0.80.0 <2.0.0"
+    binary_identity_policy: "PATH-resolved absolute path pinned with binary sha256 at Execution Approval; drift blocks with COMMAND_IDENTITY_CHANGED"
+    dialect:
+      id: "cflow.dialect.codex-jsonl.v1"
+      event_schema_revision: "1"
+    session_contract:
+      start_event: "session_started"
+      id_field: "session_id"
+      terminal_events: ["session_finished", "session_failed"]
+      conflict_rule: "every JSONL event after session_started must carry the same session_id; missing ids fail PROVIDER_SESSION_ID_MISSING, conflicts fail PROVIDER_PROTOCOL_VIOLATION"
+    start_capabilities:
+      - jsonl_events
+      - structured_output
+      - session_id_on_start
+    resume_capabilities:
+      - jsonl_events
+      - structured_output
+      - resume_by_session_id
+    cancel_behavior: "SIGTERM to the process group; missing cancel support fails cleanly without killing the session"
+    budget_behavior: "no native budget limit; runtime enforces approved hard budgets"
+    known_incompatibilities:
+      - "shell command strings, pipes and redirects are never accepted; commands run argv-only"
+      - "interactive TTY mode is unsupported; only non-interactive exec is driven"
+
+  - name: claude
+    status: enabled
+    revision: "1.0.0"
+    executable:
+      name: "claude"
+      path_policy: "PATH-resolved at Execution Approval; absolute path and binary hash pinned, re-resolved before every start"
+    version_range: ">=1.0.0 <3.0.0"
+    binary_identity_policy: "PATH-resolved absolute path pinned with binary sha256 at Execution Approval; drift blocks with COMMAND_IDENTITY_CHANGED"
+    dialect:
+      id: "cflow.dialect.claude-stream-json.v1"
+      event_schema_revision: "1"
+    session_contract:
+      start_event: "session_started"
+      id_field: "session_id"
+      terminal_events: ["session_finished", "session_failed"]
+      conflict_rule: "every stream-json event after session_started must carry the same session_id; missing ids fail PROVIDER_SESSION_ID_MISSING, conflicts fail PROVIDER_PROTOCOL_VIOLATION"
+    start_capabilities:
+      - stream_json
+      - structured_output
+      - session_id_on_start
+    resume_capabilities:
+      - stream_json
+      - structured_output
+      - resume_by_session_id
+    cancel_behavior: "SIGTERM to the process group; controlled stop drains the stream before termination"
+    budget_behavior: "native budget limit supported; runtime still enforces approved hard budgets"
+    known_incompatibilities:
+      - "shell command strings, pipes and redirects are never accepted; commands run argv-only"
+      - "interactive TTY mode is unsupported; only non-interactive stream-json is driven"
+
+  - name: opencode
+    status: disabled-p1
+    revision: "1.0.0"
+    executable:
+      name: "opencode"
+      path_policy: "P1 metadata only; never resolved and never launched"
+    version_range: ">=0.1.0"
+    binary_identity_policy: "not evaluated; adapter not implemented"
+    dialect:
+      id: "cflow.dialect.opencode-json.v1"
+      event_schema_revision: "0"
+    session_contract:
+      start_event: "session_started"
+      id_field: "session_id"
+      terminal_events: ["session_finished", "session_failed"]
+      conflict_rule: "not evaluated; provider cannot be selected"
+    start_capabilities: []
+    resume_capabilities: []
+    cancel_behavior: "not implemented"
+    budget_behavior: "not evaluated"
+    known_incompatibilities:
+      - "adapter not implemented; provider cannot be selected"

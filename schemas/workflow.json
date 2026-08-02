@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "cflow://schemas/workflow.json",
+  "title": "Dynamic Workflow",
+  "description": "Body contract of one Dynamic Workflow Artifact (PRD 已确认：Dynamic Workflow 生成模型). The Compiler deterministically derives the Agent Task -> Verify -> Merge -> Final Verify skeleton from approved Specs, then applies only validated scheduling Patches. Agents never author a full DAG, free argv, or executable code; every node references Specs and Verification Catalog entries by id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "workflow_id", "revision", "nodes", "edges"],
+  "properties": {
+    "schema": { "const": "cflow-workflow-1" },
+    "workflow_id": { "type": "string", "minLength": 1 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+          "type": {
+            "type": "string",
+            "enum": ["agent_task", "verify", "merge", "checkpoint", "final_verify"]
+          },
+          "spec_id": { "type": "string", "minLength": 1 },
+          "command_id": { "type": "string", "minLength": 1 },
+          "timeout_seconds": { "type": "integer", "minimum": 1 },
+          "max_retry": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string", "minLength": 1 },
+          "to": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
