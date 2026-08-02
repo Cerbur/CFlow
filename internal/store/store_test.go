@@ -442,6 +442,108 @@ func TestWorkflowRequiresRegisteredProject(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// managed process rows must stay visible to hydration (review fix)
+// ---------------------------------------------------------------------------
+
+// seedSessionAfter registers a Session row once the Workflow row exists.
+func seedSessionAfter(t *testing.T, s *Store, id string, workflow string, purpose model.AgentPurpose) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(`INSERT INTO sessions
+		(id, workflow_id, purpose, status, started_at)
+		VALUES (?, ?, ?, 'ACTIVE', ?)`, id, workflow, purpose, now); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+}
+
+// TestProcessAppendRequiresSession: the Store rejects a session-less
+// process at commit — the persistence layer must never accept a shape its
+// own hydration (queryProcesses resolves rows through the Session's
+// workflow) cannot return.
+func TestProcessAppendRequiresSession(t *testing.T) {
+	s := openTestStore(t)
+	mustTransact(t, s, 0, fixtureDecision)
+	_, err := s.Transact(context.Background(), 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{
+			Mutations: []model.Mutation{model.ProcessAppendMutation{Process: model.ProcessRecord{
+				ID: "proc-1", Status: model.ProcessStatusRunning, StartedAt: state.Now,
+			}}},
+			Events: []model.Event{{Seq: state.NextEventSeq, Kind: model.EventRunStarted,
+				Workflow: "wf-1", Text: "process started", At: state.Now}},
+		}, nil
+	})
+	assertFaultCode(t, err, model.CodeStateInvariantViolation)
+	view := mustView(t, s)
+	if len(view.State.Processes) != 0 || len(view.Events) != 1 || view.AggregateVersion != 1 {
+		t.Fatalf("session-less process committed: %#v", view)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM managed_processes`).Scan(&n); err != nil {
+		t.Fatalf("process rows: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("session-less process row persisted: %d", n)
+	}
+}
+
+// TestProcessAppendRejectsCrossWorkflowSession: a process bound to another
+// workflow's Session would commit and then never hydrate into this
+// aggregate; the Store rejects it.
+func TestProcessAppendRejectsCrossWorkflowSession(t *testing.T) {
+	s := openTestStore(t)
+	mustTransact(t, s, 0, fixtureDecision)
+	// A sibling Workflow (row + Session) the process must not bind to.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(`INSERT INTO workflows
+		(id, project_id, stage, runtime_status, created_at, updated_at)
+		VALUES ('wf-other', 'p-1', 'REQUIREMENT_DISCUSSION', 'PENDING', ?, ?)`, now, now); err != nil {
+		t.Fatalf("seed sibling workflow: %v", err)
+	}
+	seedSessionAfter(t, s, "sess-other", "wf-other", model.PurposePlanning)
+	_, err := s.Transact(context.Background(), 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{
+			Mutations: []model.Mutation{model.ProcessAppendMutation{Process: model.ProcessRecord{
+				ID: "proc-1", Session: "sess-other", Status: model.ProcessStatusRunning, StartedAt: state.Now,
+			}}},
+			Events: []model.Event{{Seq: state.NextEventSeq, Kind: model.EventRunStarted,
+				Workflow: "wf-1", Text: "process started", At: state.Now}},
+		}, nil
+	})
+	assertFaultCode(t, err, model.CodeStateInvariantViolation)
+	view := mustView(t, s)
+	if len(view.State.Processes) != 0 || len(view.Events) != 1 {
+		t.Fatalf("cross-workflow process committed: %#v", view)
+	}
+}
+
+// TestProcessAppendRoundTripsThroughView: a session-bound process commits
+// and hydrates back into the aggregate on the next View.
+func TestProcessAppendRoundTripsThroughView(t *testing.T) {
+	s := openTestStore(t)
+	mustTransact(t, s, 0, fixtureDecision)
+	seedSessionAfter(t, s, "sess-1", "wf-1", model.PurposeImplementation)
+	mustTransact(t, s, 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{
+			Mutations: []model.Mutation{model.ProcessAppendMutation{Process: model.ProcessRecord{
+				ID: "proc-1", Session: "sess-1", Purpose: model.PurposeImplementation,
+				Status: model.ProcessStatusRunning, StartedAt: state.Now,
+			}}},
+			Events: []model.Event{{Seq: state.NextEventSeq, Kind: model.EventRunStarted,
+				Workflow: "wf-1", Text: "process started", At: state.Now}},
+		}, nil
+	})
+	view := mustView(t, s)
+	if len(view.State.Processes) != 1 {
+		t.Fatalf("processes = %d, want 1 (committed process invisible to hydration)", len(view.State.Processes))
+	}
+	p := view.State.Processes[0]
+	if p.ID != "proc-1" || p.Session != "sess-1" || p.Status != model.ProcessStatusRunning ||
+		p.Purpose != model.PurposeImplementation {
+		t.Fatalf("process = %#v", p)
+	}
+}
+
 func TestOrphanSessionReferenceRejected(t *testing.T) {
 	s := openTestStore(t)
 	mustTransact(t, s, 0, fixtureDecision)

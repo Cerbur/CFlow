@@ -87,6 +87,13 @@ func applyMutation(st *model.State, m model.Mutation) error {
 	case model.SessionAppendMutation:
 		st.Sessions = append(st.Sessions, m.Session)
 	case model.ProcessAppendMutation:
+		// A committed process row must be attributable to the workflow
+		// aggregate: hydration resolves processes through their Session's
+		// workflow (queryProcesses), so a session-less process would
+		// commit and then vanish from every View.
+		if m.Process.Session == "" {
+			return fmt.Errorf("process %s has no session: a committed process row must be attributable to the workflow aggregate", m.Process.ID)
+		}
 		st.Processes = append(st.Processes, m.Process)
 	case model.ProcessEndMutation:
 		p := findProcess(st, m.ID)
@@ -350,14 +357,24 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 
 	case model.ProcessAppendMutation:
 		p := m.Process
-		var session any
-		if p.Session != "" {
-			session = p.Session
+		// The Session must belong to this workflow: hydration resolves
+		// processes through their Session's workflow, so a process bound
+		// to another workflow's session would commit and then never
+		// hydrate into this aggregate.
+		var n int
+		if err := q.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sessions WHERE id = ? AND workflow_id = ?`,
+			p.Session, st.Workflow.ID).Scan(&n); err != nil {
+			return fmt.Errorf("process session check: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("process %s session %s does not belong to workflow %s",
+				p.ID, p.Session, st.Workflow.ID)
 		}
 		if _, err := q.ExecContext(ctx, `INSERT INTO managed_processes
 			(id, session_id, process_type, status, started_at)
 			VALUES (?, ?, ?, ?, ?)`,
-			p.ID, session, string(p.Purpose), string(p.Status),
+			p.ID, p.Session, string(p.Purpose), string(p.Status),
 			p.StartedAt.UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("insert process: %w", err)
 		}
