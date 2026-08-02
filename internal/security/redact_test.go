@@ -45,11 +45,21 @@ func redactRule(id, category, pattern string) security.Rule {
 // and the output must contain a redaction placeholder.
 func TestRedactorFindsSecretAcrossFrames(t *testing.T) {
 	r := security.NewRedactor(testRegistry("sk-[A-Za-z0-9]+"))
-	first, err := r.WriteFrame([]byte("token=sk-ab"))
+	firstFrame := []byte("token=sk-ab")
+	secondFrame := []byte("c123\n")
+	first, err := r.WriteFrame(firstFrame)
 	requireNoError(t, err)
-	second, err := r.WriteFrame([]byte("c123\n"))
+	second, err := r.WriteFrame(secondFrame)
 	requireNoError(t, err)
 	got := first.Text + second.Text
+	// Premise guard: the brief's forbidden value "sk-abc123" is exactly
+	// the secret the joined raw frames leak, so the absence clause below
+	// is non-vacuous: a raw pass-through must fail this test, and any
+	// future edit that breaks that reachability fails here instead of
+	// silently weakening the brief-mandated assertion.
+	if !strings.Contains(string(firstFrame)+string(secondFrame), "sk-abc123") {
+		t.Fatal("test premise broken: joined raw frames must contain the forbidden value")
+	}
 	if strings.Contains(got, "sk-abc123") || !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("unsafe output %q", got)
 	}
