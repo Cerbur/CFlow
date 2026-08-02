@@ -700,6 +700,104 @@ func TestCancelCompletesImmediatelyWhenIdle(t *testing.T) {
 	requireEvent(t, got, model.EventWorkflowCancelled)
 }
 
+// TestRetryableFailureDuringPendingCancelDefersRetry: a retryable Attempt
+// failure arriving while a Cancel intent is pending must not allocate a
+// successor Attempt and must not charge the Retry Budget (design 6.1:
+// cancel may not allocate a Retry).
+func TestRetryableFailureDuringPendingCancelDefersRetry(t *testing.T) {
+	state := fixtureRunningAgentTask() // n-1 RUNNING #1, process p-1 RUNNING
+	// cancel is requested while the attempt runs; the stop effect is issued
+	got, err := decision.Decide(state, model.WorkflowCommandInput{Kind: model.CancelWorkflow})
+	requireNoError(t, err)
+	state = apply(t, state, got)
+	if state.Workflow.CancelIntent == nil || state.Workflow.Runtime != model.RuntimeRunning {
+		t.Fatalf("cancel intent not pending: %+v", state.Workflow)
+	}
+
+	// the attempt fails with a retryable code before the stop lands
+	got2, err := decision.Decide(state, endAttempt("n-1", 1, model.OutcomeFailed, model.CodeCommandFailed))
+	requireNoError(t, err)
+	for _, m := range got2.Mutations {
+		if _, ok := m.(model.AttemptAppendMutation); ok {
+			t.Fatalf("pending cancel must not allocate a successor attempt: %+v", m)
+		}
+	}
+	for _, m := range got2.Mutations {
+		em, ok := m.(model.AttemptEndMutation)
+		if !ok || em.Key.Node != "n-1" {
+			continue
+		}
+		if em.Status != model.AttemptFailed {
+			t.Fatalf("attempt ended %s, want FAILED", em.Status)
+		}
+		if em.RetryCharged {
+			t.Fatalf("pending cancel charged retry budget: %+v", em)
+		}
+	}
+	for _, m := range got2.Mutations {
+		if nm, ok := m.(model.NodeStatusMutation); ok && nm.Node == "n-1" && nm.RetryCharged != 0 {
+			t.Fatalf("pending cancel charged the node budget: %+v", nm)
+		}
+	}
+	requireNode(t, got2, "n-1", model.NodeReady) // deferred, never dispatched
+
+	// the process settles; the cancel completes; no successor ever appears
+	state = apply(t, state, got2)
+	got3, err := decision.Decide(state, model.EffectResultInput{Kind: model.ProcessStopped, Process: "p-1"})
+	requireNoError(t, err)
+	state = apply(t, state, got3)
+	requireStatus(t, got3, model.StageExecution, model.RuntimeCancelled)
+	requireNode(t, got3, "n-1", model.NodeCancelled)
+	if len(state.Attempts) != 1 {
+		t.Fatalf("attempt count = %d, want exactly 1 (no successor): %+v", len(state.Attempts), state.Attempts)
+	}
+	if state.Attempts[model.AttemptKey{Node: "n-1", Number: 1}].Status != model.AttemptFailed {
+		t.Fatalf("failed attempt mutated by cancel: %+v", state.Attempts[model.AttemptKey{Node: "n-1", Number: 1}])
+	}
+}
+
+// TestRetryableFailureCompletesPendingCancelWhenSettled: when the
+// retryable failure is the last running fact, the deferred decision also
+// completes the pending cancel in the same transaction, cancelling any
+// pre-existing READY Attempt while preserving terminal failure facts.
+func TestRetryableFailureCompletesPendingCancelWhenSettled(t *testing.T) {
+	state := workflowState(model.StageExecution, model.RuntimeRunning)
+	addRun(&state, model.RunRunning, true)
+	addNode(&state, "n-1", model.NodeAgentTask, model.NodeRunning, 2)
+	addAttempt(&state, "n-1", 1, model.AttemptRunning)
+	// a READY successor allocated before the cancel must not linger
+	addAttempt(&state, "n-1", 2, model.AttemptReady)
+
+	got, err := decision.Decide(state, model.WorkflowCommandInput{Kind: model.CancelWorkflow})
+	requireNoError(t, err)
+	state = apply(t, state, got)
+
+	got2, err := decision.Decide(state, endAttempt("n-1", 1, model.OutcomeFailed, model.CodeCommandFailed))
+	requireNoError(t, err)
+	for _, m := range got2.Mutations {
+		if _, ok := m.(model.AttemptAppendMutation); ok {
+			t.Fatalf("pending cancel must not allocate a successor attempt: %+v", m)
+		}
+	}
+	requireStatus(t, got2, model.StageExecution, model.RuntimeCancelled)
+	state = apply(t, state, got2)
+	if state.Workflow.Runtime != model.RuntimeCancelled {
+		t.Fatalf("workflow = %s, want CANCELLED", state.Workflow.Runtime)
+	}
+	if state.Nodes["n-1"].Status != model.NodeCancelled {
+		t.Fatalf("node = %s, want CANCELLED", state.Nodes["n-1"].Status)
+	}
+	if len(state.Attempts) != 2 {
+		t.Fatalf("attempt count = %d, want 2 (no successor)", len(state.Attempts))
+	}
+	if got := state.Attempts[model.AttemptKey{Node: "n-1", Number: 1}].Status; got != model.AttemptFailed {
+		t.Fatalf("terminal failure attempt = %s, want FAILED (immutable)", got)
+	}
+	if got := state.Attempts[model.AttemptKey{Node: "n-1", Number: 2}].Status; got != model.AttemptCancelled {
+		t.Fatalf("pre-cancel READY attempt = %s, want CANCELLED", got)
+	}
+}
+
 func TestPauseStopsManagedProcesses(t *testing.T) {
 	state := fixtureRunningAgentTask()
 	got, err := decision.Decide(state, model.WorkflowCommandInput{Kind: model.PauseWorkflow})

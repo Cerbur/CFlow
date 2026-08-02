@@ -149,6 +149,17 @@ func hasRunningProcess(state model.State) bool {
 	return false
 }
 
+// hasRunningProcessExcept reports whether any process other than exclude
+// is still RUNNING.
+func hasRunningProcessExcept(state model.State, exclude model.ProcessID) bool {
+	for _, p := range state.Processes {
+		if p.ID != exclude && p.Status == model.ProcessStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
 func hasBlockingFinding(state model.State) bool {
 	for _, f := range state.Findings {
 		if f.Blocking {

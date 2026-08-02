@@ -224,6 +224,7 @@ const (
 	EventAttemptSucceeded         EventKind = "ATTEMPT_SUCCEEDED"
 	EventAttemptFailed            EventKind = "ATTEMPT_FAILED"
 	EventAttemptInterrupted       EventKind = "ATTEMPT_INTERRUPTED"
+	EventAttemptCancelled         EventKind = "ATTEMPT_CANCELLED"
 	EventFindingOpened            EventKind = "FINDING_OPENED"
 	EventQuarantineRecorded       EventKind = "QUARANTINE_RECORDED"
 	EventRunStarted               EventKind = "RUN_STARTED"
@@ -251,7 +252,7 @@ func (k EventKind) Valid() bool {
 		EventWorkflowCancelRequested, EventWorkflowCancelled, EventWorkflowFailed, EventWorkflowSucceeded,
 		EventStageChanged, EventPlanApproved, EventExecutionApproved,
 		EventNodeReady, EventNodeStarted, EventNodeSucceeded, EventNodeFailed, EventNodeCancelled, EventNodeSkipped,
-		EventAttemptCreated, EventAttemptSucceeded, EventAttemptFailed, EventAttemptInterrupted,
+		EventAttemptCreated, EventAttemptSucceeded, EventAttemptFailed, EventAttemptInterrupted, EventAttemptCancelled,
 		EventFindingOpened, EventQuarantineRecorded,
 		EventRunStarted, EventRunQuiescing, EventRunStopped, EventRunInterrupted, EventRunBlocked,
 		EventRunSucceeded, EventRunCancelled,

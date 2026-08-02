@@ -110,9 +110,14 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 		pol, _ = model.Policy(code)
 	}
 	quiescing := activeQuiescing(state)
+	// A pending Cancel intent also closes the retry path: cancel may never
+	// allocate a Retry or charge budget (design 6.1). A retryable failure
+	// arriving while the controlled stop is in flight is deferred, and the
+	// cancel completes once everything settles.
+	cancelling := state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal()
 	retryable := pol.Retry.AllowsSuccessor && node.RetryCharged < node.RetryBudget
 
-	if retryable && !quiescing && !quarantined {
+	if retryable && !quiescing && !cancelling && !quarantined {
 		// Budgeted retry: the failed Attempt is terminal and immutable,
 		// the Node returns READY, and the successor Attempt is created
 		// with attempt_number+1 (design 7.3 invariants 7 and 8).
@@ -140,10 +145,11 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 		return b.decision(), nil
 	}
 
-	// Deferred during quiescing: the Node projects READY per the normal
-	// rules but no successor starts and no budget is charged (PRD 已确认：
-	// 并行失败后的 Quiescing, rule 3).
-	if retryable && quiescing {
+	// Deferred during quiescing or pending cancel: the Node projects READY
+	// per the normal rules but no successor starts and no budget is charged
+	// (PRD 已确认：并行失败后的 Quiescing, rule 3; design 6.1). A pending
+	// cancel settles through finishCancel once nothing is running.
+	if retryable && (quiescing || cancelling) {
 		b.mutate(model.AttemptEndMutation{
 			Key:                 attempt.Key,
 			Status:              model.AttemptFailed,
@@ -154,7 +160,7 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 			RetryCharged:        false,
 			EndedAt:             state.Now,
 		})
-		b.event(model.EventAttemptFailed, node.ID, attempt.Key, code, "attempt failed during quiescing")
+		b.event(model.EventAttemptFailed, node.ID, attempt.Key, code, "attempt failed; retry deferred")
 		b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeReady, RetryCharged: node.RetryCharged})
 		b.event(model.EventNodeReady, node.ID, attempt.Key, "", "node ready; retry deferred")
 		b.mutate(model.FindingAppendMutation{Finding: model.Finding{
@@ -330,6 +336,24 @@ func finishCancel(b *builder, state model.State, intent *model.CancelIntent) {
 			b.event(model.EventNodeCancelled, n.ID, model.AttemptKey{}, "", "node cancelled")
 		}
 	}
+	// Every non-terminal Attempt (e.g. a READY successor that was never
+	// dispatched) is settled CANCELLED, so no record lingers on the
+	// terminal Workflow. RUNNING Attempts are skipped: settle guarantees
+	// none can be running here, except the one this same Decision is
+	// ending, which the caller settles itself. Terminal Attempt facts stay
+	// immutable.
+	keys := make([]model.AttemptKey, 0, len(state.Attempts))
+	for k := range state.Attempts {
+		keys = append(keys, k)
+	}
+	sortedAttemptKeys(keys)
+	for _, k := range keys {
+		a := state.Attempts[k]
+		if !a.Status.IsTerminal() && a.Status != model.AttemptRunning {
+			b.mutate(model.AttemptEndMutation{Key: k, Status: model.AttemptCancelled, EndedAt: state.Now})
+			b.event(model.EventAttemptCancelled, k.Node, k, "", "attempt cancelled")
+		}
+	}
 	b.event(model.EventWorkflowCancelled, "", model.AttemptKey{}, "", "workflow cancelled")
 }
 
@@ -371,7 +395,7 @@ func decideProcessStopped(state model.State, in model.EffectResultInput) (model.
 	if state.Workflow.CancelIntent != nil || activeRunStopping(state) {
 		stopRunningProcesses(b, state, in.Process)
 	}
-	if !hasRunningProcess(state) && !hasRunningAttempt(state) {
+	if !hasRunningProcessExcept(state, in.Process) && !hasRunningAttempt(state) {
 		if state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal() {
 			finishCancel(b, state, state.Workflow.CancelIntent)
 		}
