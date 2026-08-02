@@ -6,6 +6,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,17 +15,22 @@ import (
 	"github.com/spf13/cobra"
 
 	"cflow.local/cflow/internal/config"
+	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
+	"cflow.local/cflow/internal/security"
 )
 
-// Dependencies assembles what the command tree needs. Later tasks extend
-// this with the Application seam and the configuration loader.
+// Dependencies assembles what the command tree needs. Redaction is the
+// embedded redaction rule registry every render and export path uses
+// (design 19.2); a zero registry passes text through.
 type Dependencies struct {
-	Build observe.BuildInfo
+	Build     observe.BuildInfo
+	Redaction security.Registry
 }
 
 // NewRoot builds the cflow command tree. version, help, and doctor are
-// non-mutating: they never read, create, or modify CFLOW_HOME.
+// non-mutating: they never read, create, or modify CFLOW_HOME. The
+// project commands route exclusively through the Application.
 func NewRoot(deps Dependencies) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "cflow",
@@ -34,6 +40,9 @@ func NewRoot(deps Dependencies) *cobra.Command {
 	}
 	root.AddCommand(newVersionCmd(deps.Build))
 	root.AddCommand(newDoctorCmd(deps.Build))
+	for _, cmd := range projectCommands(deps) {
+		root.AddCommand(cmd)
+	}
 	return root
 }
 
@@ -64,7 +73,9 @@ func (e *Error) Error() string { return e.Msg }
 
 // ExitCode is the single central mapping from any error to a process exit
 // class. Unrecognized errors count as invalid input (2); configuration
-// failures are local environment preconditions (4).
+// failures are local environment preconditions (4); typed Fault
+// categories map through faultClass; a cancelled command context is a
+// user interruption (130).
 func ExitCode(err error) int {
 	if err == nil {
 		return ClassSuccess.Code()
@@ -77,7 +88,40 @@ func ExitCode(err error) int {
 	if errors.As(err, &cfg) {
 		return ClassLocalEnvironment.Code()
 	}
+	var f *model.Fault
+	if errors.As(err, &f) {
+		return faultClass(f).Code()
+	}
+	if errors.Is(err, context.Canceled) {
+		return ClassInterrupted.Code()
+	}
 	return ClassInvalidInput.Code()
+}
+
+// faultClass maps the typed Fault categories to the stable exit classes
+// (design 20). This is the single central mapping: commands never pick
+// their own exit codes, and the exact numeric values are asserted
+// centrally by the exit-class tests.
+func faultClass(f *model.Fault) Class {
+	switch f.Category {
+	case model.CatInvalidInput:
+		return ClassInvalidInput
+	case model.CatUserActionRequired:
+		return ClassUserActionRequired
+	case model.CatSafetyStop:
+		// Safety stop: active work must be stopped before facts can be
+		// trusted; the local environment or compatibility precondition
+		// failed.
+		return ClassLocalEnvironment
+	case model.CatInvariantFailure:
+		return ClassInvariantFailure
+	case model.CatRetryableAttemptFailure:
+		// Retryable attempt failures surface as Outcomes, never as command
+		// errors; if one does, the requested outcome cannot be safely
+		// reconciled.
+		return ClassInvariantFailure
+	}
+	return ClassInvalidInput
 }
 
 // NotYetAvailable labels checks that later tasks implement. It is part of
