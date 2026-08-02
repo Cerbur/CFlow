@@ -145,6 +145,19 @@ func validateValue(v any, schema any, path string) error {
 			return fmt.Errorf("at %s: value is not one of the allowed values", loc())
 		}
 	}
+	// Numeric bounds apply to every numeric representation: YAML integer
+	// scalars decode as int/int64/uint while JSON schema numbers decode as
+	// float64, and all of them must hit minimum/maximum (schemas bind
+	// revision, timeout, retry and budget bounds on integer values).
+	if isNumber(v) {
+		n := toFloat(v)
+		if min, ok := number(m["minimum"]); ok && n < min {
+			return fmt.Errorf("at %s: value is below the allowed minimum", loc())
+		}
+		if max, ok := number(m["maximum"]); ok && n > max {
+			return fmt.Errorf("at %s: value is above the allowed maximum", loc())
+		}
+	}
 	switch tv := v.(type) {
 	case string:
 		n := utf8.RuneCountInString(tv)
@@ -162,13 +175,6 @@ func validateValue(v any, schema any, path string) error {
 			if !re.MatchString(tv) {
 				return fmt.Errorf("at %s: value does not match the required pattern", loc())
 			}
-		}
-	case float64:
-		if min, ok := number(m["minimum"]); ok && tv < min {
-			return fmt.Errorf("at %s: value is below the allowed minimum", loc())
-		}
-		if max, ok := number(m["maximum"]); ok && tv > max {
-			return fmt.Errorf("at %s: value is above the allowed maximum", loc())
 		}
 	}
 	if arr, ok := v.([]any); ok {

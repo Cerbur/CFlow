@@ -643,6 +643,24 @@ func TestPutValidatesBodyAgainstSchema(t *testing.T) {
 	_, err = s.Put(context.Background(), badFront)
 	requireFaultCode(t, err, model.CodeSchemaInvalid)
 
+	// Numeric bounds are enforced on integer scalars: a spec timeout or
+	// retry budget below its schema minimum must fail.
+	numericBodies := map[string]model.ArtifactType{
+		"spec-timeout-zero":     model.ArtifactSpec,
+		"spec-retry-negative":   model.ArtifactSpec,
+		"catalog-revision-zero": model.ArtifactCatalog,
+		"workflow-timeout-zero": model.ArtifactWorkflow,
+	}
+	reqNumeric := fixturePlanRequest("wf-1", "x", 1)
+	for name, typ := range numericBodies {
+		reqNumeric.Type = typ
+		reqNumeric.Body = numericViolationBody(typ)
+		t.Run(name, func(t *testing.T) {
+			_, err := s.Put(context.Background(), reqNumeric)
+			requireFaultCode(t, err, model.CodeSchemaInvalid)
+		})
+	}
+
 	// A valid spec body passes.
 	validSpec := fixturePlanRequest("wf-1", "x", 1)
 	validSpec.Type = model.ArtifactSpec
@@ -652,6 +670,33 @@ func TestPutValidatesBodyAgainstSchema(t *testing.T) {
 	if ref.Type != model.ArtifactSpec {
 		t.Fatalf("unexpected ref: %v", ref)
 	}
+
+	// Bodies at or above the schema minimums pass.
+	reqBounds := fixturePlanRequest("wf-1", "x", 2)
+	reqBounds.Type = model.ArtifactSpec
+	reqBounds.Body = []byte("id: spec-1\ngoal: x\ndepends_on: []\nwrite_scope: [src/login]\n" +
+		"acceptance:\n  verification_command_ids: [cmd-1]\ntimeout_seconds: 5\nmax_retry: 0\n")
+	_, err = s.Put(context.Background(), reqBounds)
+	requireNoError(t, err)
+}
+
+// numericViolationBody returns a body for typ whose integer value violates
+// the schema's minimum bound.
+func numericViolationBody(typ model.ArtifactType) []byte {
+	switch typ {
+	case model.ArtifactSpec:
+		return []byte("id: spec-1\ngoal: x\ndepends_on: []\nwrite_scope: [src/login]\n" +
+			"acceptance:\n  verification_command_ids: [cmd-1]\ntimeout_seconds: 0\nmax_retry: -5\n")
+	case model.ArtifactCatalog:
+		return []byte("revision: 0\nentries:\n" +
+			"  - command_id: cmd-1\n    executable: /usr/bin/true\n    args: []\n" +
+			"    cwd: /repo\n    purpose: task_verify\n    timeout_seconds: 60\n" +
+			"    expected_exit_codes: [0]\n    max_output_bytes: 1048576\n    source: fixture\n")
+	case model.ArtifactWorkflow:
+		return []byte("schema: cflow-workflow-1\nworkflow_id: wf-1\nrevision: 1\nnodes:\n" +
+			"  - id: agent-1\n    type: agent_task\n    spec_id: spec-1\n    timeout_seconds: 0\nedges: []\n")
+	}
+	return nil
 }
 
 // TestPutRedactsBeforePersisting: secrets in the body are replaced by
