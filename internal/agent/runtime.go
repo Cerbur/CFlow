@@ -317,6 +317,15 @@ func (r *Runtime) Resume(ctx context.Context, req ResumeRequest) (*ResumeResult,
 	if rec == nil {
 		return nil, model.InvalidInputFault("provider session not found for resume")
 	}
+	// A terminal Session can never be resumed: re-opening a COMPLETED or
+	// CANCELLED session would revive an immutable outcome, and resuming a
+	// LOST session would chain a second successor lineage from the same
+	// original (design 14.4 step 4: one successor per Lost original).
+	// The Runtime is the enforcement layer for Session state.
+	if sessionStatusTerminal(rec.session.Status) {
+		return nil, model.NewFault(model.CodeSessionIndependenceViolation,
+			"a terminal session can never be resumed")
+	}
 	if rec.session.Purpose != req.Purpose {
 		return nil, model.NewFault(model.CodeSessionIndependenceViolation,
 			"a resumed session must keep its purpose")

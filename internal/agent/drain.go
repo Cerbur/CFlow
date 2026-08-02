@@ -331,8 +331,9 @@ func (r *Runtime) persistEvent(ctx context.Context, cfg drainConfig, session *se
 	})
 }
 
-// sessionStatusTerminal reports whether a Session status is final: the
-// Session can never be resumed or superseded again.
+// sessionStatusTerminal reports whether a Session status is final: a
+// terminal Session can never be resumed, so it can never be re-activated
+// and can never chain another successor lineage.
 func sessionStatusTerminal(s model.SessionStatus) bool {
 	switch s {
 	case model.SessionCompleted, model.SessionFailed, model.SessionCancelled, model.SessionLost:

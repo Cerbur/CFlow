@@ -446,6 +446,52 @@ func TestResumePurposeMismatchFailsClosed(t *testing.T) {
 	assertFaultCode(t, err, model.CodeSessionIndependenceViolation)
 }
 
+// TestResumeTerminalSessionFailsClosed: a terminal Session (COMPLETED or
+// LOST) can never be resumed (design 14.4): the resume fails closed with
+// SESSION_INDEPENDENCE_VIOLATION and no successor lineage may be created
+// from a terminal session.
+func TestResumeTerminalSessionFailsClosed(t *testing.T) {
+	t.Run("completed", func(t *testing.T) {
+		script := header("resume-ok", "implementation", "s1", `"resume":"ok","seed":true`) + "\n" +
+			"session_started:s1\nassistant_message:continuing\nsession_finished:{\"done\":true}\n"
+		rt := newFakeRuntime(t, script)
+		if _, err := rt.Resume(context.Background(), fixtureResume(agent.PurposeImplementer, "s1")); err != nil {
+			t.Fatalf("first resume must succeed: %v", err)
+		}
+		_, err := rt.Resume(context.Background(), fixtureResume(agent.PurposeImplementer, "s1"))
+		assertFaultCode(t, err, model.CodeSessionIndependenceViolation)
+		if n := countSuccessors(t, rt); n != 0 {
+			t.Fatalf("no successor lineage may be created from a terminal session, got %d", n)
+		}
+	})
+	t.Run("lost", func(t *testing.T) {
+		rt := newFakeRuntime(t, readFixture(t, "resume-missing.jsonl"))
+		res, err := rt.Resume(context.Background(), fixtureResume(agent.PurposeImplementer, "c2"))
+		requireNoError(t, err)
+		if res.Fallback == nil {
+			t.Fatalf("expected a resume fallback")
+		}
+		_, err = rt.Resume(context.Background(), fixtureResume(agent.PurposeImplementer, "c2"))
+		assertFaultCode(t, err, model.CodeSessionIndependenceViolation)
+		if n := countSuccessors(t, rt); n != 1 {
+			t.Fatalf("a second resume of a LOST session must not chain a second successor, got %d", n)
+		}
+	})
+}
+
+// countSuccessors counts the ledger sessions that supersede another
+// session (successor lineage records).
+func countSuccessors(t *testing.T, rt *agent.Runtime) int {
+	t.Helper()
+	n := 0
+	for _, f := range rt.Sessions() {
+		if f.Session.Supersedes != "" {
+			n++
+		}
+	}
+	return n
+}
+
 // TestResumeCapabilityAbsent: a provider that cannot resume the session
 // blocks with PROVIDER_PROTOCOL_UNSUPPORTED and never creates a fallback.
 func TestResumeCapabilityAbsent(t *testing.T) {
