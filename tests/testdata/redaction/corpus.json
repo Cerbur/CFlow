@@ -1,0 +1,166 @@
+{
+  "revision": "cflow-corpus-1",
+  "comment": "Adversarial redaction corpus (design 19.2, 22.2). Every case is deterministic: fixed frames, fixed rules, and forbidden strings that must never appear in the redacted output. Cases marked oversized: true are expanded by the test to a frame beyond the bounded size limit. Frames may be split into multiple WriteFrame calls to exercise cross-frame secret matching.",
+  "cases": [
+    {
+      "id": "provider-token-inline",
+      "comment": "An Anthropic-style sk- provider token inside a JSON event frame.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["{\"type\":\"output\",\"text\":\"token=sk-ant-abc123def456\\n\"}\n"],
+      "forbidden": ["sk-ant-abc123def456"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "env-assignment",
+      "comment": "Secret-like environment assignment: the whole NAME=value pair is replaced.",
+      "rules": [
+        { "id": "env-assignment", "category": "env_value", "pattern": "(?i)\\b[a-z0-9_]*(?:token|secret|password|passwd|credential|api[_-]?key|access[_-]?key|auth|private[_-]?key)[a-z0-9_]*\\s*=\\s*[^\\s\"',;]+" }
+      ],
+      "frames": ["export ANTHROPIC_API_KEY=sk-ant-abc123def456\n"],
+      "forbidden": ["sk-ant-abc123def456", "ANTHROPIC_API_KEY=sk-ant-abc123def456"],
+      "expectPlaceholders": ["[REDACTED:env_value]"]
+    },
+    {
+      "id": "github-pat",
+      "comment": "GitHub personal access token form.",
+      "rules": [
+        { "id": "github-pat", "category": "github_token", "pattern": "ghp_[A-Za-z0-9]{30,}" }
+      ],
+      "frames": ["clone with ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890\n"],
+      "forbidden": ["ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"],
+      "expectPlaceholders": ["[REDACTED:github_token]"]
+    },
+    {
+      "id": "aws-access-key",
+      "comment": "AWS access key ID form.",
+      "rules": [
+        { "id": "aws-access-key", "category": "aws_access_key", "pattern": "AKIA[0-9A-Z]{16}" }
+      ],
+      "frames": ["AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"],
+      "forbidden": ["AKIAIOSFODNN7EXAMPLE"],
+      "expectPlaceholders": ["[REDACTED:aws_access_key]"]
+    },
+    {
+      "id": "slack-token",
+      "comment": "Slack bot token form.",
+      "rules": [
+        { "id": "slack-token", "category": "slack_token", "pattern": "xox[baprs]-[0-9A-Za-z-]{10,}" }
+      ],
+      "frames": ["slack token xoxb-123456789012-345678901234-abcdefghijklmnopqrstuvwx\n"],
+      "forbidden": ["xoxb-123456789012-345678901234-abcdefghijklmnopqrstuvwx"],
+      "expectPlaceholders": ["[REDACTED:slack_token]"]
+    },
+    {
+      "id": "jwt",
+      "comment": "JWT compact serialization form.",
+      "rules": [
+        { "id": "jwt", "category": "jwt", "pattern": "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20,}" }
+      ],
+      "frames": ["auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c\n"],
+      "forbidden": ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"],
+      "expectPlaceholders": ["[REDACTED:jwt]"]
+    },
+    {
+      "id": "pem-private-key",
+      "comment": "A PEM private key block: the whole block is replaced by one placeholder.",
+      "rules": [
+        { "id": "pem-private-key", "category": "private_key", "pattern": "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----([\\s\\S]*?)-----END [A-Z0-9 ]*PRIVATE KEY-----" }
+      ],
+      "frames": ["-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBAwDggEJAoIBAQC7VJTmyhZsvBqbhzBY\n/p9/9jUjR6SJp3oQyQx6U9n4w0jN2sWcR4vZ2h5yT9zLqKf3rZ0mXaP9sKv7b2F5g\n-----END RSA PRIVATE KEY-----\n"],
+      "forbidden": ["-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"],
+      "expectPlaceholders": ["[REDACTED:private_key]"]
+    },
+    {
+      "id": "json-escaped",
+      "comment": "A secret inside a JSON string, including inside escaped quotes.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["{\"output\":\"token=sk-abc12345\",\"nested\":\"{\\\"credential\\\":\\\"sk-abc12345\\\"}\"}\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "ansi-sequence",
+      "comment": "A secret hidden inside a colored ANSI escape sequence.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["\u001b[1;31mtoken=sk-abc12345\u001b[0m\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "embedded-in-word",
+      "comment": "A token glued into a larger word: the match is still replaced.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["prefixsk-abc12345suffix\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "split-across-frames",
+      "comment": "The secret is cut by a frame boundary.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["token=sk-abc", "12345\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "split-inside-json-string",
+      "comment": "The secret is cut inside a JSON string literal.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["{\"output\":\"token=sk-abc", "12345\"}\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "split-one-byte-frames",
+      "comment": "The secret is delivered one byte per frame.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["t", "o", "k", "e", "n", "=", "s", "k", "-", "a", "b", "c", "1", "2", "3", "4", "5", "\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "split-across-ansi",
+      "comment": "Both the ANSI wrapper and the secret are cut across frames.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["\u001b[1m", "token=sk-abc", "12345\u001b[0m\n"],
+      "forbidden": ["sk-abc12345"],
+      "expectPlaceholders": ["[REDACTED:provider_token]"]
+    },
+    {
+      "id": "oversized-frame",
+      "comment": "A frame beyond the bounded size limit cannot be proven safe: fail closed, nothing is persisted.",
+      "oversized": true,
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "forbidden": [],
+      "expectError": true
+    },
+    {
+      "id": "unparseable-nul",
+      "comment": "Binary content (NUL byte) cannot be checked as text: fail closed, nothing is persisted.",
+      "rules": [
+        { "id": "sk-token", "category": "provider_token", "pattern": "sk-[A-Za-z0-9_-]{8,}" }
+      ],
+      "frames": ["token=sk-abc12345\u0000tail\n"],
+      "forbidden": [],
+      "expectError": true
+    }
+  ]
+}
