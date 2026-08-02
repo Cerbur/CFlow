@@ -1,0 +1,10 @@
+{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"implementation","session_id":"c1","exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":"c1","at_ms":0}
+{"type":"assistant_delta","session_id":"c1","text":"Reading task files","at_ms":5}
+{"type":"assistant_message","session_id":"c1","text":"Implementing the search index.","at_ms":30}
+{"type":"tool_started","session_id":"c1","tool":"write_file","input":{"path":"internal/search/index.go"},"at_ms":45}
+{"type":"tool_finished","session_id":"c1","tool":"write_file","output":{"bytes":2048,"ok":true},"at_ms":90}
+{"type":"tool_started","session_id":"c1","tool":"run_tests","input":{"filter":"search"},"at_ms":100}
+{"type":"tool_finished","session_id":"c1","tool":"run_tests","output":{"passed":12,"failed":0},"at_ms":160}
+{"type":"usage","session_id":"c1","input_tokens":5200,"output_tokens":1400,"cost_usd":0.051,"at_ms":170}
+{"type":"session_finished","session_id":"c1","result":{"commits":["feat: add search index"],"tests_passed":12},"at_ms":200}

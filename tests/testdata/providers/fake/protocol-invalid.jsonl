@@ -1,0 +1,4 @@
+{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":"p3","exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":"p3","at_ms":0}
+{"type":"assistant_message","session_id":"p3","text":"Analyzing scope.","at_ms":10}
+{"type":"mystery_event","session_id":"p3","payload":{"x":1},"at_ms":20}

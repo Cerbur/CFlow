@@ -1,0 +1,4 @@
+{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":"p2","exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":"p2","at_ms":0}
+{"type":"assistant_message","session_id":"p2","text":"Draft plan is not actionable yet.","at_ms":10}
+{"type":"session_failed","session_id":"p2","code":"PLAN_REVISION_REQUIRED","message":"Draft plan needs a second revision.","at_ms":25}

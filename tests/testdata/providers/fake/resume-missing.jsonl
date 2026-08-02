@@ -1,0 +1,5 @@
+{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"implementation","session_id":"c2","exit_code":0,"resume":"not-found","seed":true}
+{"type":"session_started","session_id":"c2","at_ms":0}
+{"type":"assistant_message","session_id":"c2","text":"Halfway through the implementation.","at_ms":40}
+{"type":"usage","session_id":"c2","input_tokens":900,"output_tokens":150,"cost_usd":0.009,"at_ms":60}
+{"type":"session_finished","session_id":"c2","result":{"done":false,"reason":"interrupted"},"at_ms":100}

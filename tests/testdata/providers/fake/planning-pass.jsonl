@@ -1,0 +1,8 @@
+{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":"p1","exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":"p1","at_ms":0}
+{"type":"assistant_message","session_id":"p1","text":"Reading the repository to ground the plan.","at_ms":12}
+{"type":"tool_started","session_id":"p1","tool":"read_file","input":{"path":"README.md"},"at_ms":24}
+{"type":"tool_finished","session_id":"p1","tool":"read_file","output":{"bytes":120,"ok":true},"at_ms":40}
+{"type":"assistant_message","session_id":"p1","text":"The plan has three phases.","at_ms":55}
+{"type":"usage","session_id":"p1","input_tokens":1200,"output_tokens":300,"cost_usd":0.012,"at_ms":70}
+{"type":"session_finished","session_id":"p1","result":{"title":"Add search","phases":["index","query","wire"]},"at_ms":80}
