@@ -1,0 +1,3 @@
+# Controller and evidence state that must never be committed.
+.superpowers/
+test-artifacts/
