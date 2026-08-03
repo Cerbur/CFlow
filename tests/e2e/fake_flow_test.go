@@ -439,6 +439,17 @@ func noCommitImplementationScript() string {
 {"type":"session_finished","session_id":"i1","result":{"summary":"implemented"},"at_ms":20}`, multiplySource)
 }
 
+// dirtyRepairScript is the Repair Session fixture of the dirty retry:
+// like the implementation fixture it writes the file but never commits,
+// so the repair attempt fails DIRTY_TASK_WORKTREE again and the repeated
+// failure consumes the same Retry Budget.
+func dirtyRepairScript() string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"repair","session_id":"rp1","exit_code":0,"resume":"ok","tasks":{"task-s01":{"writes":[{"path":"src/multiply.ts","content":%q}]}}}
+{"type":"session_started","session_id":"rp1","at_ms":0}
+{"type":"assistant_message","session_id":"rp1","text":"Repair pass wrote the file but never committed.","at_ms":10}
+{"type":"session_finished","session_id":"rp1","result":{"summary":"repaired"},"at_ms":20}`, multiplySource)
+}
+
 func reviewScript() string {
 	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"review","session_id":"r1","exit_code":0,"resume":"ok"}
 {"type":"session_started","session_id":"r1","at_ms":0}
@@ -698,7 +709,12 @@ func TestFakeMissingCommitAndDirtyWorktree(t *testing.T) {
 	}
 	wf := fx.driveToExecutionApprovalWithDirty(t)
 
-	appl := fx.app(noCommitImplementationScript(), reviewScript())
+	// The budgeted retry of the DIRTY_TASK_WORKTREE failure runs an
+	// independent Repair Session (PRD 已确认：DIRTY_TASK_WORKTREE 原地
+	// Repair) whose fixture also leaves the Worktree dirty: the repeated
+	// failure consumes the same budget and exhausts into the blocking
+	// finding, and the Worktree stays preserved.
+	appl := fx.app(noCommitImplementationScript(), dirtyRepairScript(), reviewScript())
 	for i := 0; i < 6; i++ {
 		if _, err := appl.Execute(context.Background(), app.DispatchCommand{Workflow: wf}); err != nil {
 			t.Fatalf("dispatch pass %d: %v", i, err)
