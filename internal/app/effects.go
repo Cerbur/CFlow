@@ -64,16 +64,17 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return a.taskWorktreeCreate(ctx, wf, e)
 	case model.WorkflowCompileIntent:
 		return a.workflowCompile(ctx, wf, e)
-	case model.GitCommitInspectIntent, model.GitAuditRefCreateIntent:
-		// STUB (Task 13): canonical Git commit facts.
+	case model.GitCommitInspectIntent:
+		// STUB (Task 18): canonical Git commit facts for the report.
 		return model.EffectResultInput{}, stubEffect(e)
-	case model.IntegrationMergeIntent, model.IntegrationRollbackIntent:
-		// STUB (Task 13): the serial Integration merge protocol.
-		return model.EffectResultInput{}, stubEffect(e)
+	case model.GitAuditRefCreateIntent:
+		return a.gitAuditRefCreate(ctx, e)
+	case model.IntegrationMergeIntent:
+		return a.integrationMerge(ctx, wf, e)
+	case model.IntegrationRollbackIntent:
+		return a.integrationRollback(ctx, wf, e)
 	case model.VerificationRunIntent:
-		// STUB (Task 13): the Verification Engine turns the validated
-		// Catalog identity into executable plus argv after revalidation.
-		return model.EffectResultInput{}, stubEffect(e)
+		return a.verificationRun(ctx, wf, e)
 	case model.ApplyStagingCreateIntent, model.ApplyFastForwardIntent:
 		// STUB (Task 19): the protected Apply compare-and-swap protocol.
 		return model.EffectResultInput{}, stubEffect(e)
@@ -169,6 +170,25 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 		if r.Kind != model.TaskWorktreeCreated || r.WorktreePath == "" {
 			return model.InvariantFault(fmt.Errorf("task worktree result does not match its intent"))
 		}
+	case model.VerificationRunIntent:
+		if r.Kind != model.VerificationRunEnded {
+			return model.InvariantFault(fmt.Errorf("verification result does not match its intent"))
+		}
+	case model.IntegrationMergeIntent:
+		if r.Kind != model.IntegrationMerged && r.Kind != model.IntegrationMergeFailed {
+			return model.InvariantFault(fmt.Errorf("integration merge result does not match its intent"))
+		}
+		if r.Kind == model.IntegrationMergeFailed && r.PreMergeHead == "" {
+			return model.InvariantFault(fmt.Errorf("integration merge failure carries no pre-merge head"))
+		}
+	case model.IntegrationRollbackIntent:
+		if r.Kind != model.IntegrationRollbacked || r.Attempt != e.Attempt {
+			return model.InvariantFault(fmt.Errorf("integration rollback result does not match its intent"))
+		}
+	case model.GitAuditRefCreateIntent:
+		if r.Kind != model.GitAuditRefCreated {
+			return model.InvariantFault(fmt.Errorf("audit ref result does not match its intent"))
+		}
 	}
 	return nil
 }
@@ -237,6 +257,12 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	}
 	if intent.Purpose == model.PurposeImplementation {
 		return a.codingProviderStart(ctx, wf, intent, cmd, rt)
+	}
+	if intent.Purpose == model.PurposeReview {
+		// The independent Reviewer Session (design 16.2): a non-coding
+		// Session inside the Task Worktree, bound to the exact
+		// Commit/Catalog/evidence refs.
+		return a.reviewProviderStart(ctx, wf, intent, cmd, rt)
 	}
 	prompt, ok := a.planningPrompt(cmd)
 	if !ok {

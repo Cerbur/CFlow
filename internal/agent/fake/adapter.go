@@ -49,6 +49,17 @@ type FileWrite struct {
 	Content string `json:"content"`
 }
 
+// TaskPlan is one deterministic fake Task: the files the scripted coding
+// Session writes into that Task's Worktree (selected by the Worktree's
+// node id) and the message of the real implementation Commit the Agent
+// creates (Task 13: the Fake Provider produces real Task Commits in real
+// Worktrees — a real Agent runs git add/commit inside its Worktree; CFlow
+// itself never does).
+type TaskPlan struct {
+	Writes []FileWrite `json:"writes"`
+	Commit string      `json:"commit,omitempty"`
+}
+
 // Script is one parsed Fake fixture. Frames are decoded lazily from the
 // raw lines at drain time, so malformed frames surface as protocol
 // violations at the event boundary exactly like a real byte stream.
@@ -64,6 +75,13 @@ type Script struct {
 	StopAfter  int    // 0 = never; block at this boundary until Cancel
 	Seed       bool   // the declared session pre-exists (resume target)
 	Writes     []FileWrite
+	// Tasks selects per-Task writes and commits by the Worktree's node id
+	// (the CWD basename), so one shared implementation fixture drives
+	// several parallel Tasks with their own content.
+	Tasks map[string]TaskPlan
+	// Commits are the implementation Commit messages the Agent creates
+	// after materializing its writes (Task 13).
+	Commits []string
 
 	rawLines [][]byte
 }
@@ -71,18 +89,20 @@ type Script struct {
 // scriptHeader is the strict fixture header shape. Unknown fields fail
 // the load.
 type scriptHeader struct {
-	Fixture       string      `json:"fixture"`
-	ScriptVersion int         `json:"script_version"`
-	Provider      string      `json:"provider"`
-	Dialect       string      `json:"dialect"`
-	Purpose       string      `json:"purpose"`
-	SessionID     string      `json:"session_id"`
-	ExitCode      int         `json:"exit_code"`
-	Resume        string      `json:"resume"`
-	CrashAfter    int         `json:"crash_after"`
-	StopAfter     int         `json:"stop_after"`
-	Seed          bool        `json:"seed"`
-	Writes        []FileWrite `json:"writes"`
+	Fixture       string              `json:"fixture"`
+	ScriptVersion int                 `json:"script_version"`
+	Provider      string              `json:"provider"`
+	Dialect       string              `json:"dialect"`
+	Purpose       string              `json:"purpose"`
+	SessionID     string              `json:"session_id"`
+	ExitCode      int                 `json:"exit_code"`
+	Resume        string              `json:"resume"`
+	CrashAfter    int                 `json:"crash_after"`
+	StopAfter     int                 `json:"stop_after"`
+	Seed          bool                `json:"seed"`
+	Writes        []FileWrite         `json:"writes"`
+	Tasks         map[string]TaskPlan `json:"tasks"`
+	Commits       []string            `json:"commits"`
 }
 
 // wireFrame is the fake dialect wire shape (snake_case). The dialect
@@ -134,6 +154,16 @@ func ParseScript(data []byte) (*Script, error) {
 			sc.StopAfter = h.StopAfter
 			sc.Seed = h.Seed
 			sc.Writes = append([]FileWrite(nil), h.Writes...)
+			sc.Commits = append([]string(nil), h.Commits...)
+			if len(h.Tasks) > 0 {
+				sc.Tasks = map[string]TaskPlan{}
+				for id, plan := range h.Tasks {
+					sc.Tasks[id] = TaskPlan{
+						Writes: append([]FileWrite(nil), plan.Writes...),
+						Commit: plan.Commit,
+					}
+				}
+			}
 			start = 1
 		}
 	} else {

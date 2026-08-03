@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -110,9 +111,19 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 		// The scripted coding Session materializes its declared writes
 		// into the run's working directory when it finishes (Fake coding
 		// execution, Task 12): coding output never sets lifecycle state,
-		// it writes files in the Task Worktree only.
+		// it writes files in the Task Worktree only. The declared
+		// implementation Commits are then created by the simulated Agent
+		// itself (Task 13: the Fake Provider produces real Task Commits in
+		// real Worktrees; CFlow never runs git add/commit for the Agent).
 		if wf.Type == "session_finished" {
 			if err := r.materializeWrites(); err != nil {
+				return agent.Event{}, &agent.ProtocolError{
+					Code:    model.CodeProviderProtocolViolation,
+					Frame:   line,
+					Message: "fake: " + err.Error(),
+				}
+			}
+			if err := r.commitWrites(); err != nil {
 				return agent.Event{}, &agent.ProtocolError{
 					Code:    model.CodeProviderProtocolViolation,
 					Frame:   line,
@@ -132,9 +143,11 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 }
 
 // materializeWrites writes the script's declared files into the run's
-// working directory, exactly once, at the terminal Session frame. A path
-// that escapes the working directory fails closed: the fixture never
-// writes outside the directory it was given.
+// working directory, exactly once, at the terminal Session frame. When
+// the script declares per-Task plans, the plan of the run's Worktree
+// node (the CWD basename) selects the files. A path that escapes the
+// working directory fails closed: the fixture never writes outside the
+// directory it was given.
 func (r *run) materializeWrites() error {
 	r.ad.mu.Lock()
 	if r.materialized {
@@ -143,11 +156,57 @@ func (r *run) materializeWrites() error {
 	}
 	r.materialized = true
 	writes := append([]FileWrite(nil), r.script.Writes...)
+	if len(r.script.Tasks) > 0 {
+		if plan, ok := r.script.Tasks[filepath.Base(r.cwd)]; ok {
+			writes = append([]FileWrite(nil), plan.Writes...)
+		}
+	}
 	r.ad.mu.Unlock()
 	for _, w := range writes {
 		if err := materializeWrite(r.cwd, w); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// commitWrites creates the simulated Agent's real implementation
+// Commits in the run's working directory (git add + git commit, exactly
+// what a real coding Agent does inside its Worktree). The Commit
+// identity comes from the repository's effective configuration, so the
+// Task gate's Commit policy check observes the same identity the
+// Preflight approved. The commits run exactly once, after the writes.
+func (r *run) commitWrites() error {
+	r.ad.mu.Lock()
+	messages := append([]string(nil), r.script.Commits...)
+	if len(r.script.Tasks) > 0 {
+		if plan, ok := r.script.Tasks[filepath.Base(r.cwd)]; ok && plan.Commit != "" {
+			messages = append([]string(nil), plan.Commit)
+		}
+	}
+	r.ad.mu.Unlock()
+	for _, message := range messages {
+		if err := runGit(r.cwd, "add", "-A"); err != nil {
+			return err
+		}
+		if err := runGit(r.cwd, "commit", "-q", "-m", message); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runGit runs one real git argv in dir (the simulated Agent's own
+// commit; the Fake never needs the process Supervisor).
+func runGit(dir string, args ...string) error {
+	if dir == "" {
+		return fmt.Errorf("scripted commit requires a working directory")
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fake: git %v failed: %v: %s", args, err, out)
 	}
 	return nil
 }

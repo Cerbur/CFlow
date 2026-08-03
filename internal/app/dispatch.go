@@ -27,10 +27,13 @@ import (
 	"cflow.local/cflow/internal/store"
 )
 
-// nodeDispatchBudget bounds one Node's effect chain: the allocation
-// Decision, the Task Worktree result, the coding Session result, and the
-// settle Decision.
-const nodeDispatchBudget = 4
+// nodeDispatchBudget bounds one Node's effect chain. An agent-task chain
+// runs: the allocation, the Worktree creation, the coding Session, the
+// Session settle, the Task gate result, and the settle Decision. A verify
+// chain runs: the allocation, the Verification run, the Reviewer Session,
+// and the settle. A merge chain runs: the allocation, the merge, and (on
+// conflict) the rollback and the settle.
+const nodeDispatchBudget = 8
 
 // dispatchNode is one installed Node of the approved execution plus the
 // approved Task facts the dispatch needs (route, scopes, resource locks).
@@ -68,13 +71,17 @@ func (p *dispatchPlan) node(id model.NodeID) *dispatchNode {
 }
 
 // runBudget is the approved total-run budget: the initial run plus the
-// budgeted retries of every agent-task Node (design 12: the total-run
-// budget must permit every allocation).
+// budgeted retries of every agent-task Node, plus one Attempt per verify
+// and merge Node (design 12: the total-run budget must permit every
+// allocation).
 func (p *dispatchPlan) runBudget() int {
 	total := 0
 	for _, n := range p.nodes {
-		if n.kind == model.NodeAgentTask {
+		switch n.kind {
+		case model.NodeAgentTask:
 			total += 1 + n.retry
+		case model.NodeVerify, model.NodeMerge:
+			total++
 		}
 	}
 	return total
@@ -183,8 +190,16 @@ func (a *Application) executionPlan(ctx context.Context, wf model.WorkflowID) (*
 			plan.totalRuns += 1 + n.MaxRetry
 		case "verify":
 			dn.kind = model.NodeVerify
+			dn.specID = n.SpecID
+			if s, ok := specByID[n.SpecID]; ok && s.Route != nil {
+				dn.route = s.Route.Provider
+			}
 		case "merge":
 			dn.kind = model.NodeMerge
+			dn.specID = n.SpecID
+			if s, ok := specByID[n.SpecID]; ok && s.Route != nil {
+				dn.route = s.Route.Provider
+			}
 		case "checkpoint":
 			dn.kind = model.NodeCheckpoint
 		case "final_verify":
@@ -295,12 +310,32 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 
 	for _, id := range selected {
 		node := plan.node(id)
+		// A merge Node takes the Integration/Apply Lock before its
+		// Resource Locks (fixed lock order, design 18.1): the serial
+		// --no-ff merges of the trusted delivery chain never overlap.
+		var integHold *platform.Hold
+		if node.kind == model.NodeMerge {
+			ls, err := a.lockSet()
+			if err != nil {
+				return Outcome{}, err
+			}
+			integHold, err = ls.Integration(ctx, a.project.Key)
+			if err != nil {
+				return Outcome{}, lockFault(err)
+			}
+		}
 		holds, err := a.acquireResourceLocks(ctx, node.locks)
 		if err != nil {
+			if integHold != nil {
+				integHold.Release()
+			}
 			return Outcome{}, err
 		}
-		err = a.runNodeDispatch(ctx, st, wf, id, node.route, baseHead, rt)
+		err = a.runNodeDispatch(ctx, st, wf, id, node.route, baseHead, node, rt)
 		holds.Release()
+		if integHold != nil {
+			integHold.Release()
+		}
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -353,20 +388,45 @@ func (a *Application) graphSnapshot(state model.State, plan *dispatchPlan) model
 // into them in a later pass — two RUNNING Attempts with overlapping locks
 // or scopes never coexist in the state model (review fix #1; the state
 // Task 13's gates consume must never show the violation). An open
-// blocking Finding in the Node's scope, the total-run budget, and the
-// unsupported kinds (verify/merge/checkpoint/final-verify dispatch
-// arrives with Task 13) also defer.
+// blocking Finding in the Node's scope and the total-run budget also
+// defer. Verify Nodes run in their own Task Worktrees (no static
+// conflict); Merge Nodes are serial: at most one merge Node per pass and
+// never while another merge is RUNNING (design 15.5, 18.1). The
+// unsupported kinds (checkpoint/final-verify dispatch arrive with Task
+// 18) defer.
 func (a *Application) selectBatch(state model.State, plan *dispatchPlan, eligible []model.NodeID) []model.NodeID {
 	var selected []model.NodeID
+	mergeSelected := false
+	mergeRunning := false
+	for _, n := range state.Nodes {
+		if n.Kind == model.NodeMerge && n.Status == model.NodeRunning {
+			mergeRunning = true
+			break
+		}
+	}
 	for _, id := range eligible {
 		node := plan.node(id)
-		if node == nil || node.kind != model.NodeAgentTask {
+		if node == nil {
+			continue
+		}
+		switch node.kind {
+		case model.NodeAgentTask, model.NodeVerify:
+		case model.NodeMerge:
+			if mergeRunning || mergeSelected {
+				continue
+			}
+			mergeSelected = true
+		default:
 			continue
 		}
 		if blockingFinding(state, node.id) {
 			continue
 		}
 		if len(state.Attempts) >= plan.runBudget() {
+			continue
+		}
+		if node.kind != model.NodeAgentTask {
+			selected = append(selected, id)
 			continue
 		}
 		conflict := false
@@ -469,11 +529,15 @@ func (a *Application) acquireResourceLocks(ctx context.Context, names []string) 
 // runNodeDispatch allocates one Node (design 12): the RUNNING Attempt
 // commits first — a Node is considered running only after its Attempt row
 // commits, and an in-memory queued goroutine is not an in-flight Attempt
-// and must be discarded if the gate closes — then the Task Worktree
-// creation runs, then the coding Session starts inside it, then the
-// Session settles. Every Decision revalidates the committed Dispatch
-// Gate.
-func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf model.WorkflowID, node model.NodeID, route, baseHead string, rt *agent.Runtime) error {
+// and must be discarded if the gate closes — then the Node's chain runs:
+// the Task Worktree creation and the coding Session for an agent-task
+// Node, the deterministic Verification and the independent Reviewer
+// Session for a verify Node, and the serial --no-ff Integration merge
+// (with its conflict rollback) for a merge Node. When an agent-task
+// coding Session settles, the Application runs the Task Commit/Clean/
+// Scope gate and feeds the AttemptEnded result; every Decision
+// revalidates the committed Dispatch Gate.
+func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf model.WorkflowID, node model.NodeID, route, baseHead string, planNode *dispatchNode, rt *agent.Runtime) error {
 	view, err := st.View(ctx, store.StoreQuery{})
 	if err != nil {
 		return err
@@ -486,6 +550,7 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 		BaseHead: baseHead,
 	})
 	executed := map[string]struct{}{}
+	gateFed := false
 	for iter := 0; iter < nodeDispatchBudget; iter++ {
 		cd, err := st.Transact(ctx, version, func(state model.State) (model.Decision, error) {
 			return decision.Decide(state, input)
@@ -499,6 +564,18 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 			a.probeStep("attempt:" + string(node) + ":commit")
 		}
 		if cd.Decision.Effect == nil {
+			// No further Effect: when an agent-task coding Session settled
+			// and its Attempt is still RUNNING, the Application runs the
+			// Task gate and feeds the AttemptEnded result (design 15.4).
+			if planNode != nil && planNode.kind == model.NodeAgentTask && !gateFed && a.attemptRunning(ctx, wf, node) {
+				result, err := a.taskGateResult(ctx, wf, node, planNode.writeScope)
+				if err != nil {
+					return err
+				}
+				gateFed = true
+				input = result
+				continue
+			}
 			return nil
 		}
 		id := intentIdentity(cd.Decision.Effect)
@@ -516,6 +593,30 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 		input = model.EffectResultInput(result)
 	}
 	return model.InvariantFault(fmt.Errorf("node dispatch exceeded the effect bound"))
+}
+
+// attemptRunning reports whether one Node's Attempt is still RUNNING.
+// The read goes through the already-open write Store: the mutation lock
+// batch is held, so no second Schema Lock may be taken (design 18.1).
+func (a *Application) attemptRunning(ctx context.Context, wf model.WorkflowID, node model.NodeID) bool {
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return false
+	}
+	return runningAttemptOfState(view.State, node) != nil
+}
+
+// writeStoreView reads the current aggregate through the already-open
+// write Store of one workflow (no new lock; the mutation lock batch is
+// held by the caller, design 18.1).
+func (a *Application) writeStoreView(ctx context.Context, wf model.WorkflowID) (store.StoreView, error) {
+	a.mu.Lock()
+	st := a.stores[wf]
+	a.mu.Unlock()
+	if st == nil {
+		return store.StoreView{}, model.InvariantFault(fmt.Errorf("no write store is open for workflow %s", wf))
+	}
+	return st.View(ctx, store.StoreQuery{})
 }
 
 // taskWorktreePath is the deterministic Task Worktree location of one

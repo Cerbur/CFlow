@@ -1,0 +1,610 @@
+package app
+
+// The Task 13 executors: the Task Commit/Clean/Scope gate, the
+// deterministic Verification run, the independent Reviewer Session, the
+// serial --no-ff Integration merge and its conflict rollback, and the
+// append-only audit Ref. Same-package split of the Application seam: no
+// public seam added. Every executor reports typed facts; the Kernel
+// settles Attempts (design 6.2 rule 5).
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/compile"
+	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/verify"
+)
+
+// verificationRun executes one approved Catalog entry through the
+// Verification Engine (design 16.2) and persists the Evidence Manifest
+// to the managed evidence root. Engine-level failures (identity drift,
+// executable mismatch) become typed failed results, never dangling
+// Attempts.
+func (a *Application) verificationRun(ctx context.Context, wf model.WorkflowID, intent model.VerificationRunIntent) (model.EffectResultInput, error) {
+	fail := func(code model.Code, text string) model.EffectResultInput {
+		return model.EffectResultInput{
+			Kind:         model.VerificationRunEnded,
+			Attempt:      a.runningAttemptKey(ctx, wf, intent.Node),
+			Passed:       false,
+			FailureCode:  code,
+			PreMergeHead: "",
+			Reason:       text,
+		}
+	}
+	if _, err := a.readCatalogBody(ctx, wf, intent.Catalog); err != nil {
+		return fail(model.CodeEvidenceSubjectChanged, "catalog body cannot be read"), nil
+	}
+	commandID, taskNode, err := a.verifyNodeFacts(ctx, wf, intent.Node)
+	if err != nil {
+		return fail(model.CodeEvidenceSubjectChanged, err.Error()), nil
+	}
+	engine, err := verify.NewEngine(verify.EngineOptions{
+		Supervisor: a.supervisor, GitFlow: a.git, Redaction: a.redaction,
+		LoadCatalog: func(ctx context.Context, ref model.CatalogRef) ([]byte, error) {
+			return a.readCatalogBody(ctx, wf, ref)
+		},
+	})
+	if err != nil {
+		return fail(model.CodeEvidenceSubjectChanged, "verification engine cannot be built"), nil
+	}
+	manifest, err := engine.Run(ctx, verify.VerificationRequest{
+		Node:        intent.Node,
+		Catalog:     intent.Catalog,
+		CommandID:   commandID,
+		Purpose:     verify.PurposeTaskVerify,
+		Worktree:    a.taskWorktreePath(wf, taskNode),
+		CommitRange: intent.CommitRange,
+	})
+	if err != nil {
+		code, _ := model.CodeOf(err)
+		return fail(code, err.Error()), nil
+	}
+	if err := a.writeVerificationManifest(wf, intent.Node, manifest); err != nil {
+		return fail(model.CodeSensitiveDataRedactionFailed, "verification evidence cannot be persisted"), nil
+	}
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		return fail(model.CodeSensitiveDataRedactionFailed, "verification evidence cannot be serialized"), nil
+	}
+	return model.EffectResultInput{
+		Kind:         model.VerificationRunEnded,
+		Attempt:      a.runningAttemptKey(ctx, wf, intent.Node),
+		Passed:       manifest.Passed,
+		Manifest:     body,
+		ManifestHash: manifest.Hash,
+		Reason:       manifest.Reason,
+	}, nil
+}
+
+// integrationMerge performs one serial --no-ff Integration merge (design
+// 15.5): the pre-merge facts are re-observed (recorded pre-merge HEAD,
+// clean Integration Worktree, accepted Commit still the Task Branch
+// HEAD), the Commit Preflight runs before the merge, and the Merge
+// Commit's identity is verified after it. A text conflict or a failed
+// post-merge check returns a typed failed result carrying the recorded
+// pre-merge HEAD; the Kernel requests the Integration Rollback.
+func (a *Application) integrationMerge(ctx context.Context, wf model.WorkflowID, intent model.IntegrationMergeIntent) (model.EffectResultInput, error) {
+	attempt := a.runningAttemptKey(ctx, wf, intent.Node)
+	fail := func(code model.Code, reason string) model.EffectResultInput {
+		return model.EffectResultInput{
+			Kind: model.IntegrationMergeFailed, Attempt: attempt,
+			FailureCode: code, PreMergeHead: intent.BaseHead, Reason: reason,
+		}
+	}
+	path := a.integrationWorktreePath(wf)
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+
+	// Pre-merge facts (PRD: Merge 前再次比较已验收 Commit、Task Branch HEAD
+	// 和 Git-clean 状态).
+	status, err := a.observeWorktree(ctx, path, intent.BaseHead)
+	if err != nil {
+		return fail(model.CodeStateInvariantViolation, "pre-merge integration status is unreadable"), nil
+	}
+	if !status.Clean() {
+		return fail(model.CodeDirtyTaskWorktree, "the integration worktree is not git-clean before the merge"), nil
+	}
+	refFacts, err := a.git.Observe(ctx, gitflow.RefLookup{Ref: "refs/heads/" + intent.TaskBranch})
+	if err != nil {
+		return fail(model.CodeStateInvariantViolation, "task branch facts are unreadable"), nil
+	}
+	rf, ok := refFacts.(gitflow.RefFacts)
+	if !ok || !rf.Exists || rf.Value != intent.VerifiedCommit {
+		return fail(model.CodeEvidenceSubjectChanged, "the task branch moved after verification"), nil
+	}
+
+	// The Commit Preflight runs before the Merge Commit is created (PRD
+	// 已确认：Merge Conflict 处理).
+	preflightRes, err := a.git.Execute(ctx, gitflow.CommitPreflight{
+		Revision: fmt.Sprintf("merge-%s-%s", wf, attempt.Node),
+	})
+	if err != nil {
+		return fail(model.CodeGitIdentityNotConfigured, "merge commit preflight failed"), nil
+	}
+	preflight, ok := preflightRes.(gitflow.PreflightEvidence)
+	if !ok {
+		return fail(model.CodeStateInvariantViolation, "merge preflight result has an unexpected type"), nil
+	}
+
+	res, err := a.git.Execute(ctx, gitflow.MergeIntegration{Path: path, Branch: intent.TaskBranch})
+	if err != nil {
+		code, _ := model.CodeOf(err)
+		return fail(code, "the integration merge did not complete"), nil
+	}
+	switch r := res.(type) {
+	case gitflow.MergeConflictResult:
+		return fail(model.CodeMergeConflict, "text conflict; the integration worktree stays at the pre-merge head for the rollback"), nil
+	case gitflow.MergeResult:
+		// The Merge Commit's identity must match the just-run Preflight.
+		if _, err := a.git.Execute(ctx, gitflow.VerifyCommit{
+			Ref: r.Head, ExpectedAuthor: preflight.Author,
+			ExpectedCommitter: preflight.Committer, ExpectedSigning: preflight.Signing,
+		}); err != nil {
+			return fail(model.CodeCommitPolicyMismatch, "merge commit identity does not match the preflight"), nil
+		}
+		// Post-merge check: the Worktree is clean at the Merge Commit.
+		post, err := a.observeWorktree(ctx, path, r.Head)
+		if err != nil {
+			return fail(model.CodeStateInvariantViolation, "post-merge status is unreadable"), nil
+		}
+		if !post.Clean() {
+			return fail(model.CodeMergeConflict, "post-merge verification failed: the integration worktree is not git-clean"), nil
+		}
+		return model.EffectResultInput{
+			Kind: model.IntegrationMerged, Attempt: attempt,
+			EndHead: r.Head,
+			Evidence: model.EvidenceRef{
+				Kind: model.EvidenceCommit, Hash: r.Head, Subject: intent.TaskBranch,
+			},
+			EvidenceRefs: []model.EvidenceRef{
+				{Kind: model.EvidenceCommit, Hash: r.Head, Subject: intent.TaskBranch},
+				{Kind: model.EvidenceGitSnapshot, Hash: r.Head, Subject: "integration"},
+			},
+		}, nil
+	default:
+		return fail(model.CodeStateInvariantViolation, "merge result has an unexpected type"), nil
+	}
+}
+
+// integrationRollback restores the managed Integration Worktree to the
+// recorded pre-merge HEAD (RollbackMerge: `git merge --abort` for a
+// conflicted merge, the guarded reset for a committed merge that failed
+// its post-merge checks; PRD 已确认：Merge Conflict 处理). Only the managed
+// Integration Worktree is touched.
+func (a *Application) integrationRollback(ctx context.Context, wf model.WorkflowID, intent model.IntegrationRollbackIntent) (model.EffectResultInput, error) {
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	res, err := a.git.Execute(ctx, gitflow.RollbackMerge{
+		Path: a.integrationWorktreePath(wf), ExpectedHead: intent.Head,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	rr, ok := res.(gitflow.RollbackResult)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("rollback result has an unexpected type"))
+	}
+	return model.EffectResultInput{
+		Kind: model.IntegrationRollbacked, Attempt: intent.Attempt,
+		EndHead: rr.Head,
+		Evidence: model.EvidenceRef{
+			Kind: model.EvidenceGitSnapshot, Hash: rr.Head, Subject: "integration",
+		},
+	}, nil
+}
+
+// gitAuditRefCreate creates one append-only audit Ref (expected-absent
+// compare-and-swap, GitFlow).
+func (a *Application) gitAuditRefCreate(ctx context.Context, intent model.GitAuditRefCreateIntent) (model.EffectResultInput, error) {
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	if _, err := a.git.Execute(ctx, gitflow.CreateAuditRef{Ref: intent.Ref, Head: intent.Head}); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return model.EffectResultInput{Kind: model.GitAuditRefCreated}, nil
+}
+
+// reviewProviderStart runs the independent Reviewer Session (design
+// 16.2, TASK_REVIEW purpose) inside the Task Worktree, bound to the
+// exact Commit/Catalog/evidence refs through its typed input block. The
+// Reviewer is a non-coding Session: the Worktree's HEAD and Git-visible
+// state must be unchanged (UNEXPECTED_AGENT_MUTATION otherwise), and the
+// result echoes the verification manifest hash so the Kernel can record
+// the test-result evidence.
+func (a *Application) reviewProviderStart(ctx context.Context, wf model.WorkflowID, intent model.ProviderStartIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.promptForPurpose(model.PurposeReview)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the review purpose")
+	}
+	_, taskNode, err := a.verifyNodeFacts(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	cwd := a.taskWorktreePath(wf, taskNode)
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.reviewSessionInput(ctx, wf, intent.Node, taskNode)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := rt.Start(ctx, agent.StartRequest{
+		Purpose:   intent.Purpose,
+		Provider:  intent.Route,
+		Prompt:    prompt.Body,
+		Input:     input,
+		CWD:       cwd,
+		SessionID: intent.Session,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out, err := a.runOutcome(cmd, res)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	// The review verdict is the Session's terminal result (the Kernel
+	// judges the structured PASS/FAIL verdict); the planning body
+	// assembler knows no dispatch commands, so the body is carried
+	// explicitly.
+	if res.Terminal != nil {
+		out.Body = []byte(res.Terminal.Result)
+	}
+	// The review result carries the verification manifest hash so the
+	// Kernel binds the deterministic test-result evidence to the review
+	// pass (design 16.2: review never replaces deterministic
+	// verification).
+	out.ManifestHash = a.verificationManifestHash(wf, intent.Node)
+	return out, nil
+}
+
+// reviewSessionInput builds the Reviewer's typed input block: the Spec,
+// the Verification Catalog, the Task's Commit range, the Worktree, and
+// the deterministic Verification Manifest (the TASK_REVIEW prompt's
+// input contract).
+func (a *Application) reviewSessionInput(ctx context.Context, wf model.WorkflowID, verifyNode, taskNode model.NodeID) (any, error) {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil, err
+	}
+	manifestBody, err := a.readVerificationManifestFile(wf, verifyNode)
+	if err != nil {
+		return nil, err
+	}
+	return struct {
+		Spec         string `json:"spec"`
+		Catalog      string `json:"catalog"`
+		CommitRange  string `json:"commit_range"`
+		Worktree     string `json:"worktree"`
+		Verification string `json:"verification"`
+	}{
+		Spec:         string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+		Catalog:      string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		CommitRange:  manifestRange(manifestBody),
+		Worktree:     a.taskWorktreePath(wf, taskNode),
+		Verification: string(manifestBody),
+	}, nil
+}
+
+// taskGateResult runs the Task Commit/Clean/Scope gate after the coding
+// Session settles and builds the AttemptEnded input the Kernel judges
+// (PRD 已确认：Provider 默认权限与 Commit/Clean Worktree Gate). A gate
+// failure is a typed failed result with the PRD code; CFlow never fixes
+// the Worktree itself.
+func (a *Application) taskGateResult(ctx context.Context, wf model.WorkflowID, node model.NodeID, writeScope []string) (model.EffectResultInput, error) {
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	st := view.State
+	attempt := runningAttemptOfState(st, node)
+	if attempt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("gate ran without a running attempt for %s", node))
+	}
+	nd := st.Nodes[node]
+	if nd == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("gate ran without a node %s", node))
+	}
+	prior := priorAttemptEnd(st, node)
+	preflight, ok := a.readPreflightEvidence(ctx, wf, st)
+	if !ok {
+		// The recorded Commit Preflight the Execution Approval bound is
+		// missing: the Commit identity cannot be verified, so the gate
+		// fails closed with COMMIT_POLICY_MISMATCH.
+		return gateEnded(attempt.Key, model.CodeCommitPolicyMismatch, gateEndFacts(ctx, a, wf, node)), nil
+	}
+	engine, err := verify.NewEngine(verify.EngineOptions{
+		Supervisor: a.supervisor, GitFlow: a.git, Redaction: a.redaction,
+		LoadCatalog: func(ctx context.Context, ref model.CatalogRef) ([]byte, error) {
+			return a.readCatalogBody(ctx, wf, ref)
+		},
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	gate, err := engine.TaskGate(ctx, verify.TaskGateRequest{
+		WorkflowID:      wf,
+		TaskID:          string(node),
+		TaskBranch:      nd.Branch,
+		TaskBase:        nd.BaseCommit,
+		AttemptNumber:   int(attempt.Key.Number),
+		PriorAttemptEnd: prior,
+		WriteScope:      writeScope,
+		Author:          preflight.Author,
+		Committer:       preflight.Committer,
+		Signing:         preflight.Signing,
+		Worktree:        a.taskWorktreePath(wf, node),
+	})
+	if err != nil {
+		code, _ := model.CodeOf(err)
+		return gateEnded(attempt.Key, code, gateEndFacts(ctx, a, wf, node)), nil
+	}
+	return model.EffectResultInput{
+		Kind:     model.AttemptEnded,
+		Attempt:  attempt.Key,
+		Outcome:  model.OutcomeSucceeded,
+		EndHead:  gate.Head,
+		Evidence: model.EvidenceRef{Kind: model.EvidenceCommit, Hash: gate.Head, Subject: nd.Branch},
+		EvidenceRefs: []model.EvidenceRef{
+			{Kind: model.EvidenceCommit, Hash: gate.Head, Subject: nd.Branch},
+			{Kind: model.EvidenceGitSnapshot, Hash: gate.Head, Subject: string(node)},
+		},
+	}, nil
+}
+
+// gateEnded builds the failed AttemptEnded input with the Worktree's
+// current end facts (the PRD: a failed Attempt immutably records its
+// start/end HEAD and Dirty Fingerprint).
+func gateEnded(key model.AttemptKey, code model.Code, facts gitflow.StatusFacts) model.EffectResultInput {
+	return model.EffectResultInput{
+		Kind:                model.AttemptEnded,
+		Attempt:             key,
+		Outcome:             model.OutcomeFailed,
+		FailureCode:         code,
+		EndHead:             facts.Head,
+		EndDirtyFingerprint: dirtyFingerprint(facts.Dirty),
+	}
+}
+
+// gateEndFacts observes the Task Worktree's current end facts after a
+// failed gate.
+func gateEndFacts(ctx context.Context, a *Application, wf model.WorkflowID, node model.NodeID) gitflow.StatusFacts {
+	facts, err := a.observeWorktree(ctx, a.taskWorktreePath(wf, node), "")
+	if err != nil {
+		return gitflow.StatusFacts{}
+	}
+	return facts
+}
+
+// runningAttemptOfState returns the RUNNING Attempt of one Node.
+func runningAttemptOfState(st model.State, node model.NodeID) *model.Attempt {
+	for k, a := range st.Attempts {
+		if k.Node == node && a.Status == model.AttemptRunning {
+			return a
+		}
+	}
+	return nil
+}
+
+// priorAttemptEnd returns the terminal end HEAD of the previous Attempt
+// of one Node ("" when none): the append-only anchor of the gate.
+func priorAttemptEnd(st model.State, node model.NodeID) string {
+	var best model.AttemptKey
+	var end string
+	for k, a := range st.Attempts {
+		if k.Node != node || !a.Status.IsTerminal() {
+			continue
+		}
+		if end == "" || k.Number > best.Number {
+			best = k
+			end = a.EndHead
+		}
+	}
+	return end
+}
+
+// runningAttemptKey is the RUNNING Attempt key of one Node ("" when
+// none).
+func (a *Application) runningAttemptKey(ctx context.Context, wf model.WorkflowID, node model.NodeID) model.AttemptKey {
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return model.AttemptKey{}
+	}
+	if att := runningAttemptOfState(view.State, node); att != nil {
+		return att.Key
+	}
+	return model.AttemptKey{}
+}
+
+// verifyNodeFacts parses the compiled Workflow Artifact and returns the
+// verify Node's approved Catalog command id and its Task dependency's
+// node id (the Worktree the verification runs inside).
+func (a *Application) verifyNodeFacts(ctx context.Context, wf model.WorkflowID, node model.NodeID) (commandID string, taskNode model.NodeID, err error) {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return "", "", err
+	}
+	body := readArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	wfIR, err := compile.ParseWorkflow(body)
+	if err != nil {
+		return "", "", fmt.Errorf("the compiled workflow cannot be parsed")
+	}
+	var found *compile.WorkflowNode
+	for i := range wfIR.Nodes {
+		if wfIR.Nodes[i].ID == string(node) {
+			found = &wfIR.Nodes[i]
+			break
+		}
+	}
+	if found == nil {
+		return "", "", fmt.Errorf("verify node is missing from the compiled workflow")
+	}
+	commandID = found.CommandID
+	if commandID == "" {
+		return "", "", fmt.Errorf("verify node references no catalog command")
+	}
+	taskNode, err = taskDependencyNode(wfIR, found)
+	if err != nil {
+		return "", "", err
+	}
+	return commandID, taskNode, nil
+}
+
+// taskDependencyNode resolves the agent-task dependency of one verify
+// Node from the compiled workflow edges.
+func taskDependencyNode(wfIR compile.Workflow, node *compile.WorkflowNode) (model.NodeID, error) {
+	for _, e := range wfIR.Edges {
+		if e.To != node.ID {
+			continue
+		}
+		for _, n := range wfIR.Nodes {
+			if n.ID == e.From && n.Type == "agent_task" {
+				return model.NodeID(n.ID), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("verify node has no task dependency in the compiled workflow")
+}
+
+// readCatalogBody reads one immutable Catalog Revision body by identity.
+func (a *Application) readCatalogBody(ctx context.Context, wf model.WorkflowID, ref model.CatalogRef) ([]byte, error) {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil, err
+	}
+	return store.Get(ctx, model.ArtifactRef{
+		Workflow: wf, Type: model.ArtifactCatalog, Revision: ref.Revision, Hash: ref.Hash,
+	})
+}
+
+// readPreflightEvidence reads the recorded Commit Preflight report the
+// Execution Approval bound (revision and hash from the aggregate's
+// ExecutionFacts) and returns the immutable evidence the gate verifies
+// the actual Commit against.
+func (a *Application) readPreflightEvidence(ctx context.Context, wf model.WorkflowID, st model.State) (gitflow.PreflightEvidence, bool) {
+	facts := st.Workflow.ExecutionFacts
+	if facts == nil || facts.PreflightRevision < 1 || facts.CommitPolicyHash == "" {
+		return gitflow.PreflightEvidence{}, false
+	}
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return gitflow.PreflightEvidence{}, false
+	}
+	body, err := store.Get(ctx, model.ArtifactRef{
+		Workflow: wf, Type: model.ArtifactReport,
+		Revision: facts.PreflightRevision, Hash: facts.CommitPolicyHash,
+	})
+	if err != nil {
+		return gitflow.PreflightEvidence{}, false
+	}
+	// The report Artifact's canonical content is the report JSON encoded
+	// as a JSON string (the Store canonicalizes every body per type).
+	var raw string
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return gitflow.PreflightEvidence{}, false
+	}
+	var ev gitflow.PreflightEvidence
+	if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+		return gitflow.PreflightEvidence{}, false
+	}
+	return ev, true
+}
+
+// writeVerificationManifest persists one Evidence Manifest at the
+// deterministic evidence path the Recovery Engine reads (design 17.1
+// order 7): <evidence>/verification/<workflow>/<node>.json.
+func (a *Application) writeVerificationManifest(wf model.WorkflowID, node model.NodeID, m model.EvidenceManifest) error {
+	if a.agent.EvidenceDir == "" {
+		return nil
+	}
+	dir := filepath.Join(a.agent.EvidenceDir, "verification", string(wf))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, string(node)+".json"), data, 0o600)
+}
+
+// readVerificationManifestFile reads the persisted manifest of one
+// verify Node (nil when absent).
+func (a *Application) readVerificationManifestFile(wf model.WorkflowID, node model.NodeID) ([]byte, error) {
+	if a.agent.EvidenceDir == "" {
+		return nil, nil
+	}
+	path := filepath.Join(a.agent.EvidenceDir, "verification", string(wf), string(node)+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// verificationManifestHash is the persisted manifest's self-hash ("" when
+// absent).
+func (a *Application) verificationManifestHash(wf model.WorkflowID, node model.NodeID) string {
+	body, err := a.readVerificationManifestFile(wf, node)
+	if err != nil || body == nil {
+		return ""
+	}
+	var m model.EvidenceManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	return m.Hash
+}
+
+// manifestRange extracts the CommitRange field of a persisted manifest.
+func manifestRange(body []byte) string {
+	if body == nil {
+		return ""
+	}
+	var m model.EvidenceManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	return m.CommitRange
+}
+
+// integrationWorktreePath is the deterministic Integration Worktree
+// location (PRD 全局目录结构).
+func (a *Application) integrationWorktreePath(wf model.WorkflowID) string {
+	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "integration")
+}
+
+// observeWorktree observes one worktree's status with the expected HEAD.
+func (a *Application) observeWorktree(ctx context.Context, dir, expectedHead string) (gitflow.StatusFacts, error) {
+	if a.git == nil {
+		return gitflow.StatusFacts{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	facts, err := a.git.Observe(ctx, gitflow.GitStatus{Dir: dir, ExpectedHead: expectedHead, UntrackedAll: true})
+	if err != nil {
+		return gitflow.StatusFacts{}, err
+	}
+	st, ok := facts.(gitflow.StatusFacts)
+	if !ok {
+		return gitflow.StatusFacts{}, model.InvariantFault(fmt.Errorf("git status observation has an unexpected type"))
+	}
+	return st, nil
+}

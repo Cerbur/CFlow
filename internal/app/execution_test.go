@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/compile"
@@ -729,6 +730,56 @@ func (fx *planningFixture) dispatchPlanFor(a *Application, wf model.WorkflowID, 
 	return err
 }
 
+// seedNodeRow inserts one Node plus its Task projection row directly
+// (the crashed-runtime state the running-node deferral rules protect:
+// a Node whose Attempt never settled).
+func seedNodeRow(t *testing.T, dbPath string, wf model.WorkflowID, id, specID, kind, status, branch string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO tasks
+		(id, workflow_id, spec_id, branch_name, task_base_commit, created_at, updated_at)
+		VALUES (?, ?, ?, ?, '1111111111111111111111111111111111111111', ?, ?)`,
+		id, string(wf), specID, nullBranch(branch), now, now); err != nil {
+		t.Fatalf("seed task row: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes
+		(id, workflow_id, task_id, node_type, status, retry_budget_consumed, max_retry_budget, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+		id, string(wf), id, kind, status, now, now); err != nil {
+		t.Fatalf("seed node row: %v", err)
+	}
+}
+
+func nullBranch(branch string) any {
+	if branch == "" {
+		return nil
+	}
+	return branch
+}
+
+// seedRunningAttempt inserts one RUNNING Attempt row (the crashed-runtime
+// state: the Node is RUNNING and its Attempt never settled).
+func seedRunningAttempt(t *testing.T, dbPath string, wf model.WorkflowID, node string, number int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO node_attempts
+		(id, node_id, attempt_number, status, start_head_commit, evidence_manifest_json, started_at)
+		VALUES (?, ?, ?, 'RUNNING', '1111111111111111111111111111111111111111', '[]', ?)`,
+		fmt.Sprintf("%s-%d", node, number), node, number, now); err != nil {
+		t.Fatalf("seed running attempt: %v", err)
+	}
+}
+
 // RunReadyTasks drives the pipeline to Execution Approval and then runs
 // one dispatch pass over the fixture plan (node "S01", the brief's
 // fixture identity), recording the protocol probe.
@@ -824,14 +875,18 @@ func TestDispatchDefersSharedLockConflict(t *testing.T) {
 			runningAttempts++
 		}
 	}
-	if statusByID["S01"] != model.NodeRunning {
-		t.Fatalf("S01 status = %s, want RUNNING (locked task dispatches first)", statusByID["S01"])
+	// The coding Session writes without committing, so the Task 13 gate
+	// settles the Attempt FAILED with DIRTY_TASK_WORKTREE — the dispatch
+	// itself happened (S01 first, S02 deferred by the static conflict).
+	if statusByID["S01"] != model.NodeFailed {
+		t.Fatalf("S01 status = %s, want FAILED (dirty gate; locked task dispatches first)", statusByID["S01"])
 	}
 	if statusByID["S02"] != model.NodePending {
 		t.Fatalf("S02 status = %s, want PENDING (locked conflict defers the second task)", statusByID["S02"])
 	}
-	if runningAttempts != 1 {
-		t.Fatalf("running attempts = %d, want 1", runningAttempts)
+	// The Task 13 gate settled S01's Attempt inside the same pass.
+	if runningAttempts != 0 {
+		t.Fatalf("running attempts = %d, want 0 (the gate settles the coding attempt in the pass)", runningAttempts)
 	}
 }
 
@@ -859,16 +914,13 @@ func (fx *planningFixture) assertRunningAndPending(wf model.WorkflowID, wantRunn
 
 // TestDispatchDefersAgainstRunningNodeLocks (review fix #1): the static
 // parallel-safety judgment extends to the RUNNING aggregate. S02 deferred
-// by a shared resource lock in pass 1 stays deferred in pass 2 while S01
-// is still RUNNING — two RUNNING Attempts with the same declared
-// resource lock never coexist in the state model (PRD 并行安全判断: two
-// Tasks parallel only if resource_locks disjoint).
+// by a shared resource lock stays deferred while S01 is RUNNING (the
+// crashed-runtime state: a Node whose coding Attempt never settled) —
+// two RUNNING Attempts with the same declared resource lock never
+// coexist in the state model (PRD 并行安全判断: two Tasks parallel only if
+// resource_locks disjoint).
 func TestDispatchDefersAgainstRunningNodeLocks(t *testing.T) {
 	fx := newExecutionFixture(t)
-	// The second pass must actually see S02 as scheduler-eligible: the
-	// concurrency bound must allow two Tasks before the static judgment
-	// decides (PRD 并发上限), so it is configured before the Compiler
-	// validates the skeleton.
 	if err := os.MkdirAll(fx.home, 0o700); err != nil {
 		fx.t.Fatalf("mkdir home: %v", err)
 	}
@@ -882,6 +934,12 @@ func TestDispatchDefersAgainstRunningNodeLocks(t *testing.T) {
 		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
 			route: "fake", locks: []string{"db-shard-1"}},
 	}}
+	// The crashed-runtime state: S01 RUNNING with its Attempt never
+	// settled, S02 PENDING and scheduler-eligible. The graph install is
+	// skipped because the node rows already exist.
+	seedNodeRow(t, a.dbPath, wf, "S01", "S01", "agent-task", "RUNNING", "cflow/"+string(wf)+"/task-S01")
+	seedRunningAttempt(t, a.dbPath, wf, "S01", 1)
+	seedNodeRow(t, a.dbPath, wf, "S02", "S02", "agent-task", "PENDING", "")
 	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
 		fx.t.Fatalf("dispatch pass 1: %v", err)
 	}
@@ -897,8 +955,8 @@ func TestDispatchDefersAgainstRunningNodeLocks(t *testing.T) {
 
 // TestDispatchDefersAgainstRunningNodeScopes (review fix #1): the same
 // deferral applies to overlapping write scopes — a Task whose write
-// scope overlaps a still-RUNNING Task's scope cannot dispatch in a later
-// pass (PRD 并行安全判断).
+// scope overlaps a still-RUNNING Task's scope cannot dispatch (PRD 并行
+// 安全判断).
 func TestDispatchDefersAgainstRunningNodeScopes(t *testing.T) {
 	fx := newExecutionFixture(t)
 	if err := os.MkdirAll(fx.home, 0o700); err != nil {
@@ -914,6 +972,9 @@ func TestDispatchDefersAgainstRunningNodeScopes(t *testing.T) {
 		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
 			route: "fake", writeScope: []string{"src/calc/sub/**"}},
 	}}
+	seedNodeRow(t, a.dbPath, wf, "S01", "S01", "agent-task", "RUNNING", "cflow/"+string(wf)+"/task-S01")
+	seedRunningAttempt(t, a.dbPath, wf, "S01", 1)
+	seedNodeRow(t, a.dbPath, wf, "S02", "S02", "agent-task", "PENDING", "")
 	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
 		fx.t.Fatalf("dispatch pass 1: %v", err)
 	}
@@ -952,8 +1013,11 @@ func TestDispatchHonorsConcurrencyCap(t *testing.T) {
 	for _, n := range iv.Nodes {
 		statusByID[n.ID] = n.Status
 	}
-	if statusByID["S01"] != model.NodeRunning || statusByID["S02"] != model.NodePending {
-		t.Fatalf("statuses = %v, want S01 RUNNING and S02 PENDING under the cap of 1", statusByID)
+	// The coding Session writes without committing, so the Task 13 gate
+	// settles S01 FAILED (dirty); the cap claim — S02 stayed PENDING in
+	// the same pass — is what is under test.
+	if statusByID["S01"] != model.NodeFailed || statusByID["S02"] != model.NodePending {
+		t.Fatalf("statuses = %v, want S01 FAILED (dirty gate) and S02 PENDING under the cap of 1", statusByID)
 	}
 }
 
@@ -1058,14 +1122,18 @@ func TestDifferentProjectsDispatchConcurrently(t *testing.T) {
 	}
 	for _, j := range []job{{a1, fx1, wf1}, {a2, fx2, wf2}} {
 		iv := j.fx.inspect(j.wf)
-		running := 0
+		// The coding Session writes without committing: the Task 13 gate
+		// settles the Attempt FAILED with DIRTY_TASK_WORKTREE in the same
+		// pass — the claim under test is that both workflows dispatched
+		// without lock contention.
+		settled := 0
 		for _, at := range iv.Attempts {
-			if at.Status == model.AttemptRunning {
-				running++
+			if at.Status.IsTerminal() {
+				settled++
 			}
 		}
-		if running != 1 {
-			t.Fatalf("workflow %s running attempts = %d, want 1", j.wf, running)
+		if settled != 1 {
+			t.Fatalf("workflow %s settled attempts = %d, want 1", j.wf, settled)
 		}
 	}
 }

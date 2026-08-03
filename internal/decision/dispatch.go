@@ -83,7 +83,29 @@ func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.De
 	return b.decision(), nil
 }
 
-// decideDispatch is one serialized allocation (design 12). The
+// decideDispatch is one serialized allocation routed by Node kind
+// (design 12): agent-task Nodes run the coding chain, verify Nodes the
+// deterministic Verification and the independent Review, and merge Nodes
+// the serial --no-ff Integration merge (Task 13).
+func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, error) {
+	node := state.Nodes[in.Node]
+	if node == nil {
+		return model.Decision{}, model.InvalidInputFault("unknown node " + string(in.Node))
+	}
+	switch node.Kind {
+	case model.NodeAgentTask:
+		return decideDispatchAgentTask(state, in)
+	case model.NodeVerify:
+		return decideVerifyDispatch(state, in)
+	case model.NodeMerge:
+		return decideMergeDispatch(state, in)
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"node kind " + string(node.Kind) + " cannot be dispatched by this build")
+	}
+}
+
+// decideDispatchAgentTask is the agent-task allocation. The
 // Application computed the eligible set with the pure Scheduler; this
 // Decision revalidates the committed aggregate — the Run is Running with
 // the Dispatch Gate open, the Node is PENDING or READY with budget, the
@@ -92,7 +114,7 @@ func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.De
 // Effect together. A closed gate refuses with DISPATCH_GATE_CLOSED and
 // mutates nothing: an in-memory queued goroutine is never an in-flight
 // Attempt.
-func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, error) {
+func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.Decision, error) {
 	if state.Workflow.ID == "" {
 		return model.Decision{}, model.InvalidInputFault("no workflow to dispatch")
 	}
@@ -118,7 +140,12 @@ func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, 
 		return model.Decision{}, model.InvalidInputFault(
 			"node " + string(node.ID) + " cannot be allocated from status " + string(node.Status))
 	}
-	if node.Status == model.NodeReady && node.RetryCharged >= node.RetryBudget {
+	// The Retry Budget bounds automatic successor Attempts: the initial
+	// Attempt is never charged and each budgeted retry charges one, so a
+	// READY successor whose charge equals the budget is the last allowed
+	// Attempt and still dispatches; a charge beyond the budget cannot
+	// exist (failures beyond it are blocking).
+	if node.Status == model.NodeReady && node.RetryCharged > node.RetryBudget {
 		return model.Decision{}, model.InvalidInputFault("node " + string(node.ID) + " has exhausted its retry budget")
 	}
 	if in.Session == "" || in.Route == "" {

@@ -93,6 +93,13 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageExecution {
 				return decideImplementationRunEnded(state, in, created)
 			}
+		case model.PurposeReview:
+			// The independent Reviewer Session's verdict is evidence; the
+			// Kernel judges it (design 16.2: review never replaces
+			// deterministic verification).
+			if state.Workflow.Stage == model.StageExecution {
+				return decideReviewRunEnded(state, in, created)
+			}
 		}
 		return model.Decision{}, model.InvariantFault(fmt.Errorf(
 			"provider run completed in an unexpected stage %s for purpose %s",
@@ -103,7 +110,10 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			"provider run result carries non-terminal session status %s", in.Session.Status))
 	}
 
-	// A failed or cancelled run: the Session settles with the failure
+	// A failed or cancelled run: for a coding or review Session inside
+	// the EXECUTION stage, the RUNNING Attempt settles failed with the
+	// compiled failure code (an interrupted run never charges the Retry
+	// Budget, PRD 失败分类). Planning Sessions settle with the failure
 	// code and a Finding; the Workflow stays where it is. A failed Check
 	// also restores the Plan to DRAFT review: the Checker produced no
 	// judgment, so the Plan cannot stay CHECKING (the user retries the
@@ -111,6 +121,26 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 	code := in.FailureCode
 	if code == "" {
 		code = model.CodeAgentProcessCrashed
+	}
+	switch created.Purpose {
+	case model.PurposeImplementation, model.PurposeReview:
+		if state.Workflow.Stage == model.StageExecution {
+			if attempt := attemptBySession(state, created.ID); attempt != nil {
+				node := state.Nodes[attempt.Key.Node]
+				if node == nil {
+					return model.Decision{}, model.InvariantFault(fmt.Errorf("attempt %s has no node", attempt.Key))
+				}
+				b := &builder{state: state}
+				b.mutate(sessionEnd(state, created, in))
+				return decideAttemptFailure(state, node, attempt, model.EffectResultInput{
+					Kind:        model.AttemptEnded,
+					Attempt:     attempt.Key,
+					Outcome:     model.OutcomeFailed,
+					FailureCode: code,
+					EndHead:     in.EndHead,
+				}, code, b)
+			}
+		}
 	}
 	b := &builder{state: state}
 	if created.Purpose == model.PurposePlanCheck && state.Plan != nil &&

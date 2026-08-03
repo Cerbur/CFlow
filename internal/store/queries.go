@@ -51,7 +51,8 @@ func forEachRow(ctx context.Context, q querier, query string, args []any, fn fun
 const queryWorkflowRow = `
 	SELECT id, project_id, stage, runtime_status, plan_status, aggregate_version,
 	       COALESCE(target_branch, ''), COALESCE(base_commit, ''),
-	       COALESCE(integration_branch, ''), cancel_requested_at, cancel_reason
+	       COALESCE(integration_branch, ''), COALESCE(integration_head, ''),
+	       cancel_requested_at, cancel_reason
 	FROM workflows WHERE id = ?`
 
 const queryArtifactRefs = `
@@ -170,11 +171,12 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		version                     uint64
 		targetBranch, baseCommit    string
 		integrationBranch           string
+		integrationHead             string
 		cancelAt, cancelReason      sql.NullString
 	)
 	err := q.QueryRowContext(ctx, queryWorkflowRow, workflow).Scan(
 		&id, &project, &stage, &runtime, &planStatus, &version,
-		&targetBranch, &baseCommit, &integrationBranch, &cancelAt, &cancelReason)
+		&targetBranch, &baseCommit, &integrationBranch, &integrationHead, &cancelAt, &cancelReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -186,7 +188,7 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		ID: model.WorkflowID(id), Project: model.ProjectID(project),
 		Stage: model.WorkflowStage(stage), Runtime: model.RuntimeStatus(runtime),
 		TargetBranch: targetBranch, BaseCommit: baseCommit,
-		IntegrationBranch: integrationBranch,
+		IntegrationBranch: integrationBranch, IntegrationHead: integrationHead,
 	}
 	if cancelAt.Valid {
 		st.Workflow.CancelIntent = &model.CancelIntent{Reason: cancelReason.String}

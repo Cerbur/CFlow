@@ -189,6 +189,8 @@ func (a *Application) promptForPurpose(purpose model.AgentPurpose) (agent.Prompt
 		name = "WORKFLOW_OPTIMIZATION"
 	case model.PurposeImplementation:
 		name = "TASK_IMPLEMENTATION"
+	case model.PurposeReview:
+		name = "TASK_REVIEW"
 	}
 	if name == "" {
 		return agent.Prompt{}, false

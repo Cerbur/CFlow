@@ -247,10 +247,10 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 			// The identity-establishing INSERT (creation).
 			if _, err := q.ExecContext(ctx, `INSERT INTO workflows
 				(id, project_id, stage, runtime_status, target_branch, base_commit,
-				 integration_branch, cancel_requested_at, cancel_reason, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 integration_branch, integration_head, cancel_requested_at, cancel_reason, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				m.ID, m.Project, string(m.Stage), string(m.Runtime),
-				m.TargetBranch, m.BaseCommit, m.IntegrationBranch,
+				m.TargetBranch, m.BaseCommit, m.IntegrationBranch, m.IntegrationHead,
 				cancelAt, cancelReason, nowText, nowText); err != nil {
 				return fmt.Errorf("insert workflow: %w", err)
 			}
@@ -258,10 +258,10 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE workflows
 			SET stage = ?, runtime_status = ?, target_branch = ?, base_commit = ?,
-			    integration_branch = ?, cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
+			    integration_branch = ?, integration_head = ?, cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
 			WHERE id = ?`,
 			string(m.Stage), string(m.Runtime), m.TargetBranch, m.BaseCommit,
-			m.IntegrationBranch, cancelAt, cancelReason, nowText, m.ID); err != nil {
+			m.IntegrationBranch, m.IntegrationHead, cancelAt, cancelReason, nowText, m.ID); err != nil {
 			return fmt.Errorf("update workflow: %w", err)
 		}
 		return nil

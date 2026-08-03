@@ -25,6 +25,7 @@ import (
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
 	"cflow.local/cflow/internal/process"
+	"cflow.local/cflow/internal/recovery"
 	"cflow.local/cflow/internal/security"
 	"cflow.local/cflow/internal/store"
 )
@@ -120,7 +121,26 @@ func New(opts Options) (*Application, error) {
 	if opts.Recoverer != nil {
 		a.recoverer = opts.Recoverer
 	} else {
-		a.recoverer = &defaultRecoverer{home: opts.Home, dbPath: a.dbPath}
+		// The full Recovery Engine (Task 13, design 17): posture and
+		// schema compatibility plus the per-workflow fact reconciliation
+		// before every mutation.
+		eng, err := recovery.NewRecoveryEngine(recovery.RecoveryEngineOptions{
+			Supervisor:  sup,
+			GitFlow:     opts.GitFlow,
+			Home:        opts.Home,
+			ProjectKey:  opts.Project.Key,
+			EvidenceDir: opts.Agent.EvidenceDir,
+			OpenView: func(ctx context.Context, wf model.WorkflowID) (store.StoreView, error) {
+				return a.readAggregate(ctx, wf, store.StoreQuery{})
+			},
+			OpenArtifacts: func(ctx context.Context, wf model.WorkflowID) (*artifact.Store, error) {
+				return a.artifactStore(wf)
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		a.recoverer = &recoveryHook{engine: eng}
 	}
 	return a, nil
 }
@@ -284,7 +304,7 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 		return Outcome{}, orCtx(ctx, err)
 	}
 	restricted := false
-	if err := a.recoverReconcile(ctx); err != nil {
+	if err := a.recoverReconcile(ctx, wf); err != nil {
 		code, _ := model.CodeOf(err)
 		if safetyPathAllowed(cmd, code) {
 			restricted = true
@@ -341,8 +361,10 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 
 // recoverReconcile runs the Recovery-before-mutation hook while holding
 // the shared DB Schema Lock (design 9.3 step 1: version detection under
-// the shared lock).
-func (a *Application) recoverReconcile(ctx context.Context) error {
+// the shared lock). The full Recovery Engine reconciles the command's
+// workflow scope (design 17); plain Recoverers reconcile project-level
+// facts only.
+func (a *Application) recoverReconcile(ctx context.Context, wf model.WorkflowID) error {
 	a.probeStep("recover")
 	ls, err := a.lockSet()
 	if err != nil {
@@ -353,6 +375,9 @@ func (a *Application) recoverReconcile(ctx context.Context) error {
 		return lockFault(err)
 	}
 	defer hold.Release()
+	if wr, ok := a.recoverer.(workflowAwareRecoverer); ok {
+		return wr.ReconcileWorkflow(ctx, wf)
+	}
 	return a.recoverer.Reconcile(ctx)
 }
 

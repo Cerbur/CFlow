@@ -121,9 +121,16 @@ func (ProjectDiscovery) isGitQuery() {}
 // GitStatus observes the porcelain-v2 status of one working tree (default
 // the GitFlow working directory). ExpectedHead, when set, must equal the
 // actual HEAD or the observation fails closed (expected-HEAD mismatch).
+// UntrackedAll adds --untracked-files=all so every Git-visible untracked
+// file is classified individually (the PRD Commit/Clean gate form);
+// Ignored additionally classifies ignored files (verification transient
+// output, design 16.2). Ignored files never count toward the Dirty
+// Fingerprint.
 type GitStatus struct {
 	Dir          string // absolute canonical directory; empty means the bound directory
 	ExpectedHead string // full commit hash; empty means no expectation
+	UntrackedAll bool
+	Ignored      bool
 }
 
 func (GitStatus) isGitQuery() {}
@@ -228,6 +235,33 @@ type VerifyCommit struct {
 
 func (VerifyCommit) isGitOperation() {}
 
+// MergeIntegration performs one serial --no-ff Integration merge of
+// branch into the managed Integration Worktree at path (design 15.5).
+// The merge is compare-and-swap guarded: the caller records the expected
+// pre-merge HEAD with a GitStatus observation; a text conflict returns a
+// typed MergeConflictResult (never an error) and leaves the worktree in
+// the conflicted merge state for the RollbackMerge operation.
+type MergeIntegration struct {
+	Path   string // canonical Integration Worktree path
+	Branch string // Task Branch refname (without refs/heads/ prefix)
+}
+
+func (MergeIntegration) isGitOperation() {}
+
+// RollbackMerge restores a managed Integration Worktree left in a
+// conflicted merge state to its recorded pre-merge HEAD: `git merge
+// --abort` (the canonical undo of an in-progress merge that never
+// committed) plus a fail-closed verification of the expected HEAD and a
+// clean worktree. A worktree without a merge in progress blocks with
+// STATE_INVARIANT_VIOLATION: the pre-merge state can no longer be
+// restored safely (design 15.5, PRD 已确认：Merge Conflict 处理).
+type RollbackMerge struct {
+	Path         string // canonical Integration Worktree path
+	ExpectedHead string // the recorded pre-merge HEAD
+}
+
+func (RollbackMerge) isGitOperation() {}
+
 // GitFacts is the closed union of structured facts. Facts are data, never
 // formatted prose: callers make decisions, GitFlow reports truth.
 type GitFacts interface{ isGitFacts() }
@@ -254,7 +288,15 @@ type StatusFacts struct {
 	Staged    []PathEntry // index differs from HEAD (X != '.')
 	Unstaged  []PathEntry // worktree differs from index (Y != '.')
 	Untracked []PathEntry
+	Ignored   []PathEntry // '!' entries, only when the query asked for them
 	Dirty     DirtyFingerprint
+}
+
+// Clean reports whether the working tree meets the PRD Commit/Clean Gate:
+// no staged, unstaged, or Git-visible untracked content. Ignored files
+// never count (PRD 已确认：Provider 默认权限与 Commit/Clean Worktree Gate).
+func (s StatusFacts) Clean() bool {
+	return len(s.Staged) == 0 && len(s.Unstaged) == 0 && len(s.Untracked) == 0
 }
 
 func (StatusFacts) isGitFacts() {}
@@ -441,6 +483,38 @@ type VerifyCommitResult struct {
 
 func (VerifyCommitResult) isGitResult() {}
 
+// MergeResult reports a completed serial --no-ff Integration merge: the
+// new HEAD and the Merge Commit facts (the Merge Commit's parents are the
+// pre-merge HEAD and the merged Task Branch head, preserving the Task's
+// append-only history and the separate Merge Commit, PRD Worktree 策略).
+type MergeResult struct {
+	Path   string
+	Head   string
+	Commit CommitFacts
+}
+
+func (MergeResult) isGitResult() {}
+
+// MergeConflictResult is the typed text-conflict outcome (design 15.5):
+// the merge did not commit, PreMergeHead is the recorded pre-merge HEAD,
+// and the worktree is left in the conflicted merge state for the
+// RollbackMerge operation.
+type MergeConflictResult struct {
+	Path         string
+	PreMergeHead string
+}
+
+func (MergeConflictResult) isGitResult() {}
+
+// RollbackResult reports that the managed Integration Worktree was
+// restored to the recorded pre-merge HEAD and verified clean.
+type RollbackResult struct {
+	Path string
+	Head string
+}
+
+func (RollbackResult) isGitResult() {}
+
 // ---------------------------------------------------------------------------
 // Observe / Execute dispatch
 // ---------------------------------------------------------------------------
@@ -482,6 +556,10 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.commitPreflight(ctx, op)
 	case VerifyCommit:
 		return g.verifyCommit(ctx, op)
+	case MergeIntegration:
+		return g.mergeIntegration(ctx, op)
+	case RollbackMerge:
+		return g.rollbackMerge(ctx, op)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git operation")
 	}

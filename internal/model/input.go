@@ -213,6 +213,21 @@ const (
 	// TaskWorktreeCreated reports the Task Branch/Worktree created from the
 	// recorded Task Base (PRD Worktree 策略; Task 12).
 	TaskWorktreeCreated EffectResultKind = "task-worktree-created"
+	// VerificationRunEnded reports one deterministic Verification run with
+	// its Evidence Manifest and classification (design 16.2; Task 13).
+	VerificationRunEnded EffectResultKind = "verification-run-ended"
+	// IntegrationMerged reports one serial --no-ff Integration merge with
+	// the Merge Commit evidence (design 15.5; Task 13).
+	IntegrationMerged EffectResultKind = "integration-merged"
+	// IntegrationMergeFailed reports a failed Integration merge (text
+	// conflict or a post-merge check failure) with the typed reason; the
+	// Kernel requests the recorded Integration Rollback (design 15.5).
+	IntegrationMergeFailed EffectResultKind = "integration-merge-failed"
+	// IntegrationRollbacked reports that the managed Integration Worktree
+	// was restored to the recorded pre-merge HEAD.
+	IntegrationRollbacked EffectResultKind = "integration-rollbacked"
+	// GitAuditRefCreated reports one created append-only audit Ref.
+	GitAuditRefCreated EffectResultKind = "git-audit-ref-created"
 )
 
 // Valid reports whether k is a declared Effect Result Kind.
@@ -222,7 +237,9 @@ func (k EffectResultKind) Valid() bool {
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
 		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
-		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated:
+		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated,
+		VerificationRunEnded, IntegrationMerged, IntegrationMergeFailed,
+		IntegrationRollbacked, GitAuditRefCreated:
 		return true
 	}
 	return false
@@ -304,6 +321,23 @@ type EffectResultInput struct {
 	// WorktreePath is the created Task Worktree path of a
 	// TaskWorktreeCreated result (PRD Worktree 策略; Task 12).
 	WorktreePath string
+
+	// Verification result facts (Task 13, design 16.2): Passed carries
+	// the classification, Manifest the immutable Evidence Manifest, and
+	// ManifestHash its self-hash.
+	Passed       bool
+	Manifest     []byte
+	ManifestHash string
+	// PreMergeHead is the recorded Integration HEAD before a failed merge
+	// (the Rollback target, design 15.5).
+	PreMergeHead string
+	// Reason is the typed failure reason of an IntegrationMergeFailed
+	// result ("conflict" or "post-merge-check").
+	Reason string
+	// EvidenceRefs is the full immutable evidence list an Attempt's end
+	// records (the chain evidence: test-result, review-result, commit,
+	// git snapshot); Evidence stays the primary reference.
+	EvidenceRefs []EvidenceRef
 }
 
 func (EffectResultInput) isInput() {}

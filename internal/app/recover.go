@@ -7,55 +7,49 @@ package app
 import (
 	"context"
 	"errors"
-	"os"
 
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
-	"cflow.local/cflow/internal/security"
-	"cflow.local/cflow/internal/store"
+	"cflow.local/cflow/internal/recovery"
 )
 
-// defaultRecoverer is the Task 7 recovery-before-mutation hook (design
-// 17.1 order 1-2): CFLOW_HOME security posture, then store/schema
-// compatibility. The full Recovery Engine (Task 13) replaces it; it never
-// pretends to reconcile facts it did not collect.
-type defaultRecoverer struct {
-	home   string
-	dbPath string
+// recoveryHook is the full Recovery-before-mutation hook (Task 13,
+// design 17): the Recovery Engine evaluates the facts in the design's
+// order and returns typed dispositions; the hook converts blocked_drift
+// and fatal_invariant faults into typed Faults that block the mutation
+// (user action required / quarantine), and lets already_completed and
+// safe_to_retry dispositions proceed (the re-execution semantics of
+// safe intents arrive with Task 17).
+type recoveryHook struct {
+	engine *recovery.RecoveryEngine
 }
 
-func (r *defaultRecoverer) Reconcile(ctx context.Context) error {
-	if err := r.ensureHome(); err != nil {
-		return err
-	}
-	if _, err := security.CheckHome(security.HomeRequest{Path: r.home}); err != nil {
-		return err
-	}
-	return r.checkSchema(ctx)
+func (h *recoveryHook) Reconcile(ctx context.Context) error {
+	return h.reconcile(ctx, "")
 }
 
-// ensureHome creates CFLOW_HOME 0700 when missing (design 19.1: CFlow-
-// created directories use 0700). Mutations may create the home; reads
-// never reach this path.
-func (r *defaultRecoverer) ensureHome() error {
-	if _, err := os.Stat(r.home); err == nil {
-		return nil
-	}
-	return os.MkdirAll(r.home, 0o700)
+// ReconcileWorkflow reconciles one workflow's aggregate, Git, Artifact,
+// and evidence facts before a mutation of that workflow.
+func (h *recoveryHook) ReconcileWorkflow(ctx context.Context, wf model.WorkflowID) error {
+	return h.reconcile(ctx, wf)
 }
 
-// checkSchema fails closed when the database schema cannot be interpreted
-// safely by this binary (PRD 决策 9): the read-only open classifies the
-// version without migrating.
-func (r *defaultRecoverer) checkSchema(ctx context.Context) error {
-	if _, err := os.Stat(r.dbPath); err != nil {
-		return nil // no database yet: nothing to interpret
-	}
-	st, err := store.Open(ctx, store.OpenOptions{Path: r.dbPath, ReadOnly: true})
+func (h *recoveryHook) reconcile(ctx context.Context, wf model.WorkflowID) error {
+	out, err := h.engine.Reconcile(ctx, recovery.Scope{Workflow: wf})
 	if err != nil {
 		return err
 	}
-	return st.Close()
+	if len(out.Faults) > 0 {
+		return &out.Faults[0]
+	}
+	return nil
+}
+
+// workflowAwareRecoverer is the optional Recoverer extension that
+// reconciles the command's workflow scope; the plain seam stays for
+// project-level hooks and the app tests.
+type workflowAwareRecoverer interface {
+	ReconcileWorkflow(ctx context.Context, wf model.WorkflowID) error
 }
 
 // safetyPathAllowed reports whether a failed Recovery hook may route

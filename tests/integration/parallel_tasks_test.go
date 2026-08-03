@@ -190,34 +190,34 @@ func TestParallelTasksDispatchOverlapWhileDependentWaits(t *testing.T) {
 	for _, n := range iv.Nodes {
 		statusByID[n.ID] = n.Status
 	}
-	// The three independent Tasks are RUNNING; the dependent Task waits on
-	// the Merge Nodes of S01 and S02.
+	// The three independent Tasks dispatched in the same pass (their
+	// Nodes return READY because the Task 13 gate settled the dirty
+	// coding attempts with a budgeted successor); the dependent Task
+	// waits on the Merge Nodes of S01 and S02.
 	for _, id := range []string{"task-s01", "task-s02", "task-s03"} {
-		if statusByID[model.NodeID(id)] != model.NodeRunning {
-			t.Fatalf("node %s status = %s, want RUNNING", id, statusByID[model.NodeID(id)])
+		if statusByID[model.NodeID(id)] != model.NodeReady {
+			t.Fatalf("node %s status = %s, want READY (dirty gate failure with a budgeted successor)", id, statusByID[model.NodeID(id)])
 		}
 	}
 	if statusByID["task-s04"] != model.NodePending {
 		t.Fatalf("node task-s04 status = %s, want PENDING (waits on merge-s01 and merge-s02)", statusByID["task-s04"])
 	}
-	// Verify and Merge Nodes of the running Tasks are not yet ready.
+	// Verify and Merge Nodes of the dispatched Tasks are not yet ready.
 	for _, id := range []string{"verify-s01", "merge-s01", "final-verify"} {
 		if statusByID[model.NodeID(id)] == model.NodeRunning || statusByID[model.NodeID(id)] == model.NodeSucceeded {
 			t.Fatalf("node %s must not be running before its dependencies settle", id)
 		}
 	}
 
-	// Virtual-time overlap: the three RUNNING Attempts share the fixed
-	// fixture clock instant and are all in flight simultaneously.
-	running := 0
+	// Virtual-time overlap: the three coding Attempts share the fixed
+	// fixture clock instant (the parallel dispatch of one pass), and the
+	// Task 13 gate settled each of them with DIRTY_TASK_WORKTREE (the
+	// fixture scripts write without committing).
+	settled := 0
 	var startedAt time.Time
 	for _, at := range iv.Attempts {
-		if at.Status != model.AttemptRunning {
-			continue
-		}
-		running++
 		if !strings.HasPrefix(string(at.Key.Node), "task-s") {
-			t.Fatalf("running attempt %s is not a task attempt", at.Key)
+			t.Fatalf("attempt %s is not a task attempt", at.Key)
 		}
 		if startedAt.IsZero() {
 			startedAt = at.StartedAt
@@ -225,9 +225,15 @@ func TestParallelTasksDispatchOverlapWhileDependentWaits(t *testing.T) {
 		if !at.StartedAt.Equal(startedAt) {
 			t.Fatalf("attempt %s started at %v, want the shared instant %v (virtual-time overlap)", at.Key, at.StartedAt, startedAt)
 		}
+		if at.Status.IsTerminal() {
+			settled++
+			if at.FailureCode != model.CodeDirtyTaskWorktree {
+				t.Fatalf("attempt %s failed with %s, want DIRTY_TASK_WORKTREE", at.Key, at.FailureCode)
+			}
+		}
 	}
-	if running != 3 {
-		t.Fatalf("running attempts = %d, want 3", running)
+	if settled != 3 {
+		t.Fatalf("settled attempts = %d, want 3 (the gate settles each coding attempt in the pass)", settled)
 	}
 
 	// Each Task coded only inside its own Task Worktree created from the

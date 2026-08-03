@@ -35,6 +35,18 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return decideIntegrationWorktreeCreated(state, in)
 	case model.TaskWorktreeCreated:
 		return decideTaskWorktreeCreated(state, in)
+	case model.VerificationRunEnded:
+		return decideVerificationRunEnded(state, in)
+	case model.IntegrationMerged:
+		return decideIntegrationMerged(state, in)
+	case model.IntegrationMergeFailed:
+		return decideIntegrationMergeFailed(state, in)
+	case model.IntegrationRollbacked:
+		return decideIntegrationRollbacked(state, in)
+	case model.GitAuditRefCreated:
+		// The append-only audit Ref exists; the aggregate records the
+		// Attempt evidence through the gate result, not a separate row.
+		return model.Decision{}, nil
 	default:
 		return model.Decision{}, model.InvalidInputFault("unsupported effect result")
 	}
@@ -79,18 +91,7 @@ func decideAttemptEnded(state model.State, in model.EffectResultInput) (model.De
 		if in.Evidence == (model.EvidenceRef{}) {
 			return model.Decision{}, model.InvalidInputFault("attempt success requires evidence")
 		}
-		b.mutate(model.AttemptEndMutation{
-			Key:                 attempt.Key,
-			Status:              model.AttemptSucceeded,
-			EndHead:             in.EndHead,
-			EndDirtyFingerprint: in.EndDirtyFingerprint,
-			Evidence:            []model.EvidenceRef{in.Evidence},
-			EndedAt:             state.Now,
-		})
-		b.event(model.EventAttemptSucceeded, node.ID, attempt.Key, "", "attempt succeeded")
-		b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeSucceeded, RetryCharged: node.RetryCharged})
-		b.event(model.EventNodeSucceeded, node.ID, attempt.Key, "", "node succeeded")
-		settleAfterAttemptEnd(state, b, attempt.Key)
+		settleNodeSucceeded(b, state, node, attempt, in)
 		return b.decision(), nil
 	case model.OutcomeFailed:
 		if in.FailureCode == "" {
@@ -142,7 +143,7 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 			EndHead:             in.EndHead,
 			EndDirtyFingerprint: in.EndDirtyFingerprint,
 			FailureCode:         code,
-			Evidence:            []model.EvidenceRef{in.Evidence},
+			Evidence:            evidenceOf(in),
 			RetryCharged:        pol.Retry.ChargesBudget,
 			EndedAt:             state.Now,
 		})
@@ -171,7 +172,7 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 			EndHead:             in.EndHead,
 			EndDirtyFingerprint: in.EndDirtyFingerprint,
 			FailureCode:         code,
-			Evidence:            []model.EvidenceRef{in.Evidence},
+			Evidence:            evidenceOf(in),
 			RetryCharged:        false,
 			EndedAt:             state.Now,
 		})
@@ -209,7 +210,7 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 		EndHead:             in.EndHead,
 		EndDirtyFingerprint: in.EndDirtyFingerprint,
 		FailureCode:         code,
-		Evidence:            []model.EvidenceRef{in.Evidence},
+		Evidence:            evidenceOf(in),
 		RetryCharged:        pol.Retry.ChargesBudget,
 		EndedAt:             state.Now,
 	})
@@ -276,7 +277,7 @@ func settleInterrupted(state model.State, node *model.Node, attempt *model.Attem
 		Status:              model.AttemptInterrupted,
 		EndHead:             in.EndHead,
 		EndDirtyFingerprint: in.EndDirtyFingerprint,
-		Evidence:            []model.EvidenceRef{in.Evidence},
+		Evidence:            evidenceOf(in),
 		RetryCharged:        false,
 		EndedAt:             state.Now,
 	})

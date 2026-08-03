@@ -1,0 +1,11 @@
+{
+  "name": "calculator",
+  "version": "1.0.0",
+  "description": "Calculator fixture for the CFlow Gate 1 deterministic end-to-end demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

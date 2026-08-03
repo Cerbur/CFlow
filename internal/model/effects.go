@@ -98,17 +98,26 @@ type GitAuditRefCreateIntent struct {
 func (GitAuditRefCreateIntent) isEffectIntent() {}
 
 // IntegrationMergeIntent performs one serial --no-ff Integration merge.
+// BaseHead is the recorded Integration HEAD the merge must observe
+// (compare-and-swap); TaskBranch and VerifiedCommit fix the exact Task
+// Branch and the accepted Commit the merge must bring in, so the merge
+// can never be retargeted (PRD 约束: Merge 前再次比较已验收 Commit、Task
+// Branch HEAD 和 Git-clean 状态; design 15.5).
 type IntegrationMergeIntent struct {
-	Node     NodeID
-	BaseHead string
+	Node           NodeID
+	BaseHead       string
+	TaskBranch     string
+	VerifiedCommit string
 }
 
 func (IntegrationMergeIntent) isEffectIntent() {}
 
 // IntegrationRollbackIntent restores the managed Integration Worktree to
-// a recorded pre-merge HEAD.
+// a recorded pre-merge HEAD after a failed merge. Attempt fixes the
+// Attempt whose failure the rollback settles.
 type IntegrationRollbackIntent struct {
-	Head string
+	Head    string
+	Attempt AttemptKey
 }
 
 func (IntegrationRollbackIntent) isEffectIntent() {}

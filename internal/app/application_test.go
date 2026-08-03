@@ -271,12 +271,14 @@ func requireFaultCode(t *testing.T, err error, want model.Code) {
 // ---------------------------------------------------------------------------
 
 // TestEffectIntentCommitsBeforeExecutorRuns is the brief-mandated call
-// order: recovery hook, locks, Intent commit, executor, Result commit.
+// order: recovery hook (the Recovery Engine's aggregate read takes the
+// shared Schema Lock), mutation locks, Intent commit, executor, Result
+// commit.
 func TestEffectIntentCommitsBeforeExecutorRuns(t *testing.T) {
 	app, probe := fixtureApplication(t)
 	_, err := app.Execute(context.Background(), fixtureCommandWithEffect())
 	requireNoError(t, err)
-	want := []string{"recover", "lock", "intent-commit", "effect", "result-commit"}
+	want := []string{"recover", "lock", "lock", "intent-commit", "effect", "result-commit"}
 	if got := probe.Calls(); !slices.Equal(want, got) {
 		t.Fatalf("want %v, got %v", want, got)
 	}
@@ -312,7 +314,9 @@ func TestPauseStopsEveryManagedProcess(t *testing.T) {
 		t.Fatalf("runtime = %s, want PAUSED", out.Runtime)
 	}
 	calls := probe.Calls()
-	want := []string{"recover", "lock", "intent-commit", "effect", "result-commit", "intent-commit", "effect", "result-commit"}
+	// The second "lock" is the Recovery Engine's aggregate read under the
+	// shared Schema Lock before the mutation locks are taken.
+	want := []string{"recover", "lock", "lock", "intent-commit", "effect", "result-commit", "intent-commit", "effect", "result-commit"}
 	if !slices.Equal(want, calls) {
 		t.Fatalf("want %v, got %v", want, calls)
 	}

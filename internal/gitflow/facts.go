@@ -73,7 +73,7 @@ func (g *GitFlow) projectDiscovery(ctx context.Context) (ProjectFacts, error) {
 		unborn = true // no branch and no HEAD: an unborn repository
 	}
 
-	status, err := g.gitStatusAt(ctx, root, env, "")
+	status, err := g.gitStatusAt(ctx, root, env, "", false, false)
 	if err != nil {
 		return ProjectFacts{}, err
 	}
@@ -108,13 +108,17 @@ func (g *GitFlow) gitStatus(ctx context.Context, q GitStatus) (StatusFacts, erro
 			return StatusFacts{}, err
 		}
 	}
-	return g.gitStatusAt(ctx, dir, childEnv(), q.ExpectedHead)
+	return g.gitStatusAt(ctx, dir, childEnv(), q.ExpectedHead, q.UntrackedAll, q.Ignored)
 }
 
 // gitStatusAt reads and parses `git status --porcelain=v2 -z` in dir and
 // computes the Dirty Fingerprint. expectedHead, when set, must equal the
-// actual HEAD (fail-closed expected-HEAD mismatch).
-func (g *GitFlow) gitStatusAt(ctx context.Context, dir string, env map[string]string, expectedHead string) (StatusFacts, error) {
+// actual HEAD (fail-closed expected-HEAD mismatch). untrackedAll adds
+// --untracked-files=all (every Git-visible untracked file classified
+// individually, the PRD Commit/Clean gate form); ignored additionally
+// classifies ignored files. The Dirty Fingerprint never includes ignored
+// content.
+func (g *GitFlow) gitStatusAt(ctx context.Context, dir string, env map[string]string, expectedHead string, untrackedAll, ignored bool) (StatusFacts, error) {
 	head, err := g.revParseHead(ctx, dir, env)
 	if err != nil {
 		return StatusFacts{}, err
@@ -123,14 +127,21 @@ func (g *GitFlow) gitStatusAt(ctx context.Context, dir string, env map[string]st
 		return StatusFacts{}, model.NewFault(model.CodeStateInvariantViolation,
 			"gitflow: HEAD does not match the expected commit")
 	}
-	out, _, exit, err := g.run(ctx, dir, env, defaultGitTimeout, "status", "--porcelain=v2", "-z")
+	args := []string{"status", "--porcelain=v2", "-z"}
+	if untrackedAll {
+		args = append(args, "--untracked-files=all")
+	}
+	if ignored {
+		args = append(args, "--ignored")
+	}
+	out, _, exit, err := g.run(ctx, dir, env, defaultGitTimeout, args...)
 	if err != nil {
 		return StatusFacts{}, err
 	}
 	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
 		return StatusFacts{}, model.InvalidInputFault("gitflow: not a git repository")
 	}
-	staged, unstaged, untracked, err := parsePorcelainV2(out)
+	staged, unstaged, untracked, ignoredEntries, err := parsePorcelainV2(out)
 	if err != nil {
 		return StatusFacts{}, err
 	}
@@ -144,17 +155,19 @@ func (g *GitFlow) gitStatusAt(ctx context.Context, dir string, env map[string]st
 		Staged:    staged,
 		Unstaged:  unstaged,
 		Untracked: untracked,
+		Ignored:   ignoredEntries,
 		Dirty:     dirty,
 	}, nil
 }
 
 // parsePorcelainV2 parses `git status --porcelain=v2 -z` into the
-// tracked/staged/untracked classifications. Paths are the last
-// space-separated field of each entry, so paths containing spaces survive
-// verbatim; rename/copy entries carry their original path in the
-// following NUL field. An unexpected entry fails closed rather than being
-// silently dropped.
-func parsePorcelainV2(out []byte) (staged, unstaged, untracked []PathEntry, err error) {
+// tracked/staged/untracked classifications plus the ignored
+// classification ('!' entries, present only when the query asked for
+// --ignored). Paths are the last space-separated field of each entry, so
+// paths containing spaces survive verbatim; rename/copy entries carry
+// their original path in the following NUL field. An unexpected entry
+// fails closed rather than being silently dropped.
+func parsePorcelainV2(out []byte) (staged, unstaged, untracked, ignored []PathEntry, err error) {
 	// -z output is NUL-terminated and contains no newlines; the runner
 	// joins frames with '\n', so the trailing separator is trimmed.
 	out = trimTrailingNewline(out)
@@ -167,23 +180,30 @@ func parsePorcelainV2(out []byte) (staged, unstaged, untracked []PathEntry, err 
 		switch {
 		case strings.HasPrefix(f, "# "):
 			// Defensive: -z output carries no header lines.
+		case strings.HasPrefix(f, "! "):
+			// Ignored: "! path" (only with --ignored).
+			parts := strings.SplitN(f, " ", 2)
+			if len(parts) != 2 {
+				return nil, nil, nil, nil, unparsableStatus()
+			}
+			ignored = append(ignored, PathEntry{Path: cleanRel(parts[1]), X: '!', Y: '!'})
 		case strings.HasPrefix(f, "? "):
 			parts := strings.SplitN(f, " ", 2)
 			if len(parts) != 2 {
-				return nil, nil, nil, unparsableStatus()
+				return nil, nil, nil, nil, unparsableStatus()
 			}
 			untracked = append(untracked, PathEntry{Path: cleanRel(parts[1]), X: '?', Y: '?'})
 		case strings.HasPrefix(f, "u "):
 			parts := strings.SplitN(f, " ", 10)
 			if len(parts) != 10 || len(parts[1]) != 2 {
-				return nil, nil, nil, unparsableStatus()
+				return nil, nil, nil, nil, unparsableStatus()
 			}
 			e := PathEntry{Path: cleanRel(parts[9]), X: parts[1][0], Y: parts[1][1], Mode: parts[4]}
 			classify(e, &staged, &unstaged)
 		case strings.HasPrefix(f, "1 "):
 			parts := strings.SplitN(f, " ", 9)
 			if len(parts) != 9 || len(parts[1]) != 2 {
-				return nil, nil, nil, unparsableStatus()
+				return nil, nil, nil, nil, unparsableStatus()
 			}
 			// 1 XY sub mH mI mW hH hI path
 			e := PathEntry{Path: cleanRel(parts[8]), X: parts[1][0], Y: parts[1][1], Hash: parts[7], Mode: parts[5]}
@@ -191,7 +211,7 @@ func parsePorcelainV2(out []byte) (staged, unstaged, untracked []PathEntry, err 
 		case strings.HasPrefix(f, "2 "):
 			parts := strings.SplitN(f, " ", 10)
 			if len(parts) != 10 || len(parts[1]) != 2 {
-				return nil, nil, nil, unparsableStatus()
+				return nil, nil, nil, nil, unparsableStatus()
 			}
 			// 2 XY sub mH mI mW hH hI X<score> path \0 origPath
 			e := PathEntry{Path: cleanRel(parts[9]), X: parts[1][0], Y: parts[1][1], Hash: parts[7], Mode: parts[5]}
@@ -201,10 +221,10 @@ func parsePorcelainV2(out []byte) (staged, unstaged, untracked []PathEntry, err 
 			}
 			classify(e, &staged, &unstaged)
 		default:
-			return nil, nil, nil, unparsableStatus()
+			return nil, nil, nil, nil, unparsableStatus()
 		}
 	}
-	return staged, unstaged, untracked, nil
+	return staged, unstaged, untracked, ignored, nil
 }
 
 func unparsableStatus() error {
