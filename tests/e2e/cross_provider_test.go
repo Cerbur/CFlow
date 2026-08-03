@@ -32,6 +32,7 @@ import (
 	"cflow.local/cflow/internal/agent/codex"
 	"cflow.local/cflow/internal/agent/fake"
 	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
@@ -143,8 +144,21 @@ func (fx *e2eFixture) crossProviderApp(scripts ...string) *app.Application {
 
 // driveDualToExecutionApproval runs the planning lifecycle with the
 // dual-provider Spec set through the Execution Approval and returns the
-// workflow identity.
+// workflow identity. The planning phases (discussion through
+// compilation) always run on the deterministic Fake Adapter (provider
+// "fake"); the Execution Dry Run — whose routing policy records the
+// detected executable identity of the routed providers — and the
+// Execution Approval run through the caller-provided runtime App, so the
+// approved binding facts come from exactly the adapters the dispatch
+// will use.
 func (fx *e2eFixture) driveDualToExecutionApproval(t *testing.T) model.WorkflowID {
+	t.Helper()
+	return fx.driveDualToExecutionApprovalWith(t, fx.crossProviderApp())
+}
+
+// driveDualToExecutionApprovalWith is driveDualToExecutionApproval with
+// an explicit runtime App for the Dry Run and the Approval.
+func (fx *e2eFixture) driveDualToExecutionApprovalWith(t *testing.T, runtimeApp *app.Application) model.WorkflowID {
 	t.Helper()
 	wf := fx.createWorkflow("dual-provider")
 	fx.discussSeq++
@@ -175,11 +189,11 @@ func (fx *e2eFixture) driveDualToExecutionApproval(t *testing.T) model.WorkflowI
 		app.CompileWorkflowCommand{Workflow: wf, Provider: "fake"}); err != nil {
 		t.Fatalf("compile workflow: %v", err)
 	}
-	if _, err := fx.crossProviderApp().Execute(context.Background(),
+	if _, err := runtimeApp.Execute(context.Background(),
 		app.ExecutionDryRunCommand{Workflow: wf}); err != nil {
 		t.Fatalf("execution dry run: %v", err)
 	}
-	qview, err := fx.crossProviderApp().Query(context.Background(), app.ExecutionPreviewQuery{Workflow: wf})
+	qview, err := runtimeApp.Query(context.Background(), app.ExecutionPreviewQuery{Workflow: wf})
 	if err != nil {
 		t.Fatalf("execution preview: %v", err)
 	}
@@ -189,7 +203,7 @@ func (fx *e2eFixture) driveDualToExecutionApproval(t *testing.T) model.WorkflowI
 	if !strings.Contains(preview.TrustBoundary, "default permissions") || strings.Contains(preview.TrustBoundary, "sandboxed=true") {
 		t.Fatalf("trust boundary not disclosed in the preview: %q", preview.TrustBoundary)
 	}
-	if _, err := fx.crossProviderApp().Execute(context.Background(), app.ApproveExecutionCommand{
+	if _, err := runtimeApp.Execute(context.Background(), app.ApproveExecutionCommand{
 		Workflow:         wf,
 		PlanHash:         preview.PlanHash,
 		SpecHashes:       preview.SpecHashes,
@@ -204,12 +218,11 @@ func (fx *e2eFixture) driveDualToExecutionApproval(t *testing.T) model.WorkflowI
 	return wf
 }
 
-// dispatchUntilCompleted drives dispatch passes until the Workflow is
-// COMPLETED (the Final Verify chain and the exact-evidence completion
-// ran) or the pass budget is exhausted.
-func (fx *e2eFixture) dispatchUntilCompleted(t *testing.T, wf model.WorkflowID) app.InspectView {
+// dispatchUntilCompleted drives dispatch passes with the given runtime
+// App until the Workflow is COMPLETED (the Final Verify chain and the
+// exact-evidence completion ran) or the pass budget is exhausted.
+func (fx *e2eFixture) dispatchUntilCompleted(t *testing.T, wf model.WorkflowID, appl *app.Application) app.InspectView {
 	t.Helper()
-	appl := fx.crossProviderApp(implementationScript(), reviewScript(), finalReviewScript())
 	for i := 0; i < 24; i++ {
 		if _, err := appl.Execute(context.Background(), app.DispatchCommand{Workflow: wf}); err != nil {
 			t.Fatalf("dispatch pass %d: %v", i, err)
@@ -236,7 +249,7 @@ func TestDialectEquivalentCrossProvider(t *testing.T) {
 	fx := newE2EFixture(t)
 	wf := fx.driveDualToExecutionApproval(t)
 
-	iv := fx.dispatchUntilCompleted(t, wf)
+	iv := fx.dispatchUntilCompleted(t, wf, fx.crossProviderApp(implementationScript(), reviewScript(), finalReviewScript()))
 
 	// Every delivery chain Node SUCCEEDED including the Final Verify.
 	for _, id := range []string{
@@ -348,24 +361,15 @@ func claudeAdapter(sup process.Supervisor, binding agent.ProviderBinding) agent.
 	return claude.New(sup, binding)
 }
 
-// TestRealCrossProvider (brief Step 6) is the explicitly authorized real
-// Codex/Claude E2E: two parallel Tasks routed to the real providers with
-// real Commits, independent Review Sessions, deterministic Verification,
-// serial Integration merges, the Final Verify/Review, the final report,
-// and an unchanged Target Branch.
-//
-// It NEVER runs without CFLOW_E2E_REAL=1: the gate requires the user to
-// have approved the exact Dry Run, the provider routes/models/budgets,
-// the default-permission trust boundary, and the potential network/cost.
-// Its default (off) behavior is a safe skip; a failure of an authorized
-// run is retained as evidence and is never hidden by a Fake result.
-func TestRealCrossProvider(t *testing.T) {
-	if os.Getenv("CFLOW_E2E_REAL") != "1" {
-		t.Skip("CFLOW_E2E_REAL=1 required: the real Cross-Provider E2E runs paid model requests with the providers' default permissions; it must be explicitly approved (exact Dry Run, routes/models/budgets, trust boundary, network/cost) before the gate is set")
-	}
-	fx := newE2EFixture(t)
-	wf := fx.driveDualToExecutionApproval(t)
-
+// realCrossProviderApp builds the Application whose codex and claude
+// adapters are the REAL dialect adapters over the OS supervisor (the
+// production executables): the Dry Run records their detection facts,
+// the dispatch CAS re-detects and compares the same identities, and
+// every Start/Resume launches the real CLI through the real argv
+// (StartArgv / stream-json). No Fake adapter is registered under the
+// codex or claude names on this path.
+func (fx *e2eFixture) realCrossProviderApp(t *testing.T) *app.Application {
+	t.Helper()
 	sup := process.NewSupervisor(process.NewOSAdapter())
 	reg, err := agent.LoadProviderRegistry()
 	if err != nil {
@@ -406,8 +410,88 @@ func TestRealCrossProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new application: %v", err)
 	}
+	return a
+}
 
-	iv := fx.dispatchUntilCompleted(t, wf)
+// requireRealRoutingEvidence proves the approved routing policy was
+// recorded from the REAL provider executables: the codex and claude
+// bindings of the immutable routing-policy Artifact must carry the
+// detected executable path, sha256, and CLI version. Only the real
+// adapters' detection produces those facts — the deterministic Fake
+// reports an empty identity — so a pass of the gated run is genuine
+// evidence of real provider execution (review fix: the real test must
+// never fall back to Fake adapters under the provider names).
+func (fx *e2eFixture) requireRealRoutingEvidence(t *testing.T, wf model.WorkflowID) {
+	t.Helper()
+	root := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, "workflows", string(wf), "artifacts")
+	store, err := artifact.New(root, security.Registry{})
+	if err != nil {
+		t.Fatalf("artifact store: %v", err)
+	}
+	ref, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactRoutingPolicy})
+	if err != nil {
+		t.Fatalf("routing policy artifact: %v", err)
+	}
+	body, err := store.Get(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("routing policy body: %v", err)
+	}
+	set, err := agent.ParseRoutingPolicySet(body)
+	if err != nil {
+		t.Fatalf("parse routing policy: %v", err)
+	}
+	have := map[string]agent.RouteBinding{}
+	for _, p := range set.Policies {
+		for _, b := range p.Bindings {
+			if _, dup := have[b.Provider]; !dup {
+				have[b.Provider] = b
+			}
+		}
+	}
+	for _, name := range []string{"codex", "claude"} {
+		b, ok := have[name]
+		if !ok {
+			t.Fatalf("routing policy has no %s binding: %+v", name, have)
+		}
+		if b.ExecutablePath == "" || b.ExecutableSHA256 == "" || b.CLIVersion == "" {
+			t.Fatalf("routing binding for %s carries no real executable identity (path %q sha256 %q cli %q); the real adapters were not detected",
+				name, b.ExecutablePath, b.ExecutableSHA256, b.CLIVersion)
+		}
+	}
+}
+
+// TestRealCrossProvider (brief Step 6) is the explicitly authorized real
+// Codex/Claude E2E: the real Adapters over the OS supervisor drive two
+// parallel Tasks routed to codex and claude, real Commits in real
+// Worktrees, independent Review Sessions, deterministic Verification,
+// serial Integration merges, the Final Verify/Review, the final report,
+// and an unchanged Target Branch. No Fake adapter is registered under
+// the codex or claude names on this path, and the approved routing
+// evidence is asserted to carry the real executable identity facts.
+//
+// It NEVER runs without CFLOW_E2E_REAL=1: the gate requires the user to
+// have approved the exact Dry Run, the provider routes/models/budgets,
+// the default-permission trust boundary, and the potential network/cost.
+// Its default (off) behavior is a safe skip; a failure of an authorized
+// run is retained as evidence and is never hidden by a Fake result.
+func TestRealCrossProvider(t *testing.T) {
+	if os.Getenv("CFLOW_E2E_REAL") != "1" {
+		t.Skip("CFLOW_E2E_REAL=1 required: the real Cross-Provider E2E runs paid model requests with the providers' default permissions; it must be explicitly approved (exact Dry Run, routes/models/budgets, trust boundary, network/cost) before the gate is set")
+	}
+	fx := newE2EFixture(t)
+	a := fx.realCrossProviderApp(t)
+	// The Dry Run and the Execution Approval run through the real App, so
+	// the immutable routing policy records the detected identity of the
+	// real codex and claude executables (read-only version probes; no
+	// model request yet).
+	wf := fx.driveDualToExecutionApprovalWith(t, a)
+	fx.requireRealRoutingEvidence(t, wf)
+
+	// The dispatch passes launch the real CLIs: the CAS pre-pass
+	// re-detects the same executable identities and every Start submits
+	// the real argv (codex exec --json --output-schema ...; claude
+	// --print --input-format stream-json ...) over the OS supervisor.
+	iv := fx.dispatchUntilCompleted(t, wf, a)
 	for _, id := range []string{
 		"task-s01", "verify-s01", "merge-s01",
 		"task-s02", "verify-s02", "merge-s02",
@@ -416,6 +500,16 @@ func TestRealCrossProvider(t *testing.T) {
 		if statusOf(iv, id) != model.NodeSucceeded {
 			t.Fatalf("node %s status = %s, want SUCCEEDED", id, statusOf(iv, id))
 		}
+	}
+	// The implementation Sessions ran on the two real routes.
+	implProviders := map[string]bool{}
+	for _, s := range iv.Sessions {
+		if s.Purpose == model.PurposeImplementation {
+			implProviders[s.Provider] = true
+		}
+	}
+	if !implProviders["codex"] || !implProviders["claude"] {
+		t.Fatalf("implementation sessions did not run on both real routes: %v", implProviders)
 	}
 	// The wire terminal result shapes (ledger obligation from Task 15):
 	// the real provider runs must settle through the validated unified
@@ -431,5 +525,4 @@ func TestRealCrossProvider(t *testing.T) {
 	if out := git(fx.repo, "branch", "--show-current"); strings.TrimSpace(out) != "main" {
 		t.Fatalf("target branch moved to %q", out)
 	}
-	_ = a
 }
