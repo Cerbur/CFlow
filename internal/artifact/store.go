@@ -53,6 +53,11 @@ var compatibilityRegistry = map[model.ArtifactType][]string{
 	// structured check result before the write is requested).
 	model.ArtifactDiscussionTurn: {"1.0.0"},
 	model.ArtifactPlanCheck:      {"1.0.0"},
+	// Task 16 policy artifacts: the routing and budget policies are
+	// Runtime-authored canonical bodies (the Dispatch Gate re-resolves
+	// and parses them; no agent body schema applies).
+	model.ArtifactRoutingPolicy: {"1.0.0"},
+	model.ArtifactBudgetPolicy:  {"1.0.0"},
 }
 
 // supportedVersion reports whether a declared Artifact Type's schema

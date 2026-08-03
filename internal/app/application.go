@@ -54,6 +54,12 @@ type Application struct {
 	known     map[model.WorkflowID]struct{}     // workflows opened this session
 	procs     map[model.ProcessID]process.Handle
 	artifacts map[model.WorkflowID]*artifact.Store // open Artifact Stores, per workflow
+	// dispatchMu serializes the aggregate transactions of one dispatch
+	// pass (Task 16 live parallelism): the selected Nodes' effect chains
+	// run concurrently — the Provider Sessions overlap in real time —
+	// while every brief aggregate transaction stays serialized so no
+	// chain ever observes a stale aggregate version.
+	dispatchMu sync.Mutex
 }
 
 // probe is the unexported protocol-order observation seam (design 22.1:
@@ -447,6 +453,23 @@ func (a *Application) acquireMutationLocks(ctx context.Context, wf model.Workflo
 	return holds, nil
 }
 
+// transactPass commits one Decision of a dispatch pass under the pass
+// transaction mutex: the aggregate version is re-read immediately before
+// the transaction, so the concurrent node chains of one pass (Task 16
+// live parallelism) never observe a stale aggregate (design 12:
+// serialized allocation, concurrent Provider runs).
+func (a *Application) transactPass(ctx context.Context, st *store.Store, input model.Input) (model.CommittedDecision, error) {
+	a.dispatchMu.Lock()
+	defer a.dispatchMu.Unlock()
+	view, err := st.View(ctx, store.StoreQuery{})
+	if err != nil {
+		return model.CommittedDecision{}, err
+	}
+	return st.Transact(ctx, view.AggregateVersion, func(state model.State) (model.Decision, error) {
+		return decision.Decide(state, input)
+	})
+}
+
 // runDecisionLoop applies Decisions until the Kernel requests no Effect,
 // executing each committed Intent exactly once and feeding its immutable
 // Result back as evidence for the next Decision (design 6.2). The loop is
@@ -712,7 +735,16 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		if err != nil {
 			return nil, "", err
 		}
-		return model.ExecutionDryRunInput{Preflight: preflight}, wf, nil
+		// The immutable routing and budget policies are resolved (with
+		// the read-only executable probes) and written before the Dry Run
+		// decision pauses the gate: the Execution Approval binds their
+		// hashes (Task 16, design 20.1). An unapproved route or fallback
+		// Provider fails the Dry Run closed (PRD 约束 306).
+		routingRef, budgetRef, err := a.writeRoutingPolicies(ctx, wf)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.ExecutionDryRunInput{Preflight: preflight, RoutingRef: routingRef, BudgetRef: budgetRef}, wf, nil
 	case ApproveExecutionCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

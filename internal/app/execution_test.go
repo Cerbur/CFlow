@@ -726,7 +726,7 @@ func (fx *planningFixture) dispatchPlanFor(a *Application, wf model.WorkflowID, 
 		return err
 	}
 	defer releaseHolds(holds)
-	_, err = a.dispatchPass(ctx, st, wf, plan, false)
+	_, err = a.dispatchPass(ctx, st, wf, plan, false, nil)
 	return err
 }
 

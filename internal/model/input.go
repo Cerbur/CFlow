@@ -131,11 +131,18 @@ type WorkflowCompilationInput struct {
 func (WorkflowCompilationInput) isInput() {}
 
 // ExecutionDryRunInput carries the freshly observed Git Commit Preflight
-// evidence into the Execution Dry Run gate. The Workflow pauses at
+// evidence and the resolved routing/budget policy references into the
+// Execution Dry Run gate (Task 16, design 20.1). The Workflow pauses at
 // WORKFLOW_GENERATION only after the Dry Run records a successful
 // Preflight Revision and the complete execution input set.
 type ExecutionDryRunInput struct {
 	Preflight PreflightFacts
+	// RoutingRef and BudgetRef are the immutable routing-policy and
+	// budget-policy Revisions the Dry Run resolved and wrote; the gate
+	// records their active references so the Execution Approval preview
+	// binds their hashes.
+	RoutingRef ArtifactRef
+	BudgetRef  ArtifactRef
 }
 
 func (ExecutionDryRunInput) isInput() {}

@@ -14,10 +14,14 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/agent/claude"
+	"cflow.local/cflow/internal/agent/codex"
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/config"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
+	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/security"
 )
 
@@ -183,18 +187,20 @@ func hashOrUnset(hash string) string {
 var toolChecks = []string{"git", "go", "node", "npm", "codex", "claude"}
 
 // statefulChecks are checks that later tasks implement. doctor reports
-// them as NOT_YET_AVAILABLE instead of guessing a result.
+// them as NOT_YET_AVAILABLE instead of guessing a result. The provider
+// protocol bindings check became real in Task 16 (renderProviderBindings
+// below).
 var statefulChecks = []string{
 	"configuration validation",
 	"home security posture",
 	"store compatibility",
-	"provider protocol bindings",
 	"git commit policy",
 }
 
 // renderDoctor writes a read-only report: build identity, tool
-// availability on PATH, and the status of stateful checks. It performs no
-// filesystem mutation and never reads or creates CFLOW_HOME.
+// availability on PATH, the detected provider protocol bindings, and the
+// status of the remaining stateful checks. It performs no filesystem
+// mutation and never reads or creates CFLOW_HOME.
 func renderDoctor(w io.Writer, build observe.BuildInfo) {
 	renderBuildIdentity(w, build)
 	fmt.Fprintf(w, "tools:\n")
@@ -205,8 +211,63 @@ func renderDoctor(w io.Writer, build observe.BuildInfo) {
 			fmt.Fprintf(w, "  %s: not found\n", tool)
 		}
 	}
+	renderProviderBindings(w)
 	fmt.Fprintf(w, "stateful checks:\n")
 	for _, check := range statefulChecks {
 		fmt.Fprintf(w, "  %s: %s\n", check, NotYetAvailable)
 	}
+}
+
+// renderProviderBindings reports every enabled Provider binding's
+// detected installation (Task 16, ledger obligation from Tasks 14/15):
+// the read-only doctor runs each enabled binding's version probe through
+// its real Adapter — a process is only ever started for the read-only
+// version probe, never a paid model request, and nothing is written.
+// Authentication is never probed (that would require a model request)
+// and stays a distinct UNKNOWN fact.
+func renderProviderBindings(w io.Writer) {
+	fmt.Fprintf(w, "provider protocol bindings:\n")
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		fmt.Fprintf(w, "  registry: %v\n", err)
+		return
+	}
+	sup := process.NewSupervisor(process.NewOSAdapter())
+	for _, name := range reg.EnabledNames() {
+		binding, err := reg.Select(name)
+		if err != nil {
+			fmt.Fprintf(w, "  %s: %v\n", name, err)
+			continue
+		}
+		ad, ok := dialectAdapter(name, sup, binding)
+		if !ok {
+			fmt.Fprintf(w, "  %s: NO_ADAPTER\n", name)
+			continue
+		}
+		inst, err := ad.Detect(context.Background())
+		if err != nil {
+			fmt.Fprintf(w, "  %s: DETECT_FAILED (%v)\n", name, err)
+			continue
+		}
+		switch inst.Compatibility {
+		case agent.CompatibilitySupported:
+			fmt.Fprintf(w, "  %s: SUPPORTED (executable %s, sha256 %s, cli %s, dialect %s, registry revision %s)\n",
+				name, inst.ExecutablePath, inst.ExecutableSHA256, inst.CLIVersion, inst.DialectID, inst.RegistryRevision)
+		default:
+			fmt.Fprintf(w, "  %s: %s\n", name, inst.Compatibility)
+		}
+	}
+	fmt.Fprintf(w, "authentication: UNKNOWN (the read-only doctor never starts a model request)\n")
+}
+
+// dialectAdapter binds the real Adapter of one enabled Provider for the
+// read-only doctor detection.
+func dialectAdapter(name string, sup process.Supervisor, binding agent.ProviderBinding) (agent.Adapter, bool) {
+	switch name {
+	case "codex":
+		return codex.New(sup, binding), true
+	case "claude":
+		return claude.New(sup, binding), true
+	}
+	return nil, false
 }

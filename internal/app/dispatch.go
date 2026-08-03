@@ -10,16 +10,18 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 
 	yaml "go.yaml.in/yaml/v3"
 
 	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/compile"
-	"cflow.local/cflow/internal/decision"
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
@@ -104,8 +106,11 @@ func (p *dispatchPlan) installNodes() []model.InstallNode {
 // executeDispatch is the DispatchCommand's pass: the plan is derived from
 // the approved execution artifacts, the current artifact references must
 // match the approval facts (design 12: readiness binds the current
-// Artifact, route, command, and commit-policy facts), and then one
-// dispatch pass runs.
+// Artifact, route, command, and commit-policy facts), the immutable
+// routing and budget inputs must still match the approval (design 20.1),
+// and then one dispatch pass runs. A protocol-drift fault of the pass
+// closes the Dispatch Gate and pauses the Workflow (PRD 失败分类: a
+// regenerated Dry Run and Execution Approval are required).
 func (a *Application) executeDispatch(ctx context.Context, st *store.Store, wf model.WorkflowID, restricted bool) (Outcome, error) {
 	plan, err := a.executionPlan(ctx, wf)
 	if err != nil {
@@ -121,7 +126,98 @@ func (a *Application) executeDispatch(ctx context.Context, st *store.Store, wf m
 		return Outcome{}, model.NewFault(model.CodeApprovalInputChanged,
 			"the execution artifacts no longer match the approval facts; re-approve before dispatch")
 	}
-	return a.dispatchPass(ctx, st, wf, plan, restricted)
+	approved, err := a.verifyApprovedRouting(ctx, wf, facts)
+	if err != nil {
+		return Outcome{}, err
+	}
+	out, err := a.dispatchPass(ctx, st, wf, plan, restricted, approved)
+	if err != nil {
+		if code, ok := model.CodeOf(err); ok {
+			if code == model.CodeProviderBindingChanged || code == model.CodeProviderProtocolUnsupported {
+				// Protocol drift closes the Dispatch Gate: no later
+				// dispatch may cross the failed pre-pass until a
+				// regenerated Dry Run and Execution Approval. The pause
+				// is best-effort; the drift fault itself is the command
+				// error.
+				_ = a.pauseDispatch(ctx, st, wf, restricted)
+			}
+		}
+		return Outcome{}, err
+	}
+	return out, nil
+}
+
+// verifyApprovedRouting re-resolves the immutable routing and budget
+// inputs without any detection and compares them to the approval facts
+// (design 20.1, PRD fail-closed #3-4): an edited configuration, Spec
+// route, prompt, or registry revision since the Execution Approval is
+// APPROVAL_INPUT_CHANGED and requires a successor Dry Run and Execution
+// Approval. This gate runs before the CAS pre-pass, so a configuration
+// drift pauses before any executable probe. It returns the parsed
+// approved policy the pass attaches to its Runtime.
+func (a *Application) verifyApprovedRouting(ctx context.Context, wf model.WorkflowID, facts *model.ExecutionFacts) (*agent.RoutingPolicySet, error) {
+	if facts == nil || facts.RoutingHash == "" || facts.BudgetHash == "" {
+		return nil, model.NewFault(model.CodeApprovalInputChanged,
+			"the execution approval did not bind routing and budget inputs; re-approve before dispatch")
+	}
+	approved, err := a.approvedRoutingPolicy(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
+	fresh, err := a.resolveRoutingInputs(ctx, wf, false)
+	if err != nil {
+		return nil, err
+	}
+	if !agent.ContentEqual(approved, fresh) {
+		return nil, model.NewFault(model.CodeApprovalInputChanged,
+			"the resolved routing inputs changed since the execution approval; re-approve before dispatch")
+	}
+	budgetBody, err := a.resolveBudgetInputs(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil, err
+	}
+	bref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactBudgetPolicy})
+	if err != nil {
+		return nil, model.NewFault(model.CodeApprovalInputChanged,
+			"the budget policy is missing; re-run the execution dry run")
+	}
+	approvedBudget, err := store.Get(ctx, bref)
+	if err != nil {
+		return nil, err
+	}
+	// The stored body is the Artifact Store's canonical serialization
+	// (map keys sorted), so the comparison is JSON-semantic, never
+	// byte-wise.
+	if !jsonBodiesEqual(approvedBudget, budgetBody) {
+		return nil, model.NewFault(model.CodeApprovalInputChanged,
+			"the resolved budget inputs changed since the execution approval; re-approve before dispatch")
+	}
+	return approved, nil
+}
+
+// jsonBodiesEqual reports whether two JSON bodies are semantically
+// identical (the canonical serialization of the Artifact Store reorders
+// object keys deterministically).
+func jsonBodiesEqual(a, b []byte) bool {
+	var va, vb any
+	if json.Unmarshal(a, &va) != nil || json.Unmarshal(b, &vb) != nil {
+		return false
+	}
+	return reflect.DeepEqual(va, vb)
+}
+
+// pauseDispatch commits the ordinary RUNNING→PAUSED control after a
+// protocol drift closed the Dispatch Gate (design 6.1): dispatch closes
+// and no managed process may start until the user regenerates the Dry
+// Run and Execution Approval.
+func (a *Application) pauseDispatch(ctx context.Context, st *store.Store, wf model.WorkflowID, restricted bool) error {
+	_, err := a.runDecisionLoop(ctx, st, wf, PauseWorkflowCommand{Workflow: wf},
+		model.WorkflowCommandInput{Kind: model.PauseWorkflow, Workflow: wf}, restricted)
+	return err
 }
 
 // executionPlan derives the dispatch plan from the approved execution
@@ -265,13 +361,17 @@ func (a *Application) parseSpecSet(body []byte) ([]compile.Spec, error) {
 }
 
 // dispatchPass is one allocation pass (design 12): it installs the
-// execution graph when the aggregate has none, computes the eligible set
-// with the pure Scheduler, applies the pairwise static compatibility
-// judgment, and allocates every selected Node — committing each RUNNING
-// Attempt before submitting its Effects. Pause, Cancel, Quiesce, and
-// Safety Stop share the committed Dispatch Gate with allocation, so no
-// start can cross a committed closure (PRD 已确认：并行失败后的 Quiescing).
-func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf model.WorkflowID, plan *dispatchPlan, restricted bool) (Outcome, error) {
+// execution graph when the aggregate has none, runs the dispatch CAS
+// pre-pass against the approved routing policy (Task 16), computes the
+// eligible set with the pure Scheduler, applies the pairwise static
+// compatibility judgment, allocates every selected Node — committing each
+// RUNNING Attempt before submitting its Effects — and then runs the
+// selected Nodes' effect chains concurrently (Task 16 live parallelism:
+// different Tasks may run their Provider Sessions on different Providers
+// at the same time). Pause, Cancel, Quiesce, and Safety Stop share the
+// committed Dispatch Gate with allocation, so no start can cross a
+// committed closure (PRD 已确认：并行失败后的 Quiescing).
+func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf model.WorkflowID, plan *dispatchPlan, restricted bool, routing *agent.RoutingPolicySet) (Outcome, error) {
 	view, err := st.View(ctx, store.StoreQuery{})
 	if err != nil {
 		return Outcome{}, err
@@ -293,6 +393,21 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 	}
 	if rt != nil {
 		defer rt.Close()
+		// The dispatch CAS pre-pass (PRD 约束 306, design 14.2): every
+		// Provider the approved policies reference is re-detected and
+		// Compare-and-Swapped against its approved binding before any
+		// Attempt is allocated or any Provider model request starts
+		// (only the read-only version probes of detection run). A drift
+		// closes the Dispatch Gate with
+		// PROVIDER_PROTOCOL_BINDING_CHANGED; the verified detections are
+		// cached for the pass, so every Start/Resume compares the same
+		// verified identity.
+		if routing != nil {
+			rt.SetRoutingPolicy(routing)
+		}
+		if err := rt.VerifyBindings(ctx); err != nil {
+			return Outcome{}, err
+		}
 	}
 
 	// The verified Integration HEAD is observed at readiness and fixed as
@@ -308,11 +423,27 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 	sched := (schedule.Scheduler{}).Next(snapshot, policy)
 	selected := a.selectBatch(state, plan, sched.Eligible)
 
+	// Phase 1 (serialized): the selected Nodes' Resource Locks are taken
+	// and held for the whole RUNNING lifetime of each Node — the
+	// OS-level lifetime of a declared lock matches the state-model
+	// declaration, so actual concurrent use can never overlap a declared
+	// lock (ledger obligation from Task 12 re-review; the lock files live
+	// in CFLOW_HOME/locks and are shared by every workflow, so two
+	// workflows' RUNNING Attempts sharing a declared lock are excluded at
+	// the OS level too). A merge Node takes the Integration/Apply Lock
+	// before its Resource Locks (fixed lock order, design 18.1): the
+	// serial --no-ff merges of the trusted delivery chain never overlap.
+	type nodeChain struct {
+		id        model.NodeID
+		route     string
+		baseHead  string
+		node      *dispatchNode
+		holds     *platform.Hold
+		integHold *platform.Hold
+	}
+	var chains []nodeChain
 	for _, id := range selected {
 		node := plan.node(id)
-		// A merge Node takes the Integration/Apply Lock before its
-		// Resource Locks (fixed lock order, design 18.1): the serial
-		// --no-ff merges of the trusted delivery chain never overlap.
 		var integHold *platform.Hold
 		if node.kind == model.NodeMerge {
 			ls, err := a.lockSet()
@@ -331,11 +462,39 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 			}
 			return Outcome{}, err
 		}
-		err = a.runNodeDispatch(ctx, st, wf, id, node.route, baseHead, node, rt)
-		holds.Release()
-		if integHold != nil {
-			integHold.Release()
-		}
+		chains = append(chains, nodeChain{
+			id: id, route: node.route, baseHead: baseHead, node: node,
+			holds: holds, integHold: integHold,
+		})
+	}
+
+	// Phase 2 (live parallelism): every chain commits its RUNNING Attempt
+	// before its Effects submit (design 12: an in-memory queued goroutine
+	// is not an in-flight Attempt), and the chains then run concurrently.
+	// The aggregate transactions stay serialized through the pass
+	// transaction mutex, so no chain ever observes a stale aggregate; the
+	// Provider runs themselves are concurrent. The pass waits for every
+	// chain and surfaces the first failure; each chain releases its locks
+	// when it settles.
+	var wg sync.WaitGroup
+	errs := make(chan error, len(chains))
+	for _, c := range chains {
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer c.holds.Release()
+			if c.integHold != nil {
+				defer c.integHold.Release()
+			}
+			if err := a.runNodeDispatch(ctx, st, wf, c.id, c.route, c.baseHead, c.node, rt); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -538,11 +697,6 @@ func (a *Application) acquireResourceLocks(ctx context.Context, names []string) 
 // Scope gate and feeds the AttemptEnded result; every Decision
 // revalidates the committed Dispatch Gate.
 func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf model.WorkflowID, node model.NodeID, route, baseHead string, planNode *dispatchNode, rt *agent.Runtime) error {
-	view, err := st.View(ctx, store.StoreQuery{})
-	if err != nil {
-		return err
-	}
-	version := view.AggregateVersion
 	input := model.Input(model.DispatchInput{
 		Node:     node,
 		Session:  model.SessionID(a.ids(model.IDSession)),
@@ -552,13 +706,10 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 	executed := map[string]struct{}{}
 	gateFed := false
 	for iter := 0; iter < nodeDispatchBudget; iter++ {
-		cd, err := st.Transact(ctx, version, func(state model.State) (model.Decision, error) {
-			return decision.Decide(state, input)
-		})
+		cd, err := a.transactPass(ctx, st, input)
 		if err != nil {
 			return err
 		}
-		version = cd.Version
 		if iter == 0 {
 			// The RUNNING Attempt committed: only now is the Node running.
 			a.probeStep("attempt:" + string(node) + ":commit")

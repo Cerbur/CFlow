@@ -7,7 +7,10 @@
 // deterministically from the aggregate.
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
 // ID kinds recognised by the injected ID source. The model never generates
 // IDs itself; the Application injects a deterministic IDSource in tests
@@ -32,12 +35,15 @@ const (
 type IDSource func(IDKind) string
 
 // SequentialIDSource returns a deterministic IDSource producing opaque
-// sequential IDs (design 22.2 fixture protocol).
+// sequential IDs (design 22.2 fixture protocol). The counter is atomic:
+// the live parallel dispatch (Task 16) allocates Attempt/Session IDs
+// from concurrent node chains, and the source must stay race-free. The
+// order in which concurrent chains receive their IDs is not part of any
+// fixture contract.
 func SequentialIDSource() IDSource {
-	var n uint64
+	var n atomic.Uint64
 	return func(kind IDKind) string {
-		n++
-		return fmt.Sprintf("%s-%d", kind, n)
+		return fmt.Sprintf("%s-%d", kind, n.Add(1))
 	}
 }
 

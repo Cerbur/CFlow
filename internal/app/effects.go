@@ -308,8 +308,16 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 }
 
 // providerResume re-establishes an existing Provider Session (design
-// 14.4). No Task 10 command produces a Resume Intent; the executor is
-// the real seam later tasks build on.
+// 14.4, PRD 已确认：Session Resume 失败与跨 Provider 上下文交接). Native
+// Resume is attempted only when the exact binding supports Resume (the
+// Runtime's per-operation capability gate). An unrecoverable native
+// Resume falls back: the original Session is retained as LOST, the
+// immutable redacted Context Bundle is persisted, and the successor
+// Session is allocated on the approved fallback binding. The executor
+// reports the fallback as the typed facts — the LOST original with the
+// automatic-execution failure code — never as a success claim; the
+// Decision Kernel charges the approved budget from those facts (design
+// 14.4 step 5).
 func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, intent model.ProviderResumeIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
 	if rt == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
@@ -318,16 +326,18 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")
 	}
-	// The Provider Session ID of the CFlow Session is the Runtime's
-	// ledger fact; the Resume request re-establishes it.
-	providerSessionID := ""
+	// The Provider of the CFlow Session is the Runtime's ledger fact
+	// (the intent carries the CFlow Session, never a provider name); the
+	// Resume request re-establishes the Session on that Provider.
+	provider, providerSessionID := "", ""
 	for _, fact := range rt.Sessions() {
 		if fact.Session.ID == intent.Session {
+			provider = fact.Provider
 			providerSessionID = fact.Session.ProviderSessionID
 			break
 		}
 	}
-	if providerSessionID == "" {
+	if provider == "" || providerSessionID == "" {
 		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
 			"session is not known to the agent runtime")
 	}
@@ -339,25 +349,61 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 	res, err := rt.Resume(ctx, agent.ResumeRequest{
 		ProviderSessionID: agent.ProviderSessionID(providerSessionID),
 		Purpose:           intent.Purpose,
+		Provider:          provider,
 		Prompt:            prompt.Body,
 		Input:             a.sessionInput(ctx, wf, cmd),
 		CWD:               cwd,
+		Context:           a.resumeContext(ctx, wf, intent.Session, provider),
 	})
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
-	run := res.Run
-	if run == nil {
-		// An unrecoverable native Resume fell back to a successor Session
-		// with a Context Bundle; the Kernel sees the fallback facts in a
-		// later task's Resume Decision. Task 10 commands never resume.
-		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
-			"resume fallback is not supported by this command")
+	if res.Fallback != nil {
+		// An unrecoverable native Resume: the original Session is LOST
+		// and the successor Session is allocated on the approved fallback
+		// binding. The Kernel charges the approved budget from these
+		// facts; the automatic-execution failure code is the fact, never
+		// a success claim (design 14.4 step 5).
+		lost := res.Fallback.LostSession
+		if lost.Provider == "" {
+			lost.Provider = provider
+		}
+		return model.EffectResultInput{
+			Kind:        model.ProviderRunEnded,
+			Session:     lost,
+			FailureCode: model.CodeAgentProcessCrashed,
+		}, nil
 	}
+	run := res.Run
 	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
 		return model.EffectResultInput{}, err
 	}
 	return a.runOutcome(cmd, run)
+}
+
+// resumeContext assembles the Context Bundle input of one unrecoverable
+// Resume from the immutable workflow facts (design 14.4): the active
+// Plan/Spec/Catalog/Workflow pins and the Provider permission boundary.
+// It never copies Provider credentials or an unredacted transcript; the
+// Runtime redacts the bundle before it is returned or persisted.
+func (a *Application) resumeContext(ctx context.Context, wf model.WorkflowID, session model.SessionID, provider string) agent.ContextInput {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return agent.ContextInput{PermissionBoundary: providerTrustBoundary}
+	}
+	pin := func(typ model.ArtifactType) agent.ArtifactPin {
+		if ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: typ}); err == nil {
+			return agent.ArtifactPin{Type: string(typ), Revision: ref.Revision, Hash: ref.Hash}
+		}
+		return agent.ArtifactPin{}
+	}
+	return agent.ContextInput{
+		Plan:               pin(model.ArtifactPlan),
+		Spec:               pin(model.ArtifactSpec),
+		Catalog:            pin(model.ArtifactCatalog),
+		Workflow:           pin(model.ArtifactWorkflow),
+		PermissionBoundary: providerTrustBoundary,
+	}
 }
 
 // taskWorktreeCreate creates the Task Branch/Worktree from the recorded
@@ -415,7 +461,7 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 		Purpose:   intent.Purpose,
 		Provider:  intent.Route,
 		Prompt:    prompt.Body,
-		Input:     a.sessionInput(ctx, wf, cmd),
+		Input:     a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, a.sessionInput(ctx, wf, cmd)),
 		CWD:       cwd,
 		SessionID: intent.Session,
 	})

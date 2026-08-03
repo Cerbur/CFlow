@@ -20,7 +20,10 @@ import (
 // RuntimeOptions wires one Runtime: the deterministic Clock and ID source
 // (brief Step 5: byte-identical manifests for fixed Clock/ID input), the
 // immutable Provider Registry every binding check consults, the redaction
-// policy, the managed evidence root, and the Provider Adapters.
+// policy, the managed evidence root, the Provider Adapters, and the
+// immutable Routing Policy Set the Execution Approval bound (Task 16:
+// nil keeps the registry-level checks for commands outside an approved
+// workflow).
 type RuntimeOptions struct {
 	Now         func() time.Time
 	IDs         model.IDSource
@@ -28,6 +31,7 @@ type RuntimeOptions struct {
 	Redaction   security.Registry
 	EvidenceDir string
 	Adapters    map[string]Adapter
+	Routing     *RoutingPolicySet
 }
 
 // Runtime is the orchestration seam over the Adapter contract. It is safe
@@ -40,11 +44,16 @@ type Runtime struct {
 	redaction security.Registry
 	evidence  *evidenceWriter
 	adapters  map[string]Adapter
+	routing   *RoutingPolicySet
 
 	mu         sync.Mutex
 	byCFlow    map[model.SessionID]*sessionRecord
 	byProvider map[ProviderSessionID]*sessionRecord
 	live       map[model.RunID]*liveRun
+	// detectCache holds the verified Installation facts of the dispatch
+	// CAS pre-pass (Task 16): every Start/Resume of the pass reuses the
+	// same verified identity instead of re-detecting per operation.
+	detectCache map[string]Installation
 }
 
 // sessionRecord is the Runtime's ledger fact for one Session: the
@@ -108,15 +117,17 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		return nil, err
 	}
 	return &Runtime{
-		now:        now,
-		ids:        ids,
-		registry:   opts.Registry,
-		redaction:  opts.Redaction,
-		evidence:   ev,
-		adapters:   opts.Adapters,
-		byCFlow:    map[model.SessionID]*sessionRecord{},
-		byProvider: map[ProviderSessionID]*sessionRecord{},
-		live:       map[model.RunID]*liveRun{},
+		now:         now,
+		ids:         ids,
+		registry:    opts.Registry,
+		redaction:   opts.Redaction,
+		evidence:    ev,
+		adapters:    opts.Adapters,
+		routing:     opts.Routing,
+		byCFlow:     map[model.SessionID]*sessionRecord{},
+		byProvider:  map[ProviderSessionID]*sessionRecord{},
+		live:        map[model.RunID]*liveRun{},
+		detectCache: map[string]Installation{},
 	}, nil
 }
 
@@ -227,6 +238,89 @@ func (r *Runtime) Inspect(ctx context.Context, id ProviderSessionID) (SessionFac
 }
 
 // ---------------------------------------------------------------------------
+// Routing policy attachment and the dispatch CAS pre-pass (Task 16,
+// design 14.2, PRD 约束 306)
+// ---------------------------------------------------------------------------
+
+// SetRoutingPolicy attaches the immutable Routing Policy Set the
+// workflow's Execution Approval bound (nil detaches it). The policy is
+// read before every operation and never mutated after attachment.
+func (r *Runtime) SetRoutingPolicy(set *RoutingPolicySet) {
+	r.mu.Lock()
+	r.routing = set
+	r.mu.Unlock()
+}
+
+// RouteBinding returns the approved binding of one Purpose route from
+// the immutable Routing Policy Set the Execution Approval bound (false
+// when the Purpose or the Provider has no approved binding). The
+// Application reads the approved model/budget here to build the typed
+// Adapter input of a routed Session (design 14.5).
+func (r *Runtime) RouteBinding(purpose model.AgentPurpose, provider string) (RouteBinding, bool) {
+	r.mu.Lock()
+	set := r.routing
+	r.mu.Unlock()
+	if set == nil {
+		return RouteBinding{}, false
+	}
+	return set.Resolve(purpose, provider)
+}
+
+// VerifyBindings runs the dispatch CAS pre-pass: every Provider the
+// approved policies reference is re-detected and Compare-and-Swapped
+// against its approved binding before any Attempt is allocated or any
+// Provider process starts. A drift closes the Dispatch Gate with
+// PROVIDER_PROTOCOL_BINDING_CHANGED (or PROVIDER_PROTOCOL_UNSUPPORTED)
+// and nothing may start. Verified detections are cached for the pass so
+// every Start/Resume compares the same verified identity.
+func (r *Runtime) VerifyBindings(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	set := r.routing
+	r.mu.Unlock()
+	if set == nil {
+		return nil
+	}
+	for _, p := range set.Policies {
+		for _, b := range p.Bindings {
+			inst, err := r.detect(ctx, b.Provider)
+			if err != nil {
+				return err
+			}
+			if err := CompareInstallation(inst, b, false); err != nil {
+				return err
+			}
+			// Cache the verified installation for the pass: every
+			// Start/Resume compares the same verified identity instead
+			// of re-detecting per operation.
+			r.mu.Lock()
+			r.detectCache[b.Provider] = inst
+			r.mu.Unlock()
+		}
+	}
+	return nil
+}
+
+// detect returns the verified Installation of one Provider: the cached
+// pre-pass result when one exists (the dispatch CAS already proved it
+// against the approved binding), else a fresh Detect.
+func (r *Runtime) detect(ctx context.Context, name string) (Installation, error) {
+	r.mu.Lock()
+	if inst, ok := r.detectCache[name]; ok {
+		r.mu.Unlock()
+		return inst, nil
+	}
+	r.mu.Unlock()
+	ad := r.adapters[name]
+	if ad == nil {
+		return Installation{}, model.InvalidInputFault("no adapter bound for provider " + name)
+	}
+	return ad.Detect(ctx)
+}
+
+// ---------------------------------------------------------------------------
 // Start (design 14.3-14.4)
 // ---------------------------------------------------------------------------
 
@@ -261,7 +355,7 @@ func (r *Runtime) Start(ctx context.Context, req StartRequest) (*RunResult, erro
 		}
 		parent = par.session.ID
 	}
-	binding, ad, err := r.resolveProvider(ctx, req.Provider, false)
+	binding, ad, err := r.resolveProvider(ctx, req.Purpose, req.Provider, false)
 	if err != nil {
 		return nil, err
 	}
@@ -306,9 +400,6 @@ func (r *Runtime) Resume(ctx context.Context, req ResumeRequest) (*ResumeResult,
 	if !req.Purpose.Valid() {
 		return nil, model.InvalidInputFault("unknown agent purpose")
 	}
-	if req.Provider == "" {
-		return nil, model.InvalidInputFault("provider is required")
-	}
 	if req.Prompt == "" {
 		return nil, model.InvalidInputFault("prompt is required")
 	}
@@ -318,6 +409,17 @@ func (r *Runtime) Resume(ctx context.Context, req ResumeRequest) (*ResumeResult,
 	if rec == nil {
 		return nil, model.InvalidInputFault("provider session not found for resume")
 	}
+	// The Session's Provider is a ledger fact (the hydrated record from
+	// the Store); the request may name it or leave it to the ledger. An
+	// unknown ledger provider fails closed.
+	provider := req.Provider
+	if provider == "" {
+		provider = rec.provider
+	}
+	if provider == "" {
+		return nil, model.InvalidInputFault("provider is required")
+	}
+	req.Provider = provider
 	// A terminal Session can never be resumed: re-opening a COMPLETED or
 	// CANCELLED session would revive an immutable outcome, and resuming a
 	// LOST session would chain a second successor lineage from the same
@@ -331,7 +433,23 @@ func (r *Runtime) Resume(ctx context.Context, req ResumeRequest) (*ResumeResult,
 		return nil, model.NewFault(model.CodeSessionIndependenceViolation,
 			"a resumed session must keep its purpose")
 	}
-	binding, ad, err := r.resolveProvider(ctx, req.Provider, true)
+	// Native Resume is only attempted when the exact binding supports
+	// Resume (per-operation capability, PRD 已确认: structured output and
+	// Resume are never inferred across operations). A binding without the
+	// Resume capabilities makes the Session unrecoverable by definition:
+	// the approved fallback applies when one is bound, PROVIDER_PROTOCOL_
+	// UNSUPPORTED otherwise.
+	if r.routing != nil {
+		rb, ok := r.routing.Resolve(req.Purpose, req.Provider)
+		if !ok {
+			return nil, model.NewFault(model.CodeProviderProtocolUnsupported,
+				"the session's provider is not approved for the purpose")
+		}
+		if !hasCaps(rb.ResumeCapabilities, requiredResumeCapabilities) {
+			return r.resumeFallback(ctx, req, rec)
+		}
+	}
+	binding, ad, err := r.resolveProvider(ctx, req.Purpose, req.Provider, true)
 	if err != nil {
 		return nil, err
 	}
@@ -367,8 +485,24 @@ func (r *Runtime) Resume(ctx context.Context, req ResumeRequest) (*ResumeResult,
 	return &ResumeResult{Session: result.Session, Run: result}, nil
 }
 
-// resumeFallback implements design 14.4 steps 1-4.
+// resumeFallback implements design 14.4 steps 1-4 plus the approved
+// fallback resolution (Task 16): the ordered next binding of the
+// Purpose's immutable RoutingPolicy, never a silently chosen Provider
+// (PRD 约束 306).
 func (r *Runtime) resumeFallback(ctx context.Context, req ResumeRequest, rec *sessionRecord) (*ResumeResult, error) {
+	// 0. Resolve the approved fallback binding before any mutation: an
+	// unapproved fallback fails closed and preserves the original Session
+	// (it is never marked LOST and no Context Bundle is created).
+	provider := req.Provider
+	if r.routing != nil {
+		fb, ok := r.routing.Fallback(req.Purpose, req.Provider)
+		if !ok {
+			return nil, model.NewFault(model.CodeProviderProtocolUnsupported,
+				"no approved fallback binding for the purpose")
+		}
+		provider = fb.Provider
+	}
+
 	// 1. Retain the original Session as LOST.
 	r.mu.Lock()
 	rec.session.Status = model.SessionLost
@@ -394,13 +528,14 @@ func (r *Runtime) resumeFallback(ctx context.Context, req ResumeRequest, rec *se
 
 	// 3. Validate the successor Adapter's capabilities (design 14.4): the
 	// successor may switch Provider; it must prove the Start protocol
-	// capabilities of the current binding.
-	if _, _, err := r.resolveProvider(ctx, req.Provider, false); err != nil {
+	// capabilities of the approved fallback binding (Compare-and-Swap).
+	if _, _, err := r.resolveProvider(ctx, req.Purpose, provider, false); err != nil {
 		return nil, err
 	}
 
 	// 4. Create the successor Session with supersedes_session_id, keeping
-	// the original purpose (the role lineage).
+	// the original purpose (the role lineage), on the approved fallback
+	// Provider.
 	r.mu.Lock()
 	succ := &sessionRecord{
 		session: model.Session{
@@ -408,8 +543,9 @@ func (r *Runtime) resumeFallback(ctx context.Context, req ResumeRequest, rec *se
 			Purpose:    rec.session.Purpose,
 			Status:     model.SessionStarting,
 			Supersedes: rec.session.ID,
+			Provider:   provider,
 		},
-		provider: req.Provider,
+		provider: provider,
 	}
 	r.byCFlow[succ.session.ID] = succ
 	r.mu.Unlock()
@@ -507,9 +643,15 @@ func (r *Runtime) Cancel(ctx context.Context, handle RunHandle) error {
 // resolveProvider verifies the route binding before every Start/Resume/
 // fallback (PRD 已确认：未知 Provider CLI 协议 Fail-closed): the binding is
 // selected, its protocol capabilities are proven, the Adapter exists, and
-// a fresh Detect result Compare-and-Swaps the binding (dialect and
-// compatibility). Mismatches block before any Provider call.
-func (r *Runtime) resolveProvider(ctx context.Context, name string, resume bool) (ProviderBinding, Adapter, error) {
+// a fresh Detect result Compare-and-Swaps the binding. When the Runtime
+// carries the immutable Routing Policy Set of an Execution Approval, the
+// approved per-Purpose binding is resolved first and the Compare-and-Swap
+// covers the full approved identity — executable path, sha256, CLI
+// version, dialect, registry revision, and the operation's capability
+// list (Task 16, PRD 约束 306). Without a policy (commands outside an
+// approved workflow) the registry-level checks apply. Mismatches block
+// before any Provider call and no Attempt is allocated.
+func (r *Runtime) resolveProvider(ctx context.Context, purpose model.AgentPurpose, name string, resume bool) (ProviderBinding, Adapter, error) {
 	if err := ctx.Err(); err != nil {
 		return ProviderBinding{}, nil, err
 	}
@@ -517,6 +659,36 @@ func (r *Runtime) resolveProvider(ctx context.Context, name string, resume bool)
 	if err != nil {
 		return ProviderBinding{}, nil, model.NewFault(model.CodeProviderProtocolUnsupported,
 			"provider cannot be selected: "+err.Error())
+	}
+	r.mu.Lock()
+	routing := r.routing
+	r.mu.Unlock()
+	if routing != nil {
+		// The approved per-Purpose binding of the immutable Routing
+		// Policy Set: the Compare-and-Swap covers the full approved
+		// identity — executable path, sha256, CLI version, dialect,
+		// registry revision, and the operation's capability list. The
+		// detection is the pre-pass's cached verified result when one
+		// exists (the dispatch CAS already proved it), a fresh Detect
+		// otherwise (design 14.4 step 2: an unrecoverable Resume
+		// validates the fallback binding this way).
+		rb, ok := routing.Resolve(purpose, name)
+		if !ok {
+			return ProviderBinding{}, nil, model.NewFault(model.CodeProviderProtocolUnsupported,
+				"the route is not approved for the purpose")
+		}
+		ad := r.adapters[name]
+		if ad == nil {
+			return ProviderBinding{}, nil, model.InvalidInputFault("no adapter bound for provider " + name)
+		}
+		inst, err := r.detect(ctx, name)
+		if err != nil {
+			return ProviderBinding{}, nil, err
+		}
+		if err := CompareInstallation(inst, rb, resume); err != nil {
+			return ProviderBinding{}, nil, err
+		}
+		return binding, ad, nil
 	}
 	if resume {
 		if !bindingHasResume(binding, requiredResumeCapabilities) {

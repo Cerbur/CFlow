@@ -277,6 +277,7 @@ func settleInterrupted(state model.State, node *model.Node, attempt *model.Attem
 		Status:              model.AttemptInterrupted,
 		EndHead:             in.EndHead,
 		EndDirtyFingerprint: in.EndDirtyFingerprint,
+		FailureCode:         in.FailureCode,
 		Evidence:            evidenceOf(in),
 		RetryCharged:        false,
 		EndedAt:             state.Now,

@@ -21,13 +21,24 @@ const (
 	// ArtifactPlanCheck is one immutable Plan Check result (PRD Plan
 	// Check 交互).
 	ArtifactPlanCheck ArtifactType = "plan-check"
+	// ArtifactRoutingPolicy is the immutable per-Purpose approved routing
+	// policy of one Execution Approval (Task 16, design 14.2): the
+	// ordered approved Provider bindings with the observed executable
+	// identity facts. The Execution Approval binds its hash; editing
+	// configuration after the Approval changes the resolved content and
+	// requires a successor Approval (design 20.1).
+	ArtifactRoutingPolicy ArtifactType = "routing-policy"
+	// ArtifactBudgetPolicy is the immutable budget policy of one
+	// Execution Approval: the configured hard cap and the per-routed-node
+	// approved budgets (design 20.1).
+	ArtifactBudgetPolicy ArtifactType = "budget-policy"
 )
 
 // Valid reports whether t is a declared Artifact Type.
 func (t ArtifactType) Valid() bool {
 	switch t {
 	case ArtifactPlan, ArtifactSpec, ArtifactWorkflow, ArtifactCatalog, ArtifactReport, ArtifactCleanupManifest,
-		ArtifactDiscussionTurn, ArtifactPlanCheck:
+		ArtifactDiscussionTurn, ArtifactPlanCheck, ArtifactRoutingPolicy, ArtifactBudgetPolicy:
 		return true
 	}
 	return false

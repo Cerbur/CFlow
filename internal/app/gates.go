@@ -257,7 +257,7 @@ func (a *Application) reviewProviderStart(ctx context.Context, wf model.Workflow
 		Purpose:   intent.Purpose,
 		Provider:  intent.Route,
 		Prompt:    prompt.Body,
-		Input:     input,
+		Input:     a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, input),
 		CWD:       cwd,
 		SessionID: intent.Session,
 	})

@@ -6,6 +6,14 @@
 // command strings are impossible because no such key exists in the
 // schema. Provider-owned configuration is never read or copied. Only
 // CFLOW_HOME may carry persistent Runtime configuration (design 20.1).
+//
+// Routing and budget values (design 20.1) resolve here: the approved
+// model default and the ordered approved fallback Providers of every
+// Purpose, and the hard budget cap of one Agent run. Resolved values
+// become immutable inputs to the Execution Approval (the routing-policy
+// and budget-policy Artifacts bind them by hash); editing the file after
+// an Approval changes the resolved hashes and requires a successor
+// Approval.
 package config
 
 import (
@@ -13,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -29,7 +38,23 @@ func (e *Error) Error() string { return e.Msg }
 // nil when absent so precedence can distinguish "not configured" from an
 // explicit value.
 type File struct {
-	Concurrency *int `yaml:"concurrency"`
+	Concurrency *int     `yaml:"concurrency"`
+	Routing     *Routing `yaml:"routing"`
+	Budget      *Budget  `yaml:"budget"`
+}
+
+// Routing is the strict routing section: the approved default model ("" =
+// Provider default) and the ordered approved fallback Providers of every
+// Purpose route.
+type Routing struct {
+	Model     string   `yaml:"model"`
+	Fallbacks []string `yaml:"fallbacks"`
+}
+
+// Budget is the strict budget section: the approved hard budget cap of
+// one Agent run in USD (0 = no cap).
+type Budget struct {
+	MaxUSDPerRun *float64 `yaml:"max_usd_per_run"`
 }
 
 // Overrides are explicit per-command CLI inputs for the current command.
@@ -41,6 +66,15 @@ type Overrides struct {
 // Resolved is the validated configuration consumed by the Runtime.
 type Resolved struct {
 	Concurrency int
+	// Model is the approved default model of a route ("" = Provider
+	// default; the Spec's explicit route model wins over it).
+	Model string
+	// Fallbacks are the ordered approved fallback Providers of every
+	// Purpose route.
+	Fallbacks []string
+	// MaxUSDPerRun is the approved hard budget cap of one Agent run in
+	// USD (0 = unlimited; the Spec's explicit route budget wins over it).
+	MaxUSDPerRun float64
 }
 
 // Load decodes exactly one strict YAML document from path. An absent or
@@ -52,15 +86,17 @@ func Load(path string) (File, error) {
 	if err != nil {
 		return File{}, &Error{Msg: fmt.Sprintf("read config %s: %v", path, err)}
 	}
-	// The shadow struct keeps KnownFields strictness and validates the
+	// The shadow struct keeps KnownFields strictness and validates every
 	// scalar type at the decode boundary: yaml coerces floating-point
-	// scalars into int fields silently, so every value must prove it is
-	// an integer before it enters the File. The field is a value
-	// yaml.Node: the pointer form cannot decode scalars with this yaml
-	// version ("cannot unmarshal !!int into yaml.Node"), which would make
-	// every configured value fail closed.
+	// scalars into int fields silently, so every value must prove its
+	// type before it enters the File. The fields are value yaml.Nodes:
+	// the pointer form cannot decode scalars with this yaml version
+	// ("cannot unmarshal !!int into yaml.Node"), which would make every
+	// configured value fail closed.
 	var raw struct {
-		Concurrency yaml.Node `yaml:"concurrency"`
+		Concurrency yaml.Node   `yaml:"concurrency"`
+		Routing     *rawRouting `yaml:"routing"`
+		Budget      *rawBudget  `yaml:"budget"`
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -82,6 +118,20 @@ func Load(path string) (File, error) {
 		}
 		f.Concurrency = &v
 	}
+	if raw.Routing != nil {
+		r, err := decodeRouting(path, raw.Routing)
+		if err != nil {
+			return File{}, err
+		}
+		f.Routing = &r
+	}
+	if raw.Budget != nil {
+		b, err := decodeBudget(path, raw.Budget)
+		if err != nil {
+			return File{}, err
+		}
+		f.Budget = &b
+	}
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
@@ -90,6 +140,56 @@ func Load(path string) (File, error) {
 		return File{}, &Error{Msg: fmt.Sprintf("parse config %s: %v", path, err)}
 	}
 	return f, nil
+}
+
+// rawRouting is the strict routing section shadow: every value must prove
+// its scalar type.
+type rawRouting struct {
+	Model     yaml.Node   `yaml:"model"`
+	Fallbacks []yaml.Node `yaml:"fallbacks"`
+}
+
+func decodeRouting(path string, raw *rawRouting) (Routing, error) {
+	var r Routing
+	if raw.Model.Kind != 0 {
+		if raw.Model.ShortTag() != "!!str" {
+			return Routing{}, &Error{Msg: fmt.Sprintf("parse config %s: routing.model must be a string", path)}
+		}
+		if err := raw.Model.Decode(&r.Model); err != nil {
+			return Routing{}, &Error{Msg: fmt.Sprintf("parse config %s: routing.model: %v", path, err)}
+		}
+	}
+	for i, n := range raw.Fallbacks {
+		if n.ShortTag() != "!!str" {
+			return Routing{}, &Error{Msg: fmt.Sprintf("parse config %s: routing.fallbacks[%d] must be a string", path, i)}
+		}
+		var name string
+		if err := n.Decode(&name); err != nil {
+			return Routing{}, &Error{Msg: fmt.Sprintf("parse config %s: routing.fallbacks[%d]: %v", path, i, err)}
+		}
+		r.Fallbacks = append(r.Fallbacks, name)
+	}
+	return r, nil
+}
+
+// rawBudget is the strict budget section shadow.
+type rawBudget struct {
+	MaxUSDPerRun yaml.Node `yaml:"max_usd_per_run"`
+}
+
+func decodeBudget(path string, raw *rawBudget) (Budget, error) {
+	var b Budget
+	if raw.MaxUSDPerRun.Kind != 0 {
+		if raw.MaxUSDPerRun.ShortTag() != "!!float" && raw.MaxUSDPerRun.ShortTag() != "!!int" {
+			return Budget{}, &Error{Msg: fmt.Sprintf("parse config %s: budget.max_usd_per_run must be a number", path)}
+		}
+		var v float64
+		if err := raw.MaxUSDPerRun.Decode(&v); err != nil {
+			return Budget{}, &Error{Msg: fmt.Sprintf("parse config %s: budget.max_usd_per_run: %v", path, err)}
+		}
+		b.MaxUSDPerRun = &v
+	}
+	return b, nil
 }
 
 // Resolve applies precedence explicitly: CLI overrides first, then the
@@ -103,7 +203,10 @@ func Resolve(file File, cli Overrides) (Resolved, error) {
 }
 
 // builtInSafeDefaults is the embedded fallback: serial execution is the
-// only concurrency default that can never collide with a future schedule.
+// only concurrency default that can never collide with a future schedule;
+// no model override, no fallback Provider, and no budget cap are the
+// safe routing defaults (the Spec's explicit route is the only approved
+// binding then).
 func builtInSafeDefaults() Resolved {
 	return Resolved{Concurrency: 1}
 }
@@ -111,6 +214,13 @@ func builtInSafeDefaults() Resolved {
 func applyFile(out *Resolved, file File) {
 	if file.Concurrency != nil {
 		out.Concurrency = *file.Concurrency
+	}
+	if file.Routing != nil {
+		out.Model = file.Routing.Model
+		out.Fallbacks = append([]string(nil), file.Routing.Fallbacks...)
+	}
+	if file.Budget != nil && file.Budget.MaxUSDPerRun != nil {
+		out.MaxUSDPerRun = *file.Budget.MaxUSDPerRun
 	}
 }
 
@@ -123,6 +233,28 @@ func applyOverrides(out *Resolved, cli Overrides) {
 func validate(out Resolved) (Resolved, error) {
 	if out.Concurrency < 1 {
 		return Resolved{}, &Error{Msg: fmt.Sprintf("invalid concurrency %d: must be at least 1", out.Concurrency)}
+	}
+	if strings.TrimSpace(out.Model) == "" && out.Model != "" {
+		return Resolved{}, &Error{Msg: "invalid routing.model: must not be blank"}
+	}
+	// The approved model travels in Provider argv (--model): a leading
+	// dash or whitespace could inject flags, so it must be a plain
+	// identifier (PRD 约束: argv-only launch).
+	for _, r := range out.Model {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return Resolved{}, &Error{Msg: "invalid routing.model: must not contain whitespace"}
+		}
+	}
+	if len(out.Model) > 0 && out.Model[0] == '-' {
+		return Resolved{}, &Error{Msg: "invalid routing.model: must not start with '-'"}
+	}
+	for i, name := range out.Fallbacks {
+		if strings.TrimSpace(name) == "" || strings.ContainsAny(name, " \t") {
+			return Resolved{}, &Error{Msg: fmt.Sprintf("invalid routing.fallbacks[%d]: provider names must be plain identifiers", i)}
+		}
+	}
+	if out.MaxUSDPerRun < 0 {
+		return Resolved{}, &Error{Msg: fmt.Sprintf("invalid budget.max_usd_per_run %v: must not be negative", out.MaxUSDPerRun)}
 	}
 	return out, nil
 }

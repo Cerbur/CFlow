@@ -95,8 +95,12 @@ func TestFakeDetectMatchesRegistryBinding(t *testing.T) {
 	if inst.DialectID != binding.Dialect.ID {
 		t.Fatalf("detection dialect %q must match the binding %q", inst.DialectID, binding.Dialect.ID)
 	}
-	if inst.RegistryRevision != reg.Revision() {
-		t.Fatalf("detection must report the registry revision")
+	// The detection reports the binding revision the installation was
+	// judged against — the same contract the codex and claude adapters
+	// pin (the routing Compare-and-Swap compares the reported revision
+	// against the binding's pinned revision, never the aggregate).
+	if inst.RegistryRevision != binding.Revision {
+		t.Fatalf("detection must report the binding revision, got %q", inst.RegistryRevision)
 	}
 	if !inst.Capabilities.StructuredEvents || !inst.Capabilities.ResumableSession ||
 		!inst.Capabilities.SessionIDInEventStream {

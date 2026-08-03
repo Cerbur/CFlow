@@ -546,7 +546,10 @@ func decideExecutionDryRun(state model.State, in model.ExecutionDryRunInput) (mo
 	}
 	// The Kernel assigns the next immutable Preflight Revision from the
 	// aggregate; the report Artifact the Application wrote uses the same
-	// deterministic derivation.
+	// deterministic derivation. The resolved routing and budget policy
+	// Revisions the Application wrote become active references in the
+	// same transaction that pauses the gate, so the Execution Approval
+	// preview binds their hashes (Task 16, design 20.1).
 	b := &builder{state: state}
 	b.mutate(model.PreflightRecordMutation{
 		Revision:          facts.PreflightRevision + 1,
@@ -559,6 +562,22 @@ func decideExecutionDryRun(state model.State, in model.ExecutionDryRunInput) (mo
 		ArtifactPath:      p.ArtifactPath,
 		ArtifactHash:      p.EvidenceHash,
 	})
+	if in.RoutingRef.Hash != "" {
+		b.mutate(model.ArtifactRefMutation{
+			Type:     model.ArtifactRoutingPolicy,
+			Revision: in.RoutingRef.Revision,
+			Path:     in.RoutingRef.String(),
+			Hash:     in.RoutingRef.Hash,
+		})
+	}
+	if in.BudgetRef.Hash != "" {
+		b.mutate(model.ArtifactRefMutation{
+			Type:     model.ArtifactBudgetPolicy,
+			Revision: in.BudgetRef.Revision,
+			Path:     in.BudgetRef.String(),
+			Hash:     in.BudgetRef.Hash,
+		})
+	}
 	b.mutate(wfMutStatus(state, model.RuntimePaused))
 	b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused for execution approval")
 	return b.decision(), nil

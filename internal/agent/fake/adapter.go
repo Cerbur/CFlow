@@ -335,7 +335,7 @@ func (a *Adapter) Detect(ctx context.Context) (agent.Installation, error) {
 	}
 	return agent.Installation{
 		Compatibility:    agent.CompatibilitySupported,
-		RegistryRevision: a.reg.Revision(),
+		RegistryRevision: a.binding.Revision,
 		DialectID:        a.binding.Dialect.ID,
 		Capabilities:     capsFromBinding(a.binding),
 	}, nil

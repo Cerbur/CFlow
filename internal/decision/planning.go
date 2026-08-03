@@ -132,6 +132,20 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 				}
 				b := &builder{state: state}
 				b.mutate(sessionEnd(state, created, in))
+				if code == model.CodeUserInterrupted {
+					// A user Ctrl+C interruption is never a Provider
+					// failure and never charges the Retry Budget (PRD
+					// 失败分类, USER_INTERRUPTED): the Attempt settles
+					// INTERRUPTED carrying the interruption code and no
+					// successor is allocated.
+					return settleInterrupted(state, node, attempt, model.EffectResultInput{
+						Kind:        model.AttemptEnded,
+						Attempt:     attempt.Key,
+						Outcome:     model.OutcomeInterrupted,
+						FailureCode: model.CodeUserInterrupted,
+						EndHead:     in.EndHead,
+					}, b)
+				}
 				return decideAttemptFailure(state, node, attempt, model.EffectResultInput{
 					Kind:        model.AttemptEnded,
 					Attempt:     attempt.Key,
