@@ -330,25 +330,39 @@ func decideIntegrationMergeFailed(state model.State, in model.EffectResultInput)
 	if in.PreMergeHead == "" {
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("merge failure carries no pre-merge head"))
 	}
+	// The typed failure code rides the rollback Intent so the Attempt
+	// settles with the code the executor observed (a text conflict, a
+	// committed merge whose post-merge checks failed, or a refused
+	// merge), never with an invented one.
+	code := in.FailureCode
+	if code == "" {
+		code = model.CodeMergeConflict
+	}
 	b := &builder{state: state}
-	b.effect(model.IntegrationRollbackIntent{Head: in.PreMergeHead, Attempt: attempt.Key})
+	b.effect(model.IntegrationRollbackIntent{Head: in.PreMergeHead, Attempt: attempt.Key, FailureCode: code})
 	return b.decision(), nil
 }
 
 // decideIntegrationRollbacked settles the failed merge Attempt after the
 // managed Integration Worktree was restored: a text conflict fails with
 // MERGE_CONFLICT (retryable; the Merge Node's budget governs the single
-// restricted resolution Attempt of Task 17).
+// restricted resolution Attempt of Task 17), and a committed merge that
+// failed its post-merge checks settles with the typed code the executor
+// observed.
 func decideIntegrationRollbacked(state model.State, in model.EffectResultInput) (model.Decision, error) {
 	attempt := state.Attempts[in.Attempt]
 	if attempt == nil || attempt.Status != model.AttemptRunning {
 		return model.Decision{}, model.InvalidInputFault("unknown or non-running attempt " + in.Attempt.String())
 	}
+	code := in.FailureCode
+	if code == "" {
+		code = model.CodeMergeConflict
+	}
 	return decideAttemptEnded(state, model.EffectResultInput{
 		Kind:        model.AttemptEnded,
 		Attempt:     attempt.Key,
 		Outcome:     model.OutcomeFailed,
-		FailureCode: model.CodeMergeConflict,
+		FailureCode: code,
 		Evidence:    in.Evidence,
 	})
 }

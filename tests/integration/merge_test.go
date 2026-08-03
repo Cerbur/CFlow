@@ -144,6 +144,59 @@ func TestMergeConflictReturnsTypedResultAndRollsBack(t *testing.T) {
 	}
 }
 
+// TestRollbackMergeRestoresCommittedMerge (review fix #1): a merge that
+// COMMITTED but failed its post-merge checks (Merge Commit identity
+// drift, dirty post-merge Worktree) is restored by the guarded reset —
+// the managed Integration Worktree and its branch move back to the
+// recorded pre-merge HEAD, the Worktree verifies clean, and the failed
+// Merge Commit stays as captured evidence.
+func TestRollbackMergeRestoresCommittedMerge(t *testing.T) {
+	fx := newIntegrationMergeFixture(t)
+	b1 := fx.taskBranch("task-a", "export const v = 1;\n")
+	res, err := fx.flow.Execute(context.Background(), gitflow.MergeIntegration{
+		Path: fx.integration, Branch: b1,
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	mr, ok := res.(gitflow.MergeResult)
+	if !ok {
+		t.Fatalf("merge result = %T, want MergeResult", res)
+	}
+	if mr.Head == fx.base {
+		t.Fatalf("the merge did not commit")
+	}
+
+	// The rollback restores the recorded pre-merge HEAD (the committed
+	// merge's post-merge checks failed).
+	rb, err := fx.flow.Execute(context.Background(), gitflow.RollbackMerge{
+		Path: fx.integration, ExpectedHead: fx.base,
+	})
+	if err != nil {
+		t.Fatalf("rollback of a committed merge: %v", err)
+	}
+	rr, ok := rb.(gitflow.RollbackResult)
+	if !ok || rr.Head != fx.base {
+		t.Fatalf("rollback result = %+v, want the recorded pre-merge head %s", rb, fx.base)
+	}
+	status, err := fx.flow.Observe(context.Background(), gitflow.GitStatus{Dir: fx.integration, ExpectedHead: fx.base, UntrackedAll: true})
+	if err != nil {
+		t.Fatalf("post-rollback status: %v", err)
+	}
+	st := status.(gitflow.StatusFacts)
+	if !st.Clean() {
+		t.Fatalf("post-rollback worktree is not clean: %+v", st)
+	}
+	// The managed Integration Branch is back at the recorded head; the
+	// failed Merge Commit object stays reachable as captured evidence.
+	if got := strings.TrimSpace(string(fx.repo.git("rev-parse", "cflow/wf-1/integration"))); got != fx.base {
+		t.Fatalf("integration branch = %s, want the recorded pre-merge head %s", got, fx.base)
+	}
+	if !pathExists(filepath.Join(fx.repo.Root, ".git", "objects", mr.Head[:2], mr.Head[2:])) {
+		t.Fatalf("the failed merge commit object is not preserved as evidence")
+	}
+}
+
 // TestIntegrationMergeSerialNoFF: a clean merge produces a separate
 // --no-ff Merge Commit that preserves the Task's append-only history.
 func TestIntegrationMergeSerialNoFF(t *testing.T) {

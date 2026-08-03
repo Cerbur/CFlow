@@ -114,10 +114,13 @@ func (IntegrationMergeIntent) isEffectIntent() {}
 
 // IntegrationRollbackIntent restores the managed Integration Worktree to
 // a recorded pre-merge HEAD after a failed merge. Attempt fixes the
-// Attempt whose failure the rollback settles.
+// Attempt whose failure the rollback settles; FailureCode carries the
+// typed failure the Attempt settles with once the Worktree is restored
+// ("" means the default MERGE_CONFLICT).
 type IntegrationRollbackIntent struct {
-	Head    string
-	Attempt AttemptKey
+	Head        string
+	Attempt     AttemptKey
+	FailureCode Code
 }
 
 func (IntegrationRollbackIntent) isEffectIntent() {}

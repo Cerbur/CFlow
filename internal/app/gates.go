@@ -177,14 +177,27 @@ func (a *Application) integrationMerge(ctx context.Context, wf model.WorkflowID,
 // recorded pre-merge HEAD (RollbackMerge: `git merge --abort` for a
 // conflicted merge, the guarded reset for a committed merge that failed
 // its post-merge checks; PRD 已确认：Merge Conflict 处理). Only the managed
-// Integration Worktree is touched.
+// Integration Worktree is touched. When a committed merge is rolled
+// back, the failed Merge Commit's hash is captured as evidence before
+// the restore, so the failure stays auditable (PRD: 保留失败 Commit 证
+// 据); the typed FailureCode rides the result so the Attempt settles with
+// the code the executor observed.
 func (a *Application) integrationRollback(ctx context.Context, wf model.WorkflowID, intent model.IntegrationRollbackIntent) (model.EffectResultInput, error) {
 	if a.git == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
 	}
-	res, err := a.git.Execute(ctx, gitflow.RollbackMerge{
-		Path: a.integrationWorktreePath(wf), ExpectedHead: intent.Head,
-	})
+	path := a.integrationWorktreePath(wf)
+	evidence := []model.EvidenceRef{
+		{Kind: model.EvidenceGitSnapshot, Hash: intent.Head, Subject: "integration"},
+	}
+	// A committed merge that failed its post-merge checks advanced the
+	// head; its Commit is captured as evidence before the restore.
+	if pre, err := a.observeWorktree(ctx, path, ""); err == nil && pre.Head != "" && pre.Head != intent.Head {
+		evidence = append([]model.EvidenceRef{
+			{Kind: model.EvidenceCommit, Hash: pre.Head, Subject: "integration"},
+		}, evidence...)
+	}
+	res, err := a.git.Execute(ctx, gitflow.RollbackMerge{Path: path, ExpectedHead: intent.Head})
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
@@ -194,10 +207,9 @@ func (a *Application) integrationRollback(ctx context.Context, wf model.Workflow
 	}
 	return model.EffectResultInput{
 		Kind: model.IntegrationRollbacked, Attempt: intent.Attempt,
-		EndHead: rr.Head,
-		Evidence: model.EvidenceRef{
-			Kind: model.EvidenceGitSnapshot, Hash: rr.Head, Subject: "integration",
-		},
+		EndHead: rr.Head, FailureCode: intent.FailureCode,
+		Evidence:     evidence[0],
+		EvidenceRefs: evidence,
 	}, nil
 }
 

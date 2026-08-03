@@ -248,13 +248,16 @@ type MergeIntegration struct {
 
 func (MergeIntegration) isGitOperation() {}
 
-// RollbackMerge restores a managed Integration Worktree left in a
-// conflicted merge state to its recorded pre-merge HEAD: `git merge
-// --abort` (the canonical undo of an in-progress merge that never
-// committed) plus a fail-closed verification of the expected HEAD and a
-// clean worktree. A worktree without a merge in progress blocks with
-// STATE_INVARIANT_VIOLATION: the pre-merge state can no longer be
-// restored safely (design 15.5, PRD 已确认：Merge Conflict 处理).
+// RollbackMerge restores the managed Integration Worktree to the
+// recorded pre-merge HEAD (design 15.5, PRD 已确认：Merge Conflict 处理).
+// Three states are restored: an unchanged clean Worktree (a refused
+// merge: verified no-op), a conflicted merge in progress (`git merge
+// --abort`), and a merge that COMMITTED but failed its post-merge checks
+// (the guarded `git reset --hard` to the recorded head, refuse-to-run
+// when the current HEAD is not a descendant of it — a foreign or
+// replaced history is never destroyed). Every path ends in a fail-closed
+// verification of the expected HEAD and a clean worktree; only the
+// managed Integration Worktree is ever touched.
 type RollbackMerge struct {
 	Path         string // canonical Integration Worktree path
 	ExpectedHead string // the recorded pre-merge HEAD
