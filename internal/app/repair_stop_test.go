@@ -11,8 +11,10 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1329,20 +1331,13 @@ func TestInterruptedDispatchConvergesToPausedStop(t *testing.T) {
 	}
 }
 
-// TestPolicyDriftWindowCommitQuarantineSettle asserts the drift-window
-// Commit settle end to end (PRD 已确认：漂移窗口 Commit 的隔离与替代执行):
-// a Commit that lands inside the drift window (after the pre-stop HEAD
-// was fixed, before the final scan) receives the immutable Branch
-// Quarantine Record with its unique refs/cflow/<workflow>/quarantine/
-// <quarantine-id> audit Ref, the contaminated Node is FAILED (its
-// Attempt stays INTERRUPTED), and the Workflow Blocks. The quarantine
-// evidence never vanishes: the audit Ref exists in Git.
-func TestPolicyDriftWindowCommitQuarantineSettle(t *testing.T) {
-	fx := newExecutionFixture(t)
-	a, wf := fx.executionReady(implementationScript("i1"))
-	// The deterministic user interruption of a live dispatch: the
-	// Workflow converges PAUSED with the interrupted Attempts (the
-	// controlled stop).
+// driftWindowQuarantineFixture drives the deterministic window-commit
+// state: a live dispatch is interrupted (the first Ctrl+C), the policy
+// drifts, the pre-stop HEAD is fixed, a Commit lands inside the drift
+// window, and the post-stop settle records the immutable quarantine with
+// its unique audit Ref. It returns the task worktree path.
+func driftWindowQuarantineFixture(t *testing.T, fx *planningFixture, a *Application, wf model.WorkflowID) string {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -1425,7 +1420,6 @@ func TestPolicyDriftWindowCommitQuarantineSettle(t *testing.T) {
 	}
 	git("-C", worktree, "add", "-A")
 	git("-C", worktree, "commit", "-q", "-m", "window commit")
-	windowHead := git("-C", worktree, "rev-parse", "HEAD")
 
 	// The post-stop settle: the scan finds the window Commit and records
 	// the immutable quarantine with its unique audit Ref.
@@ -1437,6 +1431,33 @@ func TestPolicyDriftWindowCommitQuarantineSettle(t *testing.T) {
 		t.Fatalf("settle: %v", err)
 	}
 	iv = fx.inspect(wf)
+	if iv.Status.Runtime != model.RuntimeBlocked {
+		t.Fatalf("runtime = %s, want BLOCKED with a window commit", iv.Status.Runtime)
+	}
+	return worktree
+}
+
+// TestPolicyDriftWindowCommitQuarantineSettle asserts the drift-window
+// Commit settle end to end (PRD 已确认：漂移窗口 Commit 的隔离与替代执行):
+// a Commit that lands inside the drift window (after the pre-stop HEAD
+// was fixed, before the final scan) receives the immutable Branch
+// Quarantine Record with its unique refs/cflow/<workflow>/quarantine/
+// <quarantine-id> audit Ref, the contaminated Node is FAILED (its
+// Attempt stays INTERRUPTED), and the Workflow Blocks. The quarantine
+// evidence never vanishes: the audit Ref exists in Git.
+func TestPolicyDriftWindowCommitQuarantineSettle(t *testing.T) {
+	fx := newExecutionFixture(t)
+	a, wf := fx.executionReady(implementationScript("i1"))
+	worktree := driftWindowQuarantineFixture(t, fx, a, wf)
+	git := func(args ...string) string {
+		out, err := execGit(fx.root, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	windowHead := git("-C", worktree, "rev-parse", "HEAD")
+	iv := fx.inspect(wf)
 	if iv.Status.Runtime != model.RuntimeBlocked {
 		t.Fatalf("runtime = %s, want BLOCKED with a window commit", iv.Status.Runtime)
 	}
@@ -1471,5 +1492,98 @@ func TestPolicyDriftWindowCommitQuarantineSettle(t *testing.T) {
 	}
 	if !interrupted {
 		t.Fatalf("the window-commit attempt must stay INTERRUPTED")
+	}
+}
+
+// TestReplacementPreviewToApproveEndToEnd asserts the unified Replacement
+// Execution Approval end to end (PRD 已确认：Replacement Execution Approval
+// 吸收 Policy 确认): after the drift-window quarantine Blocks the Workflow,
+// replacement-preview generates the successor Specs, the successor
+// Dynamic Workflow Revision, the fixed Reconciliation Manifest (with its
+// self-hash persisted and displayed), and the fresh Preflight; then
+// replacement-approve binds the exact preview in one append-only
+// EXECUTION Approval and reopens dispatch on a fresh Run.
+func TestReplacementPreviewToApproveEndToEnd(t *testing.T) {
+	fx := newExecutionFixture(t)
+	a, wf := fx.executionReady(implementationScript("i1"))
+	driftWindowQuarantineFixture(t, fx, a, wf)
+
+	// The unified preview: successor execution + manifest + preflight.
+	if _, err := a.Execute(context.Background(), ReplacementPreviewCommand{Workflow: wf}); err != nil {
+		t.Fatalf("replacement preview: %v", err)
+	}
+	qview, err := a.Query(context.Background(), ReplacementPreviewQuery{Workflow: wf})
+	if err != nil {
+		t.Fatalf("replacement preview query: %v", err)
+	}
+	pv := qview.(ReplacementPreviewView)
+	if len(pv.Quarantines) == 0 {
+		t.Fatalf("the preview must display the quarantine set")
+	}
+	if pv.Manifest.Revision < 1 || len(pv.Manifest.Actions) == 0 {
+		t.Fatalf("the preview must display the reconciliation manifest, got %+v", pv.Manifest)
+	}
+	if pv.Manifest.Hash == "" {
+		t.Fatalf("the manifest self-hash must be persisted and displayed")
+	}
+	// The persisted manifest body carries the embedded hash.
+	body, err := a.readReconciliationManifest(wf, pv.Manifest.Revision)
+	if err != nil || body == nil {
+		t.Fatalf("the reconciliation manifest must be persisted: %v", err)
+	}
+	var persisted model.ReconciliationManifest
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		t.Fatalf("the persisted manifest cannot be parsed: %v", err)
+	}
+	if persisted.Hash != pv.Manifest.Hash {
+		t.Fatalf("the persisted manifest hash = %s, want the displayed %s", persisted.Hash, pv.Manifest.Hash)
+	}
+
+	// The unified approval binds the exact preview and reopens dispatch.
+	ids := make([]string, 0, len(pv.Quarantines))
+	for _, q := range pv.Quarantines {
+		ids = append(ids, q.ID)
+	}
+	if _, err := a.Execute(context.Background(), ApproveReplacementCommand{
+		Workflow:             wf,
+		PlanHash:             pv.PlanHash,
+		SpecHashes:           pv.SpecHashes,
+		CatalogHash:          pv.CatalogHash,
+		WorkflowHash:         pv.WorkflowHash,
+		RoutingHash:          pv.RoutingHash,
+		BudgetHash:           pv.BudgetHash,
+		PreflightRevision:    pv.Preflight.Revision,
+		PreflightHash:        pv.Preflight.EvidenceHash,
+		Fingerprint:          pv.NewFingerprint,
+		QuarantineIDs:        ids,
+		SupersededApprovalID: pv.SupersededApprovalID,
+		ManifestRevision:     pv.Manifest.Revision,
+		ManifestHash:         pv.Manifest.Hash,
+	}); err != nil {
+		t.Fatalf("replacement approval: %v", err)
+	}
+	iv := fx.inspect(wf)
+	if iv.Status.Runtime != model.RuntimeRunning {
+		t.Fatalf("runtime = %s, want RUNNING after the replacement approval", iv.Status.Runtime)
+	}
+	// The single append-only EXECUTION Approval carries the decision
+	// context: reason=COMMIT_POLICY_DRIFT_REPLACEMENT, the superseded
+	// approval, the quarantine set, the fixed manifest, and
+	// absorbs_commit_policy_confirmation=true.
+	replacement := false
+	for _, ap := range iv.Approvals {
+		if ap.Kind != model.ApprovalExecution {
+			continue
+		}
+		if strings.Contains(ap.DecisionContext, `"reason":"COMMIT_POLICY_DRIFT_REPLACEMENT"`) {
+			replacement = true
+			if !strings.Contains(ap.DecisionContext, `"absorbs_commit_policy_confirmation":true`) ||
+				!strings.Contains(ap.DecisionContext, `"reconciliation_manifest":{"hash":"`+pv.Manifest.Hash+`","revision":`+strconv.Itoa(pv.Manifest.Revision)+`}`) {
+				t.Fatalf("replacement decision context = %s", ap.DecisionContext)
+			}
+		}
+	}
+	if !replacement {
+		t.Fatalf("the replacement execution approval must be persisted")
 	}
 }
