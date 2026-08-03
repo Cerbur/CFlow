@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -81,10 +82,21 @@ var knownNoopTypes = map[string]bool{
 // skippedRoles are known codex message roles with no unified mapping.
 var skippedRoles = map[string]bool{"user": true, "system": true, "developer": true}
 
+// errSessionIDMissing marks a session_started frame that claims no
+// session id: per the binding's conflict rule missing ids fail
+// PROVIDER_SESSION_ID_MISSING. The run maps this onto the fail-closed
+// protocol finding with the raw frame as evidence.
+var errSessionIDMissing = errors.New("session_started frame carries no session id")
+
 // parseFrame decodes one raw codex JSONL frame into a unified event.
 // established is the session id the stream's validated start event
 // claimed ("" before the start). skip reports known frames that map to
-// no unified event and must be passed over silently.
+// no unified event and must be passed over silently. Fail-closed rules
+// at the wire boundary: a start frame with no session id, a terminal
+// event before any validated start, and a completion without a valid
+// JSON-object result are protocol findings (the Runtime enforces the
+// same rules on the unified events; the dialect holds them here so the
+// offending frame is preserved as evidence).
 func parseFrame(raw []byte, established *agent.ProviderSessionID) (agent.Event, bool, error) {
 	var wf wireFrame
 	if err := json.Unmarshal(raw, &wf); err != nil {
@@ -92,14 +104,14 @@ func parseFrame(raw []byte, established *agent.ProviderSessionID) (agent.Event, 
 	}
 	switch wf.Type {
 	case "session_started":
-		ev := agent.Event{
+		if wf.SessionID == "" {
+			return agent.Event{}, false, errSessionIDMissing
+		}
+		*established = agent.ProviderSessionID(wf.SessionID)
+		return finishEvent(agent.Event{
 			Type:      agent.EventSessionStarted,
 			SessionID: agent.ProviderSessionID(wf.SessionID),
-		}
-		if wf.SessionID != "" {
-			*established = agent.ProviderSessionID(wf.SessionID)
-		}
-		return finishEvent(ev, raw), false, nil
+		}, raw), false, nil
 	case "message":
 		return parseMessageFrame(wf, raw, established)
 	case "tool_execution":
@@ -119,6 +131,12 @@ func parseFrame(raw []byte, established *agent.ProviderSessionID) (agent.Event, 
 		}
 		return finishEvent(ev, raw), false, nil
 	case "session_finished":
+		if *established == "" {
+			return agent.Event{}, false, fmt.Errorf("terminal event before a validated session_started")
+		}
+		if !isJSONObject(wf.Result) {
+			return agent.Event{}, false, fmt.Errorf("session_finished frame carries no valid JSON object result")
+		}
 		ev := agent.Event{
 			Type:   agent.EventCompleted,
 			Result: string(wf.Result),
@@ -128,6 +146,9 @@ func parseFrame(raw []byte, established *agent.ProviderSessionID) (agent.Event, 
 		}
 		return finishEvent(ev, raw), false, nil
 	case "session_failed":
+		if *established == "" {
+			return agent.Event{}, false, fmt.Errorf("terminal event before a validated session_started")
+		}
 		ev := agent.Event{
 			Type:    agent.EventFailed,
 			Code:    wf.Code,
@@ -211,6 +232,22 @@ func withSession(ev *agent.Event, wf wireFrame, established *agent.ProviderSessi
 	}
 	ev.SessionID = *established
 	return nil
+}
+
+// isJSONObject reports whether raw is a non-null JSON object, the
+// minimum validity of a structured completion payload. The Runtime's
+// sequence validator enforces the same rule on the unified event; the
+// dialect holds it at the wire boundary so the offending frame is
+// preserved as redacted evidence.
+func isJSONObject(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+	return m != nil
 }
 
 // finishEvent stamps the sha256 of the raw wire frame (the protocol hash

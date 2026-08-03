@@ -10,6 +10,7 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -75,13 +76,20 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 // decodeFrame parses one stdout frame through the dialect and registers
 // the run under the established provider session id so Cancel and
 // Inspect can find it. A dialect failure stops the affected process and
-// returns the fail-closed protocol error carrying the raw frame.
+// returns the fail-closed protocol error carrying the raw frame; a start
+// frame with no session id carries the binding's missing-id code
+// (PROVIDER_SESSION_ID_MISSING), every other violation is
+// PROVIDER_PROTOCOL_VIOLATION.
 func (r *run) decodeFrame(raw []byte) (agent.Event, bool, error) {
 	ev, skip, err := parseFrame(raw, &r.established)
 	if err != nil {
 		r.stopProcess()
+		code := model.CodeProviderProtocolViolation
+		if errors.Is(err, errSessionIDMissing) {
+			code = model.CodeProviderSessionIDMissing
+		}
 		return agent.Event{}, false, &agent.ProtocolError{
-			Code:    model.CodeProviderProtocolViolation,
+			Code:    code,
 			Frame:   raw,
 			Message: "codex: " + err.Error(),
 		}

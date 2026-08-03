@@ -688,6 +688,111 @@ func TestDialectConflictingSessionIDsFailsClosed(t *testing.T) {
 	}
 }
 
+// TestDialectEmptyStartIDFailsClosed: a session_started frame that
+// claims no session id fails closed with PROVIDER_SESSION_ID_MISSING
+// (the binding's conflict rule: missing ids fail
+// PROVIDER_SESSION_ID_MISSING), so no session can be established by an
+// empty id and no event is emitted for the offending frame.
+func TestDialectEmptyStartIDFailsClosed(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
+	h.scriptFrames(t, 1,
+		`{"type":"session_started","session_id":""}`+"\n"+
+			`{"type":"session_finished","result":{"ok":true}}`, 0)
+	events, err := collectErr(r)
+	var pe *agent.ProtocolError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected a ProtocolError, got %v", err)
+	}
+	if pe.Code != model.CodeProviderSessionIDMissing {
+		t.Fatalf("code = %s, want PROVIDER_SESSION_ID_MISSING", pe.Code)
+	}
+	if !bytes.Contains(pe.Frame, []byte("session_started")) {
+		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
+	}
+	if len(events) != 0 {
+		t.Fatalf("an empty-id start must emit no events, got %d: %+v", len(events), events)
+	}
+}
+
+// TestDialectTerminalWithoutValidStartFailsClosed: a terminal event that
+// arrives before any validated session_started fails closed (session
+// identity appears only through a validated start event); the run can
+// never complete from a stream that never established a session.
+func TestDialectTerminalWithoutValidStartFailsClosed(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
+	h.scriptFrames(t, 1,
+		`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"no start"}]}}`+"\n"+
+			`{"type":"session_finished","result":{"ok":true}}`, 0)
+	events, err := collectErr(r)
+	var pe *agent.ProtocolError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected a ProtocolError, got %v", err)
+	}
+	if pe.Code != model.CodeProviderProtocolViolation {
+		t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
+	}
+	if !bytes.Contains(pe.Frame, []byte("session_finished")) {
+		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected only the pre-start message event, got %d", len(events))
+	}
+}
+
+// TestDialectMissingCompletionResultFailsClosed: a terminal completion
+// with no result payload cannot validate structured completion and fails
+// closed with the offending frame (PRD: invalid completion → non-retryable
+// protocol Finding).
+func TestDialectMissingCompletionResultFailsClosed(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
+	h.scriptFrames(t, 1,
+		`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
+			`{"type":"session_finished"}`, 0)
+	events, err := collectErr(r)
+	var pe *agent.ProtocolError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected a ProtocolError, got %v", err)
+	}
+	if pe.Code != model.CodeProviderProtocolViolation {
+		t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
+	}
+	if !bytes.Contains(pe.Frame, []byte("session_finished")) {
+		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected only the validated start event, got %d", len(events))
+	}
+}
+
+// TestDialectNonObjectCompletionResultFailsClosed: a terminal completion
+// whose result is not a JSON object (here a plain string) cannot validate
+// structured completion and fails closed.
+func TestDialectNonObjectCompletionResultFailsClosed(t *testing.T) {
+	for _, result := range []string{`"just a string"`, `null`} {
+		t.Run(result, func(t *testing.T) {
+			h := newHarness(t, codexBinding(t))
+			r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
+			h.scriptFrames(t, 1,
+				`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
+					`{"type":"session_finished","result":`+result+`}`, 0)
+			_, err := collectErr(r)
+			var pe *agent.ProtocolError
+			if !errors.As(err, &pe) {
+				t.Fatalf("expected a ProtocolError, got %v", err)
+			}
+			if pe.Code != model.CodeProviderProtocolViolation {
+				t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
+			}
+			if !bytes.Contains(pe.Frame, []byte("session_finished")) {
+				t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
+			}
+		})
+	}
+}
+
 // TestDialectExitWithoutTerminalFailsClosed (PRD 约束 43): a Provider
 // success exit without a validated terminal structured event can never
 // complete the run; the exit code is a fact the crash error carries, and
@@ -935,6 +1040,43 @@ func TestCancellationPreservesPartialRedactedEvents(t *testing.T) {
 	if len(res.Events) >= 2 && strings.Contains(res.Events[1].Text, "halfway") {
 		t.Logf("preserved redacted partial event: %q", res.Events[1].Text)
 	}
+}
+
+// TestRuntimeRejectsStreamWithoutValidatedStart: a stream that never
+// establishes a session through a validated session_started event fails
+// the run with a non-retryable protocol Finding (brief: missing
+// session_started → non-retryable protocol Finding; exit 0 cannot
+// override it).
+func TestRuntimeRejectsStreamWithoutValidatedStart(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	rt := newCodexRuntime(t, h.ad)
+	_, err := runtimeStart(t, rt, h, fixtureStart(h),
+		`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"no start"}]}}`+"\n"+
+			`{"type":"session_finished","result":{"ok":true}}`)
+	assertFaultCode(t, err, model.CodeProviderProtocolViolation)
+}
+
+// TestRuntimeRejectsEmptyStartID: an empty session id on session_started
+// fails the run with PROVIDER_SESSION_ID_MISSING through the pipeline.
+func TestRuntimeRejectsEmptyStartID(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	rt := newCodexRuntime(t, h.ad)
+	_, err := runtimeStart(t, rt, h, fixtureStart(h),
+		`{"type":"session_started","session_id":""}`+"\n"+
+			`{"type":"session_finished","result":{"ok":true}}`)
+	assertFaultCode(t, err, model.CodeProviderSessionIDMissing)
+}
+
+// TestRuntimeRejectsInvalidCompletion: a terminal completion without a
+// validated JSON-object result fails the run closed through the pipeline
+// (PRD: invalid completion → non-retryable protocol Finding).
+func TestRuntimeRejectsInvalidCompletion(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	rt := newCodexRuntime(t, h.ad)
+	_, err := runtimeStart(t, rt, h, fixtureStart(h),
+		`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
+			`{"type":"session_finished"}`)
+	assertFaultCode(t, err, model.CodeProviderProtocolViolation)
 }
 
 // TestResumeNotFoundFailsBeforeAnyProcessLaunch: resuming a provider
