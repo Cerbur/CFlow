@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/config"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
@@ -22,10 +23,14 @@ import (
 
 // Dependencies assembles what the command tree needs. Redaction is the
 // embedded redaction rule registry every render and export path uses
-// (design 19.2); a zero registry passes text through.
+// (design 19.2); a zero registry passes text through. OpenApplication
+// replaces the default Application construction: tests inject the Fake
+// Adapter with fixture scripts, production builds the GitFlow and the
+// embedded registries over the working directory.
 type Dependencies struct {
-	Build     observe.BuildInfo
-	Redaction security.Registry
+	Build           observe.BuildInfo
+	Redaction       security.Registry
+	OpenApplication func(ctx context.Context) (*app.Application, error)
 }
 
 // NewRoot builds the cflow command tree. version, help, and doctor are

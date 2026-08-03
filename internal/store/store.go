@@ -441,7 +441,11 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 	}
 
 	// At most one Effect Intent, committed atomically: an external Effect
-	// is not executed until its Intent and expected facts commit.
+	// is not executed until its Intent and expected facts commit. The
+	// ledger id comes from the effects table's own counter: a Decision
+	// without Events must still receive a unique intent identity (the
+	// planning chain requests a Provider run and then the Artifact write
+	// it produced, and the result Decisions carry no Events).
 	if decision.Effect != nil {
 		kind, err := effectKindOf(decision.Effect)
 		if err != nil {
@@ -451,10 +455,14 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 		if err != nil {
 			return model.CommittedDecision{}, fmt.Errorf("encode effect intent: %w", err)
 		}
+		var effectID uint64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects`).Scan(&effectID); err != nil {
+			return model.CommittedDecision{}, fmt.Errorf("effect ledger count: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO effects
 			(id, workflow_id, kind, payload_json, status, decision_version, created_at)
 			VALUES (?, ?, ?, ?, 'PENDING', ?, ?)`,
-			fmt.Sprintf("effect-%d", next), workflow, kind, string(payload),
+			fmt.Sprintf("effect-%d", effectID+1), workflow, kind, string(payload),
 			expected+1, now.Format(time.RFC3339Nano)); err != nil {
 			return model.CommittedDecision{}, s.mapSQLError(err)
 		}
@@ -492,6 +500,30 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 // ensureProject verifies the Project row exists before any Event may
 // reference it. The Store never invents Project metadata; Project
 // registration belongs to project discovery.
+// RegisterProject records the Project identity row (PRD 核心数据库表) so
+// a Workflow creation can reference it. Idempotent: an existing row is
+// left untouched; the display name is the repository directory name.
+func (s *Store) RegisterProject(ctx context.Context, id model.ProjectID, root, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !id.Valid() {
+		return model.InvalidInputFault("project id is required")
+	}
+	if root == "" {
+		return model.InvalidInputFault("project canonical path is required")
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO projects
+		(id, project_key, canonical_path, display_name, git_root, created_at, updated_at, last_opened_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		string(id), string(id), root, name, root, now, now, now); err != nil {
+		return fmt.Errorf("register project: %w", s.mapSQLError(err))
+	}
+	return nil
+}
+
 func ensureProject(ctx context.Context, q querier, project model.ProjectID) error {
 	var n int
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE id = ?`, string(project)).Scan(&n); err != nil {

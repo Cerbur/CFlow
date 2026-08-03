@@ -314,6 +314,17 @@ func ParseSessionStatus(s string) (SessionStatus, error) {
 	return v, nil
 }
 
+// IsTerminal reports whether the Session cannot be resumed: a terminal
+// Session is never re-activated and never chains another successor
+// lineage (design 14.4).
+func (s SessionStatus) IsTerminal() bool {
+	switch s {
+	case SessionCompleted, SessionFailed, SessionCancelled, SessionLost:
+		return true
+	}
+	return false
+}
+
 // AgentPurpose is the constrained role assigned to a Session (CONTEXT.md:
 // Agent Purpose). Planner and Checker may share a Provider but never a
 // Session (design 14.4).
@@ -344,12 +355,15 @@ func (p AgentPurpose) String() string { return string(p) }
 
 // Session is one Provider-managed conversation identity. A successor
 // Session records its superseded Session for audit lineage (design 14.4).
+// Provider is the route the Session ran on (PRD: SQLite sessions 表
+// records Provider/CLI Version).
 type Session struct {
 	ID                SessionID
 	ProviderSessionID string
 	Purpose           AgentPurpose
 	Status            SessionStatus
 	Supersedes        SessionID
+	Provider          string
 }
 
 // ProcessStatus is the operational status of a managed process record.

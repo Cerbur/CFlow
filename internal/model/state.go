@@ -58,7 +58,10 @@ func (s WorkflowStage) CanTransitionTo(next WorkflowStage) bool {
 	case StagePlanCheck:
 		return next == StageRequirementDiscussion || next == StagePlanGeneration || next == StageSpecGeneration
 	case StageSpecGeneration:
-		return next == StageWorkflowGeneration
+		// The user-driven adjustment loop (PRD 历史工作流交互: 调整需求或
+		// Plan) re-plans after an Approval; the main-line graph has no
+		// backward edge, so the adjustment is this explicit loop edge.
+		return next == StageWorkflowGeneration || next == StagePlanGeneration
 	case StageWorkflowGeneration:
 		return next == StageExecution
 	case StageExecution:

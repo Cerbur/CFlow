@@ -44,6 +44,40 @@ type WorkflowCommandInput struct {
 
 func (WorkflowCommandInput) isInput() {}
 
+// DiscussRequirementInput is one user turn of the requirement discussion
+// (PRD 需求讨论交互). The CFlow Session identity is allocated by the
+// Application and fixed before the Effect (design 6.2 rule 6); the Kernel
+// derives the superseded Session from the aggregate, so every turn joins
+// one discussion Session lineage.
+type DiscussRequirementInput struct {
+	Text     string
+	Provider string
+	Session  SessionID
+}
+
+func (DiscussRequirementInput) isInput() {}
+
+// GeneratePlanInput is the /finish transition (PRD Plan 生成): the
+// planner produces a new immutable Plan Revision from the requirement
+// discussion lineage. The Plan body arrives through the Provider run
+// Result; the Kernel validates it against the PRD's required sections.
+type GeneratePlanInput struct {
+	Provider string
+	Session  SessionID
+}
+
+func (GeneratePlanInput) isInput() {}
+
+// CheckPlanInput starts an independent plan-check Session (PRD Plan Check
+// 交互). The checker is always a fresh Session with the plan-check
+// purpose; it can never be the Planner's Session (design 14.4).
+type CheckPlanInput struct {
+	Provider string
+	Session  SessionID
+}
+
+func (CheckPlanInput) isInput() {}
+
 // PlanApprovalInput is the append-only user decision accepting one exact
 // checked Plan Revision and hash (CONTEXT.md: Plan Approval). The hash is
 // part of the Plan Artifact identity; a mismatched input is an
@@ -110,6 +144,15 @@ const (
 	ApplyFastForwardFailed    EffectResultKind = "apply-fast-forward-failed"
 	CleanupItemRemovedResult  EffectResultKind = "cleanup-item-removed"
 	CleanupItemFailedResult   EffectResultKind = "cleanup-item-failed"
+	// ProviderRunEnded settles one Provider run with its Session facts and
+	// the redacted artifact body it produced (planning lifecycle).
+	ProviderRunEnded EffectResultKind = "provider-run-ended"
+	// ArtifactWritten reports the immutable reference of a persisted
+	// Artifact Revision, echoing the written body for the Result Decision.
+	ArtifactWritten EffectResultKind = "artifact-written"
+	// PlanningWorktreeCreated reports that the Planning Snapshot Worktree
+	// exists at the recorded Base Commit.
+	PlanningWorktreeCreated EffectResultKind = "planning-worktree-created"
 )
 
 // Valid reports whether k is a declared Effect Result Kind.
@@ -117,7 +160,8 @@ func (k EffectResultKind) Valid() bool {
 	switch k {
 	case AttemptEnded, ProcessStopped, ApplyStagingSucceeded,
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
-		CleanupItemRemovedResult, CleanupItemFailedResult:
+		CleanupItemRemovedResult, CleanupItemFailedResult,
+		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated:
 		return true
 	}
 	return false
@@ -167,6 +211,18 @@ type EffectResultInput struct {
 	ApplyAttempt   ApplyAttemptID
 	CleanupAttempt CleanupAttemptID
 	ItemIndex      int
+
+	// Session is the settled Session fact of one Provider run (design
+	// 14.3): the identity, the Provider Session ID, the purpose, and the
+	// terminal status.
+	Session Session
+	// Artifact is the immutable reference produced by an ArtifactWrite
+	// (design 10.1).
+	Artifact ArtifactRef
+	// Body is the redacted artifact body one Provider run produced (the
+	// requirement turn, plan, or check output) or the written content an
+	// ArtifactWrite echoes to its Result Decision.
+	Body []byte
 }
 
 func (EffectResultInput) isInput() {}

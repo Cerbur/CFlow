@@ -18,7 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/decision"
+	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
 	"cflow.local/cflow/internal/process"
@@ -39,13 +42,17 @@ type Application struct {
 	redaction  security.Registry
 	recoverer  Recoverer
 	supervisor process.Supervisor
+	git        *gitflow.GitFlow
+	prompts    *agent.PromptRegistry
+	agent      agent.RuntimeOptions
 	probe      probe // test seam: protocol-order observation, nil in production
 
-	mu     sync.Mutex
-	locks  *platform.LockSet
-	stores map[model.WorkflowID]*store.Store // open write Stores, per workflow
-	known  map[model.WorkflowID]struct{}     // workflows opened this session
-	procs  map[model.ProcessID]process.Handle
+	mu        sync.Mutex
+	locks     *platform.LockSet
+	stores    map[model.WorkflowID]*store.Store // open write Stores, per workflow
+	known     map[model.WorkflowID]struct{}     // workflows opened this session
+	procs     map[model.ProcessID]process.Handle
+	artifacts map[model.WorkflowID]*artifact.Store // open Artifact Stores, per workflow
 }
 
 // probe is the unexported protocol-order observation seam (design 22.1:
@@ -102,9 +109,13 @@ func New(opts Options) (*Application, error) {
 		ids:        ids,
 		redaction:  opts.Redaction,
 		supervisor: sup,
+		git:        opts.GitFlow,
+		prompts:    opts.Prompts,
+		agent:      opts.Agent,
 		stores:     map[model.WorkflowID]*store.Store{},
 		known:      map[model.WorkflowID]struct{}{},
 		procs:      map[model.ProcessID]process.Handle{},
+		artifacts:  map[model.WorkflowID]*artifact.Store{},
 	}
 	if opts.Recoverer != nil {
 		a.recoverer = opts.Recoverer
@@ -137,7 +148,8 @@ func (a *Application) lockSet() (*platform.LockSet, error) {
 // Query runs one closed read projection. Project reads take the shared DB
 // Schema Lock, never migrate, and never take writer locks; when the
 // database schema cannot be interpreted safely the read fails closed with
-// a typed Fault.
+// a typed Fault. DiscoveryQuery is a git-only projection and takes no
+// database lock.
 func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 	switch qq := q.(type) {
 	case ListQuery:
@@ -148,6 +160,10 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryInspect(ctx, qq)
 	case LogsQuery:
 		return a.queryLogs(ctx, qq)
+	case DiscoveryQuery:
+		return a.queryDiscovery(ctx)
+	case PlanQuery:
+		return a.queryPlan(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -261,7 +277,7 @@ func (a *Application) readAggregate(ctx context.Context, wf model.WorkflowID, sq
 // validation, Store.Transact(Decide EffectResult) until no Effect
 // remains.
 func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error) {
-	input, wf, err := a.prepare(cmd)
+	input, wf, err := a.prepare(ctx, cmd)
 	if err != nil {
 		return Outcome{}, orCtx(ctx, err)
 	}
@@ -283,9 +299,29 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 		return Outcome{}, orCtx(ctx, err)
 	}
 	defer releaseHolds(holds)
-	out, err := a.runDecisionLoop(ctx, st, wf, input, restricted)
+	// The Project identity row must exist before the create Decision's
+	// workflow INSERT can reference it (PRD 核心数据库表).
+	if create, ok := cmd.(CreateWorkflowCommand); ok {
+		if err := st.RegisterProject(ctx, model.ProjectID(a.project.Key), a.project.Root,
+			filepath.Base(a.project.Root)); err != nil {
+			return Outcome{}, orCtx(ctx, err)
+		}
+		if create.Name == "" || len(create.Name) > 256 {
+			return Outcome{}, orCtx(ctx, model.InvalidInputFault("workflow name is required and bounded"))
+		}
+	}
+	out, err := a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
 	if err != nil {
 		return Outcome{}, orCtx(ctx, err)
+	}
+	// The workflow.yaml artifact manifest follows the Plan Revision it
+	// records (PRD Workflow 元信息: artifacts.active_plan). The read goes
+	// through the already-open write Store: the mutation lock batch is
+	// still held, so no second Schema lock may be taken.
+	if _, ok := cmd.(GeneratePlanCommand); ok {
+		if merr := a.refreshPlanManifest(ctx, wf, st); merr != nil {
+			return Outcome{}, orCtx(ctx, merr)
+		}
 	}
 	// The events.jsonl export is generated from the committed Event
 	// sequence and is never read by Recovery (design 21); a failure is a
@@ -384,15 +420,25 @@ func (a *Application) acquireMutationLocks(ctx context.Context, wf model.Workflo
 // Result back as evidence for the next Decision (design 6.2). The loop is
 // bounded by the persisted Intent ledger and rejects repeated identical
 // uncompleted Intent identity.
-func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf model.WorkflowID, input model.Input, restricted bool) (Outcome, error) {
+func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf model.WorkflowID, cmd Command, input model.Input, restricted bool) (Outcome, error) {
 	// Current fact snapshot: the aggregate version and the persisted
 	// pending Intent ledger bound the loop.
 	view, err := st.View(ctx, store.StoreQuery{})
 	if err != nil {
 		return Outcome{}, err
 	}
+	// The original command Input is the executor's context for prompt
+	// selection and the run output body, fixed before the loop.
+	cmdInput := input
+	rt, err := a.agentRuntime(ctx, view.State)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if rt != nil {
+		defer rt.Close()
+	}
 	version := view.AggregateVersion
-	budget := effectBudget(view.State, len(view.PendingEffects))
+	budget := effectBudget(view.State, len(view.PendingEffects), input)
 	executed := map[string]struct{}{}
 	var committed []model.CommittedDecision
 	resultFed := false
@@ -423,7 +469,7 @@ func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf m
 		executed[id] = struct{}{}
 		a.probeStep("intent-commit")
 		a.probeStep("effect")
-		result, err := a.executeEffect(ctx, cd.Decision.Effect, restricted)
+		result, err := a.executeEffect(ctx, cd.Decision.Effect, restricted, wf, cmd, cmdInput, rt)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -451,6 +497,9 @@ func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf m
 		Restricted: restricted,
 		Findings:   final.State.Findings,
 	}
+	if s := planningSessionOf(cmdInput); s != "" {
+		out.SessionID = s
+	}
 	for _, cd := range committed {
 		out.Events = append(out.Events, cd.Decision.Events...)
 	}
@@ -461,24 +510,107 @@ func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf m
 	return out, nil
 }
 
+// planningSessionOf returns the Session identity a planning command
+// allocated, for the Outcome renderer.
+func planningSessionOf(input model.Input) model.SessionID {
+	switch in := input.(type) {
+	case model.DiscussRequirementInput:
+		return in.Session
+	case model.GeneratePlanInput:
+		return in.Session
+	case model.CheckPlanInput:
+		return in.Session
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // command classification
 // ---------------------------------------------------------------------------
 
 // prepare classifies one Command into its kernel Input and its workflow
-// identity. Identity that the Runtime owns (the opaque Workflow ID) is
-// fixed before any Effect (design 6.2 rule 6).
-func (a *Application) prepare(cmd Command) (model.Input, model.WorkflowID, error) {
+// identity. Identity that the Runtime owns (the opaque Workflow ID and
+// the planning Session IDs) is fixed before any Effect (design 6.2 rule
+// 6).
+func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, model.WorkflowID, error) {
 	switch c := cmd.(type) {
 	case CreateWorkflowCommand:
-		if c.TargetBranch == "" || c.BaseCommit == "" {
-			return nil, "", model.InvalidInputFault("workflow creation requires a target branch and base commit")
+		// Creation gates (PRD 启动与项目识别): only a canonical Git root
+		// with a valid HEAD attached to a local Target Branch may create;
+		// a Detached HEAD, an unborn repository, or a non-Git directory
+		// refuses. A dirty user workspace is isolated only after explicit
+		// confirmation; CFlow never stashes, commits, resets, or checks
+		// out the user's changes.
+		facts, err := a.discoverProject(ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		if facts.Unborn {
+			return nil, "", model.InvalidInputFault("repository has no commits; a workflow requires a valid HEAD")
+		}
+		if facts.Detached {
+			return nil, "", model.InvalidInputFault("detached HEAD cannot create a new workflow")
+		}
+		if facts.Branch == "" || facts.Head == "" {
+			return nil, "", model.InvalidInputFault("a workflow requires an attached local branch with a valid HEAD")
+		}
+		if facts.Status.Dirty.StagedCount+facts.Status.Dirty.UnstagedCount+facts.Status.Dirty.UntrackedCount > 0 {
+			if !c.ConfirmDirty {
+				return nil, "", model.NewFault(model.CodeDirtyWorktreeDrifted,
+					"the user workspace is dirty; confirm to isolate it from the workflow")
+			}
+		}
+		if c.Provider == "" || len(c.Provider) > 128 {
+			return nil, "", model.InvalidInputFault("a discussion provider is required and bounded")
 		}
 		wf := model.WorkflowID(a.ids(model.IDWorkflow))
 		return model.WorkflowCommandInput{
 			Kind: model.CreateWorkflow, Workflow: wf,
 			Project:      model.ProjectID(a.project.Key),
-			TargetBranch: c.TargetBranch, BaseCommit: c.BaseCommit,
+			TargetBranch: facts.Branch, BaseCommit: facts.Head,
+		}, wf, nil
+	case DiscussRequirementCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if len(c.Text) > 64*1024 {
+			return nil, "", model.InvalidInputFault("requirement turn text is bounded")
+		}
+		return model.DiscussRequirementInput{
+			Text: c.Text, Provider: c.Provider,
+			Session: model.SessionID(a.ids(model.IDSession)),
+		}, wf, nil
+	case GeneratePlanCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.GeneratePlanInput{
+			Provider: c.Provider,
+			Session:  model.SessionID(a.ids(model.IDSession)),
+		}, wf, nil
+	case CheckPlanCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.CheckPlanInput{
+			Provider: c.Provider,
+			Session:  model.SessionID(a.ids(model.IDSession)),
+		}, wf, nil
+	case ApprovePlanCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.Revision < 1 || c.Hash == "" {
+			return nil, "", model.InvalidInputFault("approval requires the exact plan revision and hash")
+		}
+		return model.PlanApprovalInput{
+			PlanRef: model.ArtifactRef{Workflow: wf, Type: model.ArtifactPlan,
+				Revision: c.Revision, Hash: c.Hash},
+			Hash: c.Hash,
 		}, wf, nil
 	case StartWorkflowCommand:
 		return a.workflowCommand(model.StartWorkflow, c.Workflow, "")

@@ -54,6 +54,24 @@ func (r *renderer) orDash(s string) string {
 // read projections
 // ---------------------------------------------------------------------------
 
+// renderPlan renders the active Plan Revision's review state.
+func renderPlan(w io.Writer, v app.PlanView, reg security.Registry) {
+	r := newRenderer(reg)
+	if v.Revision == 0 {
+		fmt.Fprintln(w, "no plan")
+		return
+	}
+	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
+	fmt.Fprintf(w, "stage: %s\n", v.Stage)
+	fmt.Fprintf(w, "runtime: %s\n", v.Runtime)
+	fmt.Fprintf(w, "plan status: %s\n", v.PlanStatus)
+	fmt.Fprintf(w, "revision %d\n", v.Revision)
+	fmt.Fprintf(w, "sha256: %s\n", r.text(v.Hash))
+	if v.Approved {
+		fmt.Fprintln(w, "approved: true")
+	}
+}
+
 func renderList(w io.Writer, v app.ListView, reg security.Registry) {
 	r := newRenderer(reg)
 	if len(v.Workflows) == 0 {
@@ -78,6 +96,16 @@ func renderStatus(w io.Writer, v app.StatusView, reg security.Registry) {
 	fmt.Fprintf(w, "target branch: %s\n", r.orDash(v.TargetBranch))
 	fmt.Fprintf(w, "base commit: %s\n", r.orDash(v.BaseCommit))
 	fmt.Fprintf(w, "integration branch: %s\n", r.orDash(v.IntegrationBranch))
+	if v.PlanStatus != "" {
+		fmt.Fprintf(w, "plan: %s\n", v.PlanStatus)
+		if v.PlanRevision > 0 {
+			fmt.Fprintf(w, "plan revision: %d\n", v.PlanRevision)
+			fmt.Fprintf(w, "plan sha256: %s\n", r.text(v.PlanHash))
+		}
+		if v.PlanApproved {
+			fmt.Fprintln(w, "plan approved: true")
+		}
+	}
 	fmt.Fprintf(w, "integration head: %s\n", r.orDash(v.IntegrationHead))
 	if v.Run != nil {
 		gate := "closed"
@@ -175,6 +203,25 @@ func renderOutcome(w io.Writer, cmd app.Command, out app.Outcome, reg security.R
 				it.Index, it.Kind, r.text(it.CanonicalPath), r.orDash(it.Branch), r.orDash(it.ExpectedHead))
 		}
 		fmt.Fprintf(w, "manifest: %s\n", c.Manifest)
+	case app.CreateWorkflowCommand:
+		fmt.Fprintf(w, "workflow %s created\n", out.Workflow)
+		fmt.Fprintf(w, "  stage: %s\n", out.Stage)
+		fmt.Fprintf(w, "  runtime: %s\n", out.Runtime)
+	case app.DiscussRequirementCommand, app.GeneratePlanCommand, app.CheckPlanCommand:
+		fmt.Fprintf(w, "workflow %s\n", out.Workflow)
+		fmt.Fprintf(w, "  stage: %s\n", out.Stage)
+		fmt.Fprintf(w, "  runtime: %s\n", out.Runtime)
+		if out.SessionID != "" {
+			fmt.Fprintf(w, "  session: %s\n", out.SessionID)
+		}
+		fmt.Fprintf(w, "  events committed: %d\n", len(out.Events))
+		for _, f := range out.Findings {
+			fmt.Fprintf(w, "  finding: %s %s\n", f.Code, r.text(f.Text))
+		}
+	case app.ApprovePlanCommand:
+		fmt.Fprintf(w, "workflow %s\n", out.Workflow)
+		fmt.Fprintln(w, "plan approved")
+		fmt.Fprintf(w, "  stage: %s\n", out.Stage)
 	default:
 		fmt.Fprintf(w, "workflow %s %s\n", out.Workflow, strings.ToLower(string(out.Runtime)))
 		fmt.Fprintf(w, "  stage: %s\n", out.Stage)

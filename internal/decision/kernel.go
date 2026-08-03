@@ -26,6 +26,12 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideEffectResult(state, in)
 	case model.ReconcileInput:
 		return decideReconcile(state, in)
+	case model.DiscussRequirementInput:
+		return decideDiscussRequirement(state, in)
+	case model.GeneratePlanInput:
+		return decideGeneratePlan(state, in)
+	case model.CheckPlanInput:
+		return decideCheckPlan(state, in)
 	case model.PlanApprovalInput:
 		return decidePlanApproval(state, in)
 	case model.ExecutionApprovalInput:

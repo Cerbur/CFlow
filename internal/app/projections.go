@@ -13,6 +13,7 @@ import (
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
 	"cflow.local/cflow/internal/security"
+	"cflow.local/cflow/internal/store"
 )
 
 // resolveQueryWorkflow resolves the optional workflow of a Query: an
@@ -125,6 +126,12 @@ func statusView(st model.State) StatusView {
 		Findings:          st.Findings,
 		Processes:         st.Processes,
 	}
+	if st.Plan != nil {
+		v.PlanStatus = st.Plan.Status
+		v.PlanApproved = st.Plan.Status == model.PlanApproved
+		v.PlanRevision = st.Plan.Revision
+		v.PlanHash = st.Plan.Hash
+	}
 	for i := range st.Runs {
 		if !st.Runs[i].Status.IsTerminal() {
 			r := st.Runs[i]
@@ -133,6 +140,36 @@ func statusView(st model.State) StatusView {
 		}
 	}
 	return v
+}
+
+// queryPlan projects the active Plan Revision's review state.
+func (a *Application) queryPlan(ctx context.Context, q PlanQuery) (View, error) {
+	wf, err := a.resolveQueryWorkflow(q.Workflow)
+	if err != nil {
+		return nil, orCtx(ctx, err)
+	}
+	if wf == "" {
+		return PlanView{}, nil
+	}
+	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
+	if err != nil {
+		return nil, orCtx(ctx, err)
+	}
+	if view.State.Workflow.ID == "" {
+		return nil, model.InvalidInputFault("no such workflow: " + string(wf))
+	}
+	pv := PlanView{
+		Workflow: view.State.Workflow.ID,
+		Stage:    view.State.Workflow.Stage,
+		Runtime:  view.State.Workflow.Runtime,
+	}
+	if view.State.Plan != nil {
+		pv.PlanStatus = view.State.Plan.Status
+		pv.Revision = view.State.Plan.Revision
+		pv.Hash = view.State.Plan.Hash
+		pv.Approved = view.State.Plan.Status == model.PlanApproved
+	}
+	return pv, nil
 }
 
 func inspectView(st model.State, pending []string) InspectView {

@@ -7,24 +7,28 @@ package cli
 // calls Git or Provider executables, and never decides state transitions.
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/agent/fake"
 	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
 	"cflow.local/cflow/internal/process"
-	"cflow.local/cflow/internal/security"
 )
 
 // projectCommands builds the stateful command surface.
 func projectCommands(deps Dependencies) []*cobra.Command {
-	return []*cobra.Command{
+	cmds := []*cobra.Command{
 		{
 			Use:   "list",
 			Short: "list project workflows",
@@ -32,7 +36,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				ctx, stop := commandContext(cmd)
 				defer stop()
-				a, err := openApplication(ctx, deps.Redaction)
+				a, err := openApplication(ctx, deps)
 				if err != nil {
 					return err
 				}
@@ -51,7 +55,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				ctx, stop := commandContext(cmd)
 				defer stop()
-				a, err := openApplication(ctx, deps.Redaction)
+				a, err := openApplication(ctx, deps)
 				if err != nil {
 					return err
 				}
@@ -70,7 +74,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				ctx, stop := commandContext(cmd)
 				defer stop()
-				a, err := openApplication(ctx, deps.Redaction)
+				a, err := openApplication(ctx, deps)
 				if err != nil {
 					return err
 				}
@@ -89,7 +93,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				ctx, stop := commandContext(cmd)
 				defer stop()
-				a, err := openApplication(ctx, deps.Redaction)
+				a, err := openApplication(ctx, deps)
 				if err != nil {
 					return err
 				}
@@ -133,14 +137,165 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 				return executeMutation(cmd, deps, app.DryRunCommand{Workflow: workflowArg(args)})
 			},
 		},
+		{
+			Use:   "workflow-create <name>",
+			Short: "create a workflow for the current git repository",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				provider, _ := cmd.Flags().GetString("provider")
+				assumeYes, _ := cmd.Flags().GetBool("yes")
+				ctx, stop := commandContext(cmd)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.DiscoveryQuery{})
+				if err != nil {
+					return err
+				}
+				dv := view.(app.DiscoveryView)
+				if dv.Unborn {
+					return model.InvalidInputFault("repository has no commits; a workflow requires a valid HEAD")
+				}
+				if dv.Detached {
+					return model.InvalidInputFault("detached HEAD cannot create a new workflow")
+				}
+				confirm := assumeYes
+				if dv.Dirty && !assumeYes {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"user workspace is dirty (%d staged, %d unstaged, %d untracked); it will be isolated and never enter the workflow. continue? [y/N] ",
+						dv.StagedCount, dv.UnstagedCount, dv.UntrackedCount)
+					line, err := readLine(cmd)
+					if err != nil {
+						return err
+					}
+					confirm = strings.EqualFold(strings.TrimSpace(line), "y")
+					if !confirm {
+						return model.InvalidInputFault("workflow creation aborted: the user workspace is dirty")
+					}
+				}
+				out, err := a.Execute(ctx, app.CreateWorkflowCommand{Name: args[0], Provider: provider, ConfirmDirty: confirm})
+				if err != nil {
+					return err
+				}
+				renderOutcome(cmd.OutOrStdout(), app.CreateWorkflowCommand{}, out, deps.Redaction)
+				return nil
+			},
+		},
+		{
+			Use:   "discuss [workflow-id]",
+			Short: "submit one requirement discussion turn from stdin",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				provider, _ := cmd.Flags().GetString("provider")
+				text, err := readDiscussionInput(cmd)
+				if err != nil {
+					return err
+				}
+				return executeMutation(cmd, deps, app.DiscussRequirementCommand{
+					Workflow: workflowArg(args), Text: text, Provider: provider,
+				})
+			},
+		},
+		{
+			Use:   "plan-generate [workflow-id]",
+			Short: "produce a new plan revision",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				provider, _ := cmd.Flags().GetString("provider")
+				return executeMutation(cmd, deps, app.GeneratePlanCommand{
+					Workflow: workflowArg(args), Provider: provider,
+				})
+			},
+		},
+		{
+			Use:   "plan-check [workflow-id]",
+			Short: "run an independent plan check",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				provider, _ := cmd.Flags().GetString("provider")
+				return executeMutation(cmd, deps, app.CheckPlanCommand{
+					Workflow: workflowArg(args), Provider: provider,
+				})
+			},
+		},
+		{
+			Use:   "plan-approve [workflow-id]",
+			Short: "approve the exact active plan revision and hash",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.PlanQuery{Workflow: workflowArg(args)})
+				if err != nil {
+					return err
+				}
+				pv := view.(app.PlanView)
+				if pv.Revision == 0 || pv.Hash == "" {
+					return model.InvalidInputFault("no plan to approve")
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"approve plan revision %d with sha256 %s (status %s)? [y/N] ",
+					pv.Revision, pv.Hash, pv.PlanStatus)
+				line, err := readLine(cmd)
+				if err != nil {
+					return err
+				}
+				if !strings.EqualFold(strings.TrimSpace(line), "y") {
+					return model.InvalidInputFault("plan approval aborted")
+				}
+				return executeMutation(cmd, deps, app.ApprovePlanCommand{
+					Workflow: workflowArg(args), Revision: pv.Revision, Hash: pv.Hash,
+				})
+			},
+		},
+		{
+			Use:   "plan-show [workflow-id]",
+			Short: "show the active plan revision's review state",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.PlanQuery{Workflow: workflowArg(args)})
+				if err != nil {
+					return err
+				}
+				renderPlan(cmd.OutOrStdout(), view.(app.PlanView), deps.Redaction)
+				return nil
+			},
+		},
 	}
+	// The planning commands share the discussion Agent route flag.
+	for _, name := range []string{"workflow-create", "discuss", "plan-generate", "plan-check"} {
+		findCommand(cmds, name).Flags().String("provider", "fake", "provider route")
+	}
+	findCommand(cmds, "workflow-create").Flags().Bool("yes", false, "assume yes for the dirty-workspace confirmation")
+	return cmds
+}
+
+func findCommand(cmds []*cobra.Command, name string) *cobra.Command {
+	for _, c := range cmds {
+		if c.Name() == name {
+			return c
+		}
+	}
+	return nil
 }
 
 // executeMutation runs one mutation command and renders its Outcome.
 func executeMutation(cmd *cobra.Command, deps Dependencies, command app.Command) error {
 	ctx, stop := commandContext(cmd)
 	defer stop()
-	a, err := openApplication(ctx, deps.Redaction)
+	a, err := openApplication(ctx, deps)
 	if err != nil {
 		return err
 	}
@@ -150,6 +305,35 @@ func executeMutation(cmd *cobra.Command, deps Dependencies, command app.Command)
 	}
 	renderOutcome(cmd.OutOrStdout(), command, out, deps.Redaction)
 	return nil
+}
+
+// readLine reads one scripted stdin line (a full-screen TUI is never
+// used; every prompt is a line-oriented y/N question).
+func readLine(cmd *cobra.Command) (string, error) {
+	reader := bufio.NewReader(cmd.InOrStdin())
+	line, err := reader.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return line, nil
+}
+
+// readDiscussionInput reads the requirement text from scripted stdin
+// until the closing "/done" marker or EOF (PRD 需求讨论交互).
+func readDiscussionInput(cmd *cobra.Command) (string, error) {
+	scanner := bufio.NewScanner(cmd.InOrStdin())
+	var lines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "/done" {
+			break
+		}
+		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(lines, "\n"), nil
 }
 
 // commandContext wires the user interruption (design 20): a SIGINT
@@ -169,8 +353,15 @@ func workflowArg(args []string) model.WorkflowID {
 
 // openApplication assembles the Application for one stateful command from
 // the environment (design 20.1): CFLOW_HOME or the default ~/.cflow, and
-// the current working directory as the project root.
-func openApplication(ctx context.Context, redaction security.Registry) (*app.Application, error) {
+// the current working directory as the project root. The GitFlow seam is
+// built over the working directory, and the embedded Provider and Prompt
+// registries feed the deterministic Fake Adapter (the demo's only
+// Adapter until Tasks 14/15; CFLOW_FAKE_SCRIPTS may point at a fixture
+// directory for local runs).
+func openApplication(ctx context.Context, deps Dependencies) (*app.Application, error) {
+	if deps.OpenApplication != nil {
+		return deps.OpenApplication(ctx)
+	}
 	home, err := resolveHome()
 	if err != nil {
 		return nil, err
@@ -179,12 +370,39 @@ func openApplication(ctx context.Context, redaction security.Registry) (*app.App
 	if err != nil {
 		return nil, fmt.Errorf("resolve project root: %w", err)
 	}
+	sup := process.NewSupervisor(process.NewOSAdapter())
+	flow, err := gitflow.NewGitFlow(sup, root)
+	if err != nil {
+		return nil, err
+	}
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		return nil, err
+	}
+	prompts, err := agent.LoadPromptRegistry()
+	if err != nil {
+		return nil, err
+	}
+	ad := fake.New(reg)
+	if dir := os.Getenv("CFLOW_FAKE_SCRIPTS"); dir != "" {
+		if err := ad.LoadDir(dir); err != nil {
+			return nil, err
+		}
+	}
 	return app.New(app.Options{
 		Home:         home,
 		Project:      app.ProjectFor(root),
 		CflowVersion: observe.Version,
-		Redaction:    redaction,
-		Supervisor:   process.NewSupervisor(process.NewOSAdapter()),
+		Redaction:    deps.Redaction,
+		Supervisor:   sup,
+		GitFlow:      flow,
+		Prompts:      prompts,
+		Agent: agent.RuntimeOptions{
+			Registry:    reg,
+			Redaction:   deps.Redaction,
+			Adapters:    map[string]agent.Adapter{"fake": ad},
+			EvidenceDir: filepath.Join(home, "evidence"),
+		},
 	})
 }
 

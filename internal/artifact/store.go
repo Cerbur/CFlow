@@ -48,6 +48,11 @@ var compatibilityRegistry = map[model.ArtifactType][]string{
 	model.ArtifactCatalog:         {"1.0.0"},
 	model.ArtifactReport:          {"1.0.0"},
 	model.ArtifactCleanupManifest: {"1.0.0"},
+	// Task 10 planning artifacts: requirement turns and Plan Check
+	// results carry no agent body schema (the Kernel validates the
+	// structured check result before the write is requested).
+	model.ArtifactDiscussionTurn: {"1.0.0"},
+	model.ArtifactPlanCheck:      {"1.0.0"},
 }
 
 // supportedVersion reports whether a declared Artifact Type's schema

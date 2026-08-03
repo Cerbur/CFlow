@@ -5,12 +5,11 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/security"
@@ -36,6 +35,17 @@ type Options struct {
 	Now func() time.Time
 	// IDs is the injected opaque ID source (design 22.2).
 	IDs model.IDSource
+	// GitFlow is the Git seam (design 15): project discovery and the
+	// Worktree primitives. nil fails every Git-dependent command closed.
+	GitFlow *gitflow.GitFlow
+	// Prompts is the immutable Prompt Registry (design 14.5). nil loads
+	// the embedded registry on demand.
+	Prompts *agent.PromptRegistry
+	// Agent is the Agent Runtime configuration the Application constructs
+	// per command execution (design 14): the Provider Registry, the
+	// redaction policy, the evidence root, and the Provider Adapters. A
+	// zero Registry disables Provider effects (fail closed).
+	Agent agent.RuntimeOptions
 }
 
 // Project is the local project identity one Application serves: the
@@ -47,16 +57,13 @@ type Project struct {
 }
 
 // ProjectFor derives the deterministic project identity from the
-// repository root: a readable slug of the canonical path plus a short
-// content hash (PRD 全局目录结构). Full project discovery (git-root
-// resolution and approved slugs) arrives with Task 8; this constructor is
-// its Task 7 stand-in.
+// repository root with the PRD 启动与项目识别 rules: the readable slug of
+// the canonical path plus a short content hash (gitflow.ProjectKey). Full
+// project discovery (git-root resolution) happens through the GitFlow
+// seam; this constructor canonicalizes the given root.
 func ProjectFor(root string) Project {
 	clean := filepath.Clean(root)
-	slug := strings.TrimPrefix(clean, string(filepath.Separator))
-	slug = strings.ReplaceAll(slug, string(filepath.Separator), "-")
-	sum := sha256.Sum256([]byte(clean))
-	return Project{Key: slug + "--" + hex.EncodeToString(sum[:4]), Root: clean}
+	return Project{Key: gitflow.ProjectKey(clean), Root: clean}
 }
 
 // ---------------------------------------------------------------------------
@@ -83,10 +90,21 @@ type LogsQuery struct {
 	Limit    int
 }
 
-func (ListQuery) isQuery()    {}
-func (StatusQuery) isQuery()  {}
-func (InspectQuery) isQuery() {}
-func (LogsQuery) isQuery()    {}
+// DiscoveryQuery observes the project's Git facts (PRD 启动与项目识别):
+// the canonical root, the attached local branch, HEAD, the dirty
+// classification, and the Project Key. It is a git-only projection; no
+// database lock is taken.
+type DiscoveryQuery struct{}
+
+// PlanQuery projects the active Plan Revision's review state.
+type PlanQuery struct{ Workflow model.WorkflowID }
+
+func (ListQuery) isQuery()      {}
+func (StatusQuery) isQuery()    {}
+func (InspectQuery) isQuery()   {}
+func (LogsQuery) isQuery()      {}
+func (DiscoveryQuery) isQuery() {}
+func (PlanQuery) isQuery()      {}
 
 // ---------------------------------------------------------------------------
 // View union: projection results
@@ -120,6 +138,39 @@ type StatusView struct {
 	Findings          []model.Finding
 	Run               *model.Run
 	Processes         []model.ProcessRecord
+	// PlanStatus is the active Plan Revision's review status ("" when no
+	// Plan exists). PlanApproved is true only for the user's append-only
+	// Approval; a checker pass never sets it.
+	PlanStatus   model.PlanStatus
+	PlanApproved bool
+	PlanRevision int
+	PlanHash     string
+}
+
+// DiscoveryView is the project discovery projection (PRD 启动与项目识别).
+type DiscoveryView struct {
+	Root             string
+	Branch           string
+	Head             string
+	Unborn           bool
+	Detached         bool
+	Dirty            bool
+	DirtyFingerprint string
+	ProjectKey       string
+	StagedCount      int
+	UnstagedCount    int
+	UntrackedCount   int
+}
+
+// PlanView is the active Plan Revision's review projection.
+type PlanView struct {
+	Workflow   model.WorkflowID
+	Stage      model.WorkflowStage
+	Runtime    model.RuntimeStatus
+	PlanStatus model.PlanStatus
+	Revision   int
+	Hash       string
+	Approved   bool
 }
 
 // InspectView is the full aggregate projection.
@@ -143,10 +194,12 @@ type LogsView struct {
 	NextEventSeq uint64
 }
 
-func (ListView) isView()    {}
-func (StatusView) isView()  {}
-func (InspectView) isView() {}
-func (LogsView) isView()    {}
+func (ListView) isView()      {}
+func (StatusView) isView()    {}
+func (InspectView) isView()   {}
+func (LogsView) isView()      {}
+func (DiscoveryView) isView() {}
+func (PlanView) isView()      {}
 
 // ---------------------------------------------------------------------------
 // Command union (design 5, 6.1): closed mutations
@@ -155,12 +208,53 @@ func (LogsView) isView()    {}
 // Command is the closed union of mutation commands.
 type Command interface{ isCommand() }
 
-// CreateWorkflowCommand establishes a workflow with the user branch and
-// base commit fixed at creation. The opaque workflow identity is
-// generated by the Application (design 6.2 rule 6).
+// CreateWorkflowCommand establishes a workflow for the project's Git
+// repository. The Application observes the canonical root, the attached
+// local Target Branch, and HEAD through GitFlow (PRD 启动与项目识别) and
+// refuses creation on a non-Git root, an unborn repository, or a
+// Detached HEAD. ConfirmDirty confirms the user's dirty workspace is
+// isolated: it never enters the Planning Snapshot or any managed
+// Worktree. The opaque workflow identity is generated by the Application
+// (design 6.2 rule 6).
 type CreateWorkflowCommand struct {
-	TargetBranch string
-	BaseCommit   string
+	Name         string
+	Provider     string
+	ConfirmDirty bool
+}
+
+// DiscussRequirementCommand submits one requirement turn (PRD 需求讨论
+// 交互). Text is the user's message; Provider names the discussion
+// Agent route.
+type DiscussRequirementCommand struct {
+	Workflow model.WorkflowID
+	Text     string
+	Provider string
+}
+
+// GeneratePlanCommand is the /finish transition: the planner produces a
+// new immutable Plan Revision from the requirement discussion lineage
+// (PRD Plan 生成).
+type GeneratePlanCommand struct {
+	Workflow model.WorkflowID
+	Provider string
+}
+
+// CheckPlanCommand runs an independent plan-check Session over the
+// active DRAFT Plan Revision (PRD Plan Check 交互). The Checker is never
+// the Planner's Session.
+type CheckPlanCommand struct {
+	Workflow model.WorkflowID
+	Provider string
+}
+
+// ApprovePlanCommand is the user's append-only decision binding one
+// exact checked Plan Revision and hash (PRD 已确认：两个用户批准门). Any
+// mismatch with the active Plan is APPROVAL_INPUT_CHANGED with no
+// mutation.
+type ApprovePlanCommand struct {
+	Workflow model.WorkflowID
+	Revision int
+	Hash     string
 }
 
 // StartWorkflowCommand starts the first Run.
@@ -187,12 +281,16 @@ type DryRunCommand struct {
 	Items    []model.CleanupItem
 }
 
-func (CreateWorkflowCommand) isCommand() {}
-func (StartWorkflowCommand) isCommand()  {}
-func (PauseWorkflowCommand) isCommand()  {}
-func (ResumeWorkflowCommand) isCommand() {}
-func (CancelWorkflowCommand) isCommand() {}
-func (DryRunCommand) isCommand()         {}
+func (CreateWorkflowCommand) isCommand()     {}
+func (DiscussRequirementCommand) isCommand() {}
+func (GeneratePlanCommand) isCommand()       {}
+func (CheckPlanCommand) isCommand()          {}
+func (ApprovePlanCommand) isCommand()        {}
+func (StartWorkflowCommand) isCommand()      {}
+func (PauseWorkflowCommand) isCommand()      {}
+func (ResumeWorkflowCommand) isCommand()     {}
+func (CancelWorkflowCommand) isCommand()     {}
+func (DryRunCommand) isCommand()             {}
 
 // ---------------------------------------------------------------------------
 // Outcome
@@ -209,6 +307,9 @@ type Outcome struct {
 	Events     []model.Event
 	Findings   []model.Finding
 	Cleanup    *model.CleanupAttempt
+	// SessionID is the Session identity a planning command created (""
+	// for commands without one).
+	SessionID model.SessionID
 	// ExportErr reports a failed events.jsonl export. The export is a
 	// rebuildable audit file, never the recovery stream (design 21); the
 	// mutation itself is unaffected.

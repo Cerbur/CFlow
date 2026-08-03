@@ -10,18 +10,29 @@ package model
 // EffectIntent is the closed union of typed Effect Intents.
 type EffectIntent interface{ isEffectIntent() }
 
-// ArtifactWriteIntent persists one Artifact Revision.
+// ArtifactWriteIntent persists one Artifact Revision. Ref names the
+// target identity; Revision 0 means the executor assigns the next
+// Revision of the type (the aggregate does not track every type's
+// counter). Body is the authored body; Producer binds the Artifact to
+// the Session lineage that produced it (design 10.1).
 type ArtifactWriteIntent struct {
-	Ref ArtifactRef
+	Ref      ArtifactRef
+	Body     []byte
+	Producer AgentPurpose
+	Session  SessionID
 }
 
 func (ArtifactWriteIntent) isEffectIntent() {}
 
 // ProviderStartIntent starts a Provider Session for one Agent Purpose.
+// Supersedes is the Provider Session ID of the Session this run succeeds
+// in its role lineage (design 14.4); the Runtime verifies the lineage
+// before any Provider call.
 type ProviderStartIntent struct {
-	Session SessionID
-	Purpose AgentPurpose
-	Route   string
+	Session    SessionID
+	Purpose    AgentPurpose
+	Route      string
+	Supersedes string
 }
 
 func (ProviderStartIntent) isEffectIntent() {}
@@ -41,9 +52,12 @@ type ProviderCancelIntent struct {
 
 func (ProviderCancelIntent) isEffectIntent() {}
 
-// PlanningWorktreeCreateIntent creates the Planning Snapshot Worktree.
+// PlanningWorktreeCreateIntent creates the Planning Snapshot Worktree
+// fixed at the recorded Base Commit (design 15.2). The Base Commit is an
+// expected-HEAD value, fixed before the Effect (design 6.2 rule 6).
 type PlanningWorktreeCreateIntent struct {
-	Workflow WorkflowID
+	Workflow   WorkflowID
+	BaseCommit string
 }
 
 func (PlanningWorktreeCreateIntent) isEffectIntent() {}

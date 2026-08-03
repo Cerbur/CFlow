@@ -46,11 +46,14 @@ func TestWorkflowStageMatrix(t *testing.T) {
 		StageRequirementDiscussion: {StagePlanGeneration},
 		StagePlanGeneration:        {StagePlanCheck},
 		StagePlanCheck:             {StageRequirementDiscussion, StagePlanGeneration, StageSpecGeneration},
-		StageSpecGeneration:        {StageWorkflowGeneration},
-		StageWorkflowGeneration:    {StageExecution},
-		StageExecution:             {StageFinalVerification},
-		StageFinalVerification:     {StageExecution, StageCompleted},
-		StageCompleted:             nil,
+		// The user-driven adjustment loop (PRD 历史工作流交互: 调整需求或
+		// Plan) re-plans after an Approval; the PRD's main-line graph has
+		// no backward edge, so the adjustment is this explicit loop edge.
+		StageSpecGeneration:     {StageWorkflowGeneration, StagePlanGeneration},
+		StageWorkflowGeneration: {StageExecution},
+		StageExecution:          {StageFinalVerification},
+		StageFinalVerification:  {StageExecution, StageCompleted},
+		StageCompleted:          nil,
 	}, WorkflowStage.CanTransitionTo)
 }
 

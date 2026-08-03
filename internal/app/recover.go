@@ -83,9 +83,11 @@ func safetyPathAllowed(cmd Command, code model.Code) bool {
 // effectBudget bounds one command's effect loop (design 6.2): at most one
 // Intent per aggregate entity that can request an external Effect (running
 // processes, running Attempts, in-flight Apply Attempts, pending Cleanup
-// items), plus the persisted pending Intent ledger and the final
-// no-effect Decision. A Kernel that requests more is broken.
-func effectBudget(st model.State, pending int) int {
+// items), plus the planning chain (a planning command requests a Provider
+// run and then the Artifact write it produced), plus the persisted
+// pending Intent ledger and the final no-effect Decision. A Kernel that
+// requests more is broken.
+func effectBudget(st model.State, pending int, cmd model.Input) int {
 	n := 1
 	for _, p := range st.Processes {
 		if p.Status == model.ProcessStatusRunning {
@@ -107,6 +109,19 @@ func effectBudget(st model.State, pending int) int {
 			if !it.Status.IsTerminal() {
 				n++
 			}
+		}
+	}
+	// A planning Session requests its Provider run and then the Artifact
+	// write; the per-command chain is two Effects. Non-terminal Sessions
+	// already in the aggregate add the same chain for the run they are
+	// still owed from a previous command.
+	switch cmd.(type) {
+	case model.DiscussRequirementInput, model.GeneratePlanInput, model.CheckPlanInput:
+		n += 2
+	}
+	for _, s := range st.Sessions {
+		if !s.Status.IsTerminal() {
+			n += 2
 		}
 	}
 	return n + pending + 1

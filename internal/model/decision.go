@@ -48,6 +48,34 @@ type PlanMutation struct {
 
 func (PlanMutation) isMutation() {}
 
+// ArtifactRefMutation records the active Artifact Revision of one type
+// (workflow_artifact_refs row). The Artifact body itself is immutable in
+// the Artifact Store; this row is the SQLite pointer the aggregate
+// hydrates from. Only ArtifactPlan has aggregate state (the current
+// Plan); other declared types are recorded without an in-memory mirror.
+// A ref change always pairs with the PlanMutation that re-opens the
+// review (a new Revision starts DRAFT).
+type ArtifactRefMutation struct {
+	Type     ArtifactType
+	Revision int
+	Path     string
+	Hash     string
+}
+
+func (ArtifactRefMutation) isMutation() {}
+
+// SessionEndMutation settles one Session record with the Provider
+// Session ID and the final status observed from the validated run
+// (design 14.3: Session state is Kernel-owned).
+type SessionEndMutation struct {
+	ID                SessionID
+	ProviderSessionID string
+	Status            SessionStatus
+	EndedAt           time.Time
+}
+
+func (SessionEndMutation) isMutation() {}
+
 // NodeStatusMutation sets one Node's authoritative status and retry
 // charge. Terminal Nodes are never resurrected.
 type NodeStatusMutation struct {
@@ -116,9 +144,11 @@ type RunMutation struct {
 
 func (RunMutation) isMutation() {}
 
-// SessionAppendMutation appends a Session record.
+// SessionAppendMutation appends a Session record. Provider records the
+// route the Session runs on (PRD: SQLite sessions 表).
 type SessionAppendMutation struct {
-	Session Session
+	Session  Session
+	Provider string
 }
 
 func (SessionAppendMutation) isMutation() {}
@@ -212,6 +242,11 @@ const (
 	EventWorkflowFailed           EventKind = "WORKFLOW_FAILED"
 	EventWorkflowSucceeded        EventKind = "WORKFLOW_SUCCEEDED"
 	EventStageChanged             EventKind = "STAGE_CHANGED"
+	EventPlanGenerated            EventKind = "PLAN_GENERATED"
+	EventPlanCheckPassed          EventKind = "PLAN_CHECK_PASSED"
+	EventPlanCheckNeedsRevision   EventKind = "PLAN_CHECK_NEEDS_REVISION"
+	EventPlanCheckNeedsDiscussion EventKind = "PLAN_CHECK_NEEDS_DISCUSSION"
+	EventPlanCheckRejected        EventKind = "PLAN_CHECK_REJECTED"
 	EventPlanApproved             EventKind = "PLAN_APPROVED"
 	EventExecutionApproved        EventKind = "EXECUTION_APPROVED"
 	EventNodeReady                EventKind = "NODE_READY"
@@ -250,7 +285,9 @@ func (k EventKind) Valid() bool {
 	case EventWorkflowCreated, EventWorkflowStarted, EventWorkflowPaused, EventWorkflowResumed,
 		EventWorkflowBlocked, EventWorkflowQuiesceRequested, EventWorkflowQuiesced,
 		EventWorkflowCancelRequested, EventWorkflowCancelled, EventWorkflowFailed, EventWorkflowSucceeded,
-		EventStageChanged, EventPlanApproved, EventExecutionApproved,
+		EventStageChanged, EventPlanGenerated, EventPlanCheckPassed,
+		EventPlanCheckNeedsRevision, EventPlanCheckNeedsDiscussion, EventPlanCheckRejected,
+		EventPlanApproved, EventExecutionApproved,
 		EventNodeReady, EventNodeStarted, EventNodeSucceeded, EventNodeFailed, EventNodeCancelled, EventNodeSkipped,
 		EventAttemptCreated, EventAttemptSucceeded, EventAttemptFailed, EventAttemptInterrupted, EventAttemptCancelled,
 		EventFindingOpened, EventQuarantineRecorded,

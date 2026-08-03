@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,11 +19,41 @@ import (
 	"testing"
 	"time"
 
+	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/store"
 )
+
+// fixtureRepo creates a real temporary committed Git repository the
+// GitFlow seam serves (design 22.1: real repositories, no mocks).
+func fixtureRepo(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(tempRoot(t), "repo")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		cmd.Env = append(os.Environ(),
+			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
+			"GIT_AUTHOR_NAME=Test User", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test User", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-b", "main", "-q")
+	if err := os.WriteFile(filepath.Join(root, "init.txt"), []byte("init"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "init.txt")
+	git("commit", "-q", "-m", "init")
+	return root
+}
 
 // ---------------------------------------------------------------------------
 // probe: the protocol-order test seam (design 22.1)
@@ -101,10 +132,11 @@ func tempRoot(t *testing.T) string {
 }
 
 // fixtureApplication builds one Application over a real temporary SQLite
-// database: a PENDING workflow is created and started, one RUNNING managed
-// process is seeded with a registered Fake Supervisor handle, and a fresh
-// protocol probe is installed. The probe records only the test's own
-// command afterwards.
+// database and a real temporary committed Git repository (the Task 8
+// GitFlow seam drives workflow creation): a PENDING workflow is created
+// and started, one RUNNING managed process is seeded with a registered
+// Fake Supervisor handle, and a fresh protocol probe is installed. The
+// probe records only the test's own command afterwards.
 func fixtureApplication(t *testing.T) (*Application, *callProbe) {
 	t.Helper()
 	home := filepath.Join(tempRoot(t), "home")
@@ -112,11 +144,10 @@ func fixtureApplication(t *testing.T) (*Application, *callProbe) {
 		t.Fatal(err)
 	}
 	dbPath := filepath.Join(home, "cflow.db")
-	proj := ProjectFor(filepath.Join(tempRoot(t), "repo"))
+	root := fixtureRepo(t)
+	proj := ProjectFor(root)
 
-	// Migrate the database once and register the fixture Project row
-	// through the real SQLite file (Task 8 delivers project discovery;
-	// the fixture stands in for it).
+	// Migrate the database once through the real SQLite file.
 	s, err := store.Open(context.Background(), store.OpenOptions{
 		Path: dbPath, Workflow: "fixture", CflowVersion: "0.0.0-dev",
 	})
@@ -126,9 +157,15 @@ func fixtureApplication(t *testing.T) (*Application, *callProbe) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	seedProjectRow(t, dbPath, proj.Key)
 
 	fake, sup := process.NewFakeSupervisor()
+	// The GitFlow seam runs real git processes, so it needs the real OS
+	// Supervisor; the Application's own Supervisor stays the Fake one the
+	// managed-process seeding uses.
+	flow, err := gitflow.NewGitFlow(process.NewSupervisor(process.NewOSAdapter()), root)
+	if err != nil {
+		t.Fatalf("new gitflow: %v", err)
+	}
 	app, err := New(Options{
 		Home:         home,
 		Project:      proj,
@@ -136,12 +173,13 @@ func fixtureApplication(t *testing.T) (*Application, *callProbe) {
 		Now:          func() time.Time { return time.Unix(1700000000, 0).UTC() },
 		IDs:          model.SequentialIDSource(),
 		Supervisor:   sup,
+		GitFlow:      flow,
 	})
 	if err != nil {
 		t.Fatalf("new application: %v", err)
 	}
 
-	out, err := app.Execute(context.Background(), CreateWorkflowCommand{TargetBranch: "main", BaseCommit: "abc123"})
+	out, err := app.Execute(context.Background(), CreateWorkflowCommand{Name: "fixture", Provider: "fake", ConfirmDirty: false})
 	if err != nil {
 		t.Fatalf("create workflow: %v", err)
 	}
@@ -433,7 +471,7 @@ func TestSafetyPathNeverRunsNonStopEffects(t *testing.T) {
 	app.recoverer = &fixtureRecoverer{err: model.NewFault(model.CodeInsecureCFLOWHomePermissions, "fixture posture fault")}
 	if _, err := app.executeEffect(context.Background(), model.ProviderStartIntent{
 		Session: model.SessionID("s-1"), Purpose: model.PurposeImplementation,
-	}, true); err == nil {
+	}, true, "workflow-1", StartWorkflowCommand{}, model.ReconcileInput{}, nil); err == nil {
 		t.Fatal("expected the restricted path to reject a ProviderStart effect")
 	}
 }

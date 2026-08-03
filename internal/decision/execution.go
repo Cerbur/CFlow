@@ -20,6 +20,15 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return decideApplyResult(state, in)
 	case model.CleanupItemRemovedResult, model.CleanupItemFailedResult:
 		return decideCleanupResult(state, in)
+	case model.PlanningWorktreeCreated:
+		// The Planning Snapshot exists at the recorded Base Commit; its
+		// identity facts live in workflow.yaml, not in the aggregate, so
+		// the Result Decision is empty (design 15.2).
+		return model.Decision{}, nil
+	case model.ProviderRunEnded:
+		return decideProviderRunEnded(state, in)
+	case model.ArtifactWritten:
+		return decideArtifactWritten(state, in)
 	default:
 		return model.Decision{}, model.InvalidInputFault("unsupported effect result")
 	}

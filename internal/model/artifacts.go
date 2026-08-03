@@ -14,12 +14,20 @@ const (
 	ArtifactCatalog         ArtifactType = "catalog"
 	ArtifactReport          ArtifactType = "report"
 	ArtifactCleanupManifest ArtifactType = "cleanup-manifest"
+	// ArtifactDiscussionTurn is one immutable, redacted requirement
+	// discussion turn linked to its Session lineage through the artifact
+	// Producer (Task 10; PRD 需求讨论交互).
+	ArtifactDiscussionTurn ArtifactType = "discussion-turn"
+	// ArtifactPlanCheck is one immutable Plan Check result (PRD Plan
+	// Check 交互).
+	ArtifactPlanCheck ArtifactType = "plan-check"
 )
 
 // Valid reports whether t is a declared Artifact Type.
 func (t ArtifactType) Valid() bool {
 	switch t {
-	case ArtifactPlan, ArtifactSpec, ArtifactWorkflow, ArtifactCatalog, ArtifactReport, ArtifactCleanupManifest:
+	case ArtifactPlan, ArtifactSpec, ArtifactWorkflow, ArtifactCatalog, ArtifactReport, ArtifactCleanupManifest,
+		ArtifactDiscussionTurn, ArtifactPlanCheck:
 		return true
 	}
 	return false

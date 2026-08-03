@@ -97,7 +97,10 @@ type Installation struct {
 // prompt update can never change the meaning of an existing Session
 // (design 14.5). Supersedes names the provider session id of the session
 // this run succeeds; the Runtime verifies the role lineage before any
-// Provider call (design 14.4).
+// Provider call (design 14.4). SessionID, when set, is the CFlow Session
+// identity the Application allocated (design 14.4: the Application
+// allocates a new CFlow Session for every role lineage); the Runtime
+// honors it instead of allocating its own.
 type StartRequest struct {
 	Purpose    model.AgentPurpose
 	Provider   string
@@ -106,6 +109,7 @@ type StartRequest struct {
 	CWD        string
 	Timeout    time.Duration // zero: provider default
 	Supersedes ProviderSessionID
+	SessionID  model.SessionID
 }
 
 // ResumeRequest re-establishes an existing Provider Session. Context is

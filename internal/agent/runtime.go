@@ -279,6 +279,7 @@ func (r *Runtime) Start(ctx context.Context, req StartRequest) (*RunResult, erro
 		purpose:    req.Purpose,
 		provider:   req.Provider,
 		supersedes: parent,
+		sessionID:  req.SessionID,
 		promptHash: promptHash,
 		inputHash:  inputHash,
 		runID:      model.RunID(r.ids(model.IDRun)),

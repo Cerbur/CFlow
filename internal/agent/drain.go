@@ -28,6 +28,7 @@ type drainConfig struct {
 	purpose    model.AgentPurpose
 	provider   string
 	supersedes model.SessionID
+	sessionID  model.SessionID // start: the Application-allocated CFlow Session identity
 	promptHash string
 	inputHash  string
 	runID      model.RunID
@@ -177,9 +178,16 @@ func (r *Runtime) establish(ctx context.Context, cfg drainConfig, claimed Provid
 		}
 		return nil, model.InvalidInputFault("provider session id is already in use; resume it instead")
 	}
+	// The Application allocates the CFlow Session identity for every role
+	// lineage (design 14.4); the Runtime honors it and only falls back to
+	// its own source when the caller did not allocate one.
+	id := cfg.sessionID
+	if id == "" {
+		id = model.SessionID(r.ids(model.IDSession))
+	}
 	rec := &sessionRecord{
 		session: model.Session{
-			ID:                model.SessionID(r.ids(model.IDSession)),
+			ID:                id,
 			ProviderSessionID: string(claimed),
 			Purpose:           cfg.purpose,
 			Status:            model.SessionActive,

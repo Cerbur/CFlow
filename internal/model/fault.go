@@ -85,10 +85,15 @@ const (
 	CodeCleanupFactsChanged        Code = "CLEANUP_FACT_MISMATCH"
 	CodeCleanupItemFailed          Code = "CLEANUP_ITEM_FAILED"
 
-	// Design codes (compiler, session independence).
+	// Design codes (compiler, session independence, snapshot isolation).
 	CodeWorkflowPatchForbidden       Code = "WORKFLOW_PATCH_FORBIDDEN"
 	CodeSchemaInvalid                Code = "SCHEMA_INVALID"
 	CodeSessionIndependenceViolation Code = "SESSION_INDEPENDENCE_VIOLATION"
+	// CodeUnexpectedAgentMutation: a non-coding Session changed the
+	// Planning Snapshot's HEAD or Git-visible state; its output is
+	// invalid and can never enter an Artifact or Approval (PRD Worktree
+	// 策略, 约束 33).
+	CodeUnexpectedAgentMutation Code = "UNEXPECTED_AGENT_MUTATION"
 )
 
 // String renders the Code.
@@ -149,6 +154,7 @@ func Codes() []Code {
 		CodeWorkflowPatchForbidden,
 		CodeSchemaInvalid,
 		CodeSessionIndependenceViolation,
+		CodeUnexpectedAgentMutation,
 	}
 }
 
@@ -376,6 +382,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeWorkflowPatchForbidden, CatInvalidInput, ScopeWorkflowRevision, false, false, StopNone, false),
 	p(CodeSchemaInvalid, CatInvalidInput, ScopeArtifact, false, false, StopNone, false),
 	p(CodeSessionIndependenceViolation, CatInvariantFailure, ScopeSession, false, true, StopAll, false),
+	p(CodeUnexpectedAgentMutation, CatSafetyStop, ScopeSession, false, true, StopAll, false),
 }
 
 // Policy returns the compiled disposition for one Code. Every declared

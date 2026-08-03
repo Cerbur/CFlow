@@ -7,19 +7,22 @@ package app
 // Workflow successful (design 6.2 rule 5) — it only reports the typed
 // facts, and the Kernel decides.
 //
-// Effects whose full semantics arrive with later tasks (Provider*: Task 9;
-// *Worktree*, GitCommitInspect | GitAuditRefCreate: Task 8; Integration*:
-// Task 13; VerificationRun: Task 11; Apply*: Task 19; Cleanup*: Task 20;
-// ArtifactWrite: Task 10) have typed executor stubs that fail closed
-// without pretending to run the external operation. No Task 7 command
-// path can produce them, so a stub firing is an invariant failure.
+// Effects whose full semantics arrive with later tasks (ProviderCancel:
+// Task 17; Integration*: Task 13; VerificationRun: Task 11; Apply*:
+// Task 19; Cleanup*: Task 20; GitCommitInspect | GitAuditRefCreate:
+// Task 13) have typed executor stubs that fail closed without pretending
+// to run the external operation. A stub firing is an invariant failure.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/artifact"
+	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 )
@@ -31,8 +34,12 @@ const stopWaitBudget = 12 * time.Second
 
 // executeEffect runs one committed Effect Intent and returns the typed
 // Result evidence. restricted commands may only stop and reconcile
-// already managed processes (design 6.1).
-func (a *Application) executeEffect(ctx context.Context, intent model.EffectIntent, restricted bool) (model.EffectResultInput, error) {
+// already managed processes (design 6.1). wf is the command's workflow
+// identity, cmd the app Command (creation facts), input the command's
+// kernel Input (the executor's prompt and structured-input context), and
+// rt the per-command Agent Runtime (nil when the Application has no
+// Agent configuration).
+func (a *Application) executeEffect(ctx context.Context, intent model.EffectIntent, restricted bool, wf model.WorkflowID, cmd Command, input model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
 	if restricted && !restrictedAllowed(intent) {
 		return model.EffectResultInput{}, model.NewFault(model.CodeStateInvariantViolation,
 			"restricted safety path cannot execute effect "+effectName(intent))
@@ -41,17 +48,21 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 	case model.ManagedProcessStopIntent:
 		return a.stopManagedProcess(ctx, e)
 	case model.ArtifactWriteIntent:
-		// STUB (Task 10): the immutable Artifact Store writes arrive with
-		// the lifecycle tasks; no Task 7 command path produces this effect.
+		return a.artifactWrite(ctx, wf, e)
+	case model.ProviderStartIntent:
+		return a.providerStart(ctx, wf, e, input, rt)
+	case model.ProviderResumeIntent:
+		return a.providerResume(ctx, wf, e, input, rt)
+	case model.ProviderCancelIntent:
+		// STUB (Task 17): the two-phase Provider stop protocol.
 		return model.EffectResultInput{}, stubEffect(e)
-	case model.ProviderStartIntent, model.ProviderResumeIntent, model.ProviderCancelIntent:
-		// STUB (Task 9): the Agent Runtime wires Provider lifecycle.
-		return model.EffectResultInput{}, stubEffect(e)
-	case model.PlanningWorktreeCreateIntent, model.IntegrationWorktreeCreateIntent, model.TaskWorktreeCreateIntent:
-		// STUB (Task 8): GitFlow wires the Worktree primitives.
+	case model.PlanningWorktreeCreateIntent:
+		return a.planningWorktreeCreate(ctx, e, cmd)
+	case model.IntegrationWorktreeCreateIntent, model.TaskWorktreeCreateIntent:
+		// STUB (Task 11/13): Integration and Task Worktrees.
 		return model.EffectResultInput{}, stubEffect(e)
 	case model.GitCommitInspectIntent, model.GitAuditRefCreateIntent:
-		// STUB (Task 8): GitFlow wires canonical Git facts.
+		// STUB (Task 13): canonical Git commit facts.
 		return model.EffectResultInput{}, stubEffect(e)
 	case model.IntegrationMergeIntent, model.IntegrationRollbackIntent:
 		// STUB (Task 13): the serial Integration merge protocol.
@@ -119,6 +130,30 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 		if r.Kind != model.ProcessStopped || r.Process != e.Process {
 			return model.InvariantFault(fmt.Errorf("process stop result does not match intent for process %s", e.Process))
 		}
+	case model.PlanningWorktreeCreateIntent:
+		if r.Kind != model.PlanningWorktreeCreated {
+			return model.InvariantFault(fmt.Errorf("planning snapshot result does not match its intent"))
+		}
+	case model.ProviderStartIntent:
+		if r.Kind != model.ProviderRunEnded || r.Session.ID != e.Session || r.Session.Purpose != e.Purpose {
+			return model.InvariantFault(fmt.Errorf("provider run result does not match intent for session %s", e.Session))
+		}
+	case model.ProviderResumeIntent:
+		if r.Kind != model.ProviderRunEnded || r.Session.ID != e.Session || r.Session.Purpose != e.Purpose {
+			return model.InvariantFault(fmt.Errorf("provider resume result does not match intent for session %s", e.Session))
+		}
+	case model.ArtifactWriteIntent:
+		if r.Kind != model.ArtifactWritten ||
+			r.Artifact.Workflow != e.Ref.Workflow || r.Artifact.Type != e.Ref.Type {
+			return model.InvariantFault(fmt.Errorf("artifact write result does not match intent for %s", e.Ref))
+		}
+		if e.Ref.Revision != 0 && r.Artifact.Revision != e.Ref.Revision {
+			return model.InvariantFault(fmt.Errorf("artifact write result revision %d does not match intent revision %d",
+				r.Artifact.Revision, e.Ref.Revision))
+		}
+		if r.Artifact.Revision < 1 || r.Artifact.Hash == "" {
+			return model.InvariantFault(fmt.Errorf("artifact write result carries an incomplete reference"))
+		}
 	}
 	return nil
 }
@@ -140,4 +175,295 @@ func effectName(i model.EffectIntent) string {
 // pretends to run the external operation.
 func stubEffect(intent model.EffectIntent) error {
 	return model.InvariantFault(fmt.Errorf("effect %s is not executable by this build", effectName(intent)))
+}
+
+// ---------------------------------------------------------------------------
+// planning executors (design 6.3): GitFlow, Agent Runtime, Artifact Store
+// ---------------------------------------------------------------------------
+
+// planningWorktreeCreate creates the Planning Snapshot Worktree fixed at
+// the recorded Base Commit (design 15.2) and writes the workflow.yaml
+// static identity manifest (PRD Workflow 元信息). The user's target
+// branch and working tree are never touched.
+func (a *Application) planningWorktreeCreate(ctx context.Context, intent model.PlanningWorktreeCreateIntent, cmd Command) (model.EffectResultInput, error) {
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	create, ok := cmd.(CreateWorkflowCommand)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("planning snapshot effect outside workflow creation"))
+	}
+	path := a.planningWorktreePath(intent.Workflow)
+	if err := a.ensureWorktreeParent(path); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := a.git.Execute(ctx, gitflow.CreatePlanningSnapshot{BaseCommit: intent.BaseCommit, Path: path})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	snap, ok := res.(gitflow.PlanningSnapshotResult)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("planning snapshot result has an unexpected type"))
+	}
+	if err := a.writeWorkflowManifest(ctx, intent.Workflow, create, snap); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return model.EffectResultInput{Kind: model.PlanningWorktreeCreated}, nil
+}
+
+// providerStart runs one Provider Session through the Agent Runtime and
+// returns the settled Session facts plus the redacted artifact body the
+// run produced. The Planning Snapshot's HEAD and Git-visible state are
+// compared before and after every non-coding Session: any change makes
+// the output invalid with UNEXPECTED_AGENT_MUTATION (PRD Worktree 策略).
+func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, intent model.ProviderStartIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.planningPrompt(cmd)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")
+	}
+	cwd := a.planningWorktreePath(wf)
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	req := agent.StartRequest{
+		Purpose:    intent.Purpose,
+		Provider:   intent.Route,
+		Prompt:     prompt.Body,
+		Input:      a.sessionInput(ctx, wf, cmd),
+		CWD:        cwd,
+		SessionID:  intent.Session,
+		Supersedes: agent.ProviderSessionID(intent.Supersedes),
+	}
+	res, err := rt.Start(ctx, req)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return a.runOutcome(cmd, res)
+}
+
+// providerResume re-establishes an existing Provider Session (design
+// 14.4). No Task 10 command produces a Resume Intent; the executor is
+// the real seam later tasks build on.
+func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, intent model.ProviderResumeIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.planningPrompt(cmd)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")
+	}
+	// The Provider Session ID of the CFlow Session is the Runtime's
+	// ledger fact; the Resume request re-establishes it.
+	providerSessionID := ""
+	for _, fact := range rt.Sessions() {
+		if fact.Session.ID == intent.Session {
+			providerSessionID = fact.Session.ProviderSessionID
+			break
+		}
+	}
+	if providerSessionID == "" {
+		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"session is not known to the agent runtime")
+	}
+	cwd := a.planningWorktreePath(wf)
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := rt.Resume(ctx, agent.ResumeRequest{
+		ProviderSessionID: agent.ProviderSessionID(providerSessionID),
+		Purpose:           intent.Purpose,
+		Prompt:            prompt.Body,
+		Input:             a.sessionInput(ctx, wf, cmd),
+		CWD:               cwd,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	run := res.Run
+	if run == nil {
+		// An unrecoverable native Resume fell back to a successor Session
+		// with a Context Bundle; the Kernel sees the fallback facts in a
+		// later task's Resume Decision. Task 10 commands never resume.
+		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"resume fallback is not supported by this command")
+	}
+	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return a.runOutcome(cmd, run)
+}
+
+// artifactWrite persists one Artifact Revision through the immutable
+// Artifact Store (design 10.2): schema validation, redaction, canonical
+// serialization, atomic owner-only write, and reader verification. A
+// zero intent Revision asks the executor to assign the type's next
+// Revision (the aggregate does not track every type's counter).
+func (a *Application) artifactWrite(ctx context.Context, wf model.WorkflowID, intent model.ArtifactWriteIntent) (model.EffectResultInput, error) {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	revision := intent.Ref.Revision
+	if revision == 0 {
+		latest, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: intent.Ref.Type})
+		if err == nil {
+			revision = latest.Revision + 1
+		} else if code, ok := model.CodeOf(err); !ok || code != model.CodeInvalidInput {
+			return model.EffectResultInput{}, err
+		} else {
+			revision = 1
+		}
+	}
+	ref, err := store.Put(ctx, artifact.PutRequest{
+		WorkflowID:    wf,
+		Type:          intent.Ref.Type,
+		Revision:      revision,
+		SchemaVersion: "1.0.0",
+		CreatedAt:     a.now().UTC().Format(time.RFC3339),
+		Producer: artifact.ProducerRef{
+			Purpose:   string(intent.Producer),
+			SessionID: string(intent.Session),
+		},
+		Body: intent.Body,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return model.EffectResultInput{Kind: model.ArtifactWritten, Artifact: ref, Body: intent.Body}, nil
+}
+
+// runOutcome maps one settled Runtime run onto the Kernel's Effect
+// Result: the settled Session facts, the redacted artifact body the
+// command's output carries, and the failure code of a failed run.
+func (a *Application) runOutcome(cmd model.Input, res *agent.RunResult) (model.EffectResultInput, error) {
+	session := res.Session
+	if session.Provider == "" {
+		session.Provider = res.Provider
+	}
+	body := planningBody(cmd, res)
+	out := model.EffectResultInput{
+		Kind:    model.ProviderRunEnded,
+		Session: session,
+		Body:    body,
+	}
+	if res.Terminal != nil && res.Terminal.Type == agent.EventFailed {
+		out.FailureCode = model.Code(res.Terminal.Code)
+	}
+	return out, nil
+}
+
+// planningBody extracts the redacted artifact body one planning command's
+// run produced: the CFlow-assembled turn body for a discussion, the
+// agent's plan Markdown for plan generation, and the Checker's structured
+// result for a plan check.
+func planningBody(cmd model.Input, res *agent.RunResult) []byte {
+	switch in := cmd.(type) {
+	case model.DiscussRequirementInput:
+		assistant := ""
+		for _, ev := range res.Events {
+			if ev.Type == agent.EventAssistantMessage && ev.Text != "" {
+				if assistant != "" {
+					assistant += "\n"
+				}
+				assistant += ev.Text
+			}
+		}
+		if body, err := json.Marshal(map[string]any{
+			"session_id": string(res.Session.ID),
+			"user":       in.Text,
+			"assistant":  assistant,
+		}); err == nil {
+			return body
+		}
+		return nil
+	case model.GeneratePlanInput:
+		if res.Terminal != nil {
+			var result struct {
+				PlanMarkdown string `json:"plan_markdown"`
+			}
+			if json.Unmarshal([]byte(res.Terminal.Result), &result) == nil && result.PlanMarkdown != "" {
+				return []byte(result.PlanMarkdown)
+			}
+			return []byte(res.Terminal.Result)
+		}
+		return nil
+	case model.CheckPlanInput:
+		if res.Terminal != nil {
+			return []byte(res.Terminal.Result)
+		}
+		return nil
+	}
+	return nil
+}
+
+// sessionInput is the structured input recorded with the Prompt: the
+// requirement text for a discussion turn; for plan generation and check,
+// the latest discussion-turn Artifact body when one exists.
+func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd model.Input) any {
+	if in, ok := cmd.(model.DiscussRequirementInput); ok {
+		return struct {
+			Requirement string `json:"requirement"`
+		}{Requirement: in.Text}
+	}
+	if _, ok := cmd.(model.GeneratePlanInput); !ok {
+		if _, ok := cmd.(model.CheckPlanInput); !ok {
+			return nil
+		}
+	}
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil
+	}
+	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactDiscussionTurn})
+	if err != nil {
+		return nil
+	}
+	body, err := store.Get(ctx, ref)
+	if err != nil {
+		return nil
+	}
+	return struct {
+		Requirement string `json:"requirement"`
+	}{Requirement: string(body)}
+}
+
+// observeSnapshot observes the Planning Snapshot's HEAD and Git-visible
+// state before a non-coding Session.
+func (a *Application) observeSnapshot(ctx context.Context, cwd string) (gitflow.StatusFacts, error) {
+	if a.git == nil {
+		return gitflow.StatusFacts{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	facts, err := a.git.Observe(ctx, gitflow.GitStatus{Dir: cwd})
+	if err != nil {
+		return gitflow.StatusFacts{}, err
+	}
+	st, ok := facts.(gitflow.StatusFacts)
+	if !ok {
+		return gitflow.StatusFacts{}, model.InvariantFault(fmt.Errorf("git status observation has an unexpected type"))
+	}
+	return st, nil
+}
+
+// verifySnapshotUnchanged compares the Planning Snapshot's HEAD/Index/
+// Tracked/Untracked state before and after a non-coding Session. Any
+// change makes the Session's output invalid (PRD Worktree 策略:
+// UNEXPECTED_AGENT_MUTATION).
+func (a *Application) verifySnapshotUnchanged(ctx context.Context, cwd string, pre gitflow.StatusFacts) error {
+	post, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return err
+	}
+	if post.Head != pre.Head || post.Dirty != pre.Dirty {
+		return model.NewFault(model.CodeUnexpectedAgentMutation,
+			"the planning snapshot changed during a non-coding session; its output is invalid")
+	}
+	return nil
 }

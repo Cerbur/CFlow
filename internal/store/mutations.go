@@ -37,6 +37,30 @@ func applyMutation(st *model.State, m model.Mutation) error {
 			return fmt.Errorf("plan mutation without a plan")
 		}
 		st.Plan.Status = m.Status
+	case model.ArtifactRefMutation:
+		if !m.Type.Valid() {
+			return fmt.Errorf("unknown artifact ref type %q", m.Type)
+		}
+		if m.Type == model.ArtifactPlan {
+			status := model.PlanStatus("")
+			if st.Plan != nil {
+				status = st.Plan.Status
+			}
+			st.Plan = &model.Plan{
+				Revision: m.Revision,
+				Status:   status,
+				Artifact: model.ArtifactRef{Workflow: st.Workflow.ID, Type: m.Type,
+					Revision: m.Revision, Hash: m.Hash},
+				Hash: m.Hash,
+			}
+		}
+	case model.SessionEndMutation:
+		se := findSession(st, m.ID)
+		if se == nil {
+			return fmt.Errorf("session %s does not exist", m.ID)
+		}
+		se.ProviderSessionID = m.ProviderSessionID
+		se.Status = m.Status
 	case model.NodeStatusMutation:
 		n := st.Nodes[m.Node]
 		if n == nil {
@@ -143,6 +167,15 @@ func applyMutation(st *model.State, m model.Mutation) error {
 	return nil
 }
 
+func findSession(st *model.State, id model.SessionID) *model.Session {
+	for i := range st.Sessions {
+		if st.Sessions[i].ID == id {
+			return &st.Sessions[i]
+		}
+	}
+	return nil
+}
+
 func findRun(st *model.State, id model.RunID) *model.Run {
 	for i := range st.Runs {
 		if st.Runs[i].ID == id {
@@ -224,6 +257,25 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		if _, err := q.ExecContext(ctx, `UPDATE workflows SET plan_status = ? WHERE id = ?`,
 			string(m.Status), st.Workflow.ID); err != nil {
 			return fmt.Errorf("update plan status: %w", err)
+		}
+		return nil
+
+	case model.ArtifactRefMutation:
+		if !m.Type.Valid() {
+			return fmt.Errorf("unknown artifact ref type %q", m.Type)
+		}
+		// The upsert records the active Revision of one Artifact Type; the
+		// immutable body itself lives in the Artifact Store.
+		if _, err := q.ExecContext(ctx, `INSERT INTO workflow_artifact_refs
+			(workflow_id, artifact_type, active_revision, artifact_path, artifact_sha256, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(workflow_id, artifact_type) DO UPDATE SET
+				active_revision = excluded.active_revision,
+				artifact_path = excluded.artifact_path,
+				artifact_sha256 = excluded.artifact_sha256,
+				updated_at = excluded.updated_at`,
+			st.Workflow.ID, string(m.Type), m.Revision, m.Path, m.Hash, nowText); err != nil {
+			return fmt.Errorf("upsert artifact ref: %w", err)
 		}
 		return nil
 
@@ -348,10 +400,20 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		}
 		if _, err := q.ExecContext(ctx, `INSERT INTO sessions
 			(id, workflow_id, supersedes_session_id, purpose, provider, provider_session_id, status, started_at)
-			VALUES (?, ?, ?, ?, '', ?, ?, ?)`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			se.ID, st.Workflow.ID, supersedes, string(se.Purpose),
-			nullIfEmpty(se.ProviderSessionID), string(se.Status), nowText); err != nil {
+			nullIfEmpty(m.Provider), nullIfEmpty(se.ProviderSessionID), string(se.Status), nowText); err != nil {
 			return fmt.Errorf("insert session: %w", err)
+		}
+		return nil
+
+	case model.SessionEndMutation:
+		if _, err := q.ExecContext(ctx, `UPDATE sessions
+			SET provider_session_id = ?, status = ?, ended_at = ?
+			WHERE id = ? AND workflow_id = ?`,
+			nullIfEmpty(m.ProviderSessionID), string(m.Status),
+			m.EndedAt.UTC().Format(time.RFC3339Nano), m.ID, st.Workflow.ID); err != nil {
+			return fmt.Errorf("end session: %w", err)
 		}
 		return nil
 
