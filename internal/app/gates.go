@@ -414,6 +414,35 @@ func runningAttemptOfState(st model.State, node model.NodeID) *model.Attempt {
 	return nil
 }
 
+// readyAttemptOfState returns the highest-numbered READY Attempt of one
+// Node (the current budgeted successor awaiting its dispatch; nil when
+// none). The highest number is the live successor — lower-numbered READY
+// markers are stale bookkeeping rows the retry chain leaves behind.
+func readyAttemptOfState(st model.State, node model.NodeID) *model.Attempt {
+	var found *model.Attempt
+	for k, a := range st.Attempts {
+		if k.Node != node || a.Status != model.AttemptReady {
+			continue
+		}
+		if found == nil || k.Number > found.Key.Number {
+			aa := a
+			found = aa
+		}
+	}
+	return found
+}
+
+// sessionOfState returns one Session of the aggregate (nil when
+// unknown).
+func sessionOfState(st model.State, id model.SessionID) *model.Session {
+	for i := range st.Sessions {
+		if st.Sessions[i].ID == id {
+			return &st.Sessions[i]
+		}
+	}
+	return nil
+}
+
 // priorAttemptEnd returns the terminal end HEAD of the previous Attempt
 // of one Node ("" when none): the append-only anchor of the gate.
 func priorAttemptEnd(st model.State, node model.NodeID) string {

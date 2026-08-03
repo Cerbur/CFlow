@@ -362,16 +362,23 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		// An unrecoverable native Resume: the original Session is LOST
 		// and the successor Session is allocated on the approved fallback
 		// binding. The Kernel charges the approved budget from these
-		// facts; the automatic-execution failure code is the fact, never
-		// a success claim (design 14.4 step 5).
+		// facts and persists the successor Session with its
+		// supersedes_session_id lineage in the same settle Decision
+		// (design 14.4 step 5); the automatic-execution failure code is
+		// the fact, never a success claim.
 		lost := res.Fallback.LostSession
 		if lost.Provider == "" {
 			lost.Provider = provider
 		}
+		successor := res.Fallback.SuccessorSession
+		if successor.Provider == "" {
+			successor.Provider = provider
+		}
 		return model.EffectResultInput{
-			Kind:        model.ProviderRunEnded,
-			Session:     lost,
-			FailureCode: model.CodeAgentProcessCrashed,
+			Kind:             model.ProviderRunEnded,
+			Session:          lost,
+			SuccessorSession: successor,
+			FailureCode:      model.CodeAgentProcessCrashed,
 		}, nil
 	}
 	run := res.Run
@@ -379,6 +386,56 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		return model.EffectResultInput{}, err
 	}
 	return a.runOutcome(cmd, run)
+}
+
+// successorHandoff resolves the lineage facts of one Session start
+// (design 14.4): when the Session is the successor of an automatic
+// fallback (its ledger record carries Supersedes), it returns the LOST
+// original's provider session id — the Supersedes lineage fact of the
+// Start request — and the immutable redacted Context Bundle handoff
+// (nil when the Session is not a successor or no bundle exists). The
+// bundle lives in the evidence root, so a later dispatch pass reads the
+// same persisted handoff.
+func (a *Application) successorHandoff(rt *agent.Runtime, session model.SessionID) (agent.ProviderSessionID, *agent.ContextBundle) {
+	if rt == nil {
+		return "", nil
+	}
+	var lostID model.SessionID
+	for _, f := range rt.Sessions() {
+		if f.Session.ID != session {
+			continue
+		}
+		lostID = f.Session.Supersedes
+		break
+	}
+	if lostID == "" {
+		return "", nil
+	}
+	lostProviderSessionID := ""
+	for _, f := range rt.Sessions() {
+		if f.Session.ID == lostID {
+			lostProviderSessionID = f.Session.ProviderSessionID
+			break
+		}
+	}
+	b, ok := rt.FallbackBundle(lostID)
+	if !ok {
+		return "", nil
+	}
+	return agent.ProviderSessionID(lostProviderSessionID), &b
+}
+
+// attachBundleInput attaches the immutable redacted Context Bundle
+// handoff of an automatic fallback to one Session start input (nil
+// bundle leaves the input unchanged).
+func attachBundleInput(input any, bundle *agent.ContextBundle) any {
+	if bundle == nil {
+		return input
+	}
+	if c, ok := input.(*codingSessionInput); ok {
+		c.ContextBundle = bundle
+	}
+	return input
 }
 
 // resumeContext assembles the Context Bundle input of one unrecoverable
@@ -457,13 +514,20 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	// Session start (design 12: an in-memory queued goroutine is not an
 	// in-flight Attempt).
 	a.probeStep("provider:" + string(intent.Node) + ":start")
+	// The successor Session of an automatic fallback receives the LOST
+	// original's immutable redacted Context Bundle in its start input
+	// and re-establishes the lineage through Supersedes (design 14.4,
+	// PRD 已确认：Session Resume 失败与跨 Provider 上下文交接).
+	supersedes, bundle := a.successorHandoff(rt, intent.Session)
 	res, err := rt.Start(ctx, agent.StartRequest{
-		Purpose:   intent.Purpose,
-		Provider:  intent.Route,
-		Prompt:    prompt.Body,
-		Input:     a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, a.sessionInput(ctx, wf, cmd)),
-		CWD:       cwd,
-		SessionID: intent.Session,
+		Purpose:  intent.Purpose,
+		Provider: intent.Route,
+		Prompt:   prompt.Body,
+		Input: a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route,
+			attachBundleInput(a.sessionInput(ctx, wf, cmd), bundle)),
+		CWD:        cwd,
+		SessionID:  intent.Session,
+		Supersedes: supersedes,
 	})
 	if err != nil {
 		return model.EffectResultInput{}, err

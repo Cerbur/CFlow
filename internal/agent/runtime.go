@@ -251,6 +251,43 @@ func (r *Runtime) SetRoutingPolicy(set *RoutingPolicySet) {
 	r.mu.Unlock()
 }
 
+// FallbackBundle returns the latest persisted immutable Context Bundle
+// of one Session (the cross-Provider handoff of an unrecoverable Resume;
+// false when none exists). The successor Session of an automatic
+// fallback reads the LOST original's bundle through its Supersedes link
+// (design 14.4): the bundle survives across dispatch passes because it
+// lives in the evidence root, never in the pass's Runtime ledger.
+func (r *Runtime) FallbackBundle(sessionID model.SessionID) (ContextBundle, bool) {
+	pb, path, ok := r.evidence.readLatestBundle(sessionID)
+	if !ok {
+		return ContextBundle{}, false
+	}
+	return ContextBundle{
+		SchemaVersion:     pb.SchemaVersion,
+		Revision:          pb.Revision,
+		Hash:              pb.Hash,
+		Path:              path,
+		SessionID:         model.SessionID(pb.SessionID),
+		ProviderSessionID: ProviderSessionID(pb.ProviderSessionID),
+		Purpose:           pb.Purpose,
+		CreatedAt:         pb.CreatedAt,
+		Context: ContextInput{
+			Requirement:        pb.Requirement,
+			Plan:               pinFromPersisted(pb.Plan),
+			Spec:               pinFromPersisted(pb.Spec),
+			Catalog:            pinFromPersisted(pb.Catalog),
+			Workflow:           pinFromPersisted(pb.Workflow),
+			RepositoryBaseline: pb.RepositoryBaseline,
+			StageSummary:       pb.StageSummary,
+			Decisions:          append([]string(nil), pb.Decisions...),
+			FailureEvidence:    evidenceFromPersisted(pb.FailureEvidence),
+			OpenQuestions:      append([]string(nil), pb.OpenQuestions...),
+			PermissionBoundary: pb.PermissionBoundary,
+		},
+		RedactionRevision: pb.RedactionRevision,
+	}, true
+}
+
 // RouteBinding returns the approved binding of one Purpose route from
 // the immutable Routing Policy Set the Execution Approval bound (false
 // when the Purpose or the Provider has no approved binding). The

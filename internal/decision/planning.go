@@ -146,12 +146,16 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 						EndHead:     in.EndHead,
 					}, b)
 				}
+				if err := appendFallbackSuccessor(b, state, created, in); err != nil {
+					return model.Decision{}, err
+				}
 				return decideAttemptFailure(state, node, attempt, model.EffectResultInput{
-					Kind:        model.AttemptEnded,
-					Attempt:     attempt.Key,
-					Outcome:     model.OutcomeFailed,
-					FailureCode: code,
-					EndHead:     in.EndHead,
+					Kind:             model.AttemptEnded,
+					Attempt:          attempt.Key,
+					Outcome:          model.OutcomeFailed,
+					FailureCode:      code,
+					EndHead:          in.EndHead,
+					SuccessorSession: in.SuccessorSession,
 				}, code, b)
 			}
 		}
@@ -173,6 +177,37 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 	}})
 	b.event(model.EventFindingOpened, "", model.AttemptKey{}, code, "provider run failed")
 	return b.decision(), nil
+}
+
+// appendFallbackSuccessor persists the automatic fallback successor
+// Session in the same settle Decision (design 14.4): the row carries
+// supersedes_session_id and the fallback Provider, and the successor
+// Attempt references it — the "one successor per Lost original" lineage
+// is durable in the Store, never only in the pass's Runtime ledger. The
+// Runtime allocated the successor Session; the Kernel validates the
+// facts and writes the row. A result without a successor (no fallback)
+// is unchanged.
+func appendFallbackSuccessor(b *builder, state model.State, created *model.Session, in model.EffectResultInput) error {
+	s := in.SuccessorSession
+	if s.ID == "" {
+		return nil
+	}
+	if s.Purpose != created.Purpose {
+		return model.NewFault(model.CodeSessionIndependenceViolation,
+			"the fallback successor must keep the lost session's purpose")
+	}
+	if s.Supersedes != created.ID {
+		return model.InvariantFault(fmt.Errorf(
+			"fallback successor %s must supersede the lost session %s", s.ID, created.ID))
+	}
+	if s.Provider == "" {
+		return model.InvalidInputFault("fallback successor carries no provider")
+	}
+	if s.Status != model.SessionStarting {
+		return model.InvalidInputFault("fallback successor must be allocated STARTING")
+	}
+	b.mutate(model.SessionAppendMutation{Session: s, Provider: s.Provider})
+	return nil
 }
 
 // decideDiscussionTurnResult validates the CFlow-assembled turn body and

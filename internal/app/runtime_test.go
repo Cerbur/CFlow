@@ -569,6 +569,161 @@ func TestFallbackChargeThroughKernel(t *testing.T) {
 	}
 }
 
+// TestAutomaticFallbackPersistsSuccessorLineage (review fix #1): the
+// automatic fallback successor Session of an unrecoverable Resume is
+// persisted in the settle Decision — the sessions table records the
+// successor row with supersedes_session_id and the fallback Provider,
+// and the successor Attempt references the successor Session (design
+// 14.4: one successor per Lost original; the lineage is durable, never
+// only in the pass's Runtime ledger).
+func TestAutomaticFallbackPersistsSuccessorLineage(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := drivePlanningToApproval(t, fx)
+	pv := driveToExecutionGate(t, fx, wf)
+	approveExecution(t, fx, wf, pv)
+	seedExecutionAttempt(t, filepath.Join(fx.home, "cflow.db"), wf, "S01", "sess1")
+
+	settleProviderRun(t, fx, wf, model.EffectResultInput{
+		Kind:        model.ProviderRunEnded,
+		Session:     model.Session{ID: "sess1", Purpose: model.PurposeImplementation, Status: model.SessionLost},
+		FailureCode: model.CodeAgentProcessCrashed,
+		// The successor Session the Runtime allocated at the fallback:
+		// the settle Decision persists this exact row with its lineage.
+		SuccessorSession: model.Session{
+			ID:         "succ1",
+			Purpose:    model.PurposeImplementation,
+			Status:     model.SessionStarting,
+			Supersedes: "sess1",
+			Provider:   "claude",
+		},
+	})
+
+	iv := fx.inspect(wf)
+	if len(iv.Attempts) != 2 {
+		t.Fatalf("attempts = %d, want the original plus the automatic successor", len(iv.Attempts))
+	}
+	var successor *model.Attempt
+	for i := range iv.Attempts {
+		a := &iv.Attempts[i]
+		if a.Key.Number == 2 {
+			successor = a
+		}
+	}
+	if successor == nil || successor.Session != "succ1" {
+		t.Fatalf("the successor attempt must reference the persisted successor session, got %+v", successor)
+	}
+	var found bool
+	for _, s := range iv.Sessions {
+		if s.ID != "succ1" {
+			continue
+		}
+		found = true
+		if s.Supersedes != "sess1" || s.Provider != "claude" || s.Status != model.SessionStarting {
+			t.Fatalf("the persisted successor session must carry supersedes_session_id and the fallback provider, got %+v", s)
+		}
+	}
+	if !found {
+		t.Fatal("the successor session row is missing from the persisted sessions")
+	}
+	// The sessions table itself (the aggregate is read back from SQLite).
+	db, err := sql.Open("sqlite", filepath.Join(fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var supersedes, provider string
+	if err := db.QueryRow(`SELECT COALESCE(supersedes_session_id, ''), COALESCE(provider, '')
+		FROM sessions WHERE id = 'succ1' AND workflow_id = ?`, string(wf)).Scan(&supersedes, &provider); err != nil {
+		t.Fatalf("read successor session row: %v", err)
+	}
+	if supersedes != "sess1" || provider != "claude" {
+		t.Fatalf("the sessions table must record supersedes_session_id=%q and provider=%q, got %q/%q", "sess1", "claude", supersedes, provider)
+	}
+}
+
+// TestSuccessorStartInputCarriesContextBundle (review fix #2): the
+// successor Session's start input carries the immutable redacted Context
+// Bundle handoff of the LOST original and the Supersedes lineage fact
+// (design 14.4, PRD 已确认：Session Resume 失败与跨 Provider 上下文交接).
+// The successor's dispatch pass reads the same persisted bundle from the
+// evidence root — the handoff is never only in the pass's Runtime.
+func TestSuccessorStartInputCarriesContextBundle(t *testing.T) {
+	fx := newExecutionFixture(t)
+	// The evidence root chain must exist before the Runtime's guarded
+	// subdirectory creation (the fixture's app would create it on the
+	// first command; this test builds the Runtime directly).
+	if err := os.MkdirAll(filepath.Join(fx.home, "evidence"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := agent.NewRuntime(agent.RuntimeOptions{
+		Now:         fx.now,
+		IDs:         fx.ids,
+		Registry:    reg,
+		Redaction:   security.Registry{},
+		EvidenceDir: filepath.Join(fx.home, "evidence"),
+		Adapters:    map[string]agent.Adapter{"fake": fake.New(reg)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { requireNoError(t, rt.Close()) }()
+	requireNoError(t, rt.Hydrate(context.Background(), []agent.SessionFact{
+		{
+			Session: model.Session{
+				ID: "lost1", ProviderSessionID: "ps-lost",
+				Purpose: model.PurposeImplementation, Status: model.SessionLost,
+			},
+			Provider: "fake",
+		},
+		{
+			Session: model.Session{
+				ID: "succ1", Purpose: model.PurposeImplementation,
+				Status: model.SessionStarting, Supersedes: "lost1",
+			},
+			Provider: "claude",
+		},
+	}))
+	bundle, err := rt.CreateContextBundle(context.Background(), agent.ContextBundleRequest{
+		SessionID:         "lost1",
+		ProviderSessionID: "ps-lost",
+		Purpose:           model.PurposeImplementation,
+		Context: agent.ContextInput{
+			Requirement:  "Implement divide.",
+			StageSummary: "Implementation started.",
+		},
+	})
+	requireNoError(t, err)
+
+	a := fx.app()
+	supersedes, handed := a.successorHandoff(rt, "succ1")
+	if supersedes != "ps-lost" || handed == nil {
+		t.Fatalf("successor handoff must carry the superseded provider session and the bundle, got %q %v", supersedes, handed)
+	}
+	if handed.Hash != bundle.Hash || handed.Revision != bundle.Revision {
+		t.Fatalf("the handoff must be the persisted bundle, got %+v", handed)
+	}
+	// A brand-new Session (no Supersedes) never receives a handoff.
+	if _, h := a.successorHandoff(rt, "lost1"); h != nil {
+		t.Fatal("a non-successor session must not receive a bundle handoff")
+	}
+	// The successor start input carries the bundle reference.
+	input := attachBundleInput(&codingSessionInput{Spec: "spec", Catalog: "cat", Worktree: "/wt"}, handed)
+	c, ok := input.(*codingSessionInput)
+	if !ok || c.ContextBundle == nil || c.ContextBundle.Hash != bundle.Hash {
+		t.Fatalf("the successor start input must carry the bundle reference, got %+v", input)
+	}
+	if c.ContextBundle.Context.Requirement != "Implement divide." {
+		t.Fatalf("the handoff input must carry the redacted bundle content, got %q", c.ContextBundle.Context.Requirement)
+	}
+	if attachBundleInput(input, nil).(*codingSessionInput).ContextBundle == nil {
+		t.Fatal("a nil bundle must leave the input unchanged")
+	}
+}
+
 // TestUserInterruptionNeverChargesRetry: a user Ctrl+C interruption is
 // never a Provider failure: the Attempt settles INTERRUPTED without a
 // Retry charge and no successor Attempt is allocated (PRD 失败分类,

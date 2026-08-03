@@ -697,10 +697,29 @@ func (a *Application) acquireResourceLocks(ctx context.Context, names []string) 
 // Scope gate and feeds the AttemptEnded result; every Decision
 // revalidates the committed Dispatch Gate.
 func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf model.WorkflowID, node model.NodeID, route, baseHead string, planNode *dispatchNode, rt *agent.Runtime) error {
+	// A budgeted retry of an automatic fallback reuses the persisted
+	// successor Session: its row carries supersedes_session_id and the
+	// fallback Provider, so the successor Attempt dispatches on the
+	// approved fallback binding and keeps the lineage (design 14.4 —
+	// the successor Session the Runtime allocated at the fallback is the
+	// same Session the successor Attempt starts).
+	session, dispatchRoute := model.SessionID(a.ids(model.IDSession)), route
+	view, err := st.View(ctx, store.StoreQuery{})
+	if err != nil {
+		return err
+	}
+	if ready := readyAttemptOfState(view.State, node); ready != nil && ready.Session != "" {
+		if s := sessionOfState(view.State, ready.Session); s != nil {
+			session = s.ID
+			if s.Provider != "" {
+				dispatchRoute = s.Provider
+			}
+		}
+	}
 	input := model.Input(model.DispatchInput{
 		Node:     node,
-		Session:  model.SessionID(a.ids(model.IDSession)),
-		Route:    route,
+		Session:  session,
+		Route:    dispatchRoute,
 		BaseHead: baseHead,
 	})
 	executed := map[string]struct{}{}
@@ -803,16 +822,28 @@ func (a *Application) observedIntegrationHead(ctx context.Context, wf model.Work
 // the approved facts: the Spec set, the Verification Catalog, and the
 // Task Worktree location (PRD Worktree 策略; the implementation prompt's
 // input contract).
+// codingSessionInput is the coding Session's input block: the approved
+// Spec set, the Verification Catalog, the Task Worktree location, and —
+// for the successor Session of an automatic fallback — the immutable
+// redacted Context Bundle handoff of the LOST original (design 14.4,
+// PRD 已确认：Session Resume 失败与跨 Provider 上下文交接). The bundle
+// carries the auditable handoff only; it is never a credential or an
+// unredacted transcript.
+type codingSessionInput struct {
+	Spec     string `json:"spec"`
+	Catalog  string `json:"catalog"`
+	Worktree string `json:"worktree"`
+	// ContextBundle is the redacted handoff of the superseded LOST
+	// Session (nil for a brand-new Session).
+	ContextBundle *agent.ContextBundle `json:"context_bundle,omitempty"`
+}
+
 func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowID, node model.NodeID) any {
 	store, err := a.artifactStore(wf)
 	if err != nil {
 		return nil
 	}
-	return struct {
-		Spec     string `json:"spec"`
-		Catalog  string `json:"catalog"`
-		Worktree string `json:"worktree"`
-	}{
+	return &codingSessionInput{
 		Spec:     string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
 		Catalog:  string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
 		Worktree: a.taskWorktreePath(wf, node),

@@ -133,3 +133,25 @@ func evidenceToPersisted(refs []model.EvidenceRef) []persistedEvidence {
 	}
 	return out
 }
+
+// pinFromPersisted converts a persisted artifact pin back into a Context
+// Bundle pin (nil record → zero pin).
+func pinFromPersisted(p *persistedPin) ArtifactPin {
+	if p == nil {
+		return ArtifactPin{}
+	}
+	return ArtifactPin{Type: p.Type, Revision: p.Revision, Hash: p.Hash}
+}
+
+// evidenceFromPersisted converts persisted failure evidence references
+// back into the model references.
+func evidenceFromPersisted(refs []persistedEvidence) []model.EvidenceRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]model.EvidenceRef, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, model.EvidenceRef{Kind: model.EvidenceKind(ref.Kind), Hash: ref.Hash, Subject: ref.Subject})
+	}
+	return out
+}

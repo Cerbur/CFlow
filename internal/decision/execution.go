@@ -151,8 +151,14 @@ func decideAttemptFailure(state model.State, node *model.Node, attempt *model.At
 		charged := node.RetryCharged + 1
 		b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeReady, RetryCharged: charged})
 		b.event(model.EventNodeReady, node.ID, attempt.Key, "", "node ready for retry")
+		// An automatic fallback successor binds the Attempt to the
+		// persisted successor Session (the same settle Decision wrote the
+		// Session row with supersedes_session_id, design 14.4): the
+		// successor's dispatch reuses that Session instead of creating a
+		// fresh row without the lineage link.
 		b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
 			Key:       model.AttemptKey{Node: node.ID, Number: attempt.Key.Number + 1},
+			Session:   in.SuccessorSession.ID,
 			Status:    model.AttemptReady,
 			StartHead: in.EndHead,
 			StartedAt: state.Now,

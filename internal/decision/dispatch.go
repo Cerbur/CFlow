@@ -168,8 +168,31 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 		return model.Decision{}, model.InvalidInputFault(
 			"allocation requires the verified integration head")
 	}
-	if err := validateFreshSession(state, in.Session); err != nil {
-		return model.Decision{}, err
+	// A budgeted retry of an automatic fallback reuses the persisted
+	// successor Session (design 14.4): the settle Decision wrote its row
+	// with supersedes_session_id and the fallback Provider, and the
+	// successor Attempt references it — the allocation never creates a
+	// second fresh Session row, so the "one successor per Lost original"
+	// lineage stays intact in the Store.
+	session := in.Session
+	reuse := false
+	if node.Status == model.NodeReady {
+		if s := findSessionState(state, session); s != nil {
+			if s.Purpose != model.PurposeImplementation {
+				return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+					"the reused successor session's purpose does not match the task")
+			}
+			if s.Status != model.SessionStarting {
+				return model.Decision{}, model.InvalidInputFault(
+					"the reused successor session is not starting")
+			}
+			reuse = true
+		}
+	}
+	if !reuse {
+		if err := validateFreshSession(state, session); err != nil {
+			return model.Decision{}, err
+		}
 	}
 
 	number := nextAttemptNumber(state, node.ID)
@@ -178,16 +201,18 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 	b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeRunning, RetryCharged: node.RetryCharged})
 	b.event(model.EventNodeReady, node.ID, key, "", "node ready")
 	b.event(model.EventNodeStarted, node.ID, key, "", "node started")
-	// The Session row precedes the Attempt row (the node_attempts
-	// session_id foreign key references it).
-	b.mutate(model.SessionAppendMutation{Session: model.Session{
-		ID:      in.Session,
-		Purpose: model.PurposeImplementation,
-		Status:  model.SessionStarting,
-	}, Provider: in.Route})
+	if !reuse {
+		// The Session row precedes the Attempt row (the node_attempts
+		// session_id foreign key references it).
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID:      session,
+			Purpose: model.PurposeImplementation,
+			Status:  model.SessionStarting,
+		}, Provider: in.Route})
+	}
 	b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
 		Key:       key,
-		Session:   in.Session,
+		Session:   session,
 		Status:    model.AttemptRunning,
 		StartHead: base,
 		StartedAt: state.Now,
@@ -207,7 +232,7 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 		// allocation, so no worktree creation Effect is emitted — the
 		// coding Session starts directly inside it from the recorded Base.
 		b.effect(model.ProviderStartIntent{
-			Session: in.Session,
+			Session: session,
 			Purpose: model.PurposeImplementation,
 			Route:   in.Route,
 			Node:    node.ID,

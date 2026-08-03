@@ -301,6 +301,13 @@ type EffectResultInput struct {
 	// 14.3): the identity, the Provider Session ID, the purpose, and the
 	// terminal status.
 	Session Session
+	// SuccessorSession is the automatic fallback successor Session of an
+	// unrecoverable Resume (design 14.4): the successor carries
+	// supersedes_session_id pointing at the LOST original and the
+	// fallback Provider. The Kernel persists it in the same settle
+	// Decision and binds the successor Attempt to it, so the lineage is
+	// durable — never only in the pass's Runtime ledger.
+	SuccessorSession Session
 	// Artifact is the immutable reference produced by an ArtifactWrite
 	// (design 10.1).
 	Artifact ArtifactRef

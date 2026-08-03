@@ -318,9 +318,6 @@ func (w *evidenceWriter) writeBundle(session model.SessionID, b persistedBundle)
 	if w == nil {
 		return 0, "", "", fmt.Errorf("evidence: no evidence root configured")
 	}
-	digest := hashBytes(marshalCanonical(b))
-	b.Hash = digest
-	data := marshalCanonical(b)
 	dir := filepath.Join(w.dir, "bundles", string(session))
 	if err := ensureSensitiveDir(dir); err != nil {
 		return 0, "", "", err
@@ -335,11 +332,59 @@ func (w *evidenceWriter) writeBundle(session model.SessionID, b persistedBundle)
 			revision = n + 1
 		}
 	}
+	// The record carries the Revision it is persisted under (the
+	// read-back reconstructs the same immutable Context Bundle); the
+	// digest covers the record with the hash excluded from its own
+	// digest, like every registry entry.
+	b.Revision = revision
+	digest := hashBytes(marshalCanonical(b))
+	b.Hash = digest
+	data := marshalCanonical(b)
 	path := filepath.Join(dir, fmt.Sprintf("rev-%d.json", revision))
 	if err := writeSensitiveFile(path, data); err != nil {
 		return 0, "", "", err
 	}
 	return revision, digest, path, nil
+}
+
+// readLatestBundle reads the highest Revision of one Session's Context
+// Bundle and verifies its self-hash (the same canonical serialization
+// the write hashed, with the recorded hash excluded from its own
+// digest). Returns the record and its canonical path; false when the
+// Session has no bundle.
+func (w *evidenceWriter) readLatestBundle(session model.SessionID) (persistedBundle, string, bool) {
+	if w == nil {
+		return persistedBundle{}, "", false
+	}
+	dir := filepath.Join(w.dir, "bundles", string(session))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return persistedBundle{}, "", false
+	}
+	latest := 0
+	for _, e := range entries {
+		if n, ok := parseRevName(e.Name()); ok && n > latest {
+			latest = n
+		}
+	}
+	if latest == 0 {
+		return persistedBundle{}, "", false
+	}
+	path := filepath.Join(dir, fmt.Sprintf("rev-%d.json", latest))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return persistedBundle{}, "", false
+	}
+	var pb persistedBundle
+	if err := json.Unmarshal(data, &pb); err != nil {
+		return persistedBundle{}, "", false
+	}
+	verify := pb
+	verify.Hash = ""
+	if hashBytes(marshalCanonical(verify)) != pb.Hash {
+		return persistedBundle{}, "", false
+	}
+	return pb, path, true
 }
 
 // writeSensitiveFile writes one new file born 0600 via O_CREATE|O_EXCL,
