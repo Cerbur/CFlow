@@ -98,6 +98,7 @@ providers:
     known_incompatibilities:
       - "shell command strings, pipes and redirects are never accepted; commands run argv-only"
       - "interactive TTY mode is unsupported; only non-interactive stream-json is driven"
+      - "claude --print skips the workspace trust dialog and silently ignores settings files that fail validation in non-interactive mode (captured 2.1.220 help); the CLI is launched argv-only with the request worktree as process cwd"
 
   - name: opencode
     status: disabled-p1

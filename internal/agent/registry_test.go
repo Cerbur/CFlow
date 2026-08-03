@@ -309,6 +309,76 @@ func TestProviderRegistryCodexBindingCapturedFacts(t *testing.T) {
 	}
 }
 
+// TestProviderRegistryClaudeBindingCapturedFacts (task 15 fixture
+// capture): the claude binding pins the captured 2.1.220 protocol facts —
+// the executable name, the supported version range (covering the captured
+// baseline and excluding 3.x), the stream-json dialect, the session
+// contract, and the Start/Resume capability gates the Runtime applies.
+func TestProviderRegistryClaudeBindingCapturedFacts(t *testing.T) {
+	reg, err := LoadProviderRegistry()
+	requireNoError(t, err)
+	b, ok := reg.Lookup("claude")
+	if !ok {
+		t.Fatal("claude binding missing from the registry")
+	}
+	if b.Executable.Name != "claude" {
+		t.Fatalf("claude executable name = %q, want %q", b.Executable.Name, "claude")
+	}
+	if b.VersionRange != ">=1.0.0 <3.0.0" {
+		t.Fatalf("claude version range = %q, want the captured binding %q", b.VersionRange, ">=1.0.0 <3.0.0")
+	}
+	if !versionInRange("2.1.220", b.VersionRange) {
+		t.Fatal("the captured baseline 2.1.220 must be inside the claude supported range")
+	}
+	if versionInRange("3.0.0", b.VersionRange) {
+		t.Fatal("3.0.0 must be outside the claude supported range")
+	}
+	if b.Dialect.ID != "cflow.dialect.claude-stream-json.v1" || b.Dialect.EventSchemaRevision != "1" {
+		t.Fatalf("claude dialect = %+v", b.Dialect)
+	}
+	if b.SessionContract.StartEvent != "session_started" || b.SessionContract.IDField != "session_id" {
+		t.Fatalf("claude session contract = %+v", b.SessionContract)
+	}
+	// The Start and Resume capability gates the Runtime applies to every
+	// route must pass for the captured binding.
+	if !bindingHas(b, requiredStartCapabilities) {
+		t.Fatal("claude binding must pass the required Start capability gate")
+	}
+	if !bindingHasResume(b, requiredResumeCapabilities) {
+		t.Fatal("claude binding must pass the required Resume capability gate")
+	}
+}
+
+// TestProviderRegistryClaudeUnknownDialectFailClosed: a claude provider
+// binding whose dialect is unknown to this binary, or whose version range
+// is missing, fails the whole registry load (PRD 已确认：未知 Provider CLI
+// 协议 Fail-closed).
+func TestProviderRegistryClaudeUnknownDialectFailClosed(t *testing.T) {
+	base := `providers:
+  - name: claude
+    status: enabled
+    revision: "1.0.0"
+    executable: {name: "claude", path_policy: "PATH-resolved at Execution Approval"}
+    version_range: ">=1.0.0 <3.0.0"
+    binary_identity_policy: "PATH-resolved absolute path pinned with binary sha256 at Execution Approval"
+    dialect: {id: "cflow.dialect.claude-stream-json.v2", event_schema_revision: "1"}
+    session_contract: {start_event: "session_started", id_field: "session_id", terminal_events: ["session_finished", "session_failed"], conflict_rule: "x"}
+    start_capabilities: [stream_json, structured_output, session_id_on_start]
+    resume_capabilities: [stream_json, structured_output, resume_by_session_id]
+    cancel_behavior: "SIGTERM to the process group; controlled stop drains the stream before termination"
+    budget_behavior: "native budget limit supported"
+    known_incompatibilities: []
+`
+	if _, err := parseProviders([]byte(base)); err == nil {
+		t.Fatal("a claude binding with an unknown dialect revision must fail the registry load")
+	}
+	missingRange := strings.Replace(base, `version_range: ">=1.0.0 <3.0.0"`, `version_range: ""`, 1)
+	missingRange = strings.Replace(missingRange, "cflow.dialect.claude-stream-json.v2", "cflow.dialect.claude-stream-json.v1", 1)
+	if _, err := parseProviders([]byte(missingRange)); err == nil {
+		t.Fatal("a claude binding without a supported version range must fail the registry load")
+	}
+}
+
 // TestProviderRegistryCodexUnknownDialectFailClosed: a codex provider
 // binding whose dialect is unknown to this binary, or whose version range
 // is missing, fails the whole registry load (PRD 已确认：未知 Provider CLI
