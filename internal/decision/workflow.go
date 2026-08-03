@@ -443,7 +443,8 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 			{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
 			{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
 		},
-		Fingerprint: facts.Fingerprint,
+		Fingerprint:       facts.Fingerprint,
+		PreflightRevision: facts.PreflightRevision,
 	}})
 	// The approval is the workflow's entry into EXECUTION: dispatch opens
 	// with a fresh Run (closing every prior gate run) and the deterministic

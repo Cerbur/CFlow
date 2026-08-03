@@ -513,6 +513,14 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 			return Outcome{}, err
 		}
 	}
+	// The pass is over: cancel the pass context BEFORE the post-stop
+	// settle so the monitor goroutines die before the scan. A monitor
+	// that kept polling would re-arm the drift snapshot with post-stop
+	// pre-heads (the config drift is unchanged), and the next dispatch
+	// pass would settle with stale pre-heads — falsely quarantining a
+	// legitimate successor session or re-opening a duplicate
+	// COMMIT_POLICY gate after a replacement approval.
+	passCancel()
 	// A detected Commit Policy drift settles after the pass: the window
 	// scan feeds the quarantine or the confirmation gate (PRD steps 6-7).
 	if a.policyDriftPending() {
@@ -857,11 +865,20 @@ func (a *Application) interruptChain(settleCtx context.Context, st *store.Store,
 	if att == nil {
 		return true // nothing running: the chain is already done
 	}
+	// The interrupted Attempt records its Worktree end facts (observed on
+	// the settle context): the resume re-verification compares the
+	// successor's Worktree HEAD/status/Dirty Fingerprint against them
+	// (PRD 已确认：Ctrl+C 两阶段有限停止 step 7), so the end evidence must
+	// exist. A non-coding chain's Worktree observation fails closed to
+	// empty facts, which the reuse check treats as "no prior evidence".
+	head, dirty := a.driftEndFacts(settleCtx, wf, node)
 	input := model.EffectResultInput{
-		Kind:        model.AttemptEnded,
-		Attempt:     att.Key,
-		Outcome:     model.OutcomeInterrupted,
-		FailureCode: a.policyDriftCode(),
+		Kind:                model.AttemptEnded,
+		Attempt:             att.Key,
+		Outcome:             model.OutcomeInterrupted,
+		FailureCode:         a.policyDriftCode(),
+		EndHead:             head,
+		EndDirtyFingerprint: dirty,
 	}
 	executed := map[string]struct{}{}
 	for iter := 0; iter < nodeDispatchBudget; iter++ {

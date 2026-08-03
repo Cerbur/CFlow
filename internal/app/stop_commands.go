@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	yaml "go.yaml.in/yaml/v3"
@@ -319,12 +318,22 @@ func (a *Application) replacementPreviewInput(ctx context.Context, wf model.Work
 		Revision: revision + 1,
 		Actions:  decision.ClassifyManifest(st, unchanged, resumable),
 	}
+	// The manifest's self-hash is embedded in the persisted body: the
+	// hash covers the canonical body without the hash field (marshal →
+	// hash → set → re-marshal), so the displayed and approval-bound hash
+	// equals the persisted body's identity and the Recovery re-check can
+	// recompute it deterministically.
 	body, err := manifestBody(manifest)
 	if err != nil {
 		return model.ReplacementPreviewInput{}, err
 	}
-	hash, err := a.writeReconciliationManifest(wf, manifest.Revision, body)
+	hash := sha256Hex(body)
+	manifest.Hash = hash
+	body, err = manifestBody(manifest)
 	if err != nil {
+		return model.ReplacementPreviewInput{}, err
+	}
+	if _, err := a.writeReconciliationManifest(wf, manifest.Revision, body); err != nil {
 		return model.ReplacementPreviewInput{}, err
 	}
 
@@ -563,18 +572,11 @@ func (a *Application) readReconciliationManifest(wf model.WorkflowID, revision i
 	return body, nil
 }
 
-// marshalSpecSet re-serializes the successor Spec set canonically (one
-// YAML document per Spec, exactly the Artifact body shape).
+// marshalSpecSet re-serializes the successor Spec set canonically: the
+// JSON array shape of the Spec Artifact body (a spec object or a
+// spec-set sequence, both schema-validated on Put).
 func marshalSpecSet(specs []map[string]any) ([]byte, error) {
-	var buf strings.Builder
-	for _, m := range specs {
-		b, err := yaml.Marshal(m)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(b)
-	}
-	return []byte(buf.String()), nil
+	return json.Marshal(specs)
 }
 
 // queryReplacementPreview projects the unified Replacement Execution

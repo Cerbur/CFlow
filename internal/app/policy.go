@@ -127,7 +127,9 @@ func (a *Application) policyMismatch(passCtx context.Context, approved string) b
 func (a *Application) triggerPolicyStop(passCtx context.Context, wf model.WorkflowID) {
 	settleCtx := context.WithoutCancel(passCtx)
 	a.policyMu.Lock()
-	if a.policyDrift {
+	if a.policyDrift || a.policySettling {
+		// A settle is in progress (or already armed): a stale monitor poll
+		// must never re-arm the drift snapshot with post-stop pre-heads.
 		a.policyMu.Unlock()
 		return
 	}
@@ -162,7 +164,8 @@ func (a *Application) policyDriftPending() bool {
 }
 
 // takePolicyDriftSnapshot claims and clears the drift facts of the
-// settled pass (one settle per pass).
+// settled pass (one settle per pass) and marks the settle in progress so
+// a racing monitor poll can never re-arm the snapshot mid-settle.
 func (a *Application) takePolicyDriftSnapshot() (map[string]policyWorktree, bool) {
 	a.policyMu.Lock()
 	defer a.policyMu.Unlock()
@@ -173,6 +176,7 @@ func (a *Application) takePolicyDriftSnapshot() (map[string]policyWorktree, bool
 	a.policyDrift = false
 	a.policyCode = ""
 	a.policyPreHeads = nil
+	a.policySettling = true
 	return heads, true
 }
 
@@ -219,6 +223,7 @@ func (a *Application) settlePolicyDrift(ctx context.Context, st *store.Store, wf
 	if !ok {
 		return nil
 	}
+	defer a.finishPolicySettle()
 	settleCtx := context.WithoutCancel(ctx)
 	var window []model.WindowCommit
 	for path, pre := range heads {
@@ -262,23 +267,36 @@ func (a *Application) windowHasCommits(ctx context.Context, from, to string) boo
 // settle (the Kernel records the same deterministic names) and feeds the
 // quarantine settle decision.
 func (a *Application) settleDriftWindowQuarantine(ctx context.Context, st *store.Store, wf model.WorkflowID, window []model.WindowCommit) error {
-	view, err := st.View(ctx, store.StoreQuery{})
-	if err != nil {
+	// The quarantine rows commit FIRST: a crash between the row and its
+	// audit Ref leaves a row without a Ref, which the Recovery Engine
+	// flags as drift (a Ref without a row would be invisible to
+	// Recovery, and the window Commit could re-enter the trusted chain
+	// after the stop converged).
+	if _, err := a.runDecisionLoop(ctx, st, wf, DispatchCommand{Workflow: wf},
+		model.PolicyDriftSettleInput{WindowCommits: window}, false); err != nil {
 		return err
 	}
-	n := len(view.State.Quarantines)
+	// The unique audit Refs are created from the committed rows:
+	// refs/cflow/<workflow>/quarantine/<quarantine-id> pinning the
+	// discovered head. Expected-absent compare-and-swap: an existing ref
+	// (a crashed retry) is the evidence, never overwritten.
 	if a.git != nil {
-		for i, wc := range window {
-			id := fmt.Sprintf("quarantine-%d", n+i+1)
-			ref := fmt.Sprintf("refs/cflow/%s/quarantine/%s", wf, id)
-			// Expected-absent compare-and-swap: an existing ref (a crashed
-			// retry) is the evidence, never overwritten.
-			_, _ = a.git.Execute(ctx, gitflow.CreateAuditRef{Ref: ref, Head: wc.ToHead})
+		view, err := st.View(ctx, store.StoreQuery{})
+		if err != nil {
+			return err
+		}
+		for _, q := range view.State.Quarantines {
+			if q.AuditRef == "" || q.ToHead == "" {
+				continue
+			}
+			if _, err := a.git.Execute(ctx, gitflow.CreateAuditRef{Ref: q.AuditRef, Head: q.ToHead}); err != nil {
+				// The rows are committed; the missing Ref is drift the
+				// Recovery Engine flags. Fail closed so the caller sees it.
+				return err
+			}
 		}
 	}
-	_, err = a.runDecisionLoop(ctx, st, wf, DispatchCommand{Workflow: wf},
-		model.PolicyDriftSettleInput{WindowCommits: window}, false)
-	return err
+	return nil
 }
 
 // settleDriftConfirmation observes the fresh Commit Preflight and feeds
@@ -349,4 +367,11 @@ func mkdirAll0700(path string) error {
 // writeFile0600 writes one evidence file owner-only.
 func writeFile0600(path string, data []byte) error {
 	return osWriteFile(path, data, 0o600)
+}
+
+// finishPolicySettle clears the settle-in-progress marker.
+func (a *Application) finishPolicySettle() {
+	a.policyMu.Lock()
+	defer a.policyMu.Unlock()
+	a.policySettling = false
 }

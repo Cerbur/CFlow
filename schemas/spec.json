@@ -9,6 +9,7 @@
   "properties": {
     "id": { "type": "string", "minLength": 1 },
     "goal": { "type": "string", "minLength": 1 },
+    "replaces_task_id": { "type": "string", "minLength": 1 },
     "depends_on": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 }

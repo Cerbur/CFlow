@@ -158,10 +158,23 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 			return model.InvariantFault(fmt.Errorf("planning snapshot result does not match its intent"))
 		}
 	case model.ProviderStartIntent:
+		if r.Kind == model.AttemptEnded && r.Outcome == model.OutcomeFailed &&
+			(r.FailureCode == model.CodeDirtyWorktreeDrifted || r.FailureCode == model.CodeInterruptedWorktreeDrifted) {
+			// The Worktree reuse CAS (PRD 已确认：DIRTY_TASK_WORKTREE 原地
+			// Repair; 已确认：Ctrl+C 两阶段有限停止 step 7): the successor's
+			// Worktree no longer matches the prior Attempt's end evidence,
+			// so the Attempt fails closed BEFORE any Session starts. The
+			// result references exactly the Intent's Attempt.
+			return nil
+		}
 		if r.Kind != model.ProviderRunEnded || r.Session.ID != e.Session || r.Session.Purpose != e.Purpose {
 			return model.InvariantFault(fmt.Errorf("provider run result does not match intent for session %s", e.Session))
 		}
 	case model.ProviderResumeIntent:
+		if r.Kind == model.AttemptEnded && r.Outcome == model.OutcomeFailed &&
+			(r.FailureCode == model.CodeDirtyWorktreeDrifted || r.FailureCode == model.CodeInterruptedWorktreeDrifted) {
+			return nil // the Worktree reuse CAS failed the Attempt closed
+		}
 		if r.Kind != model.ProviderRunEnded || r.Session.ID != e.Session || r.Session.Purpose != e.Purpose {
 			return model.InvariantFault(fmt.Errorf("provider resume result does not match intent for session %s", e.Session))
 		}

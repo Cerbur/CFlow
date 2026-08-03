@@ -86,6 +86,7 @@ type Application struct {
 	policyDrift        bool
 	policyCode         model.Code
 	policyPreHeads     map[string]policyWorktree
+	policySettling     bool
 	passCancel         context.CancelFunc
 	policyPollInterval time.Duration
 }
