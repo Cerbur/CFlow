@@ -35,6 +35,25 @@ func TestLoadRejectsCredentialsAndCommandStringsBySchemaAbsence(t *testing.T) {
 	}
 }
 
+// TestLoadAcceptsIntegerConcurrency: a configured integer concurrency
+// decodes (the value-type yaml.Node decode; the pointer form fails on
+// scalars with this yaml version and would make every configured value
+// fail closed).
+func TestLoadAcceptsIntegerConcurrency(t *testing.T) {
+	path := writeConfig(t, "concurrency: 2\n")
+	file, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	resolved, err := config.Resolve(file, config.Overrides{})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if resolved.Concurrency != 2 {
+		t.Fatalf("concurrency = %d, want 2", resolved.Concurrency)
+	}
+}
+
 // TestLoadRejectsInvalidValueTypes: strict decoding rejects a value that
 // cannot be decoded into the declared schema type.
 func TestLoadRejectsInvalidValueTypes(t *testing.T) {

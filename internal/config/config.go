@@ -55,9 +55,12 @@ func Load(path string) (File, error) {
 	// The shadow struct keeps KnownFields strictness and validates the
 	// scalar type at the decode boundary: yaml coerces floating-point
 	// scalars into int fields silently, so every value must prove it is
-	// an integer before it enters the File.
+	// an integer before it enters the File. The field is a value
+	// yaml.Node: the pointer form cannot decode scalars with this yaml
+	// version ("cannot unmarshal !!int into yaml.Node"), which would make
+	// every configured value fail closed.
 	var raw struct {
-		Concurrency *yaml.Node `yaml:"concurrency"`
+		Concurrency yaml.Node `yaml:"concurrency"`
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -69,7 +72,7 @@ func Load(path string) (File, error) {
 		return File{}, nil
 	}
 	var f File
-	if raw.Concurrency != nil {
+	if raw.Concurrency.Kind != 0 {
 		if raw.Concurrency.ShortTag() != "!!int" {
 			return File{}, &Error{Msg: fmt.Sprintf("parse config %s: concurrency must be an integer", path)}
 		}

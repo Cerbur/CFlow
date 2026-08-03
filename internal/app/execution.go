@@ -11,11 +11,16 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	yaml "go.yaml.in/yaml/v3"
 
 	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/artifact"
@@ -75,6 +80,171 @@ func (a *Application) assembleCatalog(ctx context.Context, wf model.WorkflowID, 
 		Producer:      artifact.ProducerRef{Purpose: string(model.PurposeSpecGeneration), SessionID: string(session)},
 		Body:          body,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Proposal promotion (PRD 已确认：Workflow-local Verification Command
+// Catalog steps 2-3: the Spec Agent proposes new commands; CFlow
+// validates each Proposal with the Catalog policy and writes the
+// successor immutable Catalog Revision)
+// ---------------------------------------------------------------------------
+
+// proposalDoc is the structured proposed_commands section of the Spec
+// Generation output (the spec prompt's output contract).
+type proposalDoc struct {
+	ProposedCommands []proposal `yaml:"proposed_commands"`
+}
+
+// proposal is one agent-proposed verification command.
+type proposal struct {
+	CommandID           string   `yaml:"command_id"`
+	Executable          string   `yaml:"executable"`
+	Args                []string `yaml:"args"`
+	CWD                 string   `yaml:"cwd"`
+	Purpose             string   `yaml:"purpose"`
+	TimeoutSeconds      int      `yaml:"timeout_seconds"`
+	ExpectedExitCodes   []int    `yaml:"expected_exit_codes"`
+	MaxOutputBytes      int      `yaml:"max_output_bytes"`
+	Env                 []string `yaml:"env"`
+	TransientWritePaths []string `yaml:"transient_write_paths"`
+}
+
+// promoteCatalogProposals validates the Spec Generation Session's
+// proposed commands with the Catalog policy and writes the successor
+// immutable Catalog Revision (the Agent can never add directly to the
+// executable Catalog). A Proposal whose project-relative wrapper is not
+// fixed at the Base Commit, or that fails the command policy, is
+// rejected and never enters the Catalog; the Compiler later rejects any
+// Spec that references a rejected command id. Returns the successor
+// reference, or the zero ref when no Proposal was accepted.
+func (a *Application) promoteCatalogProposals(ctx context.Context, wf model.WorkflowID, output []byte, session model.SessionID) (model.ArtifactRef, error) {
+	var doc proposalDoc
+	if err := yaml.Unmarshal(output, &doc); err != nil || len(doc.ProposedCommands) == 0 {
+		return model.ArtifactRef{}, nil
+	}
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
+	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
+	body, err := store.Get(ctx, ref)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
+	catalog, err := compile.ParseCatalog(body)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
+	candidates := make([]verify.Candidate, 0, len(catalog.Entries)+len(doc.ProposedCommands))
+	for _, e := range catalog.Entries {
+		candidates = append(candidates, catalogEntryCandidate(e))
+	}
+	base := a.planningWorktreePath(wf)
+	accepted := 0
+	for _, p := range doc.ProposedCommands {
+		c := proposalCandidate(p, base)
+		if err := verify.ValidateCandidate(c); err != nil {
+			continue // rejected: never enters the executable Catalog
+		}
+		candidates = append(candidates, c)
+		accepted++
+	}
+	if accepted == 0 {
+		return model.ArtifactRef{}, nil
+	}
+	next := ref.Revision + 1
+	out, err := verify.CatalogBody(next, candidates)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
+	return store.Put(ctx, artifact.PutRequest{
+		WorkflowID:    wf,
+		Type:          model.ArtifactCatalog,
+		Revision:      next,
+		SchemaVersion: "1.0.0",
+		CreatedAt:     a.now().UTC().Format(time.RFC3339),
+		Producer:      artifact.ProducerRef{Purpose: string(model.PurposeSpecGeneration), SessionID: string(session)},
+		Body:          out,
+	})
+}
+
+// proposalCandidate maps one structured Proposal to a Candidate. The
+// executable must be a project-relative wrapper fixed at the Base Commit
+// (hashed from Base; unbound sources are rejected by the policy).
+func proposalCandidate(p proposal, base string) verify.Candidate {
+	c := verify.Candidate{
+		CommandID:           p.CommandID,
+		Purpose:             verify.Purpose(p.Purpose),
+		ExecutableKind:      verify.KindProjectRelative,
+		Executable:          p.Executable,
+		Args:                append([]string(nil), p.Args...),
+		CWD:                 p.CWD,
+		TimeoutSeconds:      p.TimeoutSeconds,
+		ExpectedExitCodes:   append([]int(nil), p.ExpectedExitCodes...),
+		OutputLimitBytes:    p.MaxOutputBytes,
+		Env:                 append([]string(nil), p.Env...),
+		TransientWritePaths: append([]string(nil), p.TransientWritePaths...),
+	}
+	if c.CWD == "" {
+		c.CWD = "."
+	}
+	if !pathEscapesBase(c.Executable) {
+		if data, err := os.ReadFile(filepath.Join(base, filepath.FromSlash(c.Executable))); err == nil {
+			c.SHA256 = sha256Hex(data)
+			c.Source = fmt.Sprintf("agent-proposal:%s@sha256:%s", c.Executable, c.SHA256)
+			return c
+		}
+	}
+	// Unbound source: the wrapper does not exist at the Base Commit (or
+	// the path escapes it); an empty executable fails the policy.
+	c.Executable = ""
+	return c
+}
+
+// catalogEntryCandidate round-trips one immutable Catalog entry into a
+// Candidate so the successor Revision preserves every existing entry.
+func catalogEntryCandidate(e compile.CatalogEntry) verify.Candidate {
+	kind := verify.KindProjectRelative
+	if filepath.IsAbs(e.Executable) {
+		kind = verify.KindPathExecutable
+	}
+	return verify.Candidate{
+		CommandID:           e.CommandID,
+		Purpose:             verify.Purpose(e.Purpose),
+		ExecutableKind:      kind,
+		Executable:          e.Executable,
+		SHA256:              sourceHash(e.Source),
+		Args:                append([]string(nil), e.Args...),
+		CWD:                 e.CWD,
+		TimeoutSeconds:      e.TimeoutSeconds,
+		ExpectedExitCodes:   append([]int(nil), e.ExpectedExitCodes...),
+		OutputLimitBytes:    e.MaxOutputBytes,
+		Env:                 append([]string(nil), e.Env...),
+		TransientWritePaths: append([]string(nil), e.TransientWritePaths...),
+		Source:              e.Source,
+	}
+}
+
+// pathEscapesBase reports whether a project-relative path leaves the
+// managed repository root.
+func pathEscapesBase(path string) bool {
+	if filepath.IsAbs(path) {
+		return true
+	}
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +375,21 @@ func (a *Application) workflowCompile(ctx context.Context, wf model.WorkflowID, 
 	for _, op := range out.RejectedOps {
 		rejected = append(rejected, fmt.Sprintf("%s %s: %s", op.Op, op.NodeID, op.Reason))
 	}
-	return model.EffectResultInput{Kind: model.WorkflowCompiled, Body: out.Body, RejectedOps: rejected}, nil
+	// The applied Patch operations are compile evidence: the Kernel
+	// records them as non-blocking Findings so the Dry Run and the
+	// Execution Approval gate display exactly what the user approves.
+	applied := make([]string, 0,
+		len(out.Evidence.PinnedRoutes)+len(out.Evidence.ConcurrencyCaps)+len(out.Evidence.BudgetTightenings))
+	for _, p := range out.Evidence.PinnedRoutes {
+		applied = append(applied, fmt.Sprintf("pin_route %s -> %s", p.NodeID, p.Provider))
+	}
+	for _, c := range out.Evidence.ConcurrencyCaps {
+		applied = append(applied, fmt.Sprintf("reduce_concurrency %s -> %d", c.NodeID, c.MaxParallel))
+	}
+	for _, t := range out.Evidence.BudgetTightenings {
+		applied = append(applied, fmt.Sprintf("tighten_budget %s -> %v", t.NodeID, t.Budget))
+	}
+	return model.EffectResultInput{Kind: model.WorkflowCompiled, Body: out.Body, RejectedOps: rejected, AppliedOps: applied}, nil
 }
 
 // concurrencyCap is the user's configured concurrency bound (PRD 并发上

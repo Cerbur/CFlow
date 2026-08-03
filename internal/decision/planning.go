@@ -436,25 +436,35 @@ func decidePatchProposed(state model.State, in model.EffectResultInput, created 
 }
 
 // decideWorkflowCompiled judges the compiled Dynamic Workflow body: the
-// rejected (inert) Patch operations become non-blocking Compile Findings
-// visible in Dry Run, and the canonical body is written as the immutable
-// Workflow Revision.
+// rejected (inert) Patch operations and the applied Patch operations
+// both become non-blocking Compile Findings visible in Dry Run — the
+// user at the Execution Approval gate sees exactly which scheduling
+// operations were applied — and the canonical body is written as the
+// immutable Workflow Revision.
 func decideWorkflowCompiled(state model.State, in model.EffectResultInput) (model.Decision, error) {
 	if len(in.Body) == 0 || len(in.Body) > maxPlanBody {
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("compiled workflow body is empty or exceeds the bounded size"))
 	}
 	b := &builder{state: state}
-	for i, op := range in.RejectedOps {
+	n := 0
+	recordCompileFinding := func(code model.Code, text string) {
+		n++
 		b.mutate(model.FindingAppendMutation{Finding: model.Finding{
-			ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+i+1)),
-			Code:     model.CodeWorkflowPatchForbidden,
+			ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+n)),
+			Code:     code,
 			Scope:    model.ScopeWorkflowRevision,
 			Subject:  string(state.Workflow.ID),
 			Blocking: false,
-			Text:     op,
-			Seq:      state.NextEventSeq + uint64(i),
+			Text:     text,
+			Seq:      state.NextEventSeq + uint64(n-1),
 		}})
-		b.event(model.EventFindingOpened, "", model.AttemptKey{}, model.CodeWorkflowPatchForbidden, op)
+		b.event(model.EventFindingOpened, "", model.AttemptKey{}, code, text)
+	}
+	for _, op := range in.RejectedOps {
+		recordCompileFinding(model.CodeWorkflowPatchForbidden, "rejected patch: "+op)
+	}
+	for _, op := range in.AppliedOps {
+		recordCompileFinding(model.CodeWorkflowPatchApplied, "applied patch: "+op)
 	}
 	b.effect(model.ArtifactWriteIntent{
 		Ref:      model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow},

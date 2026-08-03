@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"cflow.local/cflow/internal/artifact"
+	"cflow.local/cflow/internal/compile"
 	"cflow.local/cflow/internal/model"
 )
 
@@ -91,6 +92,12 @@ func approveCheckedPlan(t *testing.T, fx *planningFixture, wf model.WorkflowID) 
 // driveToExecutionGate runs the execution lifecycle through the paused
 // Execution Approval gate and returns the preview view.
 func driveToExecutionGate(t *testing.T, fx *planningFixture, wf model.WorkflowID) ExecutionPreviewView {
+	return driveToExecutionGateWithPatch(t, fx, wf, checkpointPatch)
+}
+
+// driveToExecutionGateWithPatch is driveToExecutionGate with an explicit
+// Patch IR for the Workflow Optimization Session.
+func driveToExecutionGateWithPatch(t *testing.T, fx *planningFixture, wf model.WorkflowID, patchJSON string) ExecutionPreviewView {
 	t.Helper()
 	out, err := fx.app(specOutputScript("s1", divideSpec)).Execute(context.Background(),
 		GenerateSpecsCommand{Workflow: wf, Provider: "fake"})
@@ -105,7 +112,7 @@ func driveToExecutionGate(t *testing.T, fx *planningFixture, wf model.WorkflowID
 		t.Fatalf("after spec generation: %#v", view)
 	}
 
-	out, err = fx.app(patchOutputScript("w1", checkpointPatch)).Execute(context.Background(),
+	out, err = fx.app(patchOutputScript("w1", patchJSON)).Execute(context.Background(),
 		CompileWorkflowCommand{Workflow: wf, Provider: "fake"})
 	if err != nil {
 		t.Fatalf("workflow compilation: %v", err)
@@ -131,6 +138,33 @@ func driveToExecutionGate(t *testing.T, fx *planningFixture, wf model.WorkflowID
 		t.Fatalf("execution preview: %v", err)
 	}
 	return qv.(ExecutionPreviewView)
+}
+
+// drivePlanningToApproval runs the planning lifecycle through Plan
+// Approval and returns the workflow id.
+func drivePlanningToApproval(t *testing.T, fx *planningFixture) model.WorkflowID {
+	t.Helper()
+	wf, err := fx.create("add divide", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.discussSeq++
+	if _, err := fx.app(discussionScript("d1", "division by zero must error")).Execute(context.Background(),
+		DiscussRequirementCommand{Workflow: wf, Text: "division by zero must error", Provider: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	fx.planSeq++
+	if _, err := fx.app(planScript("p1", validPlan())).Execute(context.Background(),
+		GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	fx.checkSeq++
+	if _, err := fx.app(checkScript("c1", "pass")).Execute(context.Background(),
+		CheckPlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	approveCheckedPlan(t, fx, wf)
+	return wf
 }
 
 // status is the fixture's status projection.
@@ -164,6 +198,17 @@ func approveExecution(t *testing.T, fx *planningFixture, wf model.WorkflowID, pv
 	}); err != nil {
 		t.Fatalf("execution approval: %v", err)
 	}
+}
+
+// specOutputScriptWithProposals is the Spec Generation Session output
+// with an explicit proposed_commands list.
+func specOutputScriptWithProposals(sessionID, specJSON, proposalsJSON string) string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"spec-generation","session_id":%s,"exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":%s,"at_ms":0}
+{"type":"assistant_message","session_id":%s,"text":"Splitting the plan.","at_ms":10}
+{"type":"session_finished","session_id":%s,"result":{"specs":[%s],"proposed_commands":[%s]},"at_ms":20}`,
+		strconv.Quote(sessionID), strconv.Quote(sessionID), strconv.Quote(sessionID),
+		strconv.Quote(sessionID), specJSON, proposalsJSON)
 }
 
 // ---------------------------------------------------------------------------
@@ -413,26 +458,7 @@ func TestCompiledWorkflowHashStableAcrossRuns(t *testing.T) {
 func compiledWorkflowHash(t *testing.T) string {
 	t.Helper()
 	fx := newExecutionFixture(t)
-	wf, err := fx.create("add divide", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fx.discussSeq++
-	if _, err := fx.app(discussionScript("d1", "division by zero must error")).Execute(context.Background(),
-		DiscussRequirementCommand{Workflow: wf, Text: "division by zero must error", Provider: "fake"}); err != nil {
-		t.Fatal(err)
-	}
-	fx.planSeq++
-	if _, err := fx.app(planScript("p1", validPlan())).Execute(context.Background(),
-		GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
-		t.Fatal(err)
-	}
-	fx.checkSeq++
-	if _, err := fx.app(checkScript("c1", "pass")).Execute(context.Background(),
-		CheckPlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
-		t.Fatal(err)
-	}
-	approveCheckedPlan(t, fx, wf)
+	wf := drivePlanningToApproval(t, fx)
 	if _, err := fx.app(specOutputScript("s1", divideSpec)).Execute(context.Background(),
 		GenerateSpecsCommand{Workflow: wf, Provider: "fake"}); err != nil {
 		t.Fatalf("spec generation: %v", err)
@@ -451,4 +477,184 @@ func compiledWorkflowHash(t *testing.T) string {
 		t.Fatalf("resolve workflow artifact: %v", err)
 	}
 	return ref.Hash
+}
+
+// TestAppliedPatchOpsPersistedAndDisplayed: applied scheduling
+// operations (route pins, budget tightenings) are persisted as
+// non-blocking Compile Findings and displayed at the Execution Approval
+// gate, so the user approves exactly the patched execution instead of
+// the raw Spec budgets (review fix #1).
+func TestAppliedPatchOpsPersistedAndDisplayed(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := drivePlanningToApproval(t, fx)
+	const appliedOpsPatch = `{"schema":"cflow-workflow-patch-1","operations":[{"op":"pin_route","node_id":"task-s01","provider":"fake"},{"op":"tighten_budget","node_id":"task-s01","budget":5}]}`
+	pv := driveToExecutionGateWithPatch(t, fx, wf, appliedOpsPatch)
+
+	var applied []model.Finding
+	for _, f := range pv.Findings {
+		if f.Code == model.CodeWorkflowPatchApplied {
+			applied = append(applied, f)
+		}
+	}
+	if len(applied) != 2 {
+		t.Fatalf("applied patch findings = %+v, want 2", applied)
+	}
+	texts := applied[0].Text + "\n" + applied[1].Text
+	if !strings.Contains(texts, "pin_route task-s01 -> fake") ||
+		!strings.Contains(texts, "tighten_budget task-s01 -> 5") {
+		t.Fatalf("applied patch findings = %+v", applied)
+	}
+	if len(pv.Budgets) != 1 || pv.Budgets[0].Budget != 10 {
+		t.Fatalf("preview budgets = %+v (the spec budget; the tightening is displayed as a finding)", pv.Budgets)
+	}
+	// The exact preview still approves: the applied operations are part
+	// of what the user sees at the gate.
+	approveExecution(t, fx, wf, pv)
+	view := fx.status(wf)
+	if view.Stage != model.StageExecution {
+		t.Fatalf("after approval with applied patch: %#v", view)
+	}
+}
+
+// TestProposedCommandsPromotedToCatalogRevision: the Spec Agent's
+// proposed commands are validated with the Catalog policy and written as
+// a successor immutable Catalog Revision; the Spec may reference them
+// and the Compiler builds their Verify nodes (review fix #2).
+func TestProposedCommandsPromotedToCatalogRevision(t *testing.T) {
+	fx := newExecutionFixture(t)
+	// A second wrapper fixed at the Base Commit the Agent proposes.
+	if err := os.WriteFile(filepath.Join(fx.root, "scripts", "lint.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write lint.sh: %v", err)
+	}
+	git := func(args ...string) {
+		if out, err := execGit(fx.root, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("add", "scripts/lint.sh")
+	git("commit", "-q", "-m", "add lint wrapper")
+	wf := drivePlanningToApproval(t, fx)
+
+	const lintProposal = `{"command_id":"lint","executable":"scripts/lint.sh","args":[],"cwd":".","purpose":"task_verify","timeout_seconds":600,"expected_exit_codes":[0],"max_output_bytes":10485760,"env":["PATH","TMPDIR"]}`
+	const divideSpecWithLint = `{"id":"s01","goal":"implement divide","depends_on":[],"write_scope":["src/divide/**"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify","lint"]},"route":{"provider":"fake","model":"default","budget":10},"timeout_seconds":1800,"max_retry":2}`
+	if _, err := fx.app(specOutputScriptWithProposals("s1", divideSpecWithLint, lintProposal)).Execute(context.Background(),
+		GenerateSpecsCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("spec generation: %v", err)
+	}
+
+	// The active Catalog revision is the successor and contains the
+	// promoted proposal with its Base-fixed identity.
+	a := fx.app()
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		t.Fatalf("artifact store: %v", err)
+	}
+	ref, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
+	if err != nil {
+		t.Fatalf("resolve catalog: %v", err)
+	}
+	if ref.Revision != 2 {
+		t.Fatalf("catalog revision = %d, want 2 (successor with the promoted proposal)", ref.Revision)
+	}
+	catalogBody, err := store.Get(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("read catalog: %v", err)
+	}
+	// The Artifact Store canonically serializes structured bodies to
+	// JSON (design 10.2); the successor body carries the promoted entry.
+	if !strings.Contains(string(catalogBody), `"command_id":"lint"`) ||
+		!strings.Contains(string(catalogBody), "agent-proposal:scripts/lint.sh@sha256:") {
+		t.Fatalf("successor catalog body = %s", catalogBody)
+	}
+
+	// Two Verify nodes run in parallel, so the user's concurrency
+	// configuration must allow it (the Compiler enforces the cap).
+	if err := os.WriteFile(filepath.Join(fx.home, "config.yaml"), []byte("concurrency: 2\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// The Compiler builds one Verify node per acceptance command and the
+	// preview displays the promoted identity.
+	if _, err := fx.app(patchOutputScript("w1", checkpointPatch)).Execute(context.Background(),
+		CompileWorkflowCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("workflow compilation: %v", err)
+	}
+	workflowRef, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactWorkflow})
+	if err != nil {
+		t.Fatalf("resolve workflow: %v", err)
+	}
+	workflowBody, err := store.Get(context.Background(), workflowRef)
+	if err != nil {
+		t.Fatalf("read workflow: %v", err)
+	}
+	wfIR, err := compile.ParseWorkflow(workflowBody)
+	if err != nil {
+		t.Fatalf("parse workflow: %v", err)
+	}
+	verifyNodes := 0
+	for _, n := range wfIR.Nodes {
+		if n.Type == "verify" {
+			verifyNodes++
+		}
+	}
+	if verifyNodes != 2 {
+		t.Fatalf("verify nodes = %d, want 2 (verify + lint)", verifyNodes)
+	}
+
+	if _, err := fx.app().Execute(context.Background(), ExecutionDryRunCommand{Workflow: wf}); err != nil {
+		t.Fatalf("execution dry run: %v", err)
+	}
+	qv, err := fx.app().Query(context.Background(), ExecutionPreviewQuery{Workflow: wf})
+	if err != nil {
+		t.Fatalf("execution preview: %v", err)
+	}
+	pv := qv.(ExecutionPreviewView)
+	found := false
+	for _, c := range pv.CommandIdentities {
+		if c.CommandID == "lint" && c.Executable == "scripts/lint.sh" && len(c.SHA256) == 64 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("promoted command identity missing: %+v", pv.CommandIdentities)
+	}
+}
+
+// TestRejectedProposalNotPromoted: a Proposal whose wrapper is not fixed
+// at the Base Commit fails the policy and never enters the Catalog; the
+// successor revision is not written and the Compiler rejects the
+// dangling reference (review fix #2).
+func TestRejectedProposalNotPromoted(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := drivePlanningToApproval(t, fx)
+
+	const ghostProposal = `{"command_id":"ghost","executable":"scripts/ghost.sh","args":[],"cwd":".","purpose":"task_verify","timeout_seconds":600,"expected_exit_codes":[0],"max_output_bytes":10485760,"env":["PATH","TMPDIR"]}`
+	const divideSpecWithGhost = `{"id":"s01","goal":"implement divide","depends_on":[],"write_scope":["src/divide/**"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify","ghost"]},"route":{"provider":"fake","model":"default","budget":10},"timeout_seconds":1800,"max_retry":2}`
+	if _, err := fx.app(specOutputScriptWithProposals("s1", divideSpecWithGhost, ghostProposal)).Execute(context.Background(),
+		GenerateSpecsCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("spec generation: %v", err)
+	}
+
+	// The rejected proposal never produced a successor revision.
+	a := fx.app()
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		t.Fatalf("artifact store: %v", err)
+	}
+	ref, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
+	if err != nil {
+		t.Fatalf("resolve catalog: %v", err)
+	}
+	if ref.Revision != 1 {
+		t.Fatalf("catalog revision = %d, want 1 (rejected proposal must not be promoted)", ref.Revision)
+	}
+
+	// The Compiler rejects the dangling reference.
+	_, err = fx.app(patchOutputScript("w1", checkpointPatch)).Execute(context.Background(),
+		CompileWorkflowCommand{Workflow: wf, Provider: "fake"})
+	if err == nil {
+		t.Fatal("compile with a dangling proposal reference succeeded")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeSchemaInvalid {
+		t.Fatalf("compile error = %v, want SCHEMA_INVALID for the unknown command id", err)
+	}
 }

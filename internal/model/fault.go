@@ -87,6 +87,7 @@ const (
 
 	// Design codes (compiler, session independence, snapshot isolation).
 	CodeWorkflowPatchForbidden       Code = "WORKFLOW_PATCH_FORBIDDEN"
+	CodeWorkflowPatchApplied         Code = "WORKFLOW_PATCH_APPLIED"
 	CodeSchemaInvalid                Code = "SCHEMA_INVALID"
 	CodeSessionIndependenceViolation Code = "SESSION_INDEPENDENCE_VIOLATION"
 	// CodeUnexpectedAgentMutation: a non-coding Session changed the
@@ -152,6 +153,7 @@ func Codes() []Code {
 		CodeCleanupFactsChanged,
 		CodeCleanupItemFailed,
 		CodeWorkflowPatchForbidden,
+		CodeWorkflowPatchApplied,
 		CodeSchemaInvalid,
 		CodeSessionIndependenceViolation,
 		CodeUnexpectedAgentMutation,
@@ -380,6 +382,7 @@ var faultPolicies = []FaultPolicy{
 
 	// Design codes.
 	p(CodeWorkflowPatchForbidden, CatInvalidInput, ScopeWorkflowRevision, false, false, StopNone, false),
+	p(CodeWorkflowPatchApplied, CatInvalidInput, ScopeWorkflowRevision, false, false, StopNone, false),
 	p(CodeSchemaInvalid, CatInvalidInput, ScopeArtifact, false, false, StopNone, false),
 	p(CodeSessionIndependenceViolation, CatInvariantFailure, ScopeSession, false, true, StopAll, false),
 	p(CodeUnexpectedAgentMutation, CatSafetyStop, ScopeSession, false, true, StopAll, false),

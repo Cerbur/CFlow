@@ -257,7 +257,22 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
 		return model.EffectResultInput{}, err
 	}
-	return a.runOutcome(cmd, res)
+	out, err := a.runOutcome(cmd, res)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	// The Spec Generation Session's proposed commands are validated with
+	// the Catalog policy and promoted into the successor immutable
+	// Catalog Revision; the Kernel records the reference with the Spec
+	// output (PRD 已确认：Workflow-local Verification Command Catalog).
+	if intent.Purpose == model.PurposeSpecGeneration && res.Terminal != nil {
+		ref, err := a.promoteCatalogProposals(ctx, wf, []byte(res.Terminal.Result), intent.Session)
+		if err != nil {
+			return model.EffectResultInput{}, err
+		}
+		out.CatalogRef = ref
+	}
+	return out, nil
 }
 
 // providerResume re-establishes an existing Provider Session (design

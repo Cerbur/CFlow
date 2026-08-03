@@ -289,6 +289,12 @@ type EffectResultInput struct {
 	// without replacing the deterministic skeleton); the Kernel records
 	// one Compile Finding per op, visible in Dry Run.
 	RejectedOps []string
+	// AppliedOps lists the Patch operations the Compiler applied to the
+	// deterministic skeleton (route pins, concurrency caps, budget
+	// tightenings). The Kernel records one non-blocking Finding per op so
+	// the applied patch is durable and visible at the Execution Approval
+	// gate (design 11: applied operations are compile evidence).
+	AppliedOps []string
 	// IntegrationHead is the HEAD of the created Integration Worktree
 	// (the recorded Base Commit at approval).
 	IntegrationHead string
