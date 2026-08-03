@@ -1651,14 +1651,14 @@ func TestDispatchGateClosureRejectsQueuedAllocation(t *testing.T) {
 // this build; Verify, Merge, Checkpoint, and FinalVerify Nodes arrive with
 // their Task 13 engines and are never silently skipped.
 func TestDispatchRejectsNonTaskKind(t *testing.T) {
-	for _, kind := range []model.NodeKind{
-		model.NodeVerify, model.NodeMerge, model.NodeCheckpoint, model.NodeFinalVerify,
-	} {
-		state := fixtureExecutionStage()
-		addNode(&state, "n-1", kind, model.NodePending, 0)
-		_, err := decision.Decide(state, model.DispatchInput{Node: "n-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
-		assertFaultCode(t, err, model.CodeInvalidInput)
-	}
+	// Every compiled Node kind dispatches through its own decision
+	// (agent-task, verify, merge, checkpoint and final-verify — the last
+	// two since Task 18); the review kind is never carried by a compiled
+	// workflow, so its dispatch is refused.
+	state := fixtureExecutionStage()
+	addNode(&state, "n-1", model.NodeReview, model.NodePending, 0)
+	_, err := decision.Decide(state, model.DispatchInput{Node: "n-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	assertFaultCode(t, err, model.CodeInvalidInput)
 }
 
 // TestDispatchRejectsRunningOrTerminalNodes: a Node that is already

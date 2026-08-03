@@ -42,9 +42,12 @@ const providerTrustBoundary = "agents run with the provider's default permission
 // (the Reviewer Session of a Task runs on the Task's approved route,
 // design 16.2), then the independent Repair lineage (a DIRTY_TASK_WORKTREE
 // successor runs on the Task's approved route with the repair purpose,
-// PRD 已确认：DIRTY_TASK_WORKTREE 原地 Repair).
+// PRD 已确认：DIRTY_TASK_WORKTREE 原地 Repair), then the independent Final
+// Reviewer lineage (Task 18: the Final Reviewer Session of the final
+// acceptance runs on the approved route set).
 var routedPurposes = []model.AgentPurpose{
 	model.PurposeImplementation, model.PurposeReview, model.PurposeRepair,
+	model.PurposeFinalVerification,
 }
 
 // resolvedConfig loads and resolves the strict local configuration
@@ -383,6 +386,13 @@ const managedCodingSchema = `{"type":"object"}`
 // output schema and the approved model/budget of the binding the
 // Execution Approval bound. The Fake Adapter accepts any input; the real
 // dialect Adapters refuse to launch without their typed facts.
+//
+// providerTypedInput replaces the base input with the typed Adapter
+// input, so the immutable redacted Context Bundle handoff of an
+// automatic fallback rides the typed input as a reference: a production
+// codex→claude successor's recorded input facts carry the handoff (Task
+// 16 ledger obligation; the typed inputs carry the bundle path, never a
+// credential or an unredacted transcript).
 func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime, purpose model.AgentPurpose, provider string, base any) any {
 	if rt == nil {
 		return base
@@ -391,17 +401,32 @@ func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime,
 	if !ok {
 		return base
 	}
+	bundleRef := contextBundleRefOf(base)
 	switch provider {
 	case "codex":
-		return codex.Input{SchemaPath: a.managedSchemaPath(ctx), Model: rb.Model}
+		return codex.Input{
+			SchemaPath:       a.managedSchemaPath(ctx),
+			Model:            rb.Model,
+			ContextBundleRef: bundleRef,
+		}
 	case "claude":
 		return claude.Input{
-			SchemaJSON:   managedCodingSchema,
-			MaxBudgetUSD: strconv.FormatFloat(rb.BudgetUSD, 'f', -1, 64),
-			Model:        rb.Model,
+			SchemaJSON:       managedCodingSchema,
+			MaxBudgetUSD:     strconv.FormatFloat(rb.BudgetUSD, 'f', -1, 64),
+			Model:            rb.Model,
+			ContextBundleRef: bundleRef,
 		}
 	}
 	return base
+}
+
+// contextBundleRefOf extracts the immutable Context Bundle handoff
+// reference of a Session start input ("" when the input carries none).
+func contextBundleRefOf(base any) string {
+	if c, ok := base.(*codingSessionInput); ok && c.ContextBundle != nil {
+		return c.ContextBundle.Path
+	}
+	return ""
 }
 
 // managedSchemaPath materializes the managed immutable output schema

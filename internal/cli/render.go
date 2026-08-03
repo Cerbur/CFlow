@@ -340,6 +340,51 @@ func (r *renderer) RefOrDash(ref model.ArtifactRef) string {
 	return ref.String()
 }
 
+// renderTaskInspect renders one Task's delivery evidence (PRD 必须提供的
+// CLI: `cflow inspect task <task-id>`): the Node status, every Attempt
+// with its start/end heads, failure code, and evidence references, and
+// the Sessions bound to those Attempts. Unknown tasks are invalid input.
+func renderTaskInspect(w io.Writer, v app.InspectView, task model.NodeID, reg security.Registry) error {
+	r := newRenderer(reg)
+	var node *model.Node
+	for i := range v.Nodes {
+		if v.Nodes[i].ID == task {
+			node = &v.Nodes[i]
+			break
+		}
+	}
+	if node == nil {
+		return model.InvalidInputFault("unknown task " + string(task))
+	}
+	fmt.Fprintf(w, "task: %s\n", task)
+	fmt.Fprintf(w, "  kind: %s\n", node.Kind)
+	fmt.Fprintf(w, "  status: %s\n", node.Status)
+	fmt.Fprintf(w, "  branch: %s\n", r.orDash(node.Branch))
+	fmt.Fprintf(w, "  retry: %d/%d\n", node.RetryCharged, node.RetryBudget)
+	sessions := map[model.SessionID]model.Session{}
+	for _, s := range v.Sessions {
+		sessions[s.ID] = s
+	}
+	for i := range v.Attempts {
+		at := &v.Attempts[i]
+		if at.Key.Node != task {
+			continue
+		}
+		fmt.Fprintf(w, "  attempt %d: %s\n", at.Key.Number, at.Status)
+		fmt.Fprintf(w, "    head: %s -> %s\n", r.orDash(at.StartHead), r.orDash(at.EndHead))
+		if at.FailureCode != "" {
+			fmt.Fprintf(w, "    failure: %s\n", at.FailureCode)
+		}
+		if s, ok := sessions[at.Session]; ok {
+			fmt.Fprintf(w, "    session: %s (%s, %s)\n", s.ID, s.Purpose, r.text(s.Provider))
+		}
+		for _, e := range at.Evidence {
+			fmt.Fprintf(w, "    evidence: %s %s %s\n", e.Kind, r.orDash(e.Hash), r.text(e.Subject))
+		}
+	}
+	return nil
+}
+
 // renderCancelSummary renders the cancel confirmation summary (PRD 已确
 // 认：Cancel 逻辑终止 step 1): the Workflow ID, Stage, active Sessions and
 // Nodes, every managed Worktree/Branch with its dirty state and unmerged

@@ -73,16 +73,16 @@ func (p *dispatchPlan) node(id model.NodeID) *dispatchNode {
 }
 
 // runBudget is the approved total-run budget: the initial run plus the
-// budgeted retries of every agent-task Node, plus one Attempt per verify
-// and merge Node (design 12: the total-run budget must permit every
-// allocation).
+// budgeted retries of every agent-task Node, plus one Attempt per verify,
+// merge, and final-verify Node (design 12: the total-run budget must
+// permit every allocation; Task 18 adds the Final Verify Node).
 func (p *dispatchPlan) runBudget() int {
 	total := 0
 	for _, n := range p.nodes {
 		switch n.kind {
 		case model.NodeAgentTask:
 			total += 1 + n.retry
-		case model.NodeVerify, model.NodeMerge:
+		case model.NodeVerify, model.NodeMerge, model.NodeFinalVerify:
 			total++
 		}
 	}
@@ -458,6 +458,16 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 	var chains []nodeChain
 	for _, id := range selected {
 		node := plan.node(id)
+		// The Final Verify Node's Reviewer Session runs on the approved
+		// final-verification route of the Execution Approval (Task 18:
+		// the independent Final Reviewer's route is bound by the policy,
+		// never invented at dispatch).
+		route := node.route
+		if node.kind == model.NodeFinalVerify {
+			if rb, ok := routingPrimaryBinding(routing, model.PurposeFinalVerification); ok {
+				route = rb.Provider
+			}
+		}
 		var integHold *platform.Hold
 		if node.kind == model.NodeMerge {
 			ls, err := a.lockSet()
@@ -477,7 +487,7 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 			return Outcome{}, err
 		}
 		chains = append(chains, nodeChain{
-			id: id, route: node.route, baseHead: baseHead, node: node,
+			id: id, route: route, baseHead: baseHead, node: node,
 			holds: holds, integHold: integHold,
 		})
 	}
@@ -532,6 +542,22 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 		Findings: state.Findings}, nil
 }
 
+// routingPrimaryBinding resolves the primary (first) approved binding of
+// one Purpose inside the approved routing policy ("" when the policy has
+// none): the route the dispatch allocates a purpose's Session on.
+func routingPrimaryBinding(set *agent.RoutingPolicySet, purpose model.AgentPurpose) (agent.RouteBinding, bool) {
+	if set == nil {
+		return agent.RouteBinding{}, false
+	}
+	for _, p := range set.Policies {
+		if p.Purpose != purpose || len(p.Bindings) == 0 {
+			continue
+		}
+		return p.Bindings[0], true
+	}
+	return agent.RouteBinding{}, false
+}
+
 // graphSnapshot builds the pure Scheduler input from the persisted Node
 // state plus the approved skeleton edges and the Run Dispatch Gate.
 func (a *Application) graphSnapshot(state model.State, plan *dispatchPlan) model.GraphSnapshot {
@@ -579,9 +605,9 @@ func (a *Application) graphSnapshot(state model.State, plan *dispatchPlan) model
 // blocking Finding in the Node's scope and the total-run budget also
 // defer. Verify Nodes run in their own Task Worktrees (no static
 // conflict); Merge Nodes are serial: at most one merge Node per pass and
-// never while another merge is RUNNING (design 15.5, 18.1). The
-// unsupported kinds (checkpoint/final-verify dispatch arrive with Task
-// 18) defer.
+// never while another merge is RUNNING (design 15.5, 18.1); the Final
+// Verify Node dispatches once every Merge Node is SUCCEEDED (Task 18;
+// the Scheduler's dependency edges already gate it).
 func (a *Application) selectBatch(state model.State, plan *dispatchPlan, eligible []model.NodeID) []model.NodeID {
 	var selected []model.NodeID
 	mergeSelected := false
@@ -598,7 +624,7 @@ func (a *Application) selectBatch(state model.State, plan *dispatchPlan, eligibl
 			continue
 		}
 		switch node.kind {
-		case model.NodeAgentTask, model.NodeVerify:
+		case model.NodeAgentTask, model.NodeVerify, model.NodeFinalVerify, model.NodeCheckpoint:
 		case model.NodeMerge:
 			if mergeRunning || mergeSelected {
 				continue
@@ -791,6 +817,25 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 				input = result
 				continue
 			}
+			// The Final Verify chain settled: the independent Final
+			// Reviewer passed, so the Application feeds the exact-evidence
+			// completion Decision in the same chain (Task 18, PRD 最终验
+			// 收). The Kernel refuses with EVIDENCE_SUBJECT_CHANGED when
+			// the Integration HEAD moved after the review bound it.
+			if planNode != nil && planNode.kind == model.NodeFinalVerify && !gateFed && a.finalVerifySucceeded(ctx, wf, node) {
+				gateFed = true
+				input = model.CompleteWorkflowInput{}
+				continue
+			}
+			// The completion Decision committed: the immutable Final
+			// Report Artifact follows it (PRD 最终验收: 生成 final-report.md).
+			// A chain that settled otherwise (a failed Final Verify or
+			// review) writes nothing.
+			if planNode != nil && planNode.kind == model.NodeFinalVerify {
+				if merr := a.writeFinalReportIfCompleted(ctx, wf, st); merr != nil {
+					return merr
+				}
+			}
 			return nil
 		}
 		id := intentIdentity(cd.Decision.Effect)
@@ -912,6 +957,45 @@ func (a *Application) attemptRunning(ctx context.Context, wf model.WorkflowID, n
 		return false
 	}
 	return runningAttemptOfState(view.State, node) != nil
+}
+
+// finalVerifySucceeded reports whether the Final Verify Node settled
+// SUCCEEDED and the Workflow is at the FINAL_VERIFICATION stage (the
+// completion Decision may be fed). The read goes through the
+// already-open write Store (design 18.1).
+func (a *Application) finalVerifySucceeded(ctx context.Context, wf model.WorkflowID, node model.NodeID) bool {
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return false
+	}
+	st := view.State
+	if st.Workflow.Stage != model.StageFinalVerification || st.Workflow.Runtime != model.RuntimeRunning {
+		return false
+	}
+	n := st.Nodes[node]
+	return n != nil && n.Kind == model.NodeFinalVerify && n.Status == model.NodeSucceeded
+}
+
+// validateTaskNode checks that the named Node exists in the installed
+// graph and is an agent-task Node (PRD 必须提供的 CLI: `cflow retry
+// <task-id>` refuses an unknown or non-task identity before any
+// dispatch).
+func (a *Application) validateTaskNode(ctx context.Context, wf model.WorkflowID, node model.NodeID) error {
+	if node == "" {
+		return model.InvalidInputFault("a task id is required")
+	}
+	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
+	if err != nil {
+		return orCtx(ctx, err)
+	}
+	if view.State.Workflow.ID == "" {
+		return model.InvalidInputFault("no such workflow: " + string(wf))
+	}
+	n := view.State.Nodes[node]
+	if n == nil || n.Kind != model.NodeAgentTask {
+		return model.InvalidInputFault("unknown task " + string(node))
+	}
+	return nil
 }
 
 // writeStoreView reads the current aggregate through the already-open

@@ -28,6 +28,16 @@ func (k WorkflowCommandKind) Valid() bool {
 // String renders the Command Kind.
 func (k WorkflowCommandKind) String() string { return string(k) }
 
+// CompleteWorkflowInput is the exact-evidence completion decision (PRD
+// 最终验收: 生成最终报告，Workflow Completed): the Workflow records
+// COMPLETED only when every Node SUCCEEDED, no Blocking Finding exists,
+// and the Integration HEAD still equals the head the independent Final
+// Reviewer verified (EVIDENCE_SUBJECT_CHANGED otherwise, with no
+// mutation). Completion never changes the Target Branch.
+type CompleteWorkflowInput struct{}
+
+func (CompleteWorkflowInput) isInput() {}
+
 // WorkflowCommandInput is a user Workflow mutation Command. CreateWorkflow
 // carries the opaque Workflow identity the Application generated; the
 // Kernel derives every later identity deterministically from the

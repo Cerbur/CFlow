@@ -114,6 +114,11 @@ const (
 	// committed closure is refused without mutation (design 12, PRD 已确
 	// 认：并行失败后的 Quiescing).
 	CodeDispatchGateClosed Code = "DISPATCH_GATE_CLOSED"
+	// CodeNotYetAvailable: a requested protocol whose full semantics land
+	// with a later task (the protected Apply, the Cleanup execute) is
+	// reported with this stable finding, never with a fabricated result
+	// (Task 18; PRD 必须提供的 CLI).
+	CodeNotYetAvailable Code = "NOT_YET_AVAILABLE"
 )
 
 // String renders the Code.
@@ -181,6 +186,7 @@ func Codes() []Code {
 		CodeSessionIndependenceViolation,
 		CodeUnexpectedAgentMutation,
 		CodeDispatchGateClosed,
+		CodeNotYetAvailable,
 	}
 }
 
@@ -421,6 +427,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeSessionIndependenceViolation, CatInvariantFailure, ScopeSession, false, true, StopAll, false),
 	p(CodeUnexpectedAgentMutation, CatSafetyStop, ScopeSession, false, true, StopAll, false),
 	p(CodeDispatchGateClosed, CatInvalidInput, ScopeRun, false, false, StopNone, false),
+	p(CodeNotYetAvailable, CatUserActionRequired, ScopeWorkflow, false, false, StopNone, false),
 }
 
 // Policy returns the compiled disposition for one Code. Every declared

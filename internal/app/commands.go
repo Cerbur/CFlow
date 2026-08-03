@@ -11,6 +11,7 @@ import (
 	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/observe"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/security"
 )
@@ -135,6 +136,17 @@ type CancelSummaryQuery struct{ Workflow model.WorkflowID }
 // the fixed Reconciliation Manifest with its per-Node categories.
 type ReplacementPreviewQuery struct{ Workflow model.WorkflowID }
 
+// ReportQuery projects the immutable Final Execution Report read model
+// (Task 18, design 21, PRD 最终报告示例): a read over approved hashes,
+// Git facts, Sessions, Attempts, Findings, verification manifests,
+// migration compatibility, security posture, permissions, and Apply
+// state. Report generation never changes Workflow state. Build is the
+// binary identity the report's Runtime section records.
+type ReportQuery struct {
+	Workflow model.WorkflowID
+	Build    observe.BuildInfo
+}
+
 func (ListQuery) isQuery()               {}
 func (StatusQuery) isQuery()             {}
 func (InspectQuery) isQuery()            {}
@@ -145,6 +157,7 @@ func (ExecutionPreviewQuery) isQuery()   {}
 func (PolicyConfirmationQuery) isQuery() {}
 func (CancelSummaryQuery) isQuery()      {}
 func (ReplacementPreviewQuery) isQuery() {}
+func (ReportQuery) isQuery()             {}
 
 // ---------------------------------------------------------------------------
 // View union: projection results
@@ -292,6 +305,13 @@ type CancelWorktree struct {
 	Unmerged bool
 }
 
+// ReportView is the rendered Final Execution Report: the read model plus
+// its redacted Markdown rendering (PRD 最终报告示例).
+type ReportView struct {
+	Report   observe.Report
+	Markdown string
+}
+
 // ReplacementPreviewView is the unified Replacement Execution Approval
 // gate: the Quarantine set with its audit Refs, the old and new
 // execution Revisions, the Replacement baseline, the routing/budget
@@ -382,6 +402,7 @@ func (ExecutionPreviewView) isView()   {}
 func (PolicyConfirmationView) isView() {}
 func (CancelSummaryView) isView()      {}
 func (ReplacementPreviewView) isView() {}
+func (ReportView) isView()             {}
 
 // ---------------------------------------------------------------------------
 // Command union (design 5, 6.1): closed mutations
@@ -571,6 +592,26 @@ type ApproveReplacementCommand struct {
 	ManifestHash         string
 }
 
+// CompleteWorkflowCommand records the Workflow's completion (Task 18,
+// PRD 最终验收): the Kernel validates the exact Integration Commit
+// evidence (every Node SUCCEEDED, no Blocking Finding, the Integration
+// HEAD still the head the independent Final Reviewer verified) and
+// records COMPLETED without changing the Target Branch. The Application
+// then writes the immutable Final Report Artifact (a rebuildable read
+// model; report generation never changes Workflow state).
+type CompleteWorkflowCommand struct {
+	Workflow model.WorkflowID
+}
+
+// RetryCommand drives one dispatch pass for a workflow whose named Task
+// carries a READY successor Attempt (PRD 必须提供的 CLI: `cflow retry
+// <task-id>`). The command validates the Task exists before any dispatch
+// and otherwise runs the ordinary dispatch pass.
+type RetryCommand struct {
+	Workflow model.WorkflowID
+	Node     model.NodeID
+}
+
 func (CreateWorkflowCommand) isCommand()      {}
 func (DiscussRequirementCommand) isCommand()  {}
 func (GeneratePlanCommand) isCommand()        {}
@@ -590,6 +631,8 @@ func (ReconcileCommand) isCommand()           {}
 func (CommitPolicyConfirmCommand) isCommand() {}
 func (ReplacementPreviewCommand) isCommand()  {}
 func (ApproveReplacementCommand) isCommand()  {}
+func (CompleteWorkflowCommand) isCommand()    {}
+func (RetryCommand) isCommand()               {}
 
 // ---------------------------------------------------------------------------
 // Outcome

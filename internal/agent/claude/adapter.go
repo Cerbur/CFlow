@@ -81,10 +81,18 @@ type ResumeRequest struct {
 // contract always carries --json-schema and an unproven schema cannot
 // promise the structured terminal event the pipeline requires (PRD 约束
 // 43).
+//
+// ContextBundleRef names the immutable redacted Context Bundle Revision
+// of the superseded LOST Session an automatic fallback successor carries
+// (Task 18; design 14.4). It is a reference only — never a credential or
+// an unredacted transcript — and a fresh Session's typed input omits it.
 type Input struct {
 	SchemaJSON   string `json:"schema_json"`
 	MaxBudgetUSD string `json:"max_budget_usd"`
 	Model        string `json:"model,omitempty"`
+	// ContextBundleRef is the persisted bundle path of the handoff ("" for
+	// a brand-new Session).
+	ContextBundleRef string `json:"context_bundle_ref,omitempty"`
 }
 
 // StartArgv builds the exact Start argv (brief acceptance): noninteractive

@@ -6,6 +6,96 @@ import (
 	"cflow.local/cflow/internal/model"
 )
 
+// decideComplete records the Workflow's completion (Task 18, PRD 最终验
+// 收: 生成最终报告，Workflow Completed). Completion requires the exact
+// Integration Commit evidence the independent Final Reviewer bound: the
+// FINAL_VERIFICATION stage, every Node SUCCEEDED, no Blocking Finding,
+// and the current Integration HEAD still equal to the head the Final
+// Verify Attempt verified (EVIDENCE_SUBJECT_CHANGED with no mutation
+// otherwise). It records COMPLETED/SUCCEEDED WITHOUT changing the Target
+// Branch: the mutation carries the recorded Target Branch, Integration
+// Branch, and Integration HEAD untouched.
+func decideComplete(state model.State, in model.CompleteWorkflowInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to complete")
+	}
+	if state.Workflow.Stage != model.StageFinalVerification {
+		return model.Decision{}, model.InvalidInputFault("completion requires the FINAL_VERIFICATION stage")
+	}
+	if state.Workflow.Runtime != model.RuntimeRunning {
+		return model.Decision{}, model.InvalidInputFault("completion requires a running workflow")
+	}
+	if hasBlockingFinding(state) {
+		return model.Decision{}, model.InvalidInputFault("a blocking finding prevents completion")
+	}
+	// Every Node of the delivery chain must be SUCCEEDED; no Node may
+	// remain PENDING, READY, RUNNING, or FAILED at completion.
+	var finalVerify *model.Node
+	for _, n := range state.Nodes {
+		if n.Status != model.NodeSucceeded {
+			return model.Decision{}, model.InvalidInputFault(
+				"completion requires every node succeeded; " + string(n.ID) + " is " + string(n.Status))
+		}
+		if n.Kind == model.NodeFinalVerify {
+			finalVerify = n
+		}
+	}
+	if finalVerify == nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("completion requires a final verify node"))
+	}
+	fv := succeededAttemptOf(state, finalVerify.ID)
+	if fv == nil || len(fv.Evidence) == 0 {
+		return model.Decision{}, model.InvalidInputFault(
+			"completion requires the succeeded final verify attempt with evidence")
+	}
+	// The exact Integration Commit evidence: the head the Final Reviewer
+	// bound must still be the current Integration HEAD (design 16.2:
+	// completion is bound to the evidence subject it verified).
+	if fv.StartHead == "" || fv.StartHead != state.Workflow.IntegrationHead {
+		return model.Decision{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the integration head moved after the final review; completion requires the exact verified head")
+	}
+	// Every Merge Node's succeeded Attempt carries commit evidence on the
+	// recorded Integration Branch: the delivery chain's evidence subjects
+	// are exact.
+	for _, n := range state.Nodes {
+		if n.Kind != model.NodeMerge {
+			continue
+		}
+		ma := succeededAttemptOf(state, n.ID)
+		if ma == nil {
+			return model.Decision{}, model.InvalidInputFault(
+				"completion requires a succeeded merge attempt for " + string(n.ID))
+		}
+		if !evidenceOn(ma.Evidence, model.EvidenceCommit, state.Workflow.IntegrationBranch) {
+			return model.Decision{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+				"a merge attempt's commit evidence subject changed; completion requires the exact verified subjects")
+		}
+	}
+	b := &builder{state: state}
+	// Completion never changes the Target Branch: wfMut carries the
+	// recorded Target Branch, Integration Branch, and Integration HEAD
+	// untouched into the terminal COMPLETED/SUCCEEDED record.
+	b.mutate(wfMut(state, model.StageCompleted, model.RuntimeSucceeded, nil))
+	b.event(model.EventWorkflowSucceeded, "", model.AttemptKey{}, "", "workflow completed")
+	if run := activeRun(state); run != nil && !run.Status.IsTerminal() {
+		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunSucceeded, DispatchGate: false})
+		b.event(model.EventRunSucceeded, "", model.AttemptKey{}, "", "run succeeded")
+	}
+	return b.decision(), nil
+}
+
+// evidenceOn reports whether one evidence list carries a reference of the
+// exact kind and subject.
+func evidenceOn(list []model.EvidenceRef, kind model.EvidenceKind, subject string) bool {
+	for _, e := range list {
+		if e.Kind == kind && e.Subject == subject {
+			return true
+		}
+	}
+	return false
+}
+
 // decideWorkflow handles the closed set of user Workflow mutation
 // Commands (design 6.1). Ordinary control allows only RUNNING→PAUSED,
 // RUNNING→BLOCKED, PAUSED→RUNNING, and BLOCKED→RUNNING (PRD 状态机与持久化

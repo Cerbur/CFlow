@@ -1348,3 +1348,23 @@ func TestInspectReportsLiveThenReaped(t *testing.T) {
 		t.Fatal("the run must not report as running after it was reaped")
 	}
 }
+
+// TestTypedInputCarriesContextBundleRef (Task 18, ledger obligation from
+// Task 16): the codex typed input carries the immutable Context Bundle
+// handoff reference of an automatic fallback so a production successor
+// Session's recorded input facts carry the handoff; a fresh Session's
+// typed input omits it.
+func TestTypedInputCarriesContextBundleRef(t *testing.T) {
+	withRef := codex.Input{SchemaPath: "/schemas/coding-output.json", Model: "gpt-5",
+		ContextBundleRef: "/evidence/sessions/lost1/bundle-1.json"}
+	body, err := json.Marshal(withRef)
+	requireNoError(t, err)
+	if !strings.Contains(string(body), `"context_bundle_ref":"/evidence/sessions/lost1/bundle-1.json"`) {
+		t.Fatalf("typed input JSON missing the bundle ref: %s", body)
+	}
+	fresh, err := json.Marshal(codex.Input{SchemaPath: "/schemas/coding-output.json", Model: "gpt-5"})
+	requireNoError(t, err)
+	if strings.Contains(string(fresh), "context_bundle_ref") {
+		t.Fatalf("fresh typed input carries a bundle ref: %s", fresh)
+	}
+}

@@ -25,7 +25,9 @@ import (
 // Verification Engine (design 16.2) and persists the Evidence Manifest
 // to the managed evidence root. Engine-level failures (identity drift,
 // executable mismatch) become typed failed results, never dangling
-// Attempts.
+// Attempts. The Final Verify Node (Task 18, PRD 最终验收) runs the
+// approved final-verify Catalog command over the full Integration range
+// inside the Integration Worktree.
 func (a *Application) verificationRun(ctx context.Context, wf model.WorkflowID, intent model.VerificationRunIntent) (model.EffectResultInput, error) {
 	fail := func(code model.Code, text string) model.EffectResultInput {
 		return model.EffectResultInput{
@@ -40,7 +42,7 @@ func (a *Application) verificationRun(ctx context.Context, wf model.WorkflowID, 
 	if _, err := a.readCatalogBody(ctx, wf, intent.Catalog); err != nil {
 		return fail(model.CodeEvidenceSubjectChanged, "catalog body cannot be read"), nil
 	}
-	commandID, taskNode, err := a.verifyNodeFacts(ctx, wf, intent.Node)
+	commandID, _, purpose, worktree, err := a.verificationNodeFacts(ctx, wf, intent.Node)
 	if err != nil {
 		return fail(model.CodeEvidenceSubjectChanged, err.Error()), nil
 	}
@@ -57,8 +59,8 @@ func (a *Application) verificationRun(ctx context.Context, wf model.WorkflowID, 
 		Node:        intent.Node,
 		Catalog:     intent.Catalog,
 		CommandID:   commandID,
-		Purpose:     verify.PurposeTaskVerify,
-		Worktree:    a.taskWorktreePath(wf, taskNode),
+		Purpose:     purpose,
+		Worktree:    worktree,
 		CommitRange: intent.CommitRange,
 	})
 	if err != nil {
@@ -286,6 +288,98 @@ func (a *Application) reviewProviderStart(ctx context.Context, wf model.Workflow
 	return out, nil
 }
 
+// finalReviewProviderStart runs the independent Final Reviewer Session
+// (Task 18, PRD 最终验收: 独立 Final Reviewer). The Final Reviewer is a
+// non-coding Session inside the Integration Worktree, bound to the exact
+// Plan/Spec/Catalog/Workflow refs, the Integration Branch and HEAD, the
+// Target Branch, and the deterministic Final Verification Manifest. The
+// Worktree's HEAD and Git-visible state must be unchanged
+// (UNEXPECTED_AGENT_MUTATION otherwise); the result echoes the final
+// verification manifest hash so the Kernel records the deterministic
+// test-result evidence with the review pass.
+func (a *Application) finalReviewProviderStart(ctx context.Context, wf model.WorkflowID, intent model.ProviderStartIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.promptForPurpose(model.PurposeFinalVerification)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the final review purpose")
+	}
+	cwd := a.integrationWorktreePath(wf)
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.finalReviewSessionInput(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := rt.Start(ctx, agent.StartRequest{
+		Purpose:   intent.Purpose,
+		Provider:  intent.Route,
+		Prompt:    prompt.Body,
+		Input:     a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, input),
+		CWD:       cwd,
+		SessionID: intent.Session,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out, err := a.runOutcome(cmd, res)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if res.Terminal != nil {
+		out.Body = []byte(res.Terminal.Result)
+	}
+	out.ManifestHash = a.verificationManifestHash(wf, intent.Node)
+	return out, nil
+}
+
+// finalReviewSessionInput builds the Final Reviewer's typed input block:
+// the Plan, the Spec set, the Verification Catalog, the compiled
+// Workflow, the Integration Branch and HEAD, the Target Branch, and the
+// deterministic Final Verification Manifest (the FINAL_REVIEW prompt's
+// input contract). The Final Reviewer is bound to the exact refs and the
+// Integration HEAD it verifies; completion later requires the same head.
+func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.WorkflowID, verifyNode model.NodeID) (any, error) {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil, err
+	}
+	manifestBody, err := a.readVerificationManifestFile(wf, verifyNode)
+	if err != nil {
+		return nil, err
+	}
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
+	st := view.State
+	return struct {
+		Plan              string `json:"plan"`
+		Spec              string `json:"spec"`
+		Catalog           string `json:"catalog"`
+		Workflow          string `json:"workflow"`
+		IntegrationBranch string `json:"integration_branch"`
+		IntegrationHead   string `json:"integration_head"`
+		TargetBranch      string `json:"target_branch"`
+		Verification      string `json:"verification"`
+	}{
+		Plan:              string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
+		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+		Catalog:           string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		Workflow:          string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		IntegrationBranch: st.Workflow.IntegrationBranch,
+		IntegrationHead:   st.Workflow.IntegrationHead,
+		TargetBranch:      st.Workflow.TargetBranch,
+		Verification:      string(manifestBody),
+	}, nil
+}
+
 // reviewSessionInput builds the Reviewer's typed input block: the Spec,
 // the Verification Catalog, the Task's Commit range, the Worktree, and
 // the deterministic Verification Manifest (the TASK_REVIEW prompt's
@@ -477,14 +571,26 @@ func (a *Application) runningAttemptKey(ctx context.Context, wf model.WorkflowID
 // verify Node's approved Catalog command id and its Task dependency's
 // node id (the Worktree the verification runs inside).
 func (a *Application) verifyNodeFacts(ctx context.Context, wf model.WorkflowID, node model.NodeID) (commandID string, taskNode model.NodeID, err error) {
+	commandID, taskNode, _, _, err = a.verificationNodeFacts(ctx, wf, node)
+	return commandID, taskNode, err
+}
+
+// verificationNodeFacts parses the compiled Workflow Artifact and returns
+// one verification Node's approved Catalog command id, its Task
+// dependency ("" for the Final Verify Node), the approved Catalog
+// purpose, and the Worktree the verification runs inside: the Task
+// Worktree for a verify Node, the Integration Worktree for the Final
+// Verify Node (Task 18, PRD 最终验收: 全量构建与测试 over the full
+// Integration range).
+func (a *Application) verificationNodeFacts(ctx context.Context, wf model.WorkflowID, node model.NodeID) (commandID string, taskNode model.NodeID, purpose verify.Purpose, worktree string, err error) {
 	store, err := a.artifactStore(wf)
 	if err != nil {
-		return "", "", err
+		return "", "", "", "", err
 	}
 	body := readArtifact(ctx, store, wf, model.ArtifactWorkflow)
 	wfIR, err := compile.ParseWorkflow(body)
 	if err != nil {
-		return "", "", fmt.Errorf("the compiled workflow cannot be parsed")
+		return "", "", "", "", fmt.Errorf("the compiled workflow cannot be parsed")
 	}
 	var found *compile.WorkflowNode
 	for i := range wfIR.Nodes {
@@ -494,17 +600,35 @@ func (a *Application) verifyNodeFacts(ctx context.Context, wf model.WorkflowID, 
 		}
 	}
 	if found == nil {
-		return "", "", fmt.Errorf("verify node is missing from the compiled workflow")
+		return "", "", "", "", fmt.Errorf("verify node is missing from the compiled workflow")
 	}
 	commandID = found.CommandID
 	if commandID == "" {
-		return "", "", fmt.Errorf("verify node references no catalog command")
+		return "", "", "", "", fmt.Errorf("verify node references no catalog command")
+	}
+	if nodeKindOf(found) == model.NodeFinalVerify {
+		return commandID, "", verify.PurposeFinalVerify, a.integrationWorktreePath(wf), nil
 	}
 	taskNode, err = taskDependencyNode(wfIR, found)
 	if err != nil {
-		return "", "", err
+		return "", "", "", "", err
 	}
-	return commandID, taskNode, nil
+	return commandID, taskNode, verify.PurposeTaskVerify, a.taskWorktreePath(wf, taskNode), nil
+}
+
+// nodeKindOf maps one compiled Workflow Node's type to its kernel kind
+// ("" when the type is not a verification node).
+func nodeKindOf(n *compile.WorkflowNode) model.NodeKind {
+	if n == nil {
+		return ""
+	}
+	switch n.Type {
+	case "final_verify":
+		return model.NodeFinalVerify
+	case "verify":
+		return model.NodeVerify
+	}
+	return ""
 }
 
 // taskDependencyNode resolves the agent-task dependency of one verify

@@ -131,10 +131,68 @@ func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, 
 		return decideVerifyDispatch(state, in)
 	case model.NodeMerge:
 		return decideMergeDispatch(state, in)
+	case model.NodeFinalVerify:
+		return decideFinalVerifyDispatch(state, in)
+	case model.NodeCheckpoint:
+		return decideCheckpointDispatch(state, in)
 	default:
 		return model.Decision{}, model.InvalidInputFault(
 			"node kind " + string(node.Kind) + " cannot be dispatched by this build")
 	}
+}
+
+// decideCheckpointDispatch settles one observation checkpoint of the
+// approved DAG (Task 18): a checkpoint is a passive observation point
+// whose inputs are the verified Merge outputs, so once every dependency
+// succeeded the checkpoint records the deterministic "checkpoint
+// reached" fact and a non-blocking Finding — the checkpoint Agent
+// Session dispatch lands with a later task. It never claims a Provider
+// run and never touches the Integration state, so the delivery chain
+// (the Final Verify after every Merge) is never permanently gated by an
+// observation point.
+func decideCheckpointDispatch(state model.State, in model.DispatchInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to dispatch")
+	}
+	switch state.Workflow.Stage {
+	case model.StageExecution, model.StageFinalVerification:
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"checkpoint dispatch requires the EXECUTION or FINAL_VERIFICATION stage")
+	}
+	run := activeRun(state)
+	if run == nil || run.Status != model.RunRunning || !run.DispatchGate {
+		return model.Decision{}, model.NewFault(model.CodeDispatchGateClosed,
+			"dispatch gate is closed; no new node may start")
+	}
+	node := state.Nodes[in.Node]
+	if node == nil {
+		return model.Decision{}, model.InvalidInputFault("unknown node " + string(in.Node))
+	}
+	if node.Kind != model.NodeCheckpoint {
+		return model.Decision{}, model.InvalidInputFault(
+			"node kind " + string(node.Kind) + " is not a checkpoint node")
+	}
+	switch node.Status {
+	case model.NodePending, model.NodeReady:
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"node " + string(node.ID) + " cannot be allocated from status " + string(node.Status))
+	}
+	b := &builder{state: state}
+	b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeSucceeded, RetryCharged: node.RetryCharged})
+	b.event(model.EventNodeSucceeded, node.ID, model.AttemptKey{}, "", "checkpoint reached")
+	b.mutate(model.FindingAppendMutation{Finding: model.Finding{
+		ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+1)),
+		Code:     model.CodeNotYetAvailable,
+		Scope:    model.ScopeWorkflow,
+		Subject:  string(node.ID),
+		Blocking: false,
+		Text:     "checkpoint observation reached; the checkpoint agent session dispatch lands with a later task",
+		Seq:      state.NextEventSeq,
+	}})
+	b.event(model.EventFindingOpened, node.ID, model.AttemptKey{}, model.CodeNotYetAvailable, "checkpoint observation recorded")
+	return b.decision(), nil
 }
 
 // decideDispatchAgentTask is the agent-task allocation. The

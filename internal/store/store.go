@@ -267,6 +267,37 @@ func (s *Store) injectFault(p FaultPoint) error {
 }
 
 // ---------------------------------------------------------------------------
+// Migration posture (the Final Report's State Compatibility section)
+// ---------------------------------------------------------------------------
+
+// AppliedMigration is one applied schema_migrations row: the version, the
+// pinned ID, and the recorded SHA-256 of the applied SQL (design 9).
+type AppliedMigration struct {
+	Version int
+	ID      string
+	SHA256  string
+}
+
+// AppliedMigrations returns the applied schema_migrations rows of the
+// open database in version order (""/zero when the database does not
+// exist yet). The Final Report reads it to report the migration
+// compatibility posture; reads never migrate (design 6.1).
+func (s *Store) AppliedMigrations(ctx context.Context) ([]AppliedMigration, error) {
+	if !s.exists {
+		return nil, nil
+	}
+	st, err := s.readSchemaState(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppliedMigration, 0, len(st.applied))
+	for _, a := range st.applied {
+		out = append(out, AppliedMigration{Version: a.Version, ID: a.ID, SHA256: a.SHA256})
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
 // View
 // ---------------------------------------------------------------------------
 

@@ -514,6 +514,12 @@ func TestCompileAppliesCheckpointPatch(t *testing.T) {
 	if !edges["merge-s01->checkpoint-1"] || !edges["checkpoint-1->final-verify"] {
 		t.Fatalf("checkpoint edges = %v", edges)
 	}
+	// The DAG never carries a self-edge: the checkpoint's successor set is
+	// captured before its incoming edge lands (Task 18 fix; a self-loop
+	// would permanently gate the final verify).
+	if edges["checkpoint-1->checkpoint-1"] {
+		t.Fatalf("checkpoint edges carry a self-loop: %v", edges)
+	}
 	// The final verify remains reachable through the checkpoint.
 	reach := reachableFromRoots(wf)
 	if !reach["final-verify"] {

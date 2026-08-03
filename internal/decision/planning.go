@@ -101,6 +101,13 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageExecution {
 				return decideReviewRunEnded(state, in, created)
 			}
+		case model.PurposeFinalVerification:
+			// The independent Final Reviewer Session (Task 18, PRD 最终验
+			// 收): the same evidence judgment over the full Integration
+			// result inside the FINAL_VERIFICATION stage.
+			if state.Workflow.Stage == model.StageFinalVerification {
+				return decideReviewRunEnded(state, in, created)
+			}
 		}
 		return model.Decision{}, model.InvariantFault(fmt.Errorf(
 			"provider run completed in an unexpected stage %s for purpose %s",
@@ -126,41 +133,28 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 	switch created.Purpose {
 	case model.PurposeImplementation, model.PurposeReview, model.PurposeRepair:
 		if state.Workflow.Stage == model.StageExecution {
-			if attempt := attemptBySession(state, created.ID); attempt != nil {
-				node := state.Nodes[attempt.Key.Node]
-				if node == nil {
-					return model.Decision{}, model.InvariantFault(fmt.Errorf("attempt %s has no node", attempt.Key))
-				}
-				b := &builder{state: state}
-				b.mutate(sessionEnd(state, created, in))
-				if code == model.CodeUserInterrupted {
-					// A user Ctrl+C interruption is never a Provider
-					// failure and never charges the Retry Budget (PRD
-					// 失败分类, USER_INTERRUPTED): the Attempt settles
-					// INTERRUPTED carrying the interruption code and no
-					// successor is allocated.
-					return settleInterrupted(state, node, attempt, model.EffectResultInput{
-						Kind:        model.AttemptEnded,
-						Attempt:     attempt.Key,
-						Outcome:     model.OutcomeInterrupted,
-						FailureCode: model.CodeUserInterrupted,
-						EndHead:     in.EndHead,
-					}, b)
-				}
-				if err := appendFallbackSuccessor(b, state, created, in); err != nil {
-					return model.Decision{}, err
-				}
-				return decideAttemptFailure(state, node, attempt, model.EffectResultInput{
-					Kind:             model.AttemptEnded,
-					Attempt:          attempt.Key,
-					Outcome:          model.OutcomeFailed,
-					FailureCode:      code,
-					EndHead:          in.EndHead,
-					SuccessorSession: in.SuccessorSession,
-				}, code, b)
-			}
+			return settleExecutionSessionFailure(state, in, created, code)
+		}
+	case model.PurposeFinalVerification:
+		// A failed or cancelled Final Reviewer Session settles its
+		// Final Verify Attempt with the compiled failure code inside
+		// the FINAL_VERIFICATION stage (Task 18).
+		if state.Workflow.Stage == model.StageFinalVerification {
+			return settleExecutionSessionFailure(state, in, created, code)
 		}
 	}
+	// A failed or cancelled run outside the execution stages — a planning
+	// Session, a Plan Check (which also restores the Plan to DRAFT: the
+	// Checker produced no judgment, so the Plan cannot stay CHECKING), or
+	// an execution Session without an Attempt — settles with the failure
+	// code and a Finding; the Workflow stays where it is.
+	return settleSessionFinding(state, in, created, code)
+}
+
+// settleSessionFinding settles a failed or cancelled Session without an
+// execution Attempt: the failure code and a Finding; the Workflow stays
+// where it is. A failed Check restores the Plan to DRAFT review.
+func settleSessionFinding(state model.State, in model.EffectResultInput, created *model.Session, code model.Code) (model.Decision, error) {
 	b := &builder{state: state}
 	if created.Purpose == model.PurposePlanCheck && state.Plan != nil &&
 		state.Plan.Status == model.PlanChecking {
@@ -178,6 +172,48 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 	}})
 	b.event(model.EventFindingOpened, "", model.AttemptKey{}, code, "provider run failed")
 	return b.decision(), nil
+}
+
+// settleExecutionSessionFailure settles the RUNNING Attempt of a failed
+// or cancelled coding/review/final-review Session with the compiled
+// failure code (an interrupted run never charges the Retry Budget, PRD
+// 失败分类). A Session without an Attempt settles with the failure code
+// and a Finding, mirroring the planning failure path.
+func settleExecutionSessionFailure(state model.State, in model.EffectResultInput, created *model.Session, code model.Code) (model.Decision, error) {
+	if attempt := attemptBySession(state, created.ID); attempt != nil {
+		node := state.Nodes[attempt.Key.Node]
+		if node == nil {
+			return model.Decision{}, model.InvariantFault(fmt.Errorf("attempt %s has no node", attempt.Key))
+		}
+		b := &builder{state: state}
+		b.mutate(sessionEnd(state, created, in))
+		if code == model.CodeUserInterrupted {
+			// A user Ctrl+C interruption is never a Provider
+			// failure and never charges the Retry Budget (PRD
+			// 失败分类, USER_INTERRUPTED): the Attempt settles
+			// INTERRUPTED carrying the interruption code and no
+			// successor is allocated.
+			return settleInterrupted(state, node, attempt, model.EffectResultInput{
+				Kind:        model.AttemptEnded,
+				Attempt:     attempt.Key,
+				Outcome:     model.OutcomeInterrupted,
+				FailureCode: model.CodeUserInterrupted,
+				EndHead:     in.EndHead,
+			}, b)
+		}
+		if err := appendFallbackSuccessor(b, state, created, in); err != nil {
+			return model.Decision{}, err
+		}
+		return decideAttemptFailure(state, node, attempt, model.EffectResultInput{
+			Kind:             model.AttemptEnded,
+			Attempt:          attempt.Key,
+			Outcome:          model.OutcomeFailed,
+			FailureCode:      code,
+			EndHead:          in.EndHead,
+			SuccessorSession: in.SuccessorSession,
+		}, code, b)
+	}
+	return settleSessionFinding(state, in, created, code)
 }
 
 // appendFallbackSuccessor persists the automatic fallback successor

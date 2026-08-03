@@ -252,10 +252,15 @@ func applyPatch(wf *Workflow, patchBody []byte, specs []Spec, groups [][]string,
 			id := fmt.Sprintf("checkpoint-%d", checkpoints)
 			wf.Nodes = append(wf.Nodes, WorkflowNode{ID: id, Type: nodeTypeCheckpoint})
 			// The checkpoint observes the node's outputs and passes them
-			// to every successor, preserving the DAG.
+			// to every successor, preserving the DAG. The successor set is
+			// captured BEFORE the incoming edge lands in the list: reading
+			// it after would see the new edge and wire a self-loop, which
+			// would permanently gate every successor (Task 18 fix; the
+			// DAG never carries a self-edge).
+			next := successors(op.NodeID)
 			wf.Edges = append(wf.Edges, WorkflowEdge{From: op.NodeID, To: id})
-			for _, next := range successors(op.NodeID) {
-				wf.Edges = append(wf.Edges, WorkflowEdge{From: id, To: next})
+			for _, s := range next {
+				wf.Edges = append(wf.Edges, WorkflowEdge{From: id, To: s})
 			}
 			exists[id] = true
 		case "tighten_budget":

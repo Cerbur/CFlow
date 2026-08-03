@@ -193,6 +193,8 @@ func (a *Application) promptForPurpose(purpose model.AgentPurpose) (agent.Prompt
 		name = "TASK_REVIEW"
 	case model.PurposeRepair:
 		name = "TASK_REPAIR"
+	case model.PurposeFinalVerification:
+		name = "FINAL_VERIFICATION"
 	}
 	if name == "" {
 		return agent.Prompt{}, false

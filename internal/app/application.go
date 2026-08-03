@@ -231,6 +231,8 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryCancelSummary(ctx, qq)
 	case ReplacementPreviewQuery:
 		return a.queryReplacementPreview(ctx, qq)
+	case ReportQuery:
+		return a.queryReport(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -384,13 +386,22 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 		}
 	}
 	var out Outcome
-	if _, ok := cmd.(DispatchCommand); ok {
+	switch cmd.(type) {
+	case DispatchCommand, RetryCommand:
 		out, err = a.executeDispatch(ctx, st, wf, restricted)
-	} else {
+	default:
 		out, err = a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
 	}
 	if err != nil {
 		return Outcome{}, orCtx(ctx, err)
+	}
+	// The immutable Final Report Artifact follows the completion Decision
+	// (PRD 最终验收: 生成 final-report.md). The report is a rebuildable read
+	// model; writing it never changes Workflow state.
+	if _, ok := cmd.(CompleteWorkflowCommand); ok {
+		if merr := a.writeFinalReport(ctx, wf, st); merr != nil {
+			return Outcome{}, orCtx(ctx, merr)
+		}
 	}
 	// The workflow.yaml artifact manifest follows the Plan Revision it
 	// records (PRD Workflow 元信息: artifacts.active_plan). The read goes
@@ -849,6 +860,25 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			return nil, "", err
 		}
 		return input, wf, nil
+	case CompleteWorkflowCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.CompleteWorkflowInput{}, wf, nil
+	case RetryCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		// The named Task must exist in the installed graph before any
+		// dispatch (PRD 必须提供的 CLI: `cflow retry <task-id>`).
+		if err := a.validateTaskNode(ctx, wf, c.Node); err != nil {
+			return nil, "", err
+		}
+		// The retry runs the ordinary dispatch pass; the kernel Input
+		// placeholder is unused by the dispatch path.
+		return model.DispatchInput{}, wf, nil
 	case ApproveReplacementCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

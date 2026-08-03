@@ -70,13 +70,26 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 		{
 			Use:   "inspect [workflow-id]",
 			Short: "show the full workflow aggregate",
-			Args:  cobra.MaximumNArgs(1),
+			Args:  cobra.MaximumNArgs(2),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
 					return err
+				}
+				// `cflow inspect task <task-id> [workflow-id]` renders one
+				// Task's delivery evidence (PRD 必须提供的 CLI).
+				if len(args) > 0 && args[0] == "task" {
+					if len(args) < 2 {
+						return model.InvalidInputFault("inspect task requires a task id")
+					}
+					view, err := a.Query(ctx, app.InspectQuery{Workflow: workflowArg(args[2:])})
+					if err != nil {
+						return err
+					}
+					return renderTaskInspect(cmd.OutOrStdout(), view.(app.InspectView),
+						model.NodeID(args[1]), deps.Redaction)
 				}
 				view, err := a.Query(ctx, app.InspectQuery{Workflow: workflowArg(args)})
 				if err != nil {
@@ -287,6 +300,63 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				return executeMutation(cmd, deps, app.DryRunCommand{Workflow: workflowArg(args)})
+			},
+		},
+		{
+			Use:   "retry <task-id> [workflow-id]",
+			Short: "drive one dispatch pass for a task with a ready retry",
+			Args:  cobra.MinimumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return executeMutation(cmd, deps, app.RetryCommand{
+					Workflow: workflowArg(args[1:]), Node: model.NodeID(args[0]),
+				})
+			},
+		},
+		{
+			Use:   "cleanup [workflow-id]",
+			Short: "produce the cleanup dry-run manifest (execute lands with a later task)",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				// The cleanup dry-run entry (PRD 必须提供的 CLI); the
+				// exact-confirmation execute protocol lands with Task 20
+				// and returns the stable NOT_YET_AVAILABLE finding.
+				if execute, _ := cmd.Flags().GetString("execute"); execute != "" {
+					return model.NewFault(model.CodeNotYetAvailable,
+						"cleanup --execute is not yet available; the exact-confirmation cleanup protocol lands with a later task")
+				}
+				return executeMutation(cmd, deps, app.DryRunCommand{Workflow: workflowArg(args)})
+			},
+		},
+		{
+			Use:   "apply [workflow-id]",
+			Short: "apply preflight entry (the protected apply lands with a later task)",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				// The Gate 3 protected Apply (Target compare-and-swap,
+				// design 18) lands with a later task; until then the
+				// command returns the stable NOT_YET_AVAILABLE finding
+				// and never claims an apply.
+				return model.NewFault(model.CodeNotYetAvailable,
+					"the protected apply to the target branch is not yet available; the workflow stays on the integration branch")
+			},
+		},
+		{
+			Use:   "report [workflow-id]",
+			Short: "render the final execution report read model",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd, nil)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.ReportQuery{Workflow: workflowArg(args), Build: deps.Build})
+				if err != nil {
+					return err
+				}
+				fmt.Fprint(cmd.OutOrStdout(), view.(app.ReportView).Markdown)
+				return nil
 			},
 		},
 		{
@@ -520,6 +590,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 		findCommand(cmds, name).Flags().String("provider", "fake", "provider route")
 	}
 	findCommand(cmds, "workflow-create").Flags().Bool("yes", false, "assume yes for the dirty-workspace confirmation")
+	findCommand(cmds, "cleanup").Flags().String("execute", "", "execute a produced cleanup manifest (not yet available)")
 	return cmds
 }
 
@@ -628,6 +699,8 @@ func workflowOf(command app.Command) model.WorkflowID {
 	case app.ReplacementPreviewCommand:
 		return c.Workflow
 	case app.ApproveReplacementCommand:
+		return c.Workflow
+	case app.RetryCommand:
 		return c.Workflow
 	}
 	return ""

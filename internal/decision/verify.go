@@ -35,6 +35,99 @@ func verifyFailureCode(node *model.Node) model.Code {
 	return model.CodeCommandFailed
 }
 
+// decideFinalVerifyDispatch allocates the Final Verify Node (Task 18,
+// PRD 最终验收): the RUNNING Attempt commits at the recorded Integration
+// HEAD, the independent Final Reviewer Session of the FINAL_VERIFICATION
+// purpose is recorded, the Workflow moves to the FINAL_VERIFICATION
+// stage, and the VerificationRun Intent requests the approved final-verify
+// Catalog command over the full Integration range base_commit..head. The
+// Final Reviewer is always a fresh Session of its own purpose — it can
+// never be or chain the implementer's Session (design 14.4).
+func decideFinalVerifyDispatch(state model.State, in model.DispatchInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to dispatch")
+	}
+	switch state.Workflow.Stage {
+	case model.StageExecution, model.StageFinalVerification:
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"final verify dispatch requires the EXECUTION or FINAL_VERIFICATION stage")
+	}
+	run := activeRun(state)
+	if run == nil || run.Status != model.RunRunning || !run.DispatchGate {
+		return model.Decision{}, model.NewFault(model.CodeDispatchGateClosed,
+			"dispatch gate is closed; no new node may start")
+	}
+	node := state.Nodes[in.Node]
+	if node == nil {
+		return model.Decision{}, model.InvalidInputFault("unknown node " + string(in.Node))
+	}
+	if node.Kind != model.NodeFinalVerify {
+		return model.Decision{}, model.InvalidInputFault(
+			"node kind " + string(node.Kind) + " is not a final verify node")
+	}
+	switch node.Status {
+	case model.NodePending, model.NodeReady:
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"node " + string(node.ID) + " cannot be allocated from status " + string(node.Status))
+	}
+	if in.Session == "" || in.Route == "" {
+		return model.Decision{}, model.InvalidInputFault(
+			"final verify allocation requires the final reviewer session and the approved route")
+	}
+	if state.Workflow.IntegrationHead == "" {
+		return model.Decision{}, model.InvalidInputFault(
+			"final verify allocation requires a recorded integration head")
+	}
+	facts := state.Workflow.ExecutionFacts
+	if facts == nil || facts.CatalogRevision < 1 || facts.CatalogHash == "" {
+		return model.Decision{}, model.InvalidInputFault(
+			"final verify allocation requires the approved verification catalog")
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	number := nextAttemptNumber(state, node.ID)
+	key := model.AttemptKey{Node: node.ID, Number: number}
+	b := &builder{state: state}
+	b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeRunning, RetryCharged: node.RetryCharged})
+	b.event(model.EventNodeStarted, node.ID, key, "", "final verify node started")
+	// The independent Final Reviewer Session is a fresh Session of the
+	// final-verification purpose (design 14.4): it can never share the
+	// implementer's lineage.
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID: in.Session, Purpose: model.PurposeFinalVerification, Status: model.SessionStarting,
+	}, Provider: in.Route})
+	if in.Process != "" {
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.Process, Session: in.Session, Purpose: model.PurposeFinalVerification,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
+	b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
+		Key:       key,
+		Session:   in.Session,
+		Status:    model.AttemptRunning,
+		StartHead: state.Workflow.IntegrationHead,
+		StartedAt: state.Now,
+	}})
+	b.event(model.EventAttemptCreated, node.ID, key, "", "final verify attempt created")
+	// The Workflow enters the final acceptance stage for the last node of
+	// the delivery chain (PRD 状态机与持久化模型: EXECUTION ->
+	// FINAL_VERIFICATION -> COMPLETED).
+	b.mutate(wfMut(state, model.StageFinalVerification, state.Workflow.Runtime, state.Workflow.CancelIntent))
+	b.event(model.EventStageChanged, "", model.AttemptKey{}, "", "stage changed to FINAL_VERIFICATION")
+	b.effect(model.VerificationRunIntent{
+		Node: node.ID,
+		Catalog: model.CatalogRef{
+			Revision: facts.CatalogRevision, Hash: facts.CatalogHash,
+		},
+		CommitRange: state.Workflow.BaseCommit + ".." + state.Workflow.IntegrationHead,
+	})
+	return b.decision(), nil
+}
+
 // decideVerifyDispatch allocates one verify Node (design 12/16): the
 // RUNNING Attempt commits with the Commit under verification, the
 // independent Reviewer Session is recorded (its route is the approved
@@ -131,9 +224,11 @@ func decideVerifyDispatch(state model.State, in model.DispatchInput) (model.Deci
 }
 
 // decideVerificationRunEnded routes one VerificationRunEnded result: a
-// failed run settles the verify Attempt with the compiled failure code
-// (and cancels the never-started Reviewer Session); a passed run starts
-// the Reviewer Session bound to the exact Commit/Catalog/evidence refs.
+// failed run settles the verify (or final verify) Attempt with the
+// compiled failure code (and cancels the never-started Reviewer Session);
+// a passed run starts the independent Reviewer Session bound to the exact
+// Commit/Catalog/evidence refs — the TASK_REVIEW Session for a verify
+// Node, the FINAL_VERIFICATION Session for the Final Verify Node.
 func decideVerificationRunEnded(state model.State, in model.EffectResultInput) (model.Decision, error) {
 	attempt := state.Attempts[in.Attempt]
 	if attempt == nil {
@@ -143,7 +238,7 @@ func decideVerificationRunEnded(state model.State, in model.EffectResultInput) (
 		return model.Decision{}, model.InvalidInputFault("attempt " + in.Attempt.String() + " is not running")
 	}
 	node := state.Nodes[attempt.Key.Node]
-	if node == nil || node.Kind != model.NodeVerify {
+	if node == nil || (node.Kind != model.NodeVerify && node.Kind != model.NodeFinalVerify) {
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("verification result references a non-verify node"))
 	}
 	b := &builder{state: state}
@@ -174,7 +269,10 @@ func decideVerificationRunEnded(state model.State, in model.EffectResultInput) (
 	}
 	b.effect(model.ProviderStartIntent{
 		Session: attempt.Session,
-		Purpose: model.PurposeReview,
+		// The Reviewer Session's own purpose rides the start intent: the
+		// Final Verify Node starts the FINAL_VERIFICATION reviewer, never
+		// a TASK_REVIEW Session (design 14.4).
+		Purpose: review.Purpose,
 		Route:   review.Provider,
 		Node:    node.ID,
 		Process: processOfAttempt(state, attempt.Key),

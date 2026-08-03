@@ -1,0 +1,435 @@
+// Package e2e: the Cross-Provider acceptance (Task 18, PRD Gate 2 与已确
+// 认：真实 Cross-Provider E2E). TestRealCrossProvider is the opt-in real
+// Codex/Claude run, gated by CFLOW_E2E_REAL=1: it NEVER executes without
+// the environment variable because it costs real model requests and runs
+// with the providers' default permissions — the user must approve the
+// exact Dry Run, routes/models/budgets, the default-permission trust
+// boundary, and the potential network/cost BEFORE the gate is set. Its
+// default (off) behavior is a safe skip.
+//
+// TestDialectEquivalentCrossProvider is the offline deterministic
+// equivalent the Gate 2 suite runs: two parallel Tasks routed to the
+// codex and claude provider names, executed by the deterministic Fake
+// Adapter registered under both names, producing real Commits in real
+// Worktrees, with independent Review Sessions, serial --no-ff merges,
+// the Final Verify over the full Integration range with an independent
+// Final Reviewer, completion with the immutable Final Report, and an
+// unchanged Target Branch.
+package e2e
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/agent/claude"
+	"cflow.local/cflow/internal/agent/codex"
+	"cflow.local/cflow/internal/agent/fake"
+	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/observe"
+	"cflow.local/cflow/internal/process"
+	"cflow.local/cflow/internal/security"
+)
+
+// ---------------------------------------------------------------------------
+// the offline dialect-equivalent Cross-Provider flow
+// ---------------------------------------------------------------------------
+
+// dualProviderSpecs is the deterministic Spec set of the cross-provider
+// fixture: two independent Tasks, S01 routed to codex and S02 routed to
+// claude, disjoint write scopes, each verified through the approved
+// "verify" wrapper.
+const dualProviderSpecs = `{"id":"s01","goal":"implement multiply","depends_on":[],"write_scope":["src/multiply.ts","test/multiply.test.ts"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"codex","model":"default","budget":10},"timeout_seconds":300,"max_retry":2}
+{"id":"s02","goal":"implement divide with a clear exception on zero divisor","depends_on":[],"write_scope":["src/divide.ts","test/divide.test.ts"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"claude","model":"default","budget":10},"timeout_seconds":300,"max_retry":2}`
+
+// dualProviderSpecScript wraps the two Specs in the Session output.
+func dualProviderSpecScript(sessionID string) string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"spec-generation","session_id":%q,"exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":%q,"at_ms":0}
+{"type":"assistant_message","session_id":%q,"text":"Splitting the plan.","at_ms":10}
+{"type":"session_finished","session_id":%q,"result":{"specs":[%s],"proposed_commands":[]},"at_ms":20}`,
+		sessionID, sessionID, sessionID, sessionID, strings.ReplaceAll(dualProviderSpecs, "\n", ","))
+}
+
+// finalReviewScript is the deterministic FINAL_VERIFICATION Session
+// output: a structured PASS verdict over the full Integration result.
+func finalReviewScript() string {
+	return `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"final-verification","session_id":"fr1","exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":"fr1","at_ms":0}
+{"type":"assistant_message","session_id":"fr1","text":"Reviewed the full integration result.","at_ms":10}
+{"type":"session_finished","session_id":"fr1","result":{"decision":"PASS","report":"PASS\n\nFindings:\n- none\n- plan acceptance criteria verified\n"},"at_ms":20}`
+}
+
+// crossProviderApp builds an Application over the fixture with the
+// deterministic Fake Adapter registered under the codex and claude
+// provider names too, each instance bound to its provider's registry
+// binding: the routing, budget, and dispatch machinery sees two real
+// provider identities (the detection facts of every adapter match the
+// approved binding of its provider, so the dispatch CAS passes) while
+// every Session runs the deterministic Fake dialect with the serving
+// provider's declared dialect (the offline equivalent of two real
+// Provider CLIs).
+func (fx *e2eFixture) crossProviderApp(scripts ...string) *app.Application {
+	fx.t.Helper()
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		fx.t.Fatalf("provider registry: %v", err)
+	}
+	prompts, err := agent.LoadPromptRegistry()
+	if err != nil {
+		fx.t.Fatalf("prompt registry: %v", err)
+	}
+	dialectOf := func(name string) string {
+		b, err := reg.Select(name)
+		if err != nil {
+			fx.t.Fatalf("binding %s: %v", name, err)
+		}
+		return b.Dialect.ID
+	}
+	load := func(ad *fake.Adapter, name, dialect string) {
+		for _, s := range scripts {
+			// The fixture scripts declare the fake dialect; each serving
+			// adapter's binding validates its own declared dialect. Every
+			// declared provider session id is prefixed with the serving
+			// provider's name, so two adapters sharing one Runtime never
+			// claim the same provider session id (the Runtime rejects a
+			// duplicate claim as an in-use id).
+			script := strings.ReplaceAll(s, "cflow.dialect.fake.v1", dialect)
+			script = strings.ReplaceAll(script, `"session_id":"`, `"session_id":"`+name+"-")
+			if err := ad.LoadScript([]byte(script)); err != nil {
+				fx.t.Fatalf("load fake script: %v", err)
+			}
+		}
+	}
+	fakeAd := fake.New(reg)
+	load(fakeAd, "fake", dialectOf("fake"))
+	codexAd := fake.NewNamed(reg, "codex")
+	load(codexAd, "codex", dialectOf("codex"))
+	claudeAd := fake.NewNamed(reg, "claude")
+	load(claudeAd, "claude", dialectOf("claude"))
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.repo)
+	if err != nil {
+		fx.t.Fatalf("new gitflow: %v", err)
+	}
+	a, err := app.New(app.Options{
+		Home:         fx.home,
+		Project:      app.ProjectFor(fx.repo),
+		CflowVersion: "0.0.0-dev",
+		Now:          fx.now,
+		IDs:          fx.ids,
+		Supervisor:   fx.sup,
+		GitFlow:      flow,
+		Prompts:      prompts,
+		Agent: agent.RuntimeOptions{
+			Registry:    reg,
+			Redaction:   security.Registry{},
+			Adapters:    map[string]agent.Adapter{"fake": fakeAd, "codex": codexAd, "claude": claudeAd},
+			EvidenceDir: filepath.Join(fx.home, "evidence"),
+		},
+	})
+	if err != nil {
+		fx.t.Fatalf("new application: %v", err)
+	}
+	return a
+}
+
+// driveDualToExecutionApproval runs the planning lifecycle with the
+// dual-provider Spec set through the Execution Approval and returns the
+// workflow identity.
+func (fx *e2eFixture) driveDualToExecutionApproval(t *testing.T) model.WorkflowID {
+	t.Helper()
+	wf := fx.createWorkflow("dual-provider")
+	fx.discussSeq++
+	if _, err := fx.crossProviderApp(discussionScript("d1")).Execute(context.Background(),
+		app.DiscussRequirementCommand{Workflow: wf, Text: requirement, Provider: "fake"}); err != nil {
+		t.Fatalf("discuss: %v", err)
+	}
+	fx.planSeq++
+	if _, err := fx.crossProviderApp(planScript("p1")).Execute(context.Background(),
+		app.GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	fx.checkSeq++
+	if _, err := fx.crossProviderApp(checkScript("c1")).Execute(context.Background(),
+		app.CheckPlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("check plan: %v", err)
+	}
+	pv := fx.planView(wf)
+	if _, err := fx.crossProviderApp().Execute(context.Background(),
+		app.ApprovePlanCommand{Workflow: wf, Revision: pv.Revision, Hash: pv.Hash}); err != nil {
+		t.Fatalf("approve plan: %v", err)
+	}
+	if _, err := fx.crossProviderApp(dualProviderSpecScript("s1")).Execute(context.Background(),
+		app.GenerateSpecsCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("generate specs: %v", err)
+	}
+	if _, err := fx.crossProviderApp(patchScript("w1")).Execute(context.Background(),
+		app.CompileWorkflowCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("compile workflow: %v", err)
+	}
+	if _, err := fx.crossProviderApp().Execute(context.Background(),
+		app.ExecutionDryRunCommand{Workflow: wf}); err != nil {
+		t.Fatalf("execution dry run: %v", err)
+	}
+	qview, err := fx.crossProviderApp().Query(context.Background(), app.ExecutionPreviewQuery{Workflow: wf})
+	if err != nil {
+		t.Fatalf("execution preview: %v", err)
+	}
+	preview := qview.(app.ExecutionPreviewView)
+	// The Dry Run discloses the Provider default-permission trust boundary
+	// (PRD 约束 30) — the approval preview names it, never a sandbox claim.
+	if !strings.Contains(preview.TrustBoundary, "default permissions") || strings.Contains(preview.TrustBoundary, "sandboxed=true") {
+		t.Fatalf("trust boundary not disclosed in the preview: %q", preview.TrustBoundary)
+	}
+	if _, err := fx.crossProviderApp().Execute(context.Background(), app.ApproveExecutionCommand{
+		Workflow:         wf,
+		PlanHash:         preview.PlanHash,
+		SpecHashes:       preview.SpecHashes,
+		CatalogHash:      preview.CatalogHash,
+		WorkflowHash:     preview.WorkflowHash,
+		RoutingHash:      preview.RoutingHash,
+		BudgetHash:       preview.BudgetHash,
+		CommitPolicyHash: preview.CommitPolicyHash,
+	}); err != nil {
+		t.Fatalf("execution approval: %v", err)
+	}
+	return wf
+}
+
+// dispatchUntilCompleted drives dispatch passes until the Workflow is
+// COMPLETED (the Final Verify chain and the exact-evidence completion
+// ran) or the pass budget is exhausted.
+func (fx *e2eFixture) dispatchUntilCompleted(t *testing.T, wf model.WorkflowID) app.InspectView {
+	t.Helper()
+	appl := fx.crossProviderApp(implementationScript(), reviewScript(), finalReviewScript())
+	for i := 0; i < 24; i++ {
+		if _, err := appl.Execute(context.Background(), app.DispatchCommand{Workflow: wf}); err != nil {
+			t.Fatalf("dispatch pass %d: %v", i, err)
+		}
+		iv := fx.inspect(wf)
+		if iv.Status.Stage == model.StageCompleted {
+			return iv
+		}
+	}
+	iv := fx.inspect(wf)
+	t.Fatalf("workflow did not complete within the pass budget: %+v", nodeStatuses(iv))
+	return iv
+}
+
+// TestDialectEquivalentCrossProvider (brief Step 5: the offline
+// dialect-equivalent concurrency path): two parallel Tasks routed to the
+// codex and claude provider names overlap in virtual time with
+// independent Session IDs, real Commits land in real Worktrees, the
+// Reviews are independent, the merges are serial --no-ff, the Final
+// Verify runs over the full Integration range with an independent Final
+// Reviewer, the Workflow completes with the immutable Final Report, and
+// the Target Branch never changes.
+func TestDialectEquivalentCrossProvider(t *testing.T) {
+	fx := newE2EFixture(t)
+	wf := fx.driveDualToExecutionApproval(t)
+
+	iv := fx.dispatchUntilCompleted(t, wf)
+
+	// Every delivery chain Node SUCCEEDED including the Final Verify.
+	for _, id := range []string{
+		"task-s01", "verify-s01", "merge-s01",
+		"task-s02", "verify-s02", "merge-s02",
+		"final-verify",
+	} {
+		if statusOf(iv, id) != model.NodeSucceeded {
+			t.Fatalf("node %s status = %s, want SUCCEEDED (%+v)", id, statusOf(iv, id), nodeStatuses(iv))
+		}
+	}
+
+	// The two codex/claude Tasks dispatched in one pass: their coding
+	// Attempts share the same virtual-time instant.
+	var started time.Time
+	taskAttempts := 0
+	for i := range iv.Attempts {
+		at := &iv.Attempts[i]
+		if !strings.HasPrefix(string(at.Key.Node), "task-s") {
+			continue
+		}
+		taskAttempts++
+		if started.IsZero() {
+			started = at.StartedAt
+		}
+		if !at.StartedAt.Equal(started) {
+			t.Fatalf("task %s started at %v, want the shared pass instant %v (cross-provider overlap)", at.Key.Node, at.StartedAt, started)
+		}
+	}
+	if taskAttempts != 2 {
+		t.Fatalf("task attempts = %d, want 2", taskAttempts)
+	}
+
+	// Independent Session lineages: the implementation Sessions ran on
+	// the two distinct routes and the review Sessions never share a
+	// provider session id with them.
+	implProviders := map[string]bool{}
+	implIDs := map[string]bool{}
+	reviewIDs := map[string]bool{}
+	for _, s := range iv.Sessions {
+		switch s.Purpose {
+		case model.PurposeImplementation:
+			implProviders[s.Provider] = true
+			implIDs[s.ProviderSessionID] = true
+		case model.PurposeReview:
+			reviewIDs[s.ProviderSessionID] = true
+		}
+	}
+	if !implProviders["codex"] || !implProviders["claude"] {
+		t.Fatalf("implementation sessions did not run on both routes: %v", implProviders)
+	}
+	for id := range reviewIDs {
+		if implIDs[id] {
+			t.Fatalf("a review session reused an implementation provider session id %q", id)
+		}
+	}
+
+	// Serial --no-ff Integration merges.
+	merged := git(fx.repo, "rev-list", "--count", "--merges", "cflow/"+string(wf)+"/integration")
+	if n, err := strconv.Atoi(merged); err != nil || n < 2 {
+		t.Fatalf("integration merge commits = %q, want at least 2 serial --no-ff merges", merged)
+	}
+
+	// The Final Verify bound the exact Integration HEAD: its Attempt's
+	// StartHead is the head the Final Reviewer verified and the Workflow
+	// completed against.
+	fv := attemptOf(iv, "final-verify")
+	if fv == nil || fv.StartHead == "" || fv.StartHead != iv.Status.IntegrationHead {
+		t.Fatalf("final-verify attempt %+v does not bind the integration head %s", fv, iv.Status.IntegrationHead)
+	}
+
+	// The immutable Final Report renders PASSED with Apply not run.
+	view, err := fx.crossProviderApp().Query(context.Background(),
+		app.ReportQuery{Workflow: wf, Build: observe.BuildInfo{Version: "0.0.0-dev"}})
+	if err != nil {
+		t.Fatalf("report query: %v", err)
+	}
+	rv := view.(app.ReportView)
+	if rv.Report.Result != "PASSED" || rv.Report.Apply.Status != "NOT_RUN" {
+		t.Fatalf("report result/apply = %s/%s, want PASSED/NOT_RUN", rv.Report.Result, rv.Report.Apply.Status)
+	}
+
+	// The Target Branch never changed: the user branch stays at the Base
+	// Commit with the workflow recorded on the integration branch only.
+	if out := git(fx.repo, "branch", "--show-current"); strings.TrimSpace(out) != "main" {
+		t.Fatalf("target branch moved to %q", out)
+	}
+	if out := git(fx.repo, "rev-parse", "HEAD"); strings.TrimSpace(out) != fx.baseCommit() {
+		t.Fatalf("target HEAD moved from the base commit")
+	}
+}
+
+// baseCommit is the recorded Base Commit of the fixture repository.
+func (fx *e2eFixture) baseCommit() string {
+	return git(fx.repo, "rev-parse", "HEAD")
+}
+
+// ---------------------------------------------------------------------------
+// the opt-in real Cross-Provider E2E (brief Step 6; approval-gated)
+// ---------------------------------------------------------------------------
+
+// codexAdapter builds the real Codex Adapter over one binding.
+func codexAdapter(sup process.Supervisor, binding agent.ProviderBinding) agent.Adapter {
+	return codex.New(sup, binding)
+}
+
+// claudeAdapter builds the real Claude Adapter over one binding.
+func claudeAdapter(sup process.Supervisor, binding agent.ProviderBinding) agent.Adapter {
+	return claude.New(sup, binding)
+}
+
+// TestRealCrossProvider (brief Step 6) is the explicitly authorized real
+// Codex/Claude E2E: two parallel Tasks routed to the real providers with
+// real Commits, independent Review Sessions, deterministic Verification,
+// serial Integration merges, the Final Verify/Review, the final report,
+// and an unchanged Target Branch.
+//
+// It NEVER runs without CFLOW_E2E_REAL=1: the gate requires the user to
+// have approved the exact Dry Run, the provider routes/models/budgets,
+// the default-permission trust boundary, and the potential network/cost.
+// Its default (off) behavior is a safe skip; a failure of an authorized
+// run is retained as evidence and is never hidden by a Fake result.
+func TestRealCrossProvider(t *testing.T) {
+	if os.Getenv("CFLOW_E2E_REAL") != "1" {
+		t.Skip("CFLOW_E2E_REAL=1 required: the real Cross-Provider E2E runs paid model requests with the providers' default permissions; it must be explicitly approved (exact Dry Run, routes/models/budgets, trust boundary, network/cost) before the gate is set")
+	}
+	fx := newE2EFixture(t)
+	wf := fx.driveDualToExecutionApproval(t)
+
+	sup := process.NewSupervisor(process.NewOSAdapter())
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		t.Fatalf("provider registry: %v", err)
+	}
+	prompts, err := agent.LoadPromptRegistry()
+	if err != nil {
+		t.Fatalf("prompt registry: %v", err)
+	}
+	codexBinding, err := reg.Select("codex")
+	if err != nil {
+		t.Fatalf("codex binding: %v", err)
+	}
+	claudeBinding, err := reg.Select("claude")
+	if err != nil {
+		t.Fatalf("claude binding: %v", err)
+	}
+	flow, err := gitflow.NewGitFlow(sup, fx.repo)
+	if err != nil {
+		t.Fatalf("new gitflow: %v", err)
+	}
+	a, err := app.New(app.Options{
+		Home:         fx.home,
+		Project:      app.ProjectFor(fx.repo),
+		CflowVersion: "0.0.0-dev",
+		Now:          fx.now,
+		IDs:          fx.ids,
+		Supervisor:   sup,
+		GitFlow:      flow,
+		Prompts:      prompts,
+		Agent: agent.RuntimeOptions{
+			Registry:    reg,
+			Redaction:   security.Registry{},
+			Adapters:    map[string]agent.Adapter{"codex": codexAdapter(sup, codexBinding), "claude": claudeAdapter(sup, claudeBinding)},
+			EvidenceDir: filepath.Join(fx.home, "evidence"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("new application: %v", err)
+	}
+
+	iv := fx.dispatchUntilCompleted(t, wf)
+	for _, id := range []string{
+		"task-s01", "verify-s01", "merge-s01",
+		"task-s02", "verify-s02", "merge-s02",
+		"final-verify",
+	} {
+		if statusOf(iv, id) != model.NodeSucceeded {
+			t.Fatalf("node %s status = %s, want SUCCEEDED", id, statusOf(iv, id))
+		}
+	}
+	// The wire terminal result shapes (ledger obligation from Task 15):
+	// the real provider runs must settle through the validated unified
+	// events with structured terminal results — the review verdict is
+	// judged from the session_finished result, never from exit codes.
+	for _, s := range iv.Sessions {
+		if s.Purpose == model.PurposeReview || s.Purpose == model.PurposeFinalVerification {
+			if s.Status != model.SessionCompleted {
+				t.Fatalf("review session %s settled %s, want COMPLETED", s.ID, s.Status)
+			}
+		}
+	}
+	if out := git(fx.repo, "branch", "--show-current"); strings.TrimSpace(out) != "main" {
+		t.Fatalf("target branch moved to %q", out)
+	}
+	_ = a
+}

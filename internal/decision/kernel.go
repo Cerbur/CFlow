@@ -22,6 +22,8 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 	switch in := input.(type) {
 	case model.WorkflowCommandInput:
 		return decideWorkflow(state, in)
+	case model.CompleteWorkflowInput:
+		return decideComplete(state, in)
 	case model.EffectResultInput:
 		return decideEffectResult(state, in)
 	case model.ReconcileInput:

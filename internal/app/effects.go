@@ -296,6 +296,13 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 		// Commit/Catalog/evidence refs.
 		return a.reviewProviderStart(ctx, wf, intent, cmd, rt)
 	}
+	if intent.Purpose == model.PurposeFinalVerification {
+		// The independent Final Reviewer Session (Task 18, PRD 最终验收):
+		// a non-coding Session inside the Integration Worktree, bound to
+		// the exact Plan/Spec/Catalog/Workflow refs and the Integration
+		// HEAD it verifies.
+		return a.finalReviewProviderStart(ctx, wf, intent, cmd, rt)
+	}
 	prompt, ok := a.planningPrompt(cmd)
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")

@@ -246,6 +246,25 @@ func New(reg *agent.ProviderRegistry) *Adapter {
 	}
 }
 
+// NewNamed constructs the deterministic Fake Adapter bound to one named
+// registry Provider (Task 18: the offline dialect-equivalent tests
+// register one fake instance per provider name, so the detection facts —
+// dialect, capabilities, registry revision — match the approved binding
+// of that provider and the dispatch CAS passes). nil when the named
+// provider is not in the registry.
+func NewNamed(reg *agent.ProviderRegistry, name string) *Adapter {
+	binding, err := reg.Select(name)
+	if err != nil {
+		return nil
+	}
+	return &Adapter{
+		reg:     reg,
+		binding: binding,
+		runs:    map[agent.ProviderSessionID]*run{},
+		used:    map[agent.ProviderSessionID]purposeCount{},
+	}
+}
+
 // LoadScript parses and registers one fixture text. The dialect must
 // match the Fake binding.
 func (a *Adapter) LoadScript(data []byte) error {
