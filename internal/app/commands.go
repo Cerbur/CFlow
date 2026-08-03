@@ -99,12 +99,20 @@ type DiscoveryQuery struct{}
 // PlanQuery projects the active Plan Revision's review state.
 type PlanQuery struct{ Workflow model.WorkflowID }
 
-func (ListQuery) isQuery()      {}
-func (StatusQuery) isQuery()    {}
-func (InspectQuery) isQuery()   {}
-func (LogsQuery) isQuery()      {}
-func (DiscoveryQuery) isQuery() {}
-func (PlanQuery) isQuery()      {}
+// ExecutionPreviewQuery projects the full Execution Approval preview
+// (PRD 已确认：两个用户批准门 step 2): the exact Plan/Spec/Catalog/
+// Workflow Revisions and hashes, routes, budgets, the Commit Preflight
+// fingerprint, the trust boundary, the Worktree plan, the parallel
+// groups, and the command identities.
+type ExecutionPreviewQuery struct{ Workflow model.WorkflowID }
+
+func (ListQuery) isQuery()             {}
+func (StatusQuery) isQuery()           {}
+func (InspectQuery) isQuery()          {}
+func (LogsQuery) isQuery()             {}
+func (DiscoveryQuery) isQuery()        {}
+func (PlanQuery) isQuery()             {}
+func (ExecutionPreviewQuery) isQuery() {}
 
 // ---------------------------------------------------------------------------
 // View union: projection results
@@ -173,6 +181,78 @@ type PlanView struct {
 	Approved   bool
 }
 
+// ExecutionPreviewView is the Execution Approval preview projection.
+type ExecutionPreviewView struct {
+	Workflow model.WorkflowID
+	Stage    model.WorkflowStage
+	Runtime  model.RuntimeStatus
+
+	Plan             *model.ArtifactRef
+	Spec             *model.ArtifactRef
+	Catalog          *model.ArtifactRef
+	WorkflowArtifact *model.ArtifactRef
+	Preflight        *PreflightPreview
+
+	// The exact hashes the Execution Approval binds (the Dry Run's
+	// compare-and-swap inputs).
+	PlanHash         string
+	SpecHashes       []string
+	CatalogHash      string
+	WorkflowHash     string
+	RoutingHash      string
+	BudgetHash       string
+	CommitPolicyHash string
+
+	Routes            []RoutePreview
+	Budgets           []BudgetPreview
+	TotalAgentRuns    int
+	TotalRetries      int
+	ParallelGroups    [][]string
+	Locks             []LockPreview
+	CommandIdentities []CommandIdentity
+	WorktreePlan      []string
+	TrustBoundary     string
+	Findings          []model.Finding
+}
+
+// PreflightPreview is the Commit Preflight summary of the Dry Run.
+type PreflightPreview struct {
+	Revision     int
+	EvidenceHash string
+	GitVersion   string
+	Fingerprint  string
+	ProbeStatus  string
+}
+
+// RoutePreview is one task's approved route.
+type RoutePreview struct {
+	NodeID   string
+	Provider string
+	Model    string
+}
+
+// BudgetPreview is one task's approved budgets.
+type BudgetPreview struct {
+	NodeID         string
+	TimeoutSeconds int
+	MaxRetry       int
+	Budget         float64
+}
+
+// LockPreview is one injected Resource Lock assignment.
+type LockPreview struct {
+	NodeID string
+	Lock   string
+}
+
+// CommandIdentity is one Catalog entry's pinned identity.
+type CommandIdentity struct {
+	CommandID  string
+	Executable string
+	SHA256     string
+	Purpose    string
+}
+
 // InspectView is the full aggregate projection.
 type InspectView struct {
 	Status          StatusView
@@ -194,12 +274,13 @@ type LogsView struct {
 	NextEventSeq uint64
 }
 
-func (ListView) isView()      {}
-func (StatusView) isView()    {}
-func (InspectView) isView()   {}
-func (LogsView) isView()      {}
-func (DiscoveryView) isView() {}
-func (PlanView) isView()      {}
+func (ListView) isView()             {}
+func (StatusView) isView()           {}
+func (InspectView) isView()          {}
+func (LogsView) isView()             {}
+func (DiscoveryView) isView()        {}
+func (PlanView) isView()             {}
+func (ExecutionPreviewView) isView() {}
 
 // ---------------------------------------------------------------------------
 // Command union (design 5, 6.1): closed mutations
@@ -281,6 +362,49 @@ type DryRunCommand struct {
 	Items    []model.CleanupItem
 }
 
+// GenerateSpecsCommand runs the Spec Generation Session (PRD Agent 角色:
+// SPEC_GENERATION 将 Plan 拆成 Specs). The Runtime first discovers the
+// Verification Catalog candidates from the fixed Base Commit and writes
+// the immutable Catalog Revision; the Session output is judged by the
+// Kernel and written as the Spec Revision.
+type GenerateSpecsCommand struct {
+	Workflow model.WorkflowID
+	Provider string
+}
+
+// CompileWorkflowCommand runs the Workflow Optimization Session (PRD
+// Agent 角色: WORKFLOW_OPTIMIZATION): the independent scheduling Agent
+// proposes a restricted Patch IR, the Compiler validates it against the
+// deterministic skeleton, and the canonical Dynamic Workflow Revision is
+// written.
+type CompileWorkflowCommand struct {
+	Workflow model.WorkflowID
+	Provider string
+}
+
+// ExecutionDryRunCommand runs the Git Commit Preflight, records the
+// immutable Preflight Revision, and pauses the Workflow at the Execution
+// Approval gate (PRD 已确认：两个用户批准门 step 2).
+type ExecutionDryRunCommand struct {
+	Workflow model.WorkflowID
+}
+
+// ApproveExecutionCommand is the user's append-only Execution Approval
+// binding one exact set of execution Artifact hashes, routing, budgets,
+// and the Commit Preflight hash. Any reference change since the
+// displayed preview is APPROVAL_INPUT_CHANGED with no mutation; only a
+// match requests the Integration Worktree creation.
+type ApproveExecutionCommand struct {
+	Workflow         model.WorkflowID
+	PlanHash         string
+	SpecHashes       []string
+	CatalogHash      string
+	WorkflowHash     string
+	RoutingHash      string
+	BudgetHash       string
+	CommitPolicyHash string
+}
+
 func (CreateWorkflowCommand) isCommand()     {}
 func (DiscussRequirementCommand) isCommand() {}
 func (GeneratePlanCommand) isCommand()       {}
@@ -291,6 +415,10 @@ func (PauseWorkflowCommand) isCommand()      {}
 func (ResumeWorkflowCommand) isCommand()     {}
 func (CancelWorkflowCommand) isCommand()     {}
 func (DryRunCommand) isCommand()             {}
+func (GenerateSpecsCommand) isCommand()      {}
+func (CompileWorkflowCommand) isCommand()    {}
+func (ExecutionDryRunCommand) isCommand()    {}
+func (ApproveExecutionCommand) isCommand()   {}
 
 // ---------------------------------------------------------------------------
 // Outcome

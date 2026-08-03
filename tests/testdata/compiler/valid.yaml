@@ -1,0 +1,77 @@
+# Valid compile request fixture (Task 11): three specs (s02 depends on
+# s01; s03 is independent and therefore parallel with s01), a catalog
+# carrying the task and final verification commands, and no patch.
+plan_ref:
+  workflow: wf-1
+  type: plan
+  revision: 1
+  hash: "c9b1e0c95bcf9767e4ac9cf70e5c6edf01c04cf06364e4d81e5e5a3e7c54a8e2"
+specs:
+  - id: s01
+    goal: add divide with error handling
+    depends_on: []
+    write_scope: ["src/divide/**"]
+    read_scope: ["src/common/**"]
+    locks: []
+    acceptance:
+      verification_command_ids: [verify]
+    route:
+      provider: fake
+      model: default
+      budget: 10
+    timeout_seconds: 1800
+    max_retry: 2
+  - id: s02
+    goal: implement divide
+    depends_on: [s01]
+    write_scope: ["src/divide/impl/**"]
+    read_scope: ["src/divide/**"]
+    locks: []
+    acceptance:
+      verification_command_ids: [verify]
+    route:
+      provider: fake
+      model: default
+      budget: 10
+    timeout_seconds: 1800
+    max_retry: 2
+  - id: s03
+    goal: document divide
+    depends_on: []
+    write_scope: ["docs/divide/**"]
+    read_scope: []
+    locks: []
+    acceptance:
+      verification_command_ids: [verify]
+    route:
+      provider: fake
+      model: default
+      budget: 5
+    timeout_seconds: 900
+    max_retry: 1
+catalog:
+  revision: 1
+  entries:
+    - command_id: verify
+      executable: scripts/verify.sh
+      args: []
+      cwd: .
+      purpose: task_verify
+      timeout_seconds: 600
+      expected_exit_codes: [0]
+      max_output_bytes: 10485760
+      env: [PATH, TMPDIR, LANG, LC_ALL]
+      source: "base-commit-wrapper:scripts/verify.sh@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    - command_id: final-verify
+      executable: scripts/final-verify.sh
+      args: []
+      cwd: .
+      purpose: final_verify
+      timeout_seconds: 600
+      expected_exit_codes: [0]
+      max_output_bytes: 10485760
+      env: [PATH, TMPDIR, LANG, LC_ALL]
+      source: "base-commit-wrapper:scripts/final-verify.sh@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+max_concurrency: 2
+max_total_runs: 100
+max_task_timeout: 3600

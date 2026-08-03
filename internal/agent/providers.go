@@ -264,6 +264,19 @@ func (r *ProviderRegistry) Select(name string) (ProviderBinding, error) {
 // canonical serialization of every binding, ordered by name.
 func (r *ProviderRegistry) Revision() string { return r.revision }
 
+// EnabledNames returns the selectable Provider names in canonical order
+// (the eligible route list the planning Sessions may choose from).
+func (r *ProviderRegistry) EnabledNames() []string {
+	var names []string
+	for n, b := range r.byName {
+		if b.Status == ProviderEnabled {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // entryHash is the content hash of one binding: the digest of its
 // canonical serialization with the hash field excluded from its own
 // digest. Reordering YAML map keys never changes it.

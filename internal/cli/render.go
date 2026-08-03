@@ -184,6 +184,100 @@ func renderLogs(w io.Writer, v app.LogsView, reg security.Registry) {
 	}
 }
 
+// renderExecutionPreview renders the Execution Approval Dry Run (PRD
+// 已确认：两个用户批准门): the exact Revisions and hashes, routes,
+// budgets, Commit Preflight fingerprint, trust boundary, Worktree plan,
+// parallel groups, and command identities.
+func renderExecutionPreview(w io.Writer, v app.ExecutionPreviewView, reg security.Registry) {
+	r := newRenderer(reg)
+	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
+	fmt.Fprintf(w, "stage: %s\n", v.Stage)
+	fmt.Fprintf(w, "runtime: %s\n", v.Runtime)
+	renderPreviewRef(w, r, "plan", v.Plan)
+	renderPreviewRef(w, r, "spec", v.Spec)
+	renderPreviewRef(w, r, "catalog", v.Catalog)
+	renderPreviewRef(w, r, "workflow", v.WorkflowArtifact)
+	if v.Preflight != nil {
+		fmt.Fprintf(w, "preflight: revision %d\n", v.Preflight.Revision)
+		fmt.Fprintf(w, "  sha256: %s\n", r.text(v.Preflight.EvidenceHash))
+		fmt.Fprintf(w, "  fingerprint: %s\n", r.text(v.Preflight.Fingerprint))
+		if v.Preflight.GitVersion != "" {
+			fmt.Fprintf(w, "  git: %s\n", r.text(v.Preflight.GitVersion))
+		}
+	} else {
+		fmt.Fprintln(w, "preflight: none")
+	}
+	if len(v.Routes) == 0 {
+		fmt.Fprintln(w, "routes: none")
+	} else {
+		fmt.Fprintln(w, "routes:")
+		for _, rt := range v.Routes {
+			fmt.Fprintf(w, "  %s -> %s (%s)\n", rt.NodeID, r.text(rt.Provider), r.text(rt.Model))
+		}
+	}
+	if len(v.Budgets) == 0 {
+		fmt.Fprintln(w, "budgets: none")
+	} else {
+		fmt.Fprintln(w, "budgets:")
+		for _, b := range v.Budgets {
+			fmt.Fprintf(w, "  %s timeout %ds retry %d budget %v\n", b.NodeID, b.TimeoutSeconds, b.MaxRetry, b.Budget)
+		}
+	}
+	fmt.Fprintf(w, "cost: %d agent runs, %d retries\n", v.TotalAgentRuns, v.TotalRetries)
+	if len(v.ParallelGroups) == 0 {
+		fmt.Fprintln(w, "parallel groups: none")
+	} else {
+		fmt.Fprintln(w, "parallel groups:")
+		for i, g := range v.ParallelGroups {
+			fmt.Fprintf(w, "  group %d: %s\n", i, strings.Join(g, ", "))
+		}
+	}
+	if len(v.Locks) == 0 {
+		fmt.Fprintln(w, "resource locks: none")
+	} else {
+		fmt.Fprintln(w, "resource locks:")
+		for _, l := range v.Locks {
+			fmt.Fprintf(w, "  %s -> %s\n", l.NodeID, r.text(l.Lock))
+		}
+	}
+	if len(v.CommandIdentities) == 0 {
+		fmt.Fprintln(w, "command identities: none")
+	} else {
+		fmt.Fprintln(w, "command identities:")
+		for _, c := range v.CommandIdentities {
+			hash := c.SHA256
+			if len(hash) > 12 {
+				hash = hash[:12]
+			}
+			fmt.Fprintf(w, "  %s %s sha256:%s (%s)\n", c.CommandID, r.text(c.Executable), r.text(hash), c.Purpose)
+		}
+	}
+	fmt.Fprintln(w, "worktree plan:")
+	for _, line := range v.WorktreePlan {
+		fmt.Fprintf(w, "  %s\n", r.text(line))
+	}
+	if v.TrustBoundary != "" {
+		fmt.Fprintf(w, "trust boundary: %s\n", r.text(v.TrustBoundary))
+	}
+	if len(v.Findings) == 0 {
+		fmt.Fprintln(w, "findings: none")
+	} else {
+		fmt.Fprintln(w, "findings:")
+		for _, f := range v.Findings {
+			fmt.Fprintf(w, "  %s %s %s\n", f.ID, f.Code, r.text(f.Text))
+		}
+	}
+}
+
+func renderPreviewRef(w io.Writer, r *renderer, name string, ref *model.ArtifactRef) {
+	if ref == nil {
+		fmt.Fprintf(w, "%s: none\n", name)
+		return
+	}
+	fmt.Fprintf(w, "%s: revision %d\n", name, ref.Revision)
+	fmt.Fprintf(w, "  sha256: %s\n", r.text(ref.Hash))
+}
+
 // ---------------------------------------------------------------------------
 // mutation outcomes
 // ---------------------------------------------------------------------------

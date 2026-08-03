@@ -242,10 +242,13 @@ func fixtureAttemptFailedWithBudget(budget int) model.State {
 
 func fixtureAwaitingExecutionApproval(hash string) model.State {
 	st := workflowState(model.StageWorkflowGeneration, model.RuntimePaused)
+	st.Plan = &model.Plan{Revision: 1, Status: model.PlanApproved,
+		Artifact: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactPlan, Revision: 1, Hash: "plan-h"}, Hash: "plan-h"}
 	st.Workflow.ExecutionFacts = &model.ExecutionFacts{
 		PlanHash: "plan-h", SpecHashes: []string{"spec-1"}, CatalogHash: "cat-1",
 		WorkflowHash: hash, RoutingHash: "r-1", BudgetHash: "b-1",
 		CommitPolicyHash: "cp-1", Fingerprint: "fp-1",
+		SpecRevision: 1, CatalogRevision: 1, WorkflowRevision: 1,
 	}
 	return st
 }
@@ -406,7 +409,7 @@ func TestApprovalMatrix(t *testing.T) {
 		{"plan approval wrong hash", fixturePlanCheck(model.PlanChecked), planWrong, "", "", model.CodeApprovalInputChanged},
 		{"plan approval before checked", fixturePlanCheck(model.PlanDraft), planExact, "", "", model.CodeInvalidInput},
 		{"plan approval without plan", workflowState(model.StagePlanCheck, model.RuntimePaused), planExact, "", "", model.CodeInvalidInput},
-		{"execution approval exact", fixtureAwaitingExecutionApproval("workflow-a"), execExact, model.StageExecution, model.RuntimePaused, ""},
+		{"execution approval exact", fixtureAwaitingExecutionApproval("workflow-a"), execExact, model.StageExecution, model.RuntimeRunning, ""},
 		{"execution approval wrong hash", fixtureAwaitingExecutionApproval("workflow-a"), model.ExecutionApprovalInput{WorkflowHash: "workflow-b"}, "", "", model.CodeApprovalInputChanged},
 		{"execution approval wrong routing", fixtureAwaitingExecutionApproval("workflow-a"), model.ExecutionApprovalInput{WorkflowHash: "workflow-a", PlanHash: "plan-h", SpecHashes: []string{"spec-1"}, CatalogHash: "cat-1", RoutingHash: "r-2", BudgetHash: "b-1", CommitPolicyHash: "cp-1"}, "", "", model.CodeApprovalInputChanged},
 	}
@@ -838,8 +841,22 @@ func TestExecutionApprovalAdvancesToExecution(t *testing.T) {
 		PlanHash: "plan-h", SpecHashes: []string{"spec-1"}, CatalogHash: "cat-1",
 		RoutingHash: "r-1", BudgetHash: "b-1", CommitPolicyHash: "cp-1"})
 	requireNoError(t, err)
-	requireStatus(t, got, model.StageExecution, model.RuntimePaused)
+	// The approval resumes the workflow into EXECUTION and requests the
+	// Integration Worktree creation (PRD Worktree 策略: the Integration
+	// Ref is withheld until the Execution Approval).
+	requireStatus(t, got, model.StageExecution, model.RuntimeRunning)
 	requireEvent(t, got, model.EventExecutionApproved)
+	if got.Effect == nil {
+		t.Fatal("execution approval must request the integration worktree creation")
+	}
+	if _, ok := got.Effect.(model.IntegrationWorktreeCreateIntent); !ok {
+		t.Fatalf("execution approval effect = %T, want IntegrationWorktreeCreateIntent", got.Effect)
+	}
+	for _, m := range got.Mutations {
+		if am, ok := m.(model.ApprovalAppendMutation); ok && am.Approval.Kind != model.ApprovalExecution {
+			t.Fatalf("approval kind = %s, want execution", am.Approval.Kind)
+		}
+	}
 }
 
 func TestCheckerPassIsNotUserApproval(t *testing.T) {

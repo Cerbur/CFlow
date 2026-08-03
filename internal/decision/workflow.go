@@ -367,7 +367,11 @@ func decidePlanApproval(state model.State, in model.PlanApprovalInput) (model.De
 // routing, budgets, and commit-policy facts. Every input hash must match
 // the active ExecutionFacts; any mismatch is APPROVAL_INPUT_CHANGED and
 // keeps the Workflow paused for a regenerated preview (PRD 约束 34,
-// design 7.3 invariant 3).
+// design 7.3 invariant 3). Only the paused Dry Run gate may be approved;
+// the single append-only EXECUTION row binds every execution Artifact
+// Revision and Hash together with the Commit Preflight Fingerprint, and
+// only then is the Integration Worktree creation requested (PRD Worktree
+// 策略: the Integration Ref is withheld until the Execution Approval).
 func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput) (model.Decision, error) {
 	facts := state.Workflow.ExecutionFacts
 	if facts == nil {
@@ -376,19 +380,186 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 	if state.Workflow.Stage != model.StageWorkflowGeneration {
 		return model.Decision{}, model.InvalidInputFault("execution approval requires the WORKFLOW_GENERATION stage")
 	}
+	if state.Workflow.Runtime != model.RuntimePaused {
+		return model.Decision{}, model.InvalidInputFault("execution approval requires the paused Dry Run gate")
+	}
+	if state.Plan == nil {
+		return model.Decision{}, model.InvalidInputFault("execution approval requires the approved plan reference")
+	}
 	if !facts.Matches(in.PlanHash, in.SpecHashes, in.CatalogHash, in.WorkflowHash, in.RoutingHash, in.BudgetHash, in.CommitPolicyHash) {
 		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged, "execution facts changed since the approval preview")
 	}
 	b := &builder{state: state}
 	b.mutate(model.ApprovalAppendMutation{Approval: model.Approval{
-		ID:          model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
-		Kind:        model.ApprovalExecution,
-		Seq:         state.NextEventSeq,
-		Refs:        []model.ArtifactRef{{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: 1, Hash: in.WorkflowHash}},
+		ID:   model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
+		Kind: model.ApprovalExecution,
+		Seq:  state.NextEventSeq,
+		Refs: []model.ArtifactRef{
+			{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: state.Plan.Revision, Hash: facts.PlanHash},
+			{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
+			{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
+			{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
+		},
 		Fingerprint: facts.Fingerprint,
 	}})
-	b.mutate(wfMut(state, model.StageExecution, state.Workflow.Runtime, state.Workflow.CancelIntent))
+	// The approval is the workflow's entry into EXECUTION: dispatch opens
+	// with a fresh Run and the deterministic Integration Branch is
+	// recorded.
+	b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
+	b.mutate(wfWithIntegration(state, model.StageExecution, model.RuntimeRunning, integrationBranch(state.Workflow.ID)))
+	b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workflow resumed into execution")
 	b.event(model.EventExecutionApproved, "", model.AttemptKey{}, "", "execution approved")
 	b.event(model.EventStageChanged, "", model.AttemptKey{}, "", "stage changed to EXECUTION")
+	b.effect(model.IntegrationWorktreeCreateIntent{
+		Workflow:   state.Workflow.ID,
+		BaseCommit: state.Workflow.BaseCommit,
+	})
+	return b.decision(), nil
+}
+
+// integrationBranch is the deterministic CFlow-owned Integration Branch
+// name (PRD Worktree 策略; the same derivation the workflow.yaml
+// manifest records).
+func integrationBranch(wf model.WorkflowID) string {
+	return "cflow/" + string(wf) + "/integration"
+}
+
+// wfWithIntegration builds a WorkflowMutation carrying the Integration
+// Branch (the first mutation that knows the workflow identity).
+func wfWithIntegration(state model.State, stage model.WorkflowStage, rt model.RuntimeStatus, branch string) model.WorkflowMutation {
+	m := wfMut(state, stage, rt, state.Workflow.CancelIntent)
+	m.IntegrationBranch = branch
+	return m
+}
+
+// ---------------------------------------------------------------------------
+// Spec generation, Workflow compilation, and the Execution Dry Run gate
+// ---------------------------------------------------------------------------
+
+// decideSpecGeneration records the Runtime-assembled Verification
+// Catalog Revision and starts the Spec Generation Session (PRD Agent
+// 角色: SPEC_GENERATION splits the approved Plan into Specs that may
+// reference existing command ids). The Catalog body was written by the
+// Runtime directly (PRD 已确认：Workflow-local Verification Command
+// Catalog: CFlow assembles the immutable Catalog Revision; the Kernel
+// records its reference and binds the Session that may use it).
+// Regeneration from WORKFLOW_GENERATION (the adjustment loop) records a
+// successor Catalog Revision and re-opens the workflow for the Session.
+func decideSpecGeneration(state model.State, in model.SpecGenerationInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to generate specs for")
+	}
+	switch state.Workflow.Stage {
+	case model.StageSpecGeneration, model.StageWorkflowGeneration:
+	default:
+		return model.Decision{}, model.InvalidInputFault("spec generation is not possible from stage " + string(state.Workflow.Stage))
+	}
+	if !planningRuntimeAllowed(state.Workflow.Runtime) {
+		return model.Decision{}, model.InvalidInputFault("workflow cannot generate specs from " + string(state.Workflow.Runtime))
+	}
+	if err := validateProvider(in.Provider); err != nil {
+		return model.Decision{}, err
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	ref := in.CatalogRef
+	if ref.Type != model.ArtifactCatalog || ref.Revision < 1 || ref.Hash == "" {
+		return model.Decision{}, model.InvalidInputFault("the verification catalog revision is required")
+	}
+	b := &builder{state: state}
+	b.mutate(model.ArtifactRefMutation{
+		Type: ref.Type, Revision: ref.Revision, Path: artifactRefPath(ref), Hash: ref.Hash,
+	})
+	startIfNeeded(b, state)
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID:      in.Session,
+		Purpose: model.PurposeSpecGeneration,
+		Status:  model.SessionStarting,
+	}, Provider: in.Provider})
+	b.effect(model.ProviderStartIntent{
+		Session: in.Session,
+		Purpose: model.PurposeSpecGeneration,
+		Route:   in.Provider,
+	})
+	return b.decision(), nil
+}
+
+// decideWorkflowCompilation starts the Workflow Optimization Session:
+// the independent scheduling Agent proposes a restricted Patch IR the
+// Compiler validates against the deterministic skeleton (PRD Agent 角色:
+// WORKFLOW_OPTIMIZATION).
+func decideWorkflowCompilation(state model.State, in model.WorkflowCompilationInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to compile")
+	}
+	if state.Workflow.Stage != model.StageWorkflowGeneration {
+		return model.Decision{}, model.InvalidInputFault("workflow compilation requires the WORKFLOW_GENERATION stage")
+	}
+	if !planningRuntimeAllowed(state.Workflow.Runtime) {
+		return model.Decision{}, model.InvalidInputFault("workflow cannot compile from " + string(state.Workflow.Runtime))
+	}
+	if err := validateProvider(in.Provider); err != nil {
+		return model.Decision{}, err
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	b := &builder{state: state}
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID:      in.Session,
+		Purpose: model.PurposeWorkflowOptimization,
+		Status:  model.SessionStarting,
+	}, Provider: in.Provider})
+	b.effect(model.ProviderStartIntent{
+		Session: in.Session,
+		Purpose: model.PurposeWorkflowOptimization,
+		Route:   in.Provider,
+	})
+	return b.decision(), nil
+}
+
+// decideExecutionDryRun records the freshly observed Commit Preflight
+// Revision and pauses the Workflow at the Execution Approval gate. Every
+// execution input must already be bound: the approved Plan, the Specs,
+// the Verification Catalog, and the compiled Dynamic Workflow; a
+// successful Preflight must exist (PRD 已确认：两个用户批准门 step 2).
+func decideExecutionDryRun(state model.State, in model.ExecutionDryRunInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow for an execution dry run")
+	}
+	if state.Workflow.Stage != model.StageWorkflowGeneration {
+		return model.Decision{}, model.InvalidInputFault("execution dry run requires the WORKFLOW_GENERATION stage")
+	}
+	if state.Workflow.Runtime != model.RuntimeRunning {
+		return model.Decision{}, model.InvalidInputFault("execution dry run requires a running workflow")
+	}
+	facts := state.Workflow.ExecutionFacts
+	if facts == nil || facts.PlanHash == "" || len(facts.SpecHashes) == 0 ||
+		facts.CatalogHash == "" || facts.WorkflowHash == "" {
+		return model.Decision{}, model.InvalidInputFault("execution inputs are incomplete; generate specs and compile the workflow first")
+	}
+	p := in.Preflight
+	if p.Fingerprint == "" || p.EvidenceHash == "" || (p.ProbeRequired && !p.ProbeSuccess) {
+		return model.Decision{}, model.InvalidInputFault("a successful commit preflight is required before the execution dry run")
+	}
+	// The Kernel assigns the next immutable Preflight Revision from the
+	// aggregate; the report Artifact the Application wrote uses the same
+	// deterministic derivation.
+	b := &builder{state: state}
+	b.mutate(model.PreflightRecordMutation{
+		Revision:          facts.PreflightRevision + 1,
+		RepositoryContext: p.RepositoryContext,
+		GitVersion:        p.GitVersion,
+		Fingerprint:       p.Fingerprint,
+		IdentityJSON:      p.IdentityJSON,
+		SigningPolicyJSON: p.SigningPolicyJSON,
+		ProbeStatus:       p.ProbeStatus,
+		ArtifactPath:      p.ArtifactPath,
+		ArtifactHash:      p.EvidenceHash,
+	})
+	b.mutate(wfMutStatus(state, model.RuntimePaused))
+	b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused for execution approval")
 	return b.decision(), nil
 }

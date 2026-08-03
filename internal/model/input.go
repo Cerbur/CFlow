@@ -105,6 +105,57 @@ type ExecutionApprovalInput struct {
 
 func (ExecutionApprovalInput) isInput() {}
 
+// SpecGenerationInput starts one Spec Generation Session (PRD Agent 角色:
+// SPEC_GENERATION 将 Plan 拆成 Specs). CatalogRef is the immutable
+// Verification Catalog Revision the Runtime assembled and wrote before
+// the Session may reference any command id (PRD 已确认：Workflow-local
+// Verification Command Catalog step 1: discovery only produces
+// Candidates; CFlow assembles the immutable Catalog Revision).
+type SpecGenerationInput struct {
+	Provider   string
+	Session    SessionID
+	CatalogRef ArtifactRef
+}
+
+func (SpecGenerationInput) isInput() {}
+
+// WorkflowCompilationInput starts one Workflow Optimization Session
+// (PRD Agent 角色: WORKFLOW_OPTIMIZATION 对确定性骨架提出受限调度补丁).
+// The Session output is the restricted Patch IR the Compiler validates
+// against the deterministic skeleton.
+type WorkflowCompilationInput struct {
+	Provider string
+	Session  SessionID
+}
+
+func (WorkflowCompilationInput) isInput() {}
+
+// ExecutionDryRunInput carries the freshly observed Git Commit Preflight
+// evidence into the Execution Dry Run gate. The Workflow pauses at
+// WORKFLOW_GENERATION only after the Dry Run records a successful
+// Preflight Revision and the complete execution input set.
+type ExecutionDryRunInput struct {
+	Preflight PreflightFacts
+}
+
+func (ExecutionDryRunInput) isInput() {}
+
+// PreflightFacts is the normalized Commit Preflight evidence the Dry Run
+// gate records (PRD 已确认：Git Commit Identity 与 Signing Preflight). It
+// never carries private keys, passphrases, or credential-helper output.
+type PreflightFacts struct {
+	EvidenceHash      string // artifact sha256 of the preflight report
+	GitVersion        string
+	RepositoryContext string
+	Fingerprint       string
+	IdentityJSON      string
+	SigningPolicyJSON string
+	ProbeStatus       string
+	ProbeRequired     bool
+	ProbeSuccess      bool
+	ArtifactPath      string
+}
+
 // AgentEventKind names the closed set of validated Agent Events the
 // Runtime may deliver to the Kernel. Agent output can never write
 // authoritative lifecycle state: an Agent-declared completion is an
@@ -153,6 +204,12 @@ const (
 	// PlanningWorktreeCreated reports that the Planning Snapshot Worktree
 	// exists at the recorded Base Commit.
 	PlanningWorktreeCreated EffectResultKind = "planning-worktree-created"
+	// WorkflowCompiled reports the canonical Dynamic Workflow body the
+	// Compiler produced from the approved Specs, Catalog, and Patch IR.
+	WorkflowCompiled EffectResultKind = "workflow-compiled"
+	// IntegrationWorktreeCreated reports the Integration Branch/Worktree
+	// created at the recorded Base Commit after the Execution Approval.
+	IntegrationWorktreeCreated EffectResultKind = "integration-worktree-created"
 )
 
 // Valid reports whether k is a declared Effect Result Kind.
@@ -161,7 +218,8 @@ func (k EffectResultKind) Valid() bool {
 	case AttemptEnded, ProcessStopped, ApplyStagingSucceeded,
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
-		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated:
+		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
+		WorkflowCompiled, IntegrationWorktreeCreated:
 		return true
 	}
 	return false
@@ -223,6 +281,17 @@ type EffectResultInput struct {
 	// requirement turn, plan, or check output) or the written content an
 	// ArtifactWrite echoes to its Result Decision.
 	Body []byte
+	// CatalogRef is the immutable reference of a new Verification Catalog
+	// Revision the Runtime assembled from the Session's validated
+	// proposals (zero when no proposal was accepted).
+	CatalogRef ArtifactRef
+	// RejectedOps lists the Compiler's inert Patch operations (skipped
+	// without replacing the deterministic skeleton); the Kernel records
+	// one Compile Finding per op, visible in Dry Run.
+	RejectedOps []string
+	// IntegrationHead is the HEAD of the created Integration Worktree
+	// (the recorded Base Commit at approval).
+	IntegrationHead string
 }
 
 func (EffectResultInput) isInput() {}

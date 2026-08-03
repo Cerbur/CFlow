@@ -29,6 +29,10 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return decideProviderRunEnded(state, in)
 	case model.ArtifactWritten:
 		return decideArtifactWritten(state, in)
+	case model.WorkflowCompiled:
+		return decideWorkflowCompiled(state, in)
+	case model.IntegrationWorktreeCreated:
+		return decideIntegrationWorktreeCreated(state, in)
 	default:
 		return model.Decision{}, model.InvalidInputFault("unsupported effect result")
 	}

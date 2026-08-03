@@ -54,6 +54,9 @@ func applyMutation(st *model.State, m model.Mutation) error {
 				Hash: m.Hash,
 			}
 		}
+	case model.PreflightRecordMutation:
+		// The aggregate carries preflights only through the hydrated
+		// ExecutionFacts; the row itself is append-only SQLite evidence.
 	case model.SessionEndMutation:
 		se := findSession(st, m.ID)
 		if se == nil {
@@ -257,6 +260,24 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		if _, err := q.ExecContext(ctx, `UPDATE workflows SET plan_status = ? WHERE id = ?`,
 			string(m.Status), st.Workflow.ID); err != nil {
 			return fmt.Errorf("update plan status: %w", err)
+		}
+		return nil
+
+	case model.PreflightRecordMutation:
+		// One immutable Git Commit Preflight row per revision (PRD 已确
+		// 认：Git Commit Identity 与 Signing Preflight). The revision is
+		// Kernel-assigned; the row is append-only.
+		if _, err := q.ExecContext(ctx, `INSERT INTO git_commit_preflights
+			(id, workflow_id, revision, repository_context, git_version,
+			 commit_policy_fingerprint, identity_json, signing_policy_json,
+			 probe_status, artifact_path, artifact_sha256, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("preflight-%s-%d", st.Workflow.ID, m.Revision), st.Workflow.ID, m.Revision,
+			nullIfEmpty(m.RepositoryContext), nullIfEmpty(m.GitVersion), m.Fingerprint,
+			nullIfEmpty(m.IdentityJSON), nullIfEmpty(m.SigningPolicyJSON),
+			nullIfEmpty(m.ProbeStatus), nullIfEmpty(m.ArtifactPath),
+			nullIfEmpty(m.ArtifactHash), nowText); err != nil {
+			return fmt.Errorf("insert preflight: %w", err)
 		}
 		return nil
 

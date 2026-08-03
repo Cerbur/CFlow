@@ -59,7 +59,7 @@ const queryArtifactRefs = `
 	FROM workflow_artifact_refs WHERE workflow_id = ? ORDER BY artifact_type`
 
 const queryLatestPreflight = `
-	SELECT artifact_sha256, commit_policy_fingerprint
+	SELECT revision, artifact_sha256, commit_policy_fingerprint
 	FROM git_commit_preflights WHERE workflow_id = ? ORDER BY revision DESC LIMIT 1`
 
 const queryNodes = `
@@ -228,18 +228,21 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID) (model.S
 			facts = &model.ExecutionFacts{}
 		}
 		facts.SpecHashes = []string{h.Hash}
+		facts.SpecRevision = h.Revision
 	}
 	if h, ok := refs[model.ArtifactCatalog]; ok {
 		if facts == nil {
 			facts = &model.ExecutionFacts{}
 		}
 		facts.CatalogHash = h.Hash
+		facts.CatalogRevision = h.Revision
 	}
 	if h, ok := refs[model.ArtifactWorkflow]; ok {
 		if facts == nil {
 			facts = &model.ExecutionFacts{}
 		}
 		facts.WorkflowHash = h.Hash
+		facts.WorkflowRevision = h.Revision
 	}
 	if h, ok := refs["routing-policy"]; ok {
 		if facts == nil {
@@ -254,8 +257,11 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID) (model.S
 		facts.BudgetHash = h.Hash
 	}
 	if facts != nil {
+		var preflightRevision int
 		var preflightHash, fingerprint sql.NullString
-		if err := q.QueryRowContext(ctx, queryLatestPreflight, workflow).Scan(&preflightHash, &fingerprint); err == nil {
+		if err := q.QueryRowContext(ctx, queryLatestPreflight, workflow).Scan(
+			&preflightRevision, &preflightHash, &fingerprint); err == nil {
+			facts.PreflightRevision = preflightRevision
 			facts.CommitPolicyHash = preflightHash.String
 			facts.Fingerprint = fingerprint.String
 		}

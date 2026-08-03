@@ -273,13 +273,132 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 				return nil
 			},
 		},
+		{
+			Use:   "spec-generate [workflow-id]",
+			Short: "discover the verification catalog and generate the spec",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				provider, _ := cmd.Flags().GetString("provider")
+				return executeMutation(cmd, deps, app.GenerateSpecsCommand{
+					Workflow: workflowArg(args), Provider: provider,
+				})
+			},
+		},
+		{
+			Use:   "compile-workflow [workflow-id]",
+			Short: "compile the approved specs into the restricted workflow",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				provider, _ := cmd.Flags().GetString("provider")
+				return executeMutation(cmd, deps, app.CompileWorkflowCommand{
+					Workflow: workflowArg(args), Provider: provider,
+				})
+			},
+		},
+		{
+			Use:   "execution-dry-run [workflow-id]",
+			Short: "run the commit preflight and pause at the execution approval gate",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return executeExecutionDryRun(cmd, deps, workflowArg(args))
+			},
+		},
+		{
+			Use:   "execution-show [workflow-id]",
+			Short: "show the execution approval preview",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.ExecutionPreviewQuery{Workflow: workflowArg(args)})
+				if err != nil {
+					return err
+				}
+				renderExecutionPreview(cmd.OutOrStdout(), view.(app.ExecutionPreviewView), deps.Redaction)
+				return nil
+			},
+		},
+		{
+			Use:   "execution-approve [workflow-id]",
+			Short: "approve the exact displayed execution inputs",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.ExecutionPreviewQuery{Workflow: workflowArg(args)})
+				if err != nil {
+					return err
+				}
+				pv := view.(app.ExecutionPreviewView)
+				renderExecutionPreview(cmd.OutOrStdout(), pv, deps.Redaction)
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"approve execution of plan %s, spec %s, catalog %s, workflow %s? [y/N] ",
+					shortRef(pv.Plan), shortRef(pv.Spec), shortRef(pv.Catalog), shortRef(pv.WorkflowArtifact))
+				line, err := readLine(cmd)
+				if err != nil {
+					return err
+				}
+				if !strings.EqualFold(strings.TrimSpace(line), "y") {
+					return model.InvalidInputFault("execution approval aborted")
+				}
+				return executeMutation(cmd, deps, app.ApproveExecutionCommand{
+					Workflow:         workflowArg(args),
+					PlanHash:         pv.PlanHash,
+					SpecHashes:       pv.SpecHashes,
+					CatalogHash:      pv.CatalogHash,
+					WorkflowHash:     pv.WorkflowHash,
+					RoutingHash:      pv.RoutingHash,
+					BudgetHash:       pv.BudgetHash,
+					CommitPolicyHash: pv.CommitPolicyHash,
+				})
+			},
+		},
 	}
 	// The planning commands share the discussion Agent route flag.
-	for _, name := range []string{"workflow-create", "discuss", "plan-generate", "plan-check"} {
+	for _, name := range []string{"workflow-create", "discuss", "plan-generate", "plan-check",
+		"spec-generate", "compile-workflow"} {
 		findCommand(cmds, name).Flags().String("provider", "fake", "provider route")
 	}
 	findCommand(cmds, "workflow-create").Flags().Bool("yes", false, "assume yes for the dirty-workspace confirmation")
 	return cmds
+}
+
+// executeExecutionDryRun runs the Execution Dry Run command and renders
+// the full preview it pauses the workflow for.
+func executeExecutionDryRun(cmd *cobra.Command, deps Dependencies, wf model.WorkflowID) error {
+	ctx, stop := commandContext(cmd)
+	defer stop()
+	a, err := openApplication(ctx, deps)
+	if err != nil {
+		return err
+	}
+	out, err := a.Execute(ctx, app.ExecutionDryRunCommand{Workflow: wf})
+	if err != nil {
+		return err
+	}
+	renderOutcome(cmd.OutOrStdout(), app.ExecutionDryRunCommand{}, out, deps.Redaction)
+	view, err := a.Query(ctx, app.ExecutionPreviewQuery{Workflow: wf})
+	if err != nil {
+		return err
+	}
+	renderExecutionPreview(cmd.OutOrStdout(), view.(app.ExecutionPreviewView), deps.Redaction)
+	return nil
+}
+
+// shortRef renders "type:revision" for a prompt.
+func shortRef(ref *model.ArtifactRef) string {
+	if ref == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%s:%d", ref.Type, ref.Revision)
 }
 
 func findCommand(cmds []*cobra.Command, name string) *cobra.Command {

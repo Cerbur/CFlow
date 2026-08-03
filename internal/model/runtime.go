@@ -331,20 +331,22 @@ func (s SessionStatus) IsTerminal() bool {
 type AgentPurpose string
 
 const (
-	PurposePlanning          AgentPurpose = "planning"
-	PurposePlanCheck         AgentPurpose = "plan-check"
-	PurposeSpecGeneration    AgentPurpose = "spec-generation"
-	PurposeImplementation    AgentPurpose = "implementation"
-	PurposeRepair            AgentPurpose = "repair"
-	PurposeReview            AgentPurpose = "review"
-	PurposeFinalVerification AgentPurpose = "final-verification"
+	PurposePlanning             AgentPurpose = "planning"
+	PurposePlanCheck            AgentPurpose = "plan-check"
+	PurposeSpecGeneration       AgentPurpose = "spec-generation"
+	PurposeWorkflowOptimization AgentPurpose = "workflow-optimization"
+	PurposeImplementation       AgentPurpose = "implementation"
+	PurposeRepair               AgentPurpose = "repair"
+	PurposeReview               AgentPurpose = "review"
+	PurposeFinalVerification    AgentPurpose = "final-verification"
 )
 
 // Valid reports whether p is a declared Agent Purpose.
 func (p AgentPurpose) Valid() bool {
 	switch p {
 	case PurposePlanning, PurposePlanCheck, PurposeSpecGeneration,
-		PurposeImplementation, PurposeRepair, PurposeReview, PurposeFinalVerification:
+		PurposeWorkflowOptimization, PurposeImplementation, PurposeRepair,
+		PurposeReview, PurposeFinalVerification:
 		return true
 	}
 	return false

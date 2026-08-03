@@ -118,6 +118,15 @@ type ExecutionFacts struct {
 	BudgetHash       string
 	CommitPolicyHash string
 	Fingerprint      string
+	// SpecRevision/CatalogRevision/WorkflowRevision are the active
+	// revisions of the execution Artifacts (the Approval row binds
+	// revisions and hashes together).
+	SpecRevision     int
+	CatalogRevision  int
+	WorkflowRevision int
+	// PreflightRevision is the revision of the latest recorded Commit
+	// Preflight row (0 when none exists yet).
+	PreflightRevision int
 }
 
 // Matches reports whether the candidate Execution Approval input binds the

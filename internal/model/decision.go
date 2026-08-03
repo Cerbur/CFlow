@@ -64,6 +64,25 @@ type ArtifactRefMutation struct {
 
 func (ArtifactRefMutation) isMutation() {}
 
+// PreflightRecordMutation appends one immutable Git Commit Preflight
+// row (git_commit_preflights, PRD 已确认：Git Commit Identity 与 Signing
+// Preflight). The evidence was observed by the Application before the
+// Dry Run decision; the Kernel records the exact revision and binds the
+// report Artifact reference.
+type PreflightRecordMutation struct {
+	Revision          int
+	RepositoryContext string
+	GitVersion        string
+	Fingerprint       string
+	IdentityJSON      string
+	SigningPolicyJSON string
+	ProbeStatus       string
+	ArtifactPath      string
+	ArtifactHash      string
+}
+
+func (PreflightRecordMutation) isMutation() {}
+
 // SessionEndMutation settles one Session record with the Provider
 // Session ID and the final status observed from the validated run
 // (design 14.3: Session state is Kernel-owned).

@@ -117,6 +117,8 @@ func effectKindOf(i model.EffectIntent) (string, error) {
 		return "integration-rollback", nil
 	case model.VerificationRunIntent:
 		return "verification-run", nil
+	case model.WorkflowCompileIntent:
+		return "workflow-compile", nil
 	case model.ApplyStagingCreateIntent:
 		return "apply-staging-create", nil
 	case model.ApplyFastForwardIntent:
@@ -181,6 +183,10 @@ func effectFromKind(kind string, payload []byte) (model.EffectIntent, error) {
 		return v, err
 	case "verification-run":
 		var v model.VerificationRunIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "workflow-compile":
+		var v model.WorkflowCompileIntent
 		err = json.Unmarshal(payload, &v)
 		return v, err
 	case "apply-staging-create":

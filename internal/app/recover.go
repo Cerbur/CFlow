@@ -114,9 +114,17 @@ func effectBudget(st model.State, pending int, cmd model.Input) int {
 	// A planning Session requests its Provider run and then the Artifact
 	// write; the per-command chain is two Effects. Non-terminal Sessions
 	// already in the aggregate add the same chain for the run they are
-	// still owed from a previous command.
+	// still owed from a previous command. Spec generation and workflow
+	// compilation chain three Effects (run, then the compile or the Spec
+	// write, then the Workflow write); the Execution Approval chains the
+	// Integration Worktree creation after the approval decision.
 	switch cmd.(type) {
-	case model.DiscussRequirementInput, model.GeneratePlanInput, model.CheckPlanInput:
+	case model.DiscussRequirementInput, model.GeneratePlanInput, model.CheckPlanInput,
+		model.SpecGenerationInput:
+		n += 2
+	case model.WorkflowCompilationInput:
+		n += 3
+	case model.ExecutionApprovalInput:
 		n += 2
 	}
 	for _, s := range st.Sessions {

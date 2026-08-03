@@ -164,6 +164,8 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryDiscovery(ctx)
 	case PlanQuery:
 		return a.queryPlan(ctx, qq)
+	case ExecutionPreviewQuery:
+		return a.queryExecutionPreview(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -520,6 +522,10 @@ func planningSessionOf(input model.Input) model.SessionID {
 		return in.Session
 	case model.CheckPlanInput:
 		return in.Session
+	case model.SpecGenerationInput:
+		return in.Session
+	case model.WorkflowCompilationInput:
+		return in.Session
 	}
 	return ""
 }
@@ -626,9 +632,88 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			return nil, "", err
 		}
 		return model.CleanupCommandInput{Kind: model.CleanupDryRun, Items: c.Items}, wf, nil
+	case GenerateSpecsCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.Provider == "" || len(c.Provider) > 128 {
+			return nil, "", model.InvalidInputFault("a spec generation provider is required and bounded")
+		}
+		session := model.SessionID(a.ids(model.IDSession))
+		// The immutable Catalog Revision is assembled and written by the
+		// Runtime before the Session may reference any command id (PRD
+		// 已确认：Workflow-local Verification Command Catalog step 1).
+		catalogRef, err := a.assembleCatalog(ctx, wf, session)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.SpecGenerationInput{
+			Provider:   c.Provider,
+			Session:    session,
+			CatalogRef: catalogRef,
+		}, wf, nil
+	case CompileWorkflowCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.Provider == "" || len(c.Provider) > 128 {
+			return nil, "", model.InvalidInputFault("a workflow optimization provider is required and bounded")
+		}
+		return model.WorkflowCompilationInput{
+			Provider: c.Provider,
+			Session:  model.SessionID(a.ids(model.IDSession)),
+		}, wf, nil
+	case ExecutionDryRunCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		// The current facts fix the next immutable Preflight Revision;
+		// the observation and the report write happen before the Kernel
+		// records the row and pauses the gate.
+		facts := a.executionFacts(ctx, wf)
+		next := 1
+		if facts != nil {
+			next = facts.PreflightRevision + 1
+		}
+		preflight, err := a.observePreflight(ctx, wf, next)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.ExecutionDryRunInput{Preflight: preflight}, wf, nil
+	case ApproveExecutionCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.PlanHash == "" || len(c.SpecHashes) == 0 || c.CatalogHash == "" ||
+			c.WorkflowHash == "" || c.CommitPolicyHash == "" {
+			return nil, "", model.InvalidInputFault("execution approval requires the exact displayed hashes")
+		}
+		return model.ExecutionApprovalInput{
+			PlanHash:         c.PlanHash,
+			SpecHashes:       append([]string(nil), c.SpecHashes...),
+			CatalogHash:      c.CatalogHash,
+			WorkflowHash:     c.WorkflowHash,
+			RoutingHash:      c.RoutingHash,
+			BudgetHash:       c.BudgetHash,
+			CommitPolicyHash: c.CommitPolicyHash,
+		}, wf, nil
 	default:
 		return nil, "", model.InvalidInputFault("unsupported command")
 	}
+}
+
+// executionFacts reads the current ExecutionFacts of one workflow
+// (nil when none exist yet).
+func (a *Application) executionFacts(ctx context.Context, wf model.WorkflowID) *model.ExecutionFacts {
+	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
+	if err != nil {
+		return nil
+	}
+	return view.State.Workflow.ExecutionFacts
 }
 
 func (a *Application) workflowCommand(kind model.WorkflowCommandKind, wf model.WorkflowID, reason string) (model.Input, model.WorkflowID, error) {

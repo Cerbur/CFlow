@@ -1,0 +1,64 @@
+# Compile request fixture with overlapping write scopes: s01 and s02
+# both write src/shared/**, neither depends on the other, and neither
+# declares a shared resource lock. The Compiler rejects the pair with
+# SCOPE_VIOLATION (the overlap is unsafe without ordering or a lock).
+plan_ref:
+  workflow: wf-1
+  type: plan
+  revision: 1
+  hash: "c9b1e0c95bcf9767e4ac9cf70e5c6edf01c04cf06364e4d81e5e5a3e7c54a8e2"
+specs:
+  - id: s01
+    goal: implement divide
+    depends_on: []
+    write_scope: ["src/shared/**"]
+    read_scope: []
+    locks: []
+    acceptance:
+      verification_command_ids: [verify]
+    route:
+      provider: fake
+      model: default
+      budget: 10
+    timeout_seconds: 1800
+    max_retry: 2
+  - id: s02
+    goal: implement subtract
+    depends_on: []
+    write_scope: ["src/shared/**"]
+    read_scope: []
+    locks: []
+    acceptance:
+      verification_command_ids: [verify]
+    route:
+      provider: fake
+      model: default
+      budget: 10
+    timeout_seconds: 1800
+    max_retry: 2
+catalog:
+  revision: 1
+  entries:
+    - command_id: verify
+      executable: scripts/verify.sh
+      args: []
+      cwd: .
+      purpose: task_verify
+      timeout_seconds: 600
+      expected_exit_codes: [0]
+      max_output_bytes: 10485760
+      env: [PATH, TMPDIR, LANG, LC_ALL]
+      source: "base-commit-wrapper:scripts/verify.sh@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    - command_id: final-verify
+      executable: scripts/final-verify.sh
+      args: []
+      cwd: .
+      purpose: final_verify
+      timeout_seconds: 600
+      expected_exit_codes: [0]
+      max_output_bytes: 10485760
+      env: [PATH, TMPDIR, LANG, LC_ALL]
+      source: "base-commit-wrapper:scripts/final-verify.sh@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+max_concurrency: 2
+max_total_runs: 100
+max_task_timeout: 3600

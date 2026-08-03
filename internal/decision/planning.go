@@ -76,6 +76,15 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StagePlanCheck {
 				return decideCheckResult(state, in, created)
 			}
+		case model.PurposeSpecGeneration:
+			switch state.Workflow.Stage {
+			case model.StageSpecGeneration, model.StageWorkflowGeneration:
+				return decideSpecsGenerated(state, in, created)
+			}
+		case model.PurposeWorkflowOptimization:
+			if state.Workflow.Stage == model.StageWorkflowGeneration {
+				return decidePatchProposed(state, in, created)
+			}
 		}
 		return model.Decision{}, model.InvariantFault(fmt.Errorf(
 			"provider run completed in an unexpected stage %s for purpose %s",
@@ -248,9 +257,224 @@ func decideArtifactWritten(state model.State, in model.EffectResultInput) (model
 		return model.Decision{}, nil
 	case model.ArtifactPlanCheck:
 		return checkResultCommitted(state, in)
+	case model.ArtifactSpec:
+		return specRevisionRecorded(state, ref)
+	case model.ArtifactWorkflow:
+		return workflowRevisionRecorded(state, ref)
 	default:
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("artifact write result for an unexpected type %s", ref.Type))
 	}
+}
+
+// specRevisionRecorded records the Spec Revision and moves the Workflow
+// to WORKFLOW_GENERATION (PRD 主状态转换: SPEC_GENERATION -> WORKFLOW_GENERATION).
+func specRevisionRecorded(state model.State, ref model.ArtifactRef) (model.Decision, error) {
+	b := &builder{state: state}
+	b.mutate(model.ArtifactRefMutation{
+		Type: ref.Type, Revision: ref.Revision, Path: artifactRefPath(ref), Hash: ref.Hash,
+	})
+	if state.Workflow.Stage != model.StageWorkflowGeneration {
+		b.mutate(wfMut(state, model.StageWorkflowGeneration, state.Workflow.Runtime, state.Workflow.CancelIntent))
+		b.event(model.EventStageChanged, "", model.AttemptKey{}, "", "stage changed to WORKFLOW_GENERATION")
+	}
+	return b.decision(), nil
+}
+
+// workflowRevisionRecorded records the compiled Dynamic Workflow
+// Revision. The Workflow stays at WORKFLOW_GENERATION until the user's
+// Execution Dry Run pauses the gate.
+func workflowRevisionRecorded(state model.State, ref model.ArtifactRef) (model.Decision, error) {
+	b := &builder{state: state}
+	b.mutate(model.ArtifactRefMutation{
+		Type: ref.Type, Revision: ref.Revision, Path: artifactRefPath(ref), Hash: ref.Hash,
+	})
+	return b.decision(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Spec generation output and the Workflow Optimization Patch (Task 11)
+// ---------------------------------------------------------------------------
+
+// maxSpecOutput bounds one Spec Generation output document.
+const maxSpecOutput = 1 << 20
+
+// specOutput is the structured Spec Generation Session output: the
+// `specs` list (each body satisfies spec.json) plus the proposed
+// commands the Runtime validates into a successor Catalog Revision.
+type specOutput struct {
+	Specs            []map[string]any `yaml:"specs"`
+	ProposedCommands []map[string]any `yaml:"proposed_commands"`
+}
+
+// decideSpecsGenerated judges the Spec Generation output. The demo
+// pipeline binds exactly one Spec per generation (the artifact model
+// tracks one active Spec Revision); the output must be structured and
+// bounded, and the Spec body is re-serialized canonically. The Runtime
+// already validated the proposed commands into the Catalog reference the
+// Result carries; the Kernel records that revision and requests the
+// immutable Spec write.
+func decideSpecsGenerated(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
+	if len(in.Body) == 0 || len(in.Body) > maxSpecOutput {
+		return invalidOutput(state, in, created, "spec generation output is empty or exceeds the bounded size", false)
+	}
+	var out specOutput
+	if err := yaml.Unmarshal(in.Body, &out); err != nil {
+		return invalidOutput(state, in, created, "spec generation output is not a structured document", false)
+	}
+	if len(out.Specs) != 1 {
+		return invalidOutput(state, in, created,
+			"spec generation output must carry exactly one spec (the demo pipeline binds one active spec revision)", false)
+	}
+	specBody, err := validateSpecOutput(out.Specs[0])
+	if err != nil {
+		return invalidOutput(state, in, created, err.Error(), false)
+	}
+	b := &builder{state: state}
+	if in.CatalogRef.Type == model.ArtifactCatalog && in.CatalogRef.Revision >= 1 && in.CatalogRef.Hash != "" {
+		b.mutate(model.ArtifactRefMutation{
+			Type: in.CatalogRef.Type, Revision: in.CatalogRef.Revision,
+			Path: artifactRefPath(in.CatalogRef), Hash: in.CatalogRef.Hash,
+		})
+	}
+	b.mutate(sessionEnd(state, created, in))
+	b.effect(model.ArtifactWriteIntent{
+		Ref:      model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactSpec},
+		Body:     specBody,
+		Producer: model.PurposeSpecGeneration,
+		Session:  created.ID,
+	})
+	return b.decision(), nil
+}
+
+// specAllowedKeys is the closed set of Spec body keys (spec.json has
+// additionalProperties: false; the Kernel's light structural check keeps
+// free argv and unknown fields out of the artifact before the strict
+// schema validation on write).
+var specAllowedKeys = map[string]bool{
+	"id": true, "goal": true, "depends_on": true, "write_scope": true,
+	"read_scope": true, "locks": true, "acceptance": true, "route": true,
+	"timeout_seconds": true, "max_retry": true,
+}
+
+// validateSpecOutput checks one Spec body structurally and returns its
+// canonical serialization (yaml.v3 sorts map keys, so the re-serialized
+// body is deterministic).
+func validateSpecOutput(m map[string]any) ([]byte, error) {
+	if m == nil {
+		return nil, fmt.Errorf("spec output carries an empty spec")
+	}
+	for key := range m {
+		if !specAllowedKeys[key] {
+			return nil, fmt.Errorf("spec output carries the disallowed field %q", key)
+		}
+	}
+	for _, required := range []string{"id", "goal", "depends_on", "write_scope", "acceptance"} {
+		if _, ok := m[required]; !ok {
+			return nil, fmt.Errorf("spec output is missing the required field %q", required)
+		}
+	}
+	if id, ok := m["id"].(string); !ok || id == "" {
+		return nil, fmt.Errorf("spec id must be a non-empty string")
+	}
+	if goal, ok := m["goal"].(string); !ok || goal == "" {
+		return nil, fmt.Errorf("spec goal must be a non-empty string")
+	}
+	if deps, ok := m["depends_on"].([]any); !ok {
+		return nil, fmt.Errorf("spec depends_on must be a list")
+	} else {
+		for _, d := range deps {
+			if _, ok := d.(string); !ok {
+				return nil, fmt.Errorf("spec depends_on entries must be strings")
+			}
+		}
+	}
+	if scope, ok := m["write_scope"].([]any); !ok || len(scope) == 0 {
+		return nil, fmt.Errorf("spec write_scope must be a non-empty list")
+	}
+	acc, ok := m["acceptance"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("spec acceptance must be an object")
+	}
+	cmds, ok := acc["verification_command_ids"].([]any)
+	if !ok || len(cmds) == 0 {
+		return nil, fmt.Errorf("spec acceptance must reference verification commands")
+	}
+	for _, c := range cmds {
+		if _, ok := c.(string); !ok {
+			return nil, fmt.Errorf("spec acceptance command ids must be strings")
+		}
+	}
+	body, err := yaml.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("spec output cannot be serialized")
+	}
+	return body, nil
+}
+
+// decidePatchProposed validates the Workflow Optimization output as a
+// restricted Patch IR (bounded, structured) and requests the Compilation
+// Effect: the Compiler validates the Patch against the deterministic
+// skeleton and returns the canonical Dynamic Workflow body.
+func decidePatchProposed(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
+	if len(in.Body) == 0 || len(in.Body) > maxPlanBody {
+		return invalidOutput(state, in, created, "workflow optimization output is empty or exceeds the bounded size", false)
+	}
+	var patch struct {
+		Schema     string `yaml:"schema"`
+		Operations []any  `yaml:"operations"`
+	}
+	if err := yaml.Unmarshal(in.Body, &patch); err != nil {
+		return invalidOutput(state, in, created, "workflow optimization output is not a structured patch", false)
+	}
+	if patch.Schema != "cflow-workflow-patch-1" || len(patch.Operations) == 0 {
+		return invalidOutput(state, in, created, "workflow optimization output is not a restricted patch document", false)
+	}
+	b := &builder{state: state}
+	b.mutate(sessionEnd(state, created, in))
+	b.effect(model.WorkflowCompileIntent{PatchBody: in.Body})
+	return b.decision(), nil
+}
+
+// decideWorkflowCompiled judges the compiled Dynamic Workflow body: the
+// rejected (inert) Patch operations become non-blocking Compile Findings
+// visible in Dry Run, and the canonical body is written as the immutable
+// Workflow Revision.
+func decideWorkflowCompiled(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	if len(in.Body) == 0 || len(in.Body) > maxPlanBody {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("compiled workflow body is empty or exceeds the bounded size"))
+	}
+	b := &builder{state: state}
+	for i, op := range in.RejectedOps {
+		b.mutate(model.FindingAppendMutation{Finding: model.Finding{
+			ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+i+1)),
+			Code:     model.CodeWorkflowPatchForbidden,
+			Scope:    model.ScopeWorkflowRevision,
+			Subject:  string(state.Workflow.ID),
+			Blocking: false,
+			Text:     op,
+			Seq:      state.NextEventSeq + uint64(i),
+		}})
+		b.event(model.EventFindingOpened, "", model.AttemptKey{}, model.CodeWorkflowPatchForbidden, op)
+	}
+	b.effect(model.ArtifactWriteIntent{
+		Ref:      model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow},
+		Body:     in.Body,
+		Producer: model.PurposeWorkflowOptimization,
+	})
+	return b.decision(), nil
+}
+
+// decideIntegrationWorktreeCreated records the Integration Worktree HEAD
+// (the recorded Base Commit at approval) into the aggregate.
+func decideIntegrationWorktreeCreated(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	if in.IntegrationHead == "" {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("integration worktree result carries no head"))
+	}
+	b := &builder{state: state}
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.IntegrationHead = in.IntegrationHead
+	b.mutate(m)
+	return b.decision(), nil
 }
 
 // planRevisionRecorded moves the Workflow to PLAN_CHECK with the new

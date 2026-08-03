@@ -157,6 +157,10 @@ func (a *Application) planningPrompt(cmd model.Input) (agent.Prompt, bool) {
 		purpose = "PLAN_GENERATION"
 	case model.CheckPlanInput:
 		purpose = "PLAN_CHECK"
+	case model.SpecGenerationInput:
+		purpose = "SPEC_GENERATION"
+	case model.WorkflowCompilationInput:
+		purpose = "WORKFLOW_OPTIMIZATION"
 	}
 	if purpose == "" {
 		return agent.Prompt{}, false

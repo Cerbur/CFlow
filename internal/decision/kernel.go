@@ -34,6 +34,12 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideCheckPlan(state, in)
 	case model.PlanApprovalInput:
 		return decidePlanApproval(state, in)
+	case model.SpecGenerationInput:
+		return decideSpecGeneration(state, in)
+	case model.WorkflowCompilationInput:
+		return decideWorkflowCompilation(state, in)
+	case model.ExecutionDryRunInput:
+		return decideExecutionDryRun(state, in)
 	case model.ExecutionApprovalInput:
 		return decideExecutionApproval(state, in)
 	case model.AgentEventInput:

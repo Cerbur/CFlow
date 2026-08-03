@@ -119,6 +119,18 @@ type VerificationRunIntent struct {
 
 func (VerificationRunIntent) isEffectIntent() {}
 
+// WorkflowCompileIntent compiles the approved Specs, Verification
+// Catalog, and the validated Patch IR into the canonical Dynamic
+// Workflow body (design 11). PatchBody is the restricted Patch IR the
+// WORKFLOW_OPTIMIZATION Session produced; the executor resolves the
+// Spec and Catalog bodies from the Artifact Store and returns the
+// compiled body plus the inert rejected Patch operations.
+type WorkflowCompileIntent struct {
+	PatchBody []byte
+}
+
+func (WorkflowCompileIntent) isEffectIntent() {}
+
 // ApplyStagingCreateIntent stages the Integration output in an isolated
 // Apply Worktree.
 type ApplyStagingCreateIntent struct {

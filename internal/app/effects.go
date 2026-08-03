@@ -58,9 +58,13 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return model.EffectResultInput{}, stubEffect(e)
 	case model.PlanningWorktreeCreateIntent:
 		return a.planningWorktreeCreate(ctx, e, cmd)
-	case model.IntegrationWorktreeCreateIntent, model.TaskWorktreeCreateIntent:
-		// STUB (Task 11/13): Integration and Task Worktrees.
+	case model.IntegrationWorktreeCreateIntent:
+		return a.integrationWorktreeCreate(ctx, e)
+	case model.TaskWorktreeCreateIntent:
+		// STUB (Task 12/13): Task Worktrees.
 		return model.EffectResultInput{}, stubEffect(e)
+	case model.WorkflowCompileIntent:
+		return a.workflowCompile(ctx, wf, e)
 	case model.GitCommitInspectIntent, model.GitAuditRefCreateIntent:
 		// STUB (Task 13): canonical Git commit facts.
 		return model.EffectResultInput{}, stubEffect(e)
@@ -68,7 +72,7 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		// STUB (Task 13): the serial Integration merge protocol.
 		return model.EffectResultInput{}, stubEffect(e)
 	case model.VerificationRunIntent:
-		// STUB (Task 11): the Verification Engine turns the validated
+		// STUB (Task 13): the Verification Engine turns the validated
 		// Catalog identity into executable plus argv after revalidation.
 		return model.EffectResultInput{}, stubEffect(e)
 	case model.ApplyStagingCreateIntent, model.ApplyFastForwardIntent:
@@ -153,6 +157,14 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 		}
 		if r.Artifact.Revision < 1 || r.Artifact.Hash == "" {
 			return model.InvariantFault(fmt.Errorf("artifact write result carries an incomplete reference"))
+		}
+	case model.WorkflowCompileIntent:
+		if r.Kind != model.WorkflowCompiled {
+			return model.InvariantFault(fmt.Errorf("workflow compilation result does not match its intent"))
+		}
+	case model.IntegrationWorktreeCreateIntent:
+		if r.Kind != model.IntegrationWorktreeCreated || r.IntegrationHead == "" {
+			return model.InvariantFault(fmt.Errorf("integration worktree result does not match its intent"))
 		}
 	}
 	return nil
@@ -400,27 +412,54 @@ func planningBody(cmd model.Input, res *agent.RunResult) []byte {
 			return []byte(res.Terminal.Result)
 		}
 		return nil
+	case model.SpecGenerationInput, model.WorkflowCompilationInput:
+		// The Kernel judges the raw structured Session output (the Spec
+		// document with proposals, or the restricted Patch IR).
+		if res.Terminal != nil {
+			return []byte(res.Terminal.Result)
+		}
+		return nil
 	}
 	return nil
 }
 
 // sessionInput is the structured input recorded with the Prompt: the
 // requirement text for a discussion turn; for plan generation and check,
-// the latest discussion-turn Artifact body when one exists.
+// the latest discussion-turn Artifact body when one exists; for Spec
+// generation, the approved Plan and the active Verification Catalog; for
+// Workflow optimization, the Spec and the eligible routes.
 func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd model.Input) any {
 	if in, ok := cmd.(model.DiscussRequirementInput); ok {
 		return struct {
 			Requirement string `json:"requirement"`
 		}{Requirement: in.Text}
 	}
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil
+	}
+	switch cmd.(type) {
+	case model.SpecGenerationInput:
+		return struct {
+			Plan    string `json:"plan"`
+			Catalog string `json:"catalog"`
+		}{
+			Plan:    string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
+			Catalog: string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		}
+	case model.WorkflowCompilationInput:
+		return struct {
+			Spec           string   `json:"spec"`
+			EligibleRoutes []string `json:"eligible_routes"`
+		}{
+			Spec:           string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+			EligibleRoutes: eligibleRouteNames(),
+		}
+	}
 	if _, ok := cmd.(model.GeneratePlanInput); !ok {
 		if _, ok := cmd.(model.CheckPlanInput); !ok {
 			return nil
 		}
-	}
-	store, err := a.artifactStore(wf)
-	if err != nil {
-		return nil
 	}
 	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactDiscussionTurn})
 	if err != nil {
@@ -433,6 +472,30 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 	return struct {
 		Requirement string `json:"requirement"`
 	}{Requirement: string(body)}
+}
+
+// readArtifact reads the active Revision body of one Artifact Type
+// ("" when none exists).
+func readArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) []byte {
+	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: typ})
+	if err != nil {
+		return nil
+	}
+	body, err := store.Get(ctx, ref)
+	if err != nil {
+		return nil
+	}
+	return body
+}
+
+// eligibleRouteNames is the deterministic eligible route list for the
+// Workflow Optimization Session: every enabled Provider binding.
+func eligibleRouteNames() []string {
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		return nil
+	}
+	return reg.EnabledNames()
 }
 
 // observeSnapshot observes the Planning Snapshot's HEAD and Git-visible
