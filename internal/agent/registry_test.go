@@ -269,6 +269,158 @@ func TestProviderRegistryReorderedYAMLMaps(t *testing.T) {
 	}
 }
 
+// TestProviderRegistryCodexBindingCapturedFacts (task 14 fixture
+// capture): the codex binding pins the captured 0.141.0 protocol facts —
+// the executable name, the supported version range (covering the captured
+// baseline and excluding 2.x), the JSONL dialect, the session contract,
+// and the Start/Resume capability gates the Runtime applies.
+func TestProviderRegistryCodexBindingCapturedFacts(t *testing.T) {
+	reg, err := LoadProviderRegistry()
+	requireNoError(t, err)
+	b, ok := reg.Lookup("codex")
+	if !ok {
+		t.Fatal("codex binding missing from the registry")
+	}
+	if b.Executable.Name != "codex" {
+		t.Fatalf("codex executable name = %q, want %q", b.Executable.Name, "codex")
+	}
+	if b.VersionRange != ">=0.80.0 <2.0.0" {
+		t.Fatalf("codex version range = %q, want the captured binding %q", b.VersionRange, ">=0.80.0 <2.0.0")
+	}
+	if !versionInRange("0.141.0", b.VersionRange) {
+		t.Fatal("the captured baseline 0.141.0 must be inside the codex supported range")
+	}
+	if versionInRange("2.0.0", b.VersionRange) {
+		t.Fatal("2.0.0 must be outside the codex supported range")
+	}
+	if b.Dialect.ID != "cflow.dialect.codex-jsonl.v1" || b.Dialect.EventSchemaRevision != "1" {
+		t.Fatalf("codex dialect = %+v", b.Dialect)
+	}
+	if b.SessionContract.StartEvent != "session_started" || b.SessionContract.IDField != "session_id" {
+		t.Fatalf("codex session contract = %+v", b.SessionContract)
+	}
+	// The Start and Resume capability gates the Runtime applies to every
+	// route must pass for the captured binding.
+	if !bindingHas(b, requiredStartCapabilities) {
+		t.Fatal("codex binding must pass the required Start capability gate")
+	}
+	if !bindingHasResume(b, requiredResumeCapabilities) {
+		t.Fatal("codex binding must pass the required Resume capability gate")
+	}
+}
+
+// TestProviderRegistryCodexUnknownDialectFailClosed: a codex provider
+// binding whose dialect is unknown to this binary, or whose version range
+// is missing, fails the whole registry load (PRD 已确认：未知 Provider CLI
+// 协议 Fail-closed).
+func TestProviderRegistryCodexUnknownDialectFailClosed(t *testing.T) {
+	base := `providers:
+  - name: codex
+    status: enabled
+    revision: "1.0.0"
+    executable: {name: "codex", path_policy: "PATH-resolved at Execution Approval"}
+    version_range: ">=0.80.0 <2.0.0"
+    binary_identity_policy: "PATH-resolved absolute path pinned with binary sha256 at Execution Approval"
+    dialect: {id: "cflow.dialect.codex-jsonl.v2", event_schema_revision: "1"}
+    session_contract: {start_event: "session_started", id_field: "session_id", terminal_events: ["session_finished", "session_failed"], conflict_rule: "x"}
+    start_capabilities: [jsonl_events, structured_output, session_id_on_start]
+    resume_capabilities: [jsonl_events, structured_output, resume_by_session_id]
+    cancel_behavior: "SIGTERM to the process group"
+    budget_behavior: "no native budget limit"
+    known_incompatibilities: []
+`
+	if _, err := parseProviders([]byte(base)); err == nil {
+		t.Fatal("a codex binding with an unknown dialect revision must fail the registry load")
+	}
+	missingRange := strings.Replace(base, `version_range: ">=0.80.0 <2.0.0"`, `version_range: ""`, 1)
+	missingRange = strings.Replace(missingRange, "cflow.dialect.codex-jsonl.v2", "cflow.dialect.codex-jsonl.v1", 1)
+	if _, err := parseProviders([]byte(missingRange)); err == nil {
+		t.Fatal("a codex binding without a supported version range must fail the registry load")
+	}
+}
+
+// versionInRange is the test-local check that the captured baseline
+// version satisfies the codex binding's declared range (the adapter owns
+// the production range matcher; this pins the binding contract).
+func versionInRange(version, constraint string) bool {
+	parse := func(s string) ([3]int, bool) {
+		parts := strings.SplitN(s, ".", 3)
+		if len(parts) != 3 {
+			return [3]int{}, false
+		}
+		var v [3]int
+		for i, p := range parts {
+			n := 0
+			for _, c := range p {
+				if c < '0' || c > '9' {
+					return [3]int{}, false
+				}
+				n = n*10 + int(c-'0')
+			}
+			v[i] = n
+		}
+		return v, true
+	}
+	want, ok := parse(version)
+	if !ok {
+		return false
+	}
+	for _, tok := range strings.Fields(constraint) {
+		op, boundText := "", tok
+		for _, candidate := range []string{">=", "<=", ">", "<"} {
+			if strings.HasPrefix(tok, candidate) {
+				op, boundText = candidate, strings.TrimPrefix(tok, candidate)
+				break
+			}
+		}
+		bound, ok := parse(boundText)
+		if !ok {
+			return false
+		}
+		switch op {
+		case ">=":
+			if lt(want, bound) {
+				return false
+			}
+		case "<=":
+			if gt(want, bound) {
+				return false
+			}
+		case ">":
+			if !gt(want, bound) {
+				return false
+			}
+		case "<":
+			if !lt(want, bound) {
+				return false
+			}
+		case "":
+			if want != bound {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func lt(a, b [3]int) bool {
+	for i := 0; i < 3; i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
+
+func gt(a, b [3]int) bool {
+	for i := 0; i < 3; i++ {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
+}
+
 // TestProviderRegistryBindingsComplete: every enabled binding carries the
 // full design 14.2 binding set, and disabled OpenCode carries P1 metadata
 // only.

@@ -1,0 +1,7 @@
+{"type":"session_started","timestamp":"2026-07-01T11:00:00.000Z","session_id":"0197f1c1-9c6e-7a00-a000-000000000001","cwd":"/Users/dev/worktrees/task-1","turn_id":"0197f1c1-9c6e-7a00-a000-000000000007"}
+{"type":"turn_started","timestamp":"2026-07-01T11:00:01.000Z","turn_id":"0197f1c1-9c6e-7a00-a000-000000000007"}
+{"type":"message","timestamp":"2026-07-01T11:00:02.000Z","message_id":"0197f1c1-9c6e-7a00-a000-000000000008","turn_id":"0197f1c1-9c6e-7a00-a000-000000000007","payload":{"role":"user","content":[{"type":"text","text":"Continue the implementation."}]}}
+{"type":"message","timestamp":"2026-07-01T11:00:03.000Z","message_id":"0197f1c1-9c6e-7a00-a000-000000000009","turn_id":"0197f1c1-9c6e-7a00-a000-000000000007","payload":{"role":"assistant","content":[{"type":"text","text":"Continuing where the session left off."}]}}
+{"type":"usage","timestamp":"2026-07-01T11:00:04.000Z","turn_id":"0197f1c1-9c6e-7a00-a000-000000000007","usage":{"input_tokens":900,"output_tokens":150,"total_tokens":1050,"cost_usd":0.009}}
+{"type":"turn_completed","timestamp":"2026-07-01T11:00:05.000Z","turn_id":"0197f1c1-9c6e-7a00-a000-000000000007"}
+{"type":"session_finished","timestamp":"2026-07-01T11:00:06.000Z","session_id":"0197f1c1-9c6e-7a00-a000-000000000001","result":{"done":true,"commits":["feat: search index"]}}

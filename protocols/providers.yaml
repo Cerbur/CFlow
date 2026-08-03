@@ -67,6 +67,7 @@ providers:
     known_incompatibilities:
       - "shell command strings, pipes and redirects are never accepted; commands run argv-only"
       - "interactive TTY mode is unsupported; only non-interactive exec is driven"
+      - "codex exec resume accepts no -C/--cd flag (captured 0.141.0 help); resumed sessions run with the supervised process cwd"
 
   - name: claude
     status: enabled

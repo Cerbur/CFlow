@@ -1,0 +1,3 @@
+{"type":"session_started","timestamp":"2026-07-01T13:00:00.000Z","session_id":"0197f1c1-9c6e-7a00-a000-0000000000aa","cwd":"/Users/dev/worktrees/task-1","turn_id":"0197f1c1-9c6e-7a00-a000-0000000000ab"}
+{"type":"message","timestamp":"2026-07-01T13:00:01.000Z","message_id":"0197f1c1-9c6e-7a00-a000-0000000000ac","turn_id":"0197f1c1-9c6e-7a00-a000-0000000000ab","payload":{"role":"assistant","content":[{"type":"text","text":"Working in the established session."}]}}
+{"type":"message","timestamp":"2026-07-01T13:00:02.000Z","message_id":"0197f1c1-9c6e-7a00-a000-0000000000ad","turn_id":"0197f1c1-9c6e-7a00-a000-0000000000ab","session_id":"0197f1c1-9c6e-7a00-a000-0000000000bb","payload":{"role":"assistant","content":[{"type":"text","text":"Claiming a different session id."}]}}

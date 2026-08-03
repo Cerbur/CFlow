@@ -1,0 +1,10 @@
+{"type":"session_started","timestamp":"2026-07-01T10:00:00.000Z","session_id":"0197f1c1-9c6e-7a00-a000-000000000001","cwd":"/Users/dev/worktrees/task-1","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002"}
+{"type":"turn_started","timestamp":"2026-07-01T10:00:01.000Z","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002"}
+{"type":"message","timestamp":"2026-07-01T10:00:02.000Z","message_id":"0197f1c1-9c6e-7a00-a000-000000000003","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002","payload":{"role":"user","content":[{"type":"text","text":"Implement the search feature."}]}}
+{"type":"message","timestamp":"2026-07-01T10:00:03.000Z","message_id":"0197f1c1-9c6e-7a00-a000-000000000004","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002","payload":{"role":"assistant","content":[{"type":"text","text":"Reading the repository to ground the plan."}]}}
+{"type":"tool_execution","timestamp":"2026-07-01T10:00:04.000Z","tool_call_id":"0197f1c1-9c6e-7a00-a000-000000000005","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002","state":"running","tool_call":{"name":"shell","arguments":"{\"command\":\"git status --porcelain\"}"}}
+{"type":"tool_execution","timestamp":"2026-07-01T10:00:06.000Z","tool_call_id":"0197f1c1-9c6e-7a00-a000-000000000005","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002","state":"success","tool_call":{"name":"shell","arguments":"{\"command\":\"git status --porcelain\"}"},"output":"?? internal/search/"}
+{"type":"message","timestamp":"2026-07-01T10:00:07.000Z","message_id":"0197f1c1-9c6e-7a00-a000-000000000006","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002","payload":{"role":"assistant","content":[{"type":"text","text":"The plan has three phases."}]}}
+{"type":"usage","timestamp":"2026-07-01T10:00:08.000Z","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002","usage":{"input_tokens":1200,"output_tokens":300,"total_tokens":1500,"cost_usd":0.012}}
+{"type":"turn_completed","timestamp":"2026-07-01T10:00:09.000Z","turn_id":"0197f1c1-9c6e-7a00-a000-000000000002"}
+{"type":"session_finished","timestamp":"2026-07-01T10:00:10.000Z","session_id":"0197f1c1-9c6e-7a00-a000-000000000001","result":{"summary":"The plan has three phases.","phases":["index","query","wire"]}}
