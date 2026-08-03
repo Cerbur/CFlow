@@ -346,9 +346,15 @@ func (a *Application) graphSnapshot(state model.State, plan *dispatchPlan) model
 // the same pass when no mutual dependency exists (the DAG guarantees it),
 // their write scopes are disjoint, and their resource locks are disjoint.
 // The Agent can only downgrade parallel to serial, never override a
-// static conflict; a conflicting Task is deferred to a later pass. An
-// open blocking Finding in the Node's scope, the total-run budget, and
-// the unsupported kinds (verify/merge/checkpoint/final-verify dispatch
+// static conflict; a conflicting Task is deferred to a later pass. The
+// judgment extends to the RUNNING aggregate: a RUNNING agent-task Node
+// holds its declared resource locks and write scopes for its Attempt's
+// RUNNING lifetime, so a Task deferred in an earlier pass cannot dispatch
+// into them in a later pass — two RUNNING Attempts with overlapping locks
+// or scopes never coexist in the state model (review fix #1; the state
+// Task 13's gates consume must never show the violation). An open
+// blocking Finding in the Node's scope, the total-run budget, and the
+// unsupported kinds (verify/merge/checkpoint/final-verify dispatch
 // arrives with Task 13) also defer.
 func (a *Application) selectBatch(state model.State, plan *dispatchPlan, eligible []model.NodeID) []model.NodeID {
 	var selected []model.NodeID
@@ -368,6 +374,17 @@ func (a *Application) selectBatch(state model.State, plan *dispatchPlan, eligibl
 			if tasksConflict(plan.node(other), node) {
 				conflict = true
 				break
+			}
+		}
+		if !conflict {
+			for nid, n := range state.Nodes {
+				if n.Status != model.NodeRunning || n.Kind != model.NodeAgentTask {
+					continue
+				}
+				if rn := plan.node(nid); rn != nil && tasksConflict(rn, node) {
+					conflict = true
+					break
+				}
 			}
 		}
 		if conflict {

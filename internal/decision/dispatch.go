@@ -121,9 +121,25 @@ func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, 
 	if node.Status == model.NodeReady && node.RetryCharged >= node.RetryBudget {
 		return model.Decision{}, model.InvalidInputFault("node " + string(node.ID) + " has exhausted its retry budget")
 	}
-	if in.Session == "" || in.Route == "" || in.BaseHead == "" {
+	if in.Session == "" || in.Route == "" {
 		return model.Decision{}, model.InvalidInputFault(
-			"allocation requires a session identity, an approved route, and the verified integration head")
+			"allocation requires a session identity and an approved route")
+	}
+	// The Task Base: the current verified Integration HEAD at readiness,
+	// recorded once and immutable (PRD Worktree 策略). A first allocation
+	// carries it from the Application; a budgeted retry reuses the
+	// recorded Base — the freshly observed HEAD is ignored and the Task
+	// never silently rebases onto a different baseline.
+	base := in.BaseHead
+	if node.Status == model.NodeReady {
+		if node.BaseCommit == "" {
+			return model.Decision{}, model.InvalidInputFault(
+				"node " + string(node.ID) + " has no recorded task base to retry from")
+		}
+		base = node.BaseCommit
+	} else if base == "" {
+		return model.Decision{}, model.InvalidInputFault(
+			"allocation requires the verified integration head")
 	}
 	if err := validateFreshSession(state, in.Session); err != nil {
 		return model.Decision{}, err
@@ -146,20 +162,30 @@ func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, 
 		Key:       key,
 		Session:   in.Session,
 		Status:    model.AttemptRunning,
-		StartHead: in.BaseHead,
+		StartHead: base,
 		StartedAt: state.Now,
 	}})
 	b.event(model.EventAttemptCreated, node.ID, key, "", "attempt created")
 	if node.Status == model.NodePending {
 		// The Task Base is the current verified Integration HEAD at
 		// readiness, recorded once and immutable (PRD Worktree 策略).
-		b.mutate(model.TaskMutation{Node: node.ID, BaseCommit: in.BaseHead})
+		b.mutate(model.TaskMutation{Node: node.ID, BaseCommit: base})
+		b.effect(model.TaskWorktreeCreateIntent{
+			Node:     node.ID,
+			Branch:   taskBranch(state.Workflow.ID, node.ID),
+			BaseHead: base,
+		})
+	} else {
+		// Budgeted retry: the Task Worktree already exists from the first
+		// allocation, so no worktree creation Effect is emitted — the
+		// coding Session starts directly inside it from the recorded Base.
+		b.effect(model.ProviderStartIntent{
+			Session: in.Session,
+			Purpose: model.PurposeImplementation,
+			Route:   in.Route,
+			Node:    node.ID,
+		})
 	}
-	b.effect(model.TaskWorktreeCreateIntent{
-		Node:     node.ID,
-		Branch:   taskBranch(state.Workflow.ID, node.ID),
-		BaseHead: in.BaseHead,
-	})
 	return b.decision(), nil
 }
 

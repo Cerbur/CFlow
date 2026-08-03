@@ -793,6 +793,16 @@ func TestAttemptCommitsBeforeProviderStart(t *testing.T) {
 // for a later pass.
 func TestDispatchDefersSharedLockConflict(t *testing.T) {
 	fx := newExecutionFixture(t)
+	// Both Tasks must be scheduler-eligible before the static conflict
+	// judgment decides: the concurrency bound of two lets the second Task
+	// through the cap so the conflict — not the cap — defers it (PRD 并发
+	// 上限).
+	if err := os.MkdirAll(fx.home, 0o700); err != nil {
+		fx.t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.home, "config.yaml"), []byte("concurrency: 2\n"), 0o600); err != nil {
+		fx.t.Fatalf("write config: %v", err)
+	}
 	a, wf := fx.executionReady(implementationScript("i1"))
 	plan := &dispatchPlan{nodes: []dispatchNode{
 		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
@@ -823,6 +833,95 @@ func TestDispatchDefersSharedLockConflict(t *testing.T) {
 	if runningAttempts != 1 {
 		t.Fatalf("running attempts = %d, want 1", runningAttempts)
 	}
+}
+
+// assertRunningAndPending projects the dispatch state of one workflow and
+// asserts exactly wantRunning RUNNING Attempts with the named node still
+// PENDING.
+func (fx *planningFixture) assertRunningAndPending(wf model.WorkflowID, wantRunning int, pending model.NodeID) {
+	fx.t.Helper()
+	iv := fx.inspect(wf)
+	statusByID := map[model.NodeID]model.NodeStatus{}
+	running := 0
+	for _, n := range iv.Nodes {
+		statusByID[n.ID] = n.Status
+	}
+	for _, at := range iv.Attempts {
+		if at.Status == model.AttemptRunning {
+			running++
+		}
+	}
+	if running != wantRunning || statusByID[pending] != model.NodePending {
+		fx.t.Fatalf("running attempts = %d, %s = %s; want %d/PENDING",
+			running, pending, statusByID[pending], wantRunning)
+	}
+}
+
+// TestDispatchDefersAgainstRunningNodeLocks (review fix #1): the static
+// parallel-safety judgment extends to the RUNNING aggregate. S02 deferred
+// by a shared resource lock in pass 1 stays deferred in pass 2 while S01
+// is still RUNNING — two RUNNING Attempts with the same declared
+// resource lock never coexist in the state model (PRD 并行安全判断: two
+// Tasks parallel only if resource_locks disjoint).
+func TestDispatchDefersAgainstRunningNodeLocks(t *testing.T) {
+	fx := newExecutionFixture(t)
+	// The second pass must actually see S02 as scheduler-eligible: the
+	// concurrency bound must allow two Tasks before the static judgment
+	// decides (PRD 并发上限), so it is configured before the Compiler
+	// validates the skeleton.
+	if err := os.MkdirAll(fx.home, 0o700); err != nil {
+		fx.t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.home, "config.yaml"), []byte("concurrency: 4\n"), 0o600); err != nil {
+		fx.t.Fatalf("write config: %v", err)
+	}
+	a, wf := fx.executionReady(implementationScript("i1"))
+	plan := &dispatchPlan{nodes: []dispatchNode{
+		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+			route: "fake", locks: []string{"db-shard-1"}},
+		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+			route: "fake", locks: []string{"db-shard-1"}},
+	}}
+	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
+		fx.t.Fatalf("dispatch pass 1: %v", err)
+	}
+	fx.assertRunningAndPending(wf, 1, "S02")
+	// Pass 2 runs while S01 is still RUNNING: S02 is scheduler-eligible
+	// but its declared lock is held by the RUNNING S01, so the pass
+	// allocates nothing and the state model never shows the conflict.
+	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
+		fx.t.Fatalf("dispatch pass 2: %v", err)
+	}
+	fx.assertRunningAndPending(wf, 1, "S02")
+}
+
+// TestDispatchDefersAgainstRunningNodeScopes (review fix #1): the same
+// deferral applies to overlapping write scopes — a Task whose write
+// scope overlaps a still-RUNNING Task's scope cannot dispatch in a later
+// pass (PRD 并行安全判断).
+func TestDispatchDefersAgainstRunningNodeScopes(t *testing.T) {
+	fx := newExecutionFixture(t)
+	if err := os.MkdirAll(fx.home, 0o700); err != nil {
+		fx.t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.home, "config.yaml"), []byte("concurrency: 4\n"), 0o600); err != nil {
+		fx.t.Fatalf("write config: %v", err)
+	}
+	a, wf := fx.executionReady(implementationScript("i1"))
+	plan := &dispatchPlan{nodes: []dispatchNode{
+		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+			route: "fake", writeScope: []string{"src/calc/**"}},
+		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+			route: "fake", writeScope: []string{"src/calc/sub/**"}},
+	}}
+	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
+		fx.t.Fatalf("dispatch pass 1: %v", err)
+	}
+	fx.assertRunningAndPending(wf, 1, "S02")
+	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
+		fx.t.Fatalf("dispatch pass 2: %v", err)
+	}
+	fx.assertRunningAndPending(wf, 1, "S02")
 }
 
 // TestDispatchHonorsConcurrencyCap: the user's configured concurrency

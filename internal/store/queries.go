@@ -63,7 +63,7 @@ const queryLatestPreflight = `
 	FROM git_commit_preflights WHERE workflow_id = ? ORDER BY revision DESC LIMIT 1`
 
 const queryNodes = `
-	SELECT n.id, COALESCE(t.branch_name, ''), n.node_type, n.status,
+	SELECT n.id, COALESCE(t.branch_name, ''), COALESCE(t.task_base_commit, ''), n.node_type, n.status,
 	       n.retry_budget_consumed, n.max_retry_budget
 	FROM nodes n LEFT JOIN tasks t ON t.id = n.task_id
 	WHERE n.workflow_id = ? ORDER BY n.id`
@@ -272,10 +272,12 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		st.Workflow.ExecutionFacts = facts
 	}
 
-	// Nodes (branch comes from the Task projection row).
+	// Nodes (branch and the recorded Task Base come from the Task
+	// projection row; the Base is "" until the first allocation records
+	// it at readiness, design 12).
 	if err := forEachRow(ctx, q, queryNodes, []any{workflow}, func(row rowScanner) error {
 		var n model.Node
-		if err := row.Scan(&n.ID, &n.Branch, &n.Kind, &n.Status, &n.RetryCharged, &n.RetryBudget); err != nil {
+		if err := row.Scan(&n.ID, &n.Branch, &n.BaseCommit, &n.Kind, &n.Status, &n.RetryCharged, &n.RetryBudget); err != nil {
 			return fmt.Errorf("scan node: %w", err)
 		}
 		st.Nodes[n.ID] = &n

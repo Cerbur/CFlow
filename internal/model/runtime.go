@@ -101,13 +101,17 @@ func (s NodeStatus) CanTransitionTo(next NodeStatus) bool {
 
 // Node is one schedulable operation. RetryBudget bounds automatic
 // successor Attempts (CONTEXT.md: Retry Budget); the initial Attempt is
-// never charged, each budgeted retry charges one.
+// never charged, each budgeted retry charges one. BaseCommit is the
+// recorded immutable Task Base ("" until the first allocation records it
+// at readiness): a budgeted retry reuses it and never rebases (PRD
+// Worktree 策略). The Store hydrates it from the Task projection row.
 type Node struct {
 	ID           NodeID
 	Kind         NodeKind
 	Status       NodeStatus
 	Dependencies []NodeID
 	Branch       string
+	BaseCommit   string
 	RetryBudget  int
 	RetryCharged int
 }

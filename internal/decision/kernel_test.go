@@ -1760,3 +1760,72 @@ func TestGraphInstallRejectsDanglingDependencies(t *testing.T) {
 	}})
 	assertFaultCode(t, err, model.CodeInvalidInput)
 }
+
+// TestRetryAllocationReusesRecordedBaseWithoutWorktreeEffect (review fix
+// #2): a budgeted retry (READY) reuses the recorded immutable Task Base —
+// the freshly observed Integration HEAD is ignored, so the Task never
+// silently rebases (PRD Worktree 策略) — and emits no Task Worktree
+// creation Effect (the Worktree already exists from the first
+// allocation); the coding Session starts directly inside it.
+func TestRetryAllocationReusesRecordedBaseWithoutWorktreeEffect(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodeReady, 2)
+	state.Nodes["task-1"].RetryCharged = 1
+	state.Nodes["task-1"].BaseCommit = "base-1"
+	got, err := decision.Decide(state, model.DispatchInput{
+		Node: "task-1", Session: "s-2", Route: "fake", BaseHead: "int-9",
+	})
+	requireNoError(t, err)
+	requireNode(t, got, "task-1", model.NodeRunning)
+	requireEvent(t, got, model.EventNodeStarted)
+	requireEvent(t, got, model.EventAttemptCreated)
+
+	foundAttempt := false
+	foundBase := false
+	for _, m := range got.Mutations {
+		switch mm := m.(type) {
+		case model.AttemptAppendMutation:
+			if mm.Attempt.Key != (model.AttemptKey{Node: "task-1", Number: 1}) ||
+				mm.Attempt.Status != model.AttemptRunning ||
+				mm.Attempt.Session != "s-2" ||
+				mm.Attempt.StartHead != "base-1" {
+				t.Fatalf("retry attempt append = %+v", mm.Attempt)
+			}
+			foundAttempt = true
+		case model.SessionAppendMutation:
+			if mm.Session.ID != "s-2" || mm.Session.Purpose != model.PurposeImplementation ||
+				mm.Session.Status != model.SessionStarting || mm.Provider != "fake" {
+				t.Fatalf("retry session append = %+v (provider %q)", mm.Session, mm.Provider)
+			}
+		case model.TaskMutation:
+			// The recorded Base is immutable: a retry never re-records it.
+			foundBase = true
+		}
+	}
+	if !foundAttempt {
+		t.Fatalf("retry allocation missing the attempt mutation: %+v", got.Mutations)
+	}
+	if foundBase {
+		t.Fatalf("retry allocation re-recorded the task base: %+v", got.Mutations)
+	}
+	effect, ok := got.Effect.(model.ProviderStartIntent)
+	if !ok {
+		t.Fatalf("retry allocation effect = %T, want ProviderStartIntent (no worktree creation)", got.Effect)
+	}
+	if effect.Node != "task-1" || effect.Session != "s-2" || effect.Route != "fake" {
+		t.Fatalf("retry coding intent = %+v", effect)
+	}
+}
+
+// TestRetryWithoutRecordedBaseRefused: a READY allocation with no
+// recorded Task Base is refused — the retry cannot rebase onto a freshly
+// observed HEAD (PRD Worktree 策略: the Task never silently rebases).
+func TestRetryWithoutRecordedBaseRefused(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodeReady, 2)
+	state.Nodes["task-1"].RetryCharged = 1
+	_, err := decision.Decide(state, model.DispatchInput{
+		Node: "task-1", Session: "s-2", Route: "fake", BaseHead: "int-9",
+	})
+	assertFaultCode(t, err, model.CodeInvalidInput)
+}
