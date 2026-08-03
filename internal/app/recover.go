@@ -11,6 +11,7 @@ import (
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
 	"cflow.local/cflow/internal/recovery"
+	"cflow.local/cflow/internal/store"
 )
 
 // recoveryHook is the full Recovery-before-mutation hook (Task 13,
@@ -50,6 +51,57 @@ func (h *recoveryHook) reconcile(ctx context.Context, wf model.WorkflowID) error
 // project-level hooks and the app tests.
 type workflowAwareRecoverer interface {
 	ReconcileWorkflow(ctx context.Context, wf model.WorkflowID) error
+}
+
+// reconcileSweep completes the unfinished recovery protocols a crash may
+// have left behind — a persisted Cancel intent, a QUIESCING or STOPPING
+// Run whose snapshot Attempts and processes settled, or a RUNNING
+// Workflow carrying a FAILED Node with nothing in flight (design 17,
+// PRD 已确认：Cancel 逻辑终止 step 4). It runs before every mutation with
+// the mutation locks held, after the Recovery Engine accepted the facts,
+// and never reopens dispatch: Recovery of a Stop, Cancel, Quiesce, or
+// Safety Stop can only finish the persisted protocol.
+func (a *Application) reconcileSweep(ctx context.Context, st *store.Store, wf model.WorkflowID) error {
+	view, err := st.View(ctx, store.StoreQuery{})
+	if err != nil {
+		return err
+	}
+	if !needsReconcile(view.State) {
+		return nil
+	}
+	_, err = a.runDecisionLoop(ctx, st, wf, ReconcileCommand{Workflow: wf}, model.ReconcileInput{}, false)
+	return err
+}
+
+// needsReconcile reports whether the aggregate carries an unfinished
+// recovery protocol the sweep can complete.
+func needsReconcile(st model.State) bool {
+	if st.Workflow.CancelIntent != nil && !st.Workflow.Runtime.IsTerminal() {
+		return true
+	}
+	if run := activeRunOfState(st); run != nil {
+		if run.Status == model.RunQuiescing || run.Status == model.RunStopping {
+			return true
+		}
+	}
+	if st.Workflow.Runtime == model.RuntimeRunning {
+		for _, n := range st.Nodes {
+			if n.Status == model.NodeFailed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// activeRunOfState returns the first non-terminal Run of one aggregate.
+func activeRunOfState(st model.State) *model.Run {
+	for i := range st.Runs {
+		if !st.Runs[i].Status.IsTerminal() {
+			return &st.Runs[i]
+		}
+	}
+	return nil
 }
 
 // safetyPathAllowed reports whether a failed Recovery hook may route

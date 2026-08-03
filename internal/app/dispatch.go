@@ -372,6 +372,20 @@ func (a *Application) parseSpecSet(body []byte) ([]compile.Spec, error) {
 // committed Dispatch Gate with allocation, so no start can cross a
 // committed closure (PRD 已确认：并行失败后的 Quiescing).
 func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf model.WorkflowID, plan *dispatchPlan, restricted bool, routing *agent.RoutingPolicySet) (Outcome, error) {
+	// The pass context: a user interruption (first Ctrl+C) or a detected
+	// Commit Policy drift cancels it; every chain derives from it, so all
+	// active Sessions abort together and no new external action starts
+	// after the stop request.
+	passCtx, passCancel := context.WithCancel(ctx)
+	defer passCancel()
+	a.mu.Lock()
+	a.passCancel = passCancel
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.passCancel = nil
+		a.mu.Unlock()
+	}()
 	view, err := st.View(ctx, store.StoreQuery{})
 	if err != nil {
 		return Outcome{}, err
@@ -487,7 +501,7 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 			if c.integHold != nil {
 				defer c.integHold.Release()
 			}
-			if err := a.runNodeDispatch(ctx, st, wf, c.id, c.route, c.baseHead, c.node, rt); err != nil {
+			if err := a.runNodeDispatch(passCtx, st, wf, c.id, c.route, c.baseHead, c.node, rt); err != nil {
 				errs <- err
 			}
 		}()
@@ -497,6 +511,13 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 	for err := range errs {
 		if err != nil {
 			return Outcome{}, err
+		}
+	}
+	// A detected Commit Policy drift settles after the pass: the window
+	// scan feeds the quarantine or the confirmation gate (PRD steps 6-7).
+	if a.policyDriftPending() {
+		if serr := a.settlePolicyDrift(ctx, st, wf); serr != nil {
+			return Outcome{}, serr
 		}
 	}
 	return Outcome{Workflow: wf, Stage: state.Workflow.Stage, Runtime: state.Workflow.Runtime,
@@ -716,17 +737,33 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 			}
 		}
 	}
+	processID := model.ProcessID(a.ids(model.IDProcess))
 	input := model.Input(model.DispatchInput{
 		Node:     node,
 		Session:  session,
 		Route:    dispatchRoute,
 		BaseHead: baseHead,
+		Process:  processID,
 	})
 	executed := map[string]struct{}{}
 	gateFed := false
+	// The pass may be cancelled mid-chain (user Ctrl+C or a detected
+	// Commit Policy drift): the RUNNING Attempt then settles INTERRUPTED
+	// without Retry charge and the stop converges through the Kernel. The
+	// settle transactions and the process-stop Effects continue on a
+	// context that is not cancelled, so the aggregate transactions and
+	// the two-phase stop complete.
+	settleCtx := ctx
 	for iter := 0; iter < nodeDispatchBudget; iter++ {
 		cd, err := a.transactPass(ctx, st, input)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The pass was interrupted between Effects: settle the
+				// RUNNING Attempt and complete the controlled stop.
+				if a.interruptChain(context.WithoutCancel(ctx), st, wf, node, rt) {
+					return nil
+				}
+			}
 			return err
 		}
 		if iter == 0 {
@@ -740,7 +777,7 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 			if planNode != nil && planNode.kind == model.NodeAgentTask && !gateFed && a.attemptRunning(ctx, wf, node) {
 				result, err := a.taskGateResult(ctx, wf, node, planNode.writeScope)
 				if err != nil {
-					return err
+					return a.interruptedOr(err, ctx, settleCtx, st, wf, node, rt)
 				}
 				gateFed = true
 				input = result
@@ -753,16 +790,100 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 			return model.InvariantFault(fmt.Errorf("repeated identical uncompleted effect intent %s", id))
 		}
 		executed[id] = struct{}{}
+		// The Commit Policy monitor runs while the commit-capable Session
+		// is active (PRD step 5: no slower than once per second). It
+		// starts at the chain's first Effect — before the Worktree
+		// creation and the Session — so its first recompute observes the
+		// drift before any Commit can land inside the window.
+		if planNode != nil && planNode.kind == model.NodeAgentTask {
+			switch cd.Decision.Effect.(type) {
+			case model.ProviderStartIntent, model.TaskWorktreeCreateIntent:
+				go a.monitorPolicy(ctx, wf)
+			}
+		}
 		result, err := a.executeEffect(ctx, cd.Decision.Effect, false, wf, DispatchCommand{Workflow: wf}, input, rt)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The pass was interrupted (user Ctrl+C or a detected
+				// Commit Policy drift): settle the RUNNING Attempt as
+				// INTERRUPTED (never charged) and complete the controlled
+				// stop of the pass on the non-cancelled settle context.
+				if a.interruptChain(context.WithoutCancel(ctx), st, wf, node, rt) {
+					return nil
+				}
+			}
 			return err
 		}
 		if err := validateEffectResult(cd.Decision.Effect, result); err != nil {
+			if ctx.Err() != nil {
+				// The pass was interrupted: a result that no longer matches
+				// its Intent is the interruption's symptom (e.g. the Worktree
+				// could not be observed under the cancelled context). The
+				// RUNNING Attempt settles INTERRUPTED through the stop
+				// protocol, never as a fabricated failure.
+				if a.interruptChain(context.WithoutCancel(ctx), st, wf, node, rt) {
+					return nil
+				}
+			}
 			return err
 		}
 		input = model.EffectResultInput(result)
 	}
 	return model.InvariantFault(fmt.Errorf("node dispatch exceeded the effect bound"))
+}
+
+// interruptedOr settles the chain's RUNNING Attempt when a pass
+// interruption aborted the gate, and reports nil when the stop completed.
+func (a *Application) interruptedOr(err error, ctx, settleCtx context.Context, st *store.Store, wf model.WorkflowID, node model.NodeID, rt *agent.Runtime) error {
+	if ctx.Err() != nil && a.interruptChain(context.WithoutCancel(ctx), st, wf, node, rt) {
+		return nil
+	}
+	return err
+}
+
+// interruptChain settles the chain's RUNNING Attempt as interrupted when
+// the pass was cancelled and completes the controlled stop of the pass:
+// the typed interrupted result opens the stop (gate close, Run STOPPING,
+// CONTROLLED_STOP_REQUESTED or the COMMIT_POLICY_SAFETY_STOP_REQUESTED
+// intent) and the process-stop Effects are executed to convergence — all
+// on the non-cancelled settle context. It reports whether the chain may
+// finish (the stop completed or nothing was running).
+func (a *Application) interruptChain(settleCtx context.Context, st *store.Store, wf model.WorkflowID, node model.NodeID, rt *agent.Runtime) bool {
+	view, err := st.View(settleCtx, store.StoreQuery{})
+	if err != nil {
+		return false
+	}
+	att := runningAttemptOfState(view.State, node)
+	if att == nil {
+		return true // nothing running: the chain is already done
+	}
+	input := model.EffectResultInput{
+		Kind:        model.AttemptEnded,
+		Attempt:     att.Key,
+		Outcome:     model.OutcomeInterrupted,
+		FailureCode: a.policyDriftCode(),
+	}
+	executed := map[string]struct{}{}
+	for iter := 0; iter < nodeDispatchBudget; iter++ {
+		cd, err := a.transactPass(settleCtx, st, input)
+		if err != nil {
+			return false
+		}
+		if cd.Decision.Effect == nil {
+			return true
+		}
+		id := intentIdentity(cd.Decision.Effect)
+		if _, dup := executed[id]; dup {
+			return false
+		}
+		executed[id] = struct{}{}
+		result, err := a.executeEffect(settleCtx, cd.Decision.Effect, false, wf, DispatchCommand{Workflow: wf}, input, rt)
+		if err != nil {
+			return false
+		}
+		input = model.EffectResultInput(result)
+	}
+	return false
 }
 
 // attemptRunning reports whether one Node's Attempt is still RUNNING.

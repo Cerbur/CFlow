@@ -292,6 +292,7 @@ func TestResumeRendersOutcome(t *testing.T) {
 	seedWorkflow(t, dbPath, model.WorkflowCommandInput{Kind: model.StartWorkflow, Workflow: "wf-1"})
 	seedWorkflow(t, dbPath, model.WorkflowCommandInput{Kind: model.PauseWorkflow, Workflow: "wf-1"})
 	out, code := runCLI(t, home, "resume", "wf-1")
+	t.Logf("resume out=%q code=%d", out, code)
 	requireExit(t, out, code, 0)
 	if !strings.Contains(out, "running") {
 		t.Fatalf("resume output missing running status:\n%s", out)

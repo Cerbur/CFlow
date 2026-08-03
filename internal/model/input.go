@@ -352,17 +352,180 @@ type EffectResultInput struct {
 	// records (the chain evidence: test-result, review-result, commit,
 	// git snapshot); Evidence stays the primary reference.
 	EvidenceRefs []EvidenceRef
+	// Orphan reports that the stopped process was still alive with the
+	// exact PID/start-token identity after the force-kill phase of the
+	// controlled stop (PRD 已确认：Ctrl+C 两阶段有限停止 step 9): the
+	// Workflow Blocks with ORPHAN_CHILD_PROCESS (or keeps a Cancel intent
+	// with CANCEL_PENDING_ORPHAN_PROCESS) and Project mutation is
+	// quarantined.
+	Orphan bool
 }
 
 func (EffectResultInput) isInput() {}
 
 // ReconcileInput triggers the Recovery sweep of the Kernel: it completes a
 // persisted Cancel intent once everything is settled, converges a
-// QUIESCING Run to BLOCKED, and blocks a Workflow that carries a FAILED
+// QUIESCING Run to BLOCKED, converges a STOPPING Run whose processes and
+// Attempts have all settled, and blocks a Workflow that carries a FAILED
 // Node with no in-flight Attempts. It never reopens dispatch.
 type ReconcileInput struct{}
 
 func (ReconcileInput) isInput() {}
+
+// PolicyDriftSettleInput carries the post-Safety-Stop facts the Runtime
+// observed after the two-phase stop settled (PRD 已确认：Commit Policy 漂移
+// 立即安全停止 steps 6-7): the freshly observed Commit Preflight (nil when
+// the new Preflight failed) and the scanned drift-window Commit facts of
+// every active Task/Integration Worktree (Stop-request HEAD to final
+// HEAD). With no window Commit the Kernel records the exact new Preflight
+// and pauses the Workflow for the COMMIT_POLICY confirmation; with window
+// Commits it records one immutable Branch Quarantine per window Commit,
+// marks the contaminated Node FAILED, Blocks the Workflow, and requests
+// the unique audit Refs.
+type PolicyDriftSettleInput struct {
+	// Preflight is the freshly observed Commit Preflight evidence (nil
+	// when the new Preflight failed: the Workflow stays Blocked with
+	// GIT_IDENTITY_NOT_CONFIGURED or GIT_SIGNING_PREFLIGHT_FAILED).
+	Preflight *PreflightFacts
+	// WindowCommits are the per-Branch Commit ranges created inside the
+	// drift window.
+	WindowCommits []WindowCommit
+}
+
+func (PolicyDriftSettleInput) isInput() {}
+
+// WindowCommit is one scanned Branch Commit range of the drift window:
+// the HEAD fixed at the Safety Stop request and the final HEAD after the
+// stop, with the Branch and the owning Node when the Branch is a Task
+// Branch.
+type WindowCommit struct {
+	Branch   string
+	FromHead string
+	ToHead   string
+	Node     NodeID
+}
+
+// CommitPolicyApprovalInput is the append-only user decision binding the
+// exact new Commit Policy Preflight Revision, hash, and fingerprint after
+// a drift Safety Stop (PRD 已确认：执行期间 Commit Policy 漂移确认 step 4).
+// Any reference change since the recorded Preflight is
+// COMMIT_POLICY_INPUT_CHANGED with no mutation.
+type CommitPolicyApprovalInput struct {
+	PreflightRevision int
+	PreflightHash     string
+	Fingerprint       string
+}
+
+func (CommitPolicyApprovalInput) isInput() {}
+
+// ReplacementApprovalInput is the user's unified Replacement Execution
+// Approval (PRD 已确认：Replacement Execution Approval 吸收 Policy 确认):
+// one append-only EXECUTION Approval binding the Quarantine Set, the
+// superseded Execution Approval, every successor execution Artifact and
+// policy hash, the current Preflight, and the fixed Reconciliation
+// Manifest Revision/Hash. It absorbs the Commit Policy confirmation for
+// the exact bound fingerprint, so no duplicate COMMIT_POLICY Approval is
+// required.
+// ReplacementPreviewInput carries the successor execution of a
+// drift-window quarantine into the Kernel (PRD 已确认：漂移窗口 Commit 的隔
+// 离与替代执行): the successor Spec/Workflow references, the current
+// routing and budget references, the fresh Commit Preflight, the
+// Quarantine ID set, the superseded Execution Approval, and the fixed
+// Reconciliation Manifest Revision/Hash. The Kernel records the
+// successor references and keeps the Workflow at the unified Replacement
+// Execution Approval gate; the successor references are what the
+// Replacement Execution Approval compares-and-swaps against.
+type ReplacementPreviewInput struct {
+	PlanHash             string
+	SpecHashes           []string
+	SpecRevision         int
+	CatalogHash          string
+	WorkflowHash         string
+	WorkflowRevision     int
+	RoutingHash          string
+	BudgetHash           string
+	Preflight            PreflightFacts
+	QuarantineIDs        []string
+	SupersededApprovalID string
+	ManifestRevision     int
+	ManifestHash         string
+}
+
+func (ReplacementPreviewInput) isInput() {}
+
+type ReplacementApprovalInput struct {
+	// The exact successor execution references (compare-and-swap against
+	// the active ExecutionFacts and the newly recorded Preflight).
+	PlanHash          string
+	SpecHashes        []string
+	CatalogHash       string
+	WorkflowHash      string
+	RoutingHash       string
+	BudgetHash        string
+	PreflightRevision int
+	PreflightHash     string
+	Fingerprint       string
+	// QuarantineIDs is the exact Quarantine ID set the approval contains.
+	QuarantineIDs []string
+	// SupersededApprovalID is the Execution Approval the replacement
+	// supersedes (approval-<n>).
+	SupersededApprovalID string
+	// ManifestRevision and ManifestHash fix the persisted Reconciliation
+	// Manifest the approval binds.
+	ManifestRevision int
+	ManifestHash     string
+}
+
+func (ReplacementApprovalInput) isInput() {}
+
+// ManifestActionKind is one per-Node action of the Reconciliation
+// Manifest (design 15.6, PRD 已确认：未污染兄弟 Task 增量恢复).
+type ManifestActionKind string
+
+const (
+	// ManifestReuseSucceeded: a SUCCEEDED Node whose evidence is intact
+	// and whose definition/dependencies match; never re-executed.
+	ManifestReuseSucceeded ManifestActionKind = "reuse_succeeded"
+	// ManifestResumeInterrupted: an interrupted Node whose facts still
+	// match; resumes with a successor Attempt on the same Branch/Worktree.
+	ManifestResumeInterrupted ManifestActionKind = "resume_interrupted"
+	// ManifestReplaceContaminated: the Node owns a quarantined Branch or
+	// failed within the drift window; replaced on a new Branch/Worktree.
+	ManifestReplaceContaminated ManifestActionKind = "replace_contaminated"
+	// ManifestRerunVerification: a Verify Node of a replaced Task must
+	// re-run against the new path.
+	ManifestRerunVerification ManifestActionKind = "rerun_verification"
+)
+
+// Valid reports whether k is a declared Manifest action.
+func (k ManifestActionKind) Valid() bool {
+	switch k {
+	case ManifestReuseSucceeded, ManifestResumeInterrupted, ManifestReplaceContaminated, ManifestRerunVerification:
+		return true
+	}
+	return false
+}
+
+// String renders the Manifest action.
+func (k ManifestActionKind) String() string { return string(k) }
+
+// ManifestAction is one Node's classification with its reason.
+type ManifestAction struct {
+	Node   NodeID
+	Action ManifestActionKind
+	Reason string
+}
+
+// ReconciliationManifest is the immutable per-Workflow classification of
+// every Node after a Policy Safety Stop (design 15.6): the Runtime
+// recomputes it from Git, Attempt, Session, and evidence facts — never
+// from an Agent claim. The Replacement Execution Approval binds its
+// Revision and Hash; Recovery recomputes and compares.
+type ReconciliationManifest struct {
+	Revision int
+	Hash     string
+	Actions  []ManifestAction
+}
 
 // GraphInstallInput installs the execution graph of the approved compiled
 // Dynamic Workflow (design 12). The Node definitions arrive from the
@@ -372,6 +535,12 @@ func (ReconcileInput) isInput() {}
 // never from Task display status.
 type GraphInstallInput struct {
 	Nodes []InstallNode
+	// Replacement installs the successor graph of an approved Replacement
+	// Execution Approval: existing Node identities whose kind and
+	// dependencies are unchanged stay (the persisted state is reused),
+	// only the new Nodes are appended (PRD 已确认：未污染兄弟 Task 增量恢复
+	// step 3).
+	Replacement bool
 }
 
 func (GraphInstallInput) isInput() {}
@@ -401,6 +570,11 @@ type DispatchInput struct {
 	Session  SessionID
 	Route    string
 	BaseHead string
+	// Process is the Application-allocated managed Process identity of the
+	// Node's chain (design 13.3): the Kernel records the ProcessRecord as
+	// RUNNING with the chain's Session, so the controlled stop ledger
+	// covers every active Provider run.
+	Process ProcessID
 }
 
 func (DispatchInput) isInput() {}

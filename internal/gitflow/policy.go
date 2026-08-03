@@ -386,3 +386,57 @@ func identityNotConfigured() error {
 func signingPreflightFailed() error {
 	return model.NewFault(model.CodeGitSigningPreflightFailed, "gitflow: signing preflight probe failed")
 }
+
+// fingerprintObserve recomputes the effective Commit Policy fingerprint
+// without the signing probe (PRD 已确认：Commit Policy 漂移立即安全停止 step
+// 5): the monitor reads only the public effective configuration — never
+// Signer Secrets — and never runs a signature probe per poll. The result
+// is the normalized fingerprint plus the effective identity and signing
+// policy facts for evidence.
+func (g *GitFlow) fingerprintObserve(ctx context.Context, op FingerprintObserve) (GitFacts, error) {
+	if op.Revision == "" {
+		return nil, model.InvalidInputFault("gitflow: fingerprint observation revision is required")
+	}
+	env := childEnv()
+	versionOut, _, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "--version")
+	if err != nil {
+		return nil, err
+	}
+	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, identityNotConfigured()
+	}
+	gitVersion := strings.TrimSpace(strings.TrimPrefix(string(versionOut), "git version "))
+	author, err := g.resolveIdent(ctx, env, "GIT_AUTHOR_IDENT")
+	if err != nil {
+		return nil, err
+	}
+	committer, err := g.resolveIdent(ctx, env, "GIT_COMMITTER_IDENT")
+	if err != nil {
+		return nil, err
+	}
+	policy, err := g.signingPolicy(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	facts := FingerprintFacts{
+		Revision:          op.Revision,
+		PolicyFingerprint: commitPolicyFingerprint(g.git, gitVersion, author, committer, policy),
+		GitVersion:        gitVersion,
+		Author:            author,
+		Committer:         committer,
+		Signing:           policy,
+	}
+	facts.EvidenceHash = fingerprintFactsHash(facts)
+	return facts, nil
+}
+
+// fingerprintFactsHash binds the exact observation evidence: a canonical
+// JSON serialization of the facts (map keys marshal deterministically).
+func fingerprintFactsHash(f FingerprintFacts) string {
+	f.EvidenceHash = ""
+	b, err := json.Marshal(f)
+	if err != nil {
+		return ""
+	}
+	return sha256Hex(string(b))
+}

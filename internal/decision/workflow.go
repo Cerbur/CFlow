@@ -124,11 +124,13 @@ func decideGeneratePlan(state model.State, in model.GeneratePlanInput) (model.De
 	rt := state.Workflow.Runtime
 	switch rt {
 	case model.RuntimePending:
+		closePriorRuns(b, state)
 		b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 		b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 		b.event(model.EventWorkflowStarted, "", model.AttemptKey{}, "", "workflow started")
 		rt = model.RuntimeRunning
 	case model.RuntimePaused:
+		closePriorRuns(b, state)
 		b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 		b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 		b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workflow resumed")
@@ -204,11 +206,13 @@ func startIfNeeded(b *builder, state model.State) {
 	switch state.Workflow.Runtime {
 	case model.RuntimePending:
 		b.mutate(wfMutStatus(state, model.RuntimeRunning))
+		closePriorRuns(b, state)
 		b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 		b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 		b.event(model.EventWorkflowStarted, "", model.AttemptKey{}, "", "workflow started")
 	case model.RuntimePaused:
 		b.mutate(wfMutStatus(state, model.RuntimeRunning))
+		closePriorRuns(b, state)
 		b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 		b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 		b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workflow resumed")
@@ -284,6 +288,7 @@ func decideStart(state model.State, in model.WorkflowCommandInput) (model.Decisi
 	}
 	b := &builder{state: state}
 	b.mutate(wfMutStatus(state, model.RuntimeRunning))
+	closePriorRuns(b, state)
 	b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 	b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 	b.event(model.EventWorkflowStarted, "", model.AttemptKey{}, "", "workflow started")
@@ -301,19 +306,42 @@ func decidePause(state model.State, in model.WorkflowCommandInput) (model.Decisi
 		return model.Decision{}, model.InvalidInputFault("workflow can only pause from RUNNING")
 	}
 	b := &builder{state: state}
-	b.mutate(wfMutStatus(state, model.RuntimePaused))
-	b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused")
-	if run := activeRun(state); run != nil && !run.Status.IsTerminal() {
-		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunStopping, DispatchGate: false})
-		b.event(model.EventRunStopped, "", model.AttemptKey{}, "", "run stopping")
-		stopRunningProcesses(b, state)
+	run := activeRun(state)
+	if hasBlockingFinding(state) || (run != nil && run.Status == model.RunQuiescing) {
+		// A pause during Quiescing or with a blocking Finding converges to
+		// BLOCKED — Ctrl+C never clears the original Finding (PRD 已确认：
+		// 并行失败后的 Quiescing rule 6).
+		b.mutate(wfMutStatus(state, model.RuntimeBlocked))
+		b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked")
+	} else {
+		b.mutate(wfMutStatus(state, model.RuntimePaused))
+		b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused")
 	}
+	transitioned := false
+	if run != nil && !run.Status.IsTerminal() {
+		if run.Status != model.RunStopping {
+			// The controlled stop intent: dispatch closes and the managed
+			// processes are stopped through the two-phase protocol.
+			b.mutate(model.RunMutation{ID: run.ID, Status: model.RunStopping, DispatchGate: false, StopReason: model.CodeUserInterrupted})
+			b.event(model.EventControlledStopRequested, "", model.AttemptKey{}, "", "stop requested")
+			b.event(model.EventRunStopped, "", model.AttemptKey{}, "", "run stopping")
+			stopRunningProcesses(b, state)
+			transitioned = true
+		}
+	}
+	// The stop may already be complete (no processes, no attempts in
+	// flight): the Run converges INTERRUPTED in the same transaction.
+	convergeStopping(b, state, model.AttemptKey{}, "", transitioned)
 	return b.decision(), nil
 }
 
 // decideResume reopens dispatch with a new Run record; a resume never
 // resurrects a failed Node or reopens a terminal Attempt (PRD 状态机与持久
-// 化模型).
+// 化模型). A Run still mid-stop or mid-quiesce never resumes — Recovery
+// settles the persisted stop first — and a pending Commit Policy
+// confirmation must be bound before any commit-capable action resumes
+// (PRD 已确认：执行期间 Commit Policy 漂移确认 step 7: resume must re-verify
+// the fingerprint and must not skip the confirmation across a restart).
 func decideResume(state model.State, in model.WorkflowCommandInput) (model.Decision, error) {
 	if state.Workflow.ID == "" {
 		return model.Decision{}, model.InvalidInputFault("no workflow to resume")
@@ -321,8 +349,23 @@ func decideResume(state model.State, in model.WorkflowCommandInput) (model.Decis
 	if state.Workflow.Runtime != model.RuntimePaused && state.Workflow.Runtime != model.RuntimeBlocked {
 		return model.Decision{}, model.InvalidInputFault("workflow can only resume from PAUSED or BLOCKED")
 	}
+	if run := activeRun(state); run != nil &&
+		(run.Status == model.RunStopping || run.Status == model.RunQuiescing) {
+		return model.Decision{}, model.InvalidInputFault(
+			"a stop or quiesce is still settling; resume is refused until it completes")
+	}
+	// The Commit Policy confirmation gate guards commit-capable execution
+	// (PRD 已确认：执行期间 Commit Policy 漂移确认 steps 2 and 7): at
+	// EXECUTION the latest Preflight Revision must be bound by an approval
+	// before a resume may reopen dispatch. The pre-execution approval gates
+	// (e.g. the paused Dry Run at WORKFLOW_GENERATION) resume normally.
+	if state.Workflow.Stage == model.StageExecution && !policyConfirmed(state) {
+		return model.Decision{}, model.NewFault(model.CodeCommitPolicyConfirmationRequired,
+			"the exact new commit policy must be confirmed before resume")
+	}
 	b := &builder{state: state}
 	b.mutate(wfMutStatus(state, model.RuntimeRunning))
+	closePriorRuns(b, state)
 	b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 	b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workflow resumed")
@@ -403,8 +446,9 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 		Fingerprint: facts.Fingerprint,
 	}})
 	// The approval is the workflow's entry into EXECUTION: dispatch opens
-	// with a fresh Run and the deterministic Integration Branch is
-	// recorded.
+	// with a fresh Run (closing every prior gate run) and the deterministic
+	// Integration Branch is recorded.
+	closePriorRuns(b, state)
 	b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
 	b.mutate(wfWithIntegration(state, model.StageExecution, model.RuntimeRunning, integrationBranch(state.Workflow.ID)))
 	b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
@@ -580,5 +624,11 @@ func decideExecutionDryRun(state model.State, in model.ExecutionDryRunInput) (mo
 	}
 	b.mutate(wfMutStatus(state, model.RuntimePaused))
 	b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused for execution approval")
+	// The gate pause closes the foreground Run (no processes exist at the
+	// gate): exactly one Run stays active per foreground execution.
+	if run := activeRun(state); run != nil && !run.Status.IsTerminal() {
+		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunInterrupted, DispatchGate: false})
+		b.event(model.EventRunInterrupted, "", model.AttemptKey{}, "", "run interrupted at the approval gate")
+	}
 	return b.decision(), nil
 }

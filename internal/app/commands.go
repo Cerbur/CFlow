@@ -46,6 +46,15 @@ type Options struct {
 	// redaction policy, the evidence root, and the Provider Adapters. A
 	// zero Registry disables Provider effects (fail closed).
 	Agent agent.RuntimeOptions
+	// StopPolicy overrides the staged budgets of the two-phase controlled
+	// stop (design 13.3). nil uses the PRD 10s + 2s + 2s budget; tests
+	// inject tiny values.
+	StopPolicy *StopPolicy
+	// PolicyPollInterval is the Commit Policy monitor's recompute period
+	// (PRD 已确认：Commit Policy 漂移立即安全停止 step 5: no slower than once
+	// per second while a commit-capable managed process is active). 0 uses
+	// the one-second default; tests inject tiny values.
+	PolicyPollInterval time.Duration
 }
 
 // Project is the local project identity one Application serves: the
@@ -106,13 +115,36 @@ type PlanQuery struct{ Workflow model.WorkflowID }
 // groups, and the command identities.
 type ExecutionPreviewQuery struct{ Workflow model.WorkflowID }
 
-func (ListQuery) isQuery()             {}
-func (StatusQuery) isQuery()           {}
-func (InspectQuery) isQuery()          {}
-func (LogsQuery) isQuery()             {}
-func (DiscoveryQuery) isQuery()        {}
-func (PlanQuery) isQuery()             {}
-func (ExecutionPreviewQuery) isQuery() {}
+// PolicyConfirmationQuery projects the pending Commit Policy
+// confirmation gate after a drift Safety Stop (PRD 已确认：执行期间 Commit
+// Policy 漂移确认 step 3): the exact new Preflight Revision/Hash/
+// Fingerprint and the old/new normalized diff, rendered side by side.
+type PolicyConfirmationQuery struct{ Workflow model.WorkflowID }
+
+// CancelSummaryQuery projects the cancel confirmation summary (PRD 已确
+// 认：Cancel 逻辑终止 step 1): the Workflow ID, current Stage, active
+// Sessions and Nodes, every managed Worktree/Branch, the dirty state,
+// the unmerged Commits, and the preserved paths.
+type CancelSummaryQuery struct{ Workflow model.WorkflowID }
+
+// ReplacementPreviewQuery projects the unified Replacement Execution
+// Approval gate (PRD 已确认：Replacement Execution Approval 吸收 Policy 确
+// 认 step 1): the Quarantine Findings/Branches/Audit Refs, the old and
+// new execution Revisions, the Replacement baseline, the routing/budget
+// references, the old/new Commit Policy diff, the current Preflight, and
+// the fixed Reconciliation Manifest with its per-Node categories.
+type ReplacementPreviewQuery struct{ Workflow model.WorkflowID }
+
+func (ListQuery) isQuery()               {}
+func (StatusQuery) isQuery()             {}
+func (InspectQuery) isQuery()            {}
+func (LogsQuery) isQuery()               {}
+func (DiscoveryQuery) isQuery()          {}
+func (PlanQuery) isQuery()               {}
+func (ExecutionPreviewQuery) isQuery()   {}
+func (PolicyConfirmationQuery) isQuery() {}
+func (CancelSummaryQuery) isQuery()      {}
+func (ReplacementPreviewQuery) isQuery() {}
 
 // ---------------------------------------------------------------------------
 // View union: projection results
@@ -224,6 +256,72 @@ type PreflightPreview struct {
 	ProbeStatus  string
 }
 
+// PolicyConfirmationView is the pending Commit Policy confirmation gate:
+// the exact new Preflight Revision/Hash/Fingerprint plus the old
+// fingerprint the drift moved away from.
+type PolicyConfirmationView struct {
+	Workflow          model.WorkflowID
+	Stage             model.WorkflowStage
+	Runtime           model.RuntimeStatus
+	PreflightRevision int
+	PreflightHash     string
+	Fingerprint       string
+	OldFingerprint    string
+	Pending           bool
+}
+
+// CancelSummaryView is the cancel confirmation summary: the Workflow ID,
+// Stage, active Sessions and Nodes, every managed Worktree/Branch with
+// its dirty state and unmerged Commits, and the preserved paths.
+type CancelSummaryView struct {
+	Workflow        model.WorkflowID
+	Stage           model.WorkflowStage
+	Runtime         model.RuntimeStatus
+	ActiveNodes     []model.NodeID
+	ActiveSessions  []model.SessionID
+	Worktrees       []CancelWorktree
+	Preserved       []string
+	UnmergedCommits int
+}
+
+// CancelWorktree is one managed Worktree of the cancel summary.
+type CancelWorktree struct {
+	Path     string
+	Branch   string
+	Dirty    bool
+	Unmerged bool
+}
+
+// ReplacementPreviewView is the unified Replacement Execution Approval
+// gate: the Quarantine set with its audit Refs, the old and new
+// execution Revisions, the Replacement baseline, the routing/budget
+// references, the old/new Commit Policy diff, the current Preflight, and
+// the fixed Reconciliation Manifest with its per-Node categories.
+type ReplacementPreviewView struct {
+	Workflow model.WorkflowID
+	Stage    model.WorkflowStage
+	Runtime  model.RuntimeStatus
+
+	Quarantines  []model.Quarantine
+	OldRevision  int
+	NewRevision  int
+	BaselineHead string
+
+	RoutingHash string
+	BudgetHash  string
+
+	OldFingerprint string
+	NewFingerprint string
+	Preflight      *PreflightPreview
+
+	Manifest             model.ReconciliationManifest
+	SupersededApprovalID string
+	SpecHashes           []string
+	PlanHash             string
+	CatalogHash          string
+	WorkflowHash         string
+}
+
 // RoutePreview is one task's approved route.
 type RoutePreview struct {
 	NodeID   string
@@ -274,13 +372,16 @@ type LogsView struct {
 	NextEventSeq uint64
 }
 
-func (ListView) isView()             {}
-func (StatusView) isView()           {}
-func (InspectView) isView()          {}
-func (LogsView) isView()             {}
-func (DiscoveryView) isView()        {}
-func (PlanView) isView()             {}
-func (ExecutionPreviewView) isView() {}
+func (ListView) isView()               {}
+func (StatusView) isView()             {}
+func (InspectView) isView()            {}
+func (LogsView) isView()               {}
+func (DiscoveryView) isView()          {}
+func (PlanView) isView()               {}
+func (ExecutionPreviewView) isView()   {}
+func (PolicyConfirmationView) isView() {}
+func (CancelSummaryView) isView()      {}
+func (ReplacementPreviewView) isView() {}
 
 // ---------------------------------------------------------------------------
 // Command union (design 5, 6.1): closed mutations
@@ -415,21 +516,80 @@ type DispatchCommand struct {
 	Workflow model.WorkflowID
 }
 
-func (CreateWorkflowCommand) isCommand()     {}
-func (DiscussRequirementCommand) isCommand() {}
-func (GeneratePlanCommand) isCommand()       {}
-func (CheckPlanCommand) isCommand()          {}
-func (ApprovePlanCommand) isCommand()        {}
-func (StartWorkflowCommand) isCommand()      {}
-func (PauseWorkflowCommand) isCommand()      {}
-func (ResumeWorkflowCommand) isCommand()     {}
-func (CancelWorkflowCommand) isCommand()     {}
-func (DryRunCommand) isCommand()             {}
-func (GenerateSpecsCommand) isCommand()      {}
-func (CompileWorkflowCommand) isCommand()    {}
-func (ExecutionDryRunCommand) isCommand()    {}
-func (ApproveExecutionCommand) isCommand()   {}
-func (DispatchCommand) isCommand()           {}
+// ReconcileCommand runs the Recovery sweep of the Kernel: it completes a
+// persisted Cancel intent, converges a QUIESCING or STOPPING Run whose
+// Attempts and processes settled, and Blocks a Workflow that carries a
+// FAILED Node with nothing in flight. It never reopens dispatch (design
+// 17: Recovery of a Stop, Cancel, Quiesce, or Safety Stop only finishes
+// the persisted protocol).
+type ReconcileCommand struct {
+	Workflow model.WorkflowID
+}
+
+// CommitPolicyConfirmCommand is the user's append-only COMMIT_POLICY
+// Approval binding the exact new Preflight Revision, hash, and
+// fingerprint after a drift Safety Stop (PRD 已确认：执行期间 Commit Policy
+// 漂移确认 step 4). The CLI shows the old/new diff before asking.
+type CommitPolicyConfirmCommand struct {
+	Workflow          model.WorkflowID
+	PreflightRevision int
+	PreflightHash     string
+	Fingerprint       string
+}
+
+// ReplacementPreviewCommand generates the successor execution of a
+// drift-window quarantine (PRD 已确认：漂移窗口 Commit 的隔离与替代执行): the
+// Repair Specs (new Spec IDs with replaces_task_id), the successor
+// Dynamic Workflow Revision, the fixed Reconciliation Manifest, and the
+// fresh Commit Preflight. It pauses the Workflow at the unified
+// Replacement Execution Approval gate; nothing dispatches until the user
+// approves the exact preview.
+type ReplacementPreviewCommand struct {
+	Workflow model.WorkflowID
+}
+
+// ApproveReplacementCommand is the user's unified Replacement Execution
+// Approval (PRD 已确认：Replacement Execution Approval 吸收 Policy 确认):
+// one append-only EXECUTION Approval binding the Quarantine Set, the
+// superseded approval, every successor reference, the current Preflight,
+// and the fixed Reconciliation Manifest Revision/Hash.
+type ApproveReplacementCommand struct {
+	Workflow model.WorkflowID
+
+	PlanHash             string
+	SpecHashes           []string
+	CatalogHash          string
+	WorkflowHash         string
+	RoutingHash          string
+	BudgetHash           string
+	PreflightRevision    int
+	PreflightHash        string
+	Fingerprint          string
+	QuarantineIDs        []string
+	SupersededApprovalID string
+	ManifestRevision     int
+	ManifestHash         string
+}
+
+func (CreateWorkflowCommand) isCommand()      {}
+func (DiscussRequirementCommand) isCommand()  {}
+func (GeneratePlanCommand) isCommand()        {}
+func (CheckPlanCommand) isCommand()           {}
+func (ApprovePlanCommand) isCommand()         {}
+func (StartWorkflowCommand) isCommand()       {}
+func (PauseWorkflowCommand) isCommand()       {}
+func (ResumeWorkflowCommand) isCommand()      {}
+func (CancelWorkflowCommand) isCommand()      {}
+func (DryRunCommand) isCommand()              {}
+func (GenerateSpecsCommand) isCommand()       {}
+func (CompileWorkflowCommand) isCommand()     {}
+func (ExecutionDryRunCommand) isCommand()     {}
+func (ApproveExecutionCommand) isCommand()    {}
+func (DispatchCommand) isCommand()            {}
+func (ReconcileCommand) isCommand()           {}
+func (CommitPolicyConfirmCommand) isCommand() {}
+func (ReplacementPreviewCommand) isCommand()  {}
+func (ApproveReplacementCommand) isCommand()  {}
 
 // ---------------------------------------------------------------------------
 // Outcome

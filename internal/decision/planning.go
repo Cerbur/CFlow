@@ -85,11 +85,12 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageWorkflowGeneration {
 				return decidePatchProposed(state, in, created)
 			}
-		case model.PurposeImplementation:
-			// A settled coding Session records its Session facts only; the
-			// Attempt's outcome is judged from Git evidence by the Commit
-			// gate (Task 13), never from the Agent's output (design 7.3
-			// invariant 1).
+		case model.PurposeImplementation, model.PurposeRepair:
+			// A settled coding or Repair Session records its Session facts
+			// only; the Attempt's outcome is judged from Git evidence by
+			// the Commit gate (Task 13), never from the Agent's output
+			// (design 7.3 invariant 1; PRD 已确认：DIRTY_TASK_WORKTREE 原地
+			// Repair).
 			if state.Workflow.Stage == model.StageExecution {
 				return decideImplementationRunEnded(state, in, created)
 			}
@@ -123,7 +124,7 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 		code = model.CodeAgentProcessCrashed
 	}
 	switch created.Purpose {
-	case model.PurposeImplementation, model.PurposeReview:
+	case model.PurposeImplementation, model.PurposeReview, model.PurposeRepair:
 		if state.Workflow.Stage == model.StageExecution {
 			if attempt := attemptBySession(state, created.ID); attempt != nil {
 				node := state.Nodes[attempt.Key.Node]

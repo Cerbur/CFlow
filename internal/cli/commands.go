@@ -34,7 +34,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "list project workflows",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -53,7 +53,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "show workflow status",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -72,7 +72,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "show the full workflow aggregate",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -91,7 +91,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "show the redacted event log",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -123,10 +123,162 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 		},
 		{
 			Use:   "cancel [workflow-id]",
-			Short: "cancel a workflow",
+			Short: "cancel a workflow (all evidence is preserved)",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return executeMutation(cmd, deps, app.CancelWorkflowCommand{Workflow: workflowArg(args)})
+				ctx, stop := commandContext(cmd, nil)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				wf := workflowArg(args)
+				view, err := a.Query(ctx, app.CancelSummaryQuery{Workflow: wf})
+				if err != nil {
+					return err
+				}
+				renderCancelSummary(cmd.OutOrStdout(), view.(app.CancelSummaryView), deps.Redaction)
+				// Default-negative explicit confirmation (PRD 已确认：Cancel
+				// 逻辑终止 step 1): the Agent never initiates or confirms a
+				// Cancel.
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"cancel workflow %s? This stops the workflow permanently; every artifact, session, worktree, branch, commit, and audit ref is preserved. [y/N] ", wf)
+				line, err := readLine(cmd)
+				if err != nil {
+					return err
+				}
+				if !strings.EqualFold(strings.TrimSpace(line), "y") {
+					return model.InvalidInputFault("cancel aborted")
+				}
+				out, err := a.Execute(ctx, app.CancelWorkflowCommand{Workflow: wf, Reason: "user confirmed cancel"})
+				if err != nil {
+					return err
+				}
+				renderOutcome(cmd.OutOrStdout(), app.CancelWorkflowCommand{}, out, deps.Redaction)
+				return nil
+			},
+		},
+		{
+			Use:   "policy-confirm [workflow-id]",
+			Short: "confirm the exact new commit policy after a drift safety stop",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd, nil)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				wf := workflowArg(args)
+				view, err := a.Query(ctx, app.PolicyConfirmationQuery{Workflow: wf})
+				if err != nil {
+					return err
+				}
+				pv := view.(app.PolicyConfirmationView)
+				renderPolicyConfirmation(cmd.OutOrStdout(), pv, deps.Redaction)
+				if !pv.Pending {
+					return model.InvalidInputFault("no pending commit policy confirmation")
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"confirm commit policy fingerprint %s (preflight revision %d)? [y/N] ",
+					shortHash(pv.Fingerprint), pv.PreflightRevision)
+				line, err := readLine(cmd)
+				if err != nil {
+					return err
+				}
+				if !strings.EqualFold(strings.TrimSpace(line), "y") {
+					return model.InvalidInputFault("commit policy confirmation aborted")
+				}
+				out, err := a.Execute(ctx, app.CommitPolicyConfirmCommand{
+					Workflow: wf, PreflightRevision: pv.PreflightRevision,
+					PreflightHash: pv.PreflightHash, Fingerprint: pv.Fingerprint,
+				})
+				if err != nil {
+					return err
+				}
+				renderOutcome(cmd.OutOrStdout(), app.CommitPolicyConfirmCommand{}, out, deps.Redaction)
+				return nil
+			},
+		},
+		{
+			Use:   "replacement-preview [workflow-id]",
+			Short: "generate the replacement execution of a quarantined workflow",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd, nil)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				wf := workflowArg(args)
+				if _, err := a.Execute(ctx, app.ReplacementPreviewCommand{Workflow: wf}); err != nil {
+					return err
+				}
+				view, err := a.Query(ctx, app.ReplacementPreviewQuery{Workflow: wf})
+				if err != nil {
+					return err
+				}
+				renderReplacementPreview(cmd.OutOrStdout(), view.(app.ReplacementPreviewView), deps.Redaction)
+				return nil
+			},
+		},
+		{
+			Use:   "replacement-approve [workflow-id]",
+			Short: "approve the unified replacement execution approval",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ctx, stop := commandContext(cmd, nil)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
+				}
+				wf := workflowArg(args)
+				view, err := a.Query(ctx, app.ReplacementPreviewQuery{Workflow: wf})
+				if err != nil {
+					return err
+				}
+				pv := view.(app.ReplacementPreviewView)
+				renderReplacementPreview(cmd.OutOrStdout(), pv, deps.Redaction)
+				if len(pv.Quarantines) == 0 || pv.Manifest.Hash == "" {
+					return model.InvalidInputFault("no replacement preview to approve; run replacement-preview first")
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"approve the replacement execution binding %d quarantines and manifest %s? [y/N] ",
+					len(pv.Quarantines), shortHash(pv.Manifest.Hash))
+				line, err := readLine(cmd)
+				if err != nil {
+					return err
+				}
+				if !strings.EqualFold(strings.TrimSpace(line), "y") {
+					return model.InvalidInputFault("replacement approval aborted")
+				}
+				ids := make([]string, 0, len(pv.Quarantines))
+				for _, q := range pv.Quarantines {
+					ids = append(ids, q.ID)
+				}
+				out, err := a.Execute(ctx, app.ApproveReplacementCommand{
+					Workflow:             wf,
+					PlanHash:             pv.PlanHash,
+					SpecHashes:           pv.SpecHashes,
+					CatalogHash:          pv.CatalogHash,
+					WorkflowHash:         pv.WorkflowHash,
+					RoutingHash:          pv.RoutingHash,
+					BudgetHash:           pv.BudgetHash,
+					PreflightRevision:    pv.Preflight.Revision,
+					PreflightHash:        pv.Preflight.EvidenceHash,
+					Fingerprint:          pv.NewFingerprint,
+					QuarantineIDs:        ids,
+					SupersededApprovalID: pv.SupersededApprovalID,
+					ManifestRevision:     pv.Manifest.Revision,
+					ManifestHash:         pv.Manifest.Hash,
+				})
+				if err != nil {
+					return err
+				}
+				renderOutcome(cmd.OutOrStdout(), app.ApproveReplacementCommand{}, out, deps.Redaction)
+				return nil
 			},
 		},
 		{
@@ -144,7 +296,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				provider, _ := cmd.Flags().GetString("provider")
 				assumeYes, _ := cmd.Flags().GetBool("yes")
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -225,7 +377,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "approve the exact active plan revision and hash",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -259,7 +411,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "show the active plan revision's review state",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -308,7 +460,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "show the execution approval preview",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -327,7 +479,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 			Short: "approve the exact displayed execution inputs",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				ctx, stop := commandContext(cmd)
+				ctx, stop := commandContext(cmd, nil)
 				defer stop()
 				a, err := openApplication(ctx, deps)
 				if err != nil {
@@ -374,7 +526,7 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 // executeExecutionDryRun runs the Execution Dry Run command and renders
 // the full preview it pauses the workflow for.
 func executeExecutionDryRun(cmd *cobra.Command, deps Dependencies, wf model.WorkflowID) error {
-	ctx, stop := commandContext(cmd)
+	ctx, stop := commandContext(cmd, nil)
 	defer stop()
 	a, err := openApplication(ctx, deps)
 	if err != nil {
@@ -410,20 +562,75 @@ func findCommand(cmds []*cobra.Command, name string) *cobra.Command {
 	return nil
 }
 
-// executeMutation runs one mutation command and renders its Outcome.
+// executeMutation runs one mutation command and renders its Outcome. A
+// user interruption (the first Ctrl+C) is translated into the controlled
+// stop: the in-flight command aborted; when the Workflow is still RUNNING
+// (a planning command whose Session could not settle, or an approval-gate
+// pause), the pause persists CONTROLLED_STOP_REQUESTED, closes dispatch,
+// and stops the managed processes (PRD 已确认：Ctrl+C 两阶段有限停止 steps
+// 1 and 10). The interruption itself remains the authoritative outcome
+// (exit class 130).
 func executeMutation(cmd *cobra.Command, deps Dependencies, command app.Command) error {
-	ctx, stop := commandContext(cmd)
-	defer stop()
-	a, err := openApplication(ctx, deps)
+	a, err := openApplication(cmd.Context(), deps)
 	if err != nil {
 		return err
 	}
+	ctx, stop := commandContext(cmd, a)
+	defer stop()
+	wf := workflowOf(command)
 	out, err := a.Execute(ctx, command)
 	if err != nil {
+		if ctx.Err() != nil && wf != "" {
+			// The controlled-stop translation: best-effort; the
+			// interruption is the outcome either way.
+			_, _ = a.Execute(context.Background(), app.PauseWorkflowCommand{Workflow: wf})
+		}
 		return err
 	}
 	renderOutcome(cmd.OutOrStdout(), command, out, deps.Redaction)
 	return nil
+}
+
+// workflowOf is the workflow identity a mutation command addresses ("" for
+// project-level commands).
+func workflowOf(command app.Command) model.WorkflowID {
+	switch c := command.(type) {
+	case app.DiscussRequirementCommand:
+		return c.Workflow
+	case app.GeneratePlanCommand:
+		return c.Workflow
+	case app.CheckPlanCommand:
+		return c.Workflow
+	case app.ApprovePlanCommand:
+		return c.Workflow
+	case app.StartWorkflowCommand:
+		return c.Workflow
+	case app.PauseWorkflowCommand:
+		return c.Workflow
+	case app.ResumeWorkflowCommand:
+		return c.Workflow
+	case app.CancelWorkflowCommand:
+		return c.Workflow
+	case app.DryRunCommand:
+		return c.Workflow
+	case app.GenerateSpecsCommand:
+		return c.Workflow
+	case app.CompileWorkflowCommand:
+		return c.Workflow
+	case app.ExecutionDryRunCommand:
+		return c.Workflow
+	case app.ApproveExecutionCommand:
+		return c.Workflow
+	case app.DispatchCommand:
+		return c.Workflow
+	case app.CommitPolicyConfirmCommand:
+		return c.Workflow
+	case app.ReplacementPreviewCommand:
+		return c.Workflow
+	case app.ApproveReplacementCommand:
+		return c.Workflow
+	}
+	return ""
 }
 
 // readLine reads one scripted stdin line (a full-screen TUI is never
@@ -455,12 +662,64 @@ func readDiscussionInput(cmd *cobra.Command) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-// commandContext wires the user interruption (design 20): a SIGINT
-// cancels the command context, and the central exit mapping turns the
-// cancellation into exit class 130. The first/second controlled-stop
-// command translation arrives with the full stop protocol (Task 17).
-func commandContext(cmd *cobra.Command) (context.Context, func()) {
-	return signal.NotifyContext(cmd.Context(), os.Interrupt)
+// commandContext wires the two-phase interruption (Task 17, PRD 已确认：
+// Ctrl+C 两阶段有限停止): the first SIGINT cancels the command context so
+// in-flight effects abort at the next context boundary; the second SIGINT
+// escalates a running controlled stop to the force-kill phase through the
+// Application (a nil Application makes the second signal a no-op). The
+// central exit mapping turns the cancellation into exit class 130.
+func commandContext(cmd *cobra.Command, a *app.Application) (context.Context, func()) {
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	sig := make(chan os.Signal, 2)
+	signal.Notify(sig, os.Interrupt)
+	translateInterrupts(ctx, cancel, done, sig, func() {
+		if a != nil {
+			a.EscalateStop()
+		}
+	}, func() { signal.Stop(sig) })
+	return ctx, func() {
+		signal.Stop(sig)
+		close(done)
+		cancel()
+	}
+}
+
+// translateInterrupts is the two-phase SIGINT translation (Task 7
+// obligation, PRD 已确认：Ctrl+C 两阶段有限停止): the first signal cancels
+// the command context (in-flight effects abort at the next context
+// boundary); the second signal escalates the running controlled stop to
+// the force-kill phase. done closes when the command returned (the
+// translation then drains one racing signal and finishes); stop
+// unregisters the signal source.
+func translateInterrupts(ctx context.Context, cancel context.CancelFunc, done <-chan struct{}, sig <-chan os.Signal, escalate, stop func()) {
+	go func() {
+		defer stop()
+		select {
+		case <-sig:
+			// First Ctrl+C: abort in-flight work.
+			cancel()
+		case <-ctx.Done():
+			return // the command finished without a signal
+		}
+		// The second Ctrl+C escalates the controlled stop to the
+		// force-kill phase whenever it arrives during the stop; a signal
+		// racing the command's return is drained, never lost.
+		select {
+		case <-sig:
+			escalate()
+		case <-done:
+			select {
+			case <-sig:
+				escalate()
+			default:
+			}
+		}
+	}()
 }
 
 func workflowArg(args []string) model.WorkflowID {

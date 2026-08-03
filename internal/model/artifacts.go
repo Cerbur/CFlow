@@ -113,6 +113,19 @@ type Approval struct {
 	Seq         uint64
 	Refs        []ArtifactRef
 	Fingerprint string
+	// PreflightRevision is the exact Git Commit Preflight Revision the
+	// approval bound (the git_commit_preflight_revision row column).
+	// latestConfirmedCommitPolicy derives the confirmed policy from
+	// approvals that bind the latest Preflight Revision (PRD 已确认：
+	// Replacement Execution Approval 吸收 Policy 确认 item 4).
+	PreflightRevision int
+	// DecisionContext is the immutable JSON decision-context of the
+	// approval (decision_context_json). A Replacement Execution Approval
+	// records reason=COMMIT_POLICY_DRIFT_REPLACEMENT, the superseded
+	// Execution Approval ID, the Quarantine ID set, the Reconciliation
+	// Manifest Revision/Hash, and absorbs_commit_policy_confirmation=true
+	// (PRD 已确认 item 2).
+	DecisionContext string
 }
 
 // ExecutionFacts are the immutable inputs an Execution Approval binds by

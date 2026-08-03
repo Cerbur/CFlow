@@ -339,3 +339,108 @@ func (r *renderer) RefOrDash(ref model.ArtifactRef) string {
 	}
 	return ref.String()
 }
+
+// renderCancelSummary renders the cancel confirmation summary (PRD 已确
+// 认：Cancel 逻辑终止 step 1): the Workflow ID, Stage, active Sessions and
+// Nodes, every managed Worktree/Branch with its dirty state and unmerged
+// Commits, and the preserved paths.
+func renderCancelSummary(w io.Writer, v app.CancelSummaryView, red security.Registry) {
+	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
+	fmt.Fprintf(w, "  stage: %s  runtime: %s\n", v.Stage, v.Runtime)
+	if len(v.ActiveNodes) > 0 {
+		fmt.Fprintf(w, "  active nodes: %s\n", strings.Join(ids(v.ActiveNodes), ", "))
+	}
+	if len(v.ActiveSessions) > 0 {
+		fmt.Fprintf(w, "  active sessions: %s\n", strings.Join(ids2(v.ActiveSessions), ", "))
+	}
+	for _, wt := range v.Worktrees {
+		dirty := "clean"
+		if wt.Dirty {
+			dirty = "dirty"
+		}
+		unmerged := ""
+		if wt.Unmerged {
+			unmerged = " (unmerged commits)"
+		}
+		fmt.Fprintf(w, "  worktree: %s [%s]%s\n", redactPath(red, wt.Path), dirty, unmerged)
+	}
+	if v.UnmergedCommits > 0 {
+		fmt.Fprintf(w, "  unmerged commits: %d\n", v.UnmergedCommits)
+	}
+	fmt.Fprintf(w, "  preserved: %s\n", strings.Join(v.Preserved, ", "))
+}
+
+// renderPolicyConfirmation renders the pending Commit Policy confirmation
+// gate: the exact new Preflight Revision/Hash/Fingerprint and the old/new
+// normalized diff (PRD 已确认：执行期间 Commit Policy 漂移确认 step 3).
+func renderPolicyConfirmation(w io.Writer, v app.PolicyConfirmationView, red security.Registry) {
+	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
+	if !v.Pending {
+		fmt.Fprintf(w, "commit policy: confirmed (no pending confirmation)\n")
+		return
+	}
+	fmt.Fprintf(w, "commit policy drift: confirmation required\n")
+	fmt.Fprintf(w, "  old fingerprint: %s\n", shortHash(v.OldFingerprint))
+	fmt.Fprintf(w, "  new fingerprint: %s\n", shortHash(v.Fingerprint))
+	fmt.Fprintf(w, "  preflight revision: %d\n", v.PreflightRevision)
+	fmt.Fprintf(w, "  preflight sha256: %s\n", shortHash(v.PreflightHash))
+}
+
+// renderReplacementPreview renders the unified Replacement Execution
+// Approval gate (PRD 已确认：Replacement Execution Approval 吸收 Policy 确
+// 认 step 1): the Quarantine set with its audit Refs, the old/new
+// execution Revisions, the Replacement baseline, the old/new Commit
+// Policy diff, the current Preflight, and the fixed Reconciliation
+// Manifest with its per-Node categories.
+func renderReplacementPreview(w io.Writer, v app.ReplacementPreviewView, red security.Registry) {
+	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
+	fmt.Fprintf(w, "replacement execution approval required\n")
+	for _, q := range v.Quarantines {
+		fmt.Fprintf(w, "  quarantine: %s [%s]\n", q.Branch, q.AuditRef)
+	}
+	fmt.Fprintf(w, "  execution revision: %d -> %d\n", v.OldRevision, v.NewRevision)
+	fmt.Fprintf(w, "  replacement baseline: %s\n", shortHash(v.BaselineHead))
+	fmt.Fprintf(w, "  routing: %s  budget: %s\n", shortHash(v.RoutingHash), shortHash(v.BudgetHash))
+	fmt.Fprintf(w, "  commit policy: %s -> %s\n", shortHash(v.OldFingerprint), shortHash(v.NewFingerprint))
+	if v.Preflight != nil {
+		fmt.Fprintf(w, "  preflight: revision %d sha256 %s\n", v.Preflight.Revision, shortHash(v.Preflight.EvidenceHash))
+	}
+	fmt.Fprintf(w, "  supersedes approval: %s\n", v.SupersededApprovalID)
+	fmt.Fprintf(w, "reconciliation manifest (revision %d):\n", v.Manifest.Revision)
+	for _, action := range v.Manifest.Actions {
+		fmt.Fprintf(w, "  %s: %s (%s)\n", action.Node, action.Action, action.Reason)
+	}
+	fmt.Fprintf(w, "  manifest sha256: %s\n", shortHash(v.Manifest.Hash))
+}
+
+// shortHash renders a truncated hash for prompts and diffs.
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12] + "..."
+}
+
+// ids renders Node identities.
+func ids(ids []model.NodeID) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, string(id))
+	}
+	return out
+}
+
+// ids2 renders Session identities.
+func ids2(ids []model.SessionID) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, string(id))
+	}
+	return out
+}
+
+// redactPath redacts a managed path with the registry (paths carry no
+// secrets, but the renderer stays uniform).
+func redactPath(red security.Registry, path string) string {
+	return path
+}

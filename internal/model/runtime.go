@@ -462,6 +462,12 @@ type EvidenceRef struct {
 // (CONTEXT.md: Quarantine). A quarantined Branch is never repaired in
 // place and can never re-enter Verify, Merge, Final Verify, or Apply.
 type Quarantine struct {
+	// ID is the unique quarantine identity (branch_quarantines.id).
+	ID string
+	// AuditRef is the unique append-only `refs/cflow/<workflow-id>/
+	// quarantine/<quarantine-id>` audit Ref that pins the discovered HEAD
+	// (PRD 已确认：漂移窗口 Commit 的隔离与替代执行 step 1).
+	AuditRef string
 	Branch   string
 	FromHead string
 	ToHead   string

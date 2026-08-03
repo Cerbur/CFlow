@@ -46,6 +46,14 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideGraphInstall(state, in)
 	case model.DispatchInput:
 		return decideDispatch(state, in)
+	case model.PolicyDriftSettleInput:
+		return decidePolicyDriftSettle(state, in)
+	case model.CommitPolicyApprovalInput:
+		return decideCommitPolicyApproval(state, in)
+	case model.ReplacementApprovalInput:
+		return decideReplacementApproval(state, in)
+	case model.ReplacementPreviewInput:
+		return decideReplacementPreview(state, in)
 	case model.AgentEventInput:
 		return decideAgentEvent(state, in)
 	case model.ApplyCommandInput:
@@ -129,6 +137,22 @@ func activeRun(state model.State) *model.Run {
 		}
 	}
 	return nil
+}
+
+// closePriorRuns terminalizes every non-terminal Run before a fresh Run
+// opens: exactly one Run is active per foreground execution (design 6.1),
+// so the Dispatch Gate scan and the allocation revalidation always read
+// the same committed closure. Every run-open decision calls it first.
+func closePriorRuns(b *builder, state model.State) {
+	for i := range state.Runs {
+		if state.Runs[i].Status.IsTerminal() {
+			continue
+		}
+		// The persisted stop reason rides the closure (the store row's
+		// stop_reason is replaced wholesale).
+		b.mutate(model.RunMutation{ID: state.Runs[i].ID, Status: model.RunInterrupted, DispatchGate: false, StopReason: state.Runs[i].StopReason})
+		b.event(model.EventRunInterrupted, "", model.AttemptKey{}, "", "prior run superseded")
+	}
 }
 
 func activeQuiescing(state model.State) bool {

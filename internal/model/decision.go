@@ -282,6 +282,16 @@ const (
 	EventWorkflowQuiesced         EventKind = "WORKFLOW_QUIESCED"
 	EventWorkflowCancelRequested  EventKind = "WORKFLOW_CANCEL_REQUESTED"
 	EventWorkflowCancelled        EventKind = "WORKFLOW_CANCELLED"
+	// EventControlledStopRequested appends the user's persisted controlled
+	// stop intent (PRD 已确认：Ctrl+C 两阶段有限停止 step 1).
+	EventControlledStopRequested EventKind = "CONTROLLED_STOP_REQUESTED"
+	// EventCommitPolicySafetyStopRequested records the persisted Policy
+	// Safety Stop intent (PRD 已确认：Commit Policy 漂移立即安全停止 step 1).
+	EventCommitPolicySafetyStopRequested EventKind = "COMMIT_POLICY_SAFETY_STOP_REQUESTED"
+	// EventCommitPolicyConfirmed records the append-only COMMIT_POLICY
+	// Approval binding the exact new Preflight Revision/Hash/Fingerprint
+	// (PRD 已确认：执行期间 Commit Policy 漂移确认 step 4).
+	EventCommitPolicyConfirmed    EventKind = "COMMIT_POLICY_CONFIRMED"
 	EventWorkflowFailed           EventKind = "WORKFLOW_FAILED"
 	EventWorkflowSucceeded        EventKind = "WORKFLOW_SUCCEEDED"
 	EventStageChanged             EventKind = "STAGE_CHANGED"
@@ -328,7 +338,8 @@ func (k EventKind) Valid() bool {
 	switch k {
 	case EventWorkflowCreated, EventWorkflowStarted, EventWorkflowPaused, EventWorkflowResumed,
 		EventWorkflowBlocked, EventWorkflowQuiesceRequested, EventWorkflowQuiesced,
-		EventWorkflowCancelRequested, EventWorkflowCancelled, EventWorkflowFailed, EventWorkflowSucceeded,
+		EventWorkflowCancelRequested, EventWorkflowCancelled, EventControlledStopRequested,
+		EventCommitPolicySafetyStopRequested, EventCommitPolicyConfirmed, EventWorkflowFailed, EventWorkflowSucceeded,
 		EventStageChanged, EventPlanGenerated, EventPlanCheckPassed,
 		EventPlanCheckNeedsRevision, EventPlanCheckNeedsDiscussion, EventPlanCheckRejected,
 		EventPlanApproved, EventExecutionApproved,

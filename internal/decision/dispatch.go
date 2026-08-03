@@ -22,7 +22,12 @@ import (
 // Workflow: every Node starts PENDING with its skeleton dependencies, and
 // agent-task Nodes carry their deterministic Task Branch. The install is
 // refused outside EXECUTION, on a Workflow whose graph is already
-// installed, or for a DAG with dangling dependencies.
+// installed, or for a DAG with dangling dependencies. A Replacement
+// install (after a Replacement Execution Approval) keeps every existing
+// Node identity whose kind and dependencies are unchanged — the
+// persisted state is the incremental recovery — and appends only the new
+// Nodes (PRD 已确认：未污染兄弟 Task 增量恢复 step 3: a changed definition
+// must use a new Node id, never a "recovered" old one).
 func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.Decision, error) {
 	if state.Workflow.ID == "" {
 		return model.Decision{}, model.InvalidInputFault("no workflow to install an execution graph for")
@@ -30,8 +35,10 @@ func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.De
 	if state.Workflow.Stage != model.StageExecution {
 		return model.Decision{}, model.InvalidInputFault("the execution graph can only be installed at the EXECUTION stage")
 	}
-	if len(state.Nodes) > 0 {
-		return model.Decision{}, model.InvalidInputFault("the execution graph is already installed")
+	replacement := len(state.Nodes) > 0
+	if replacement && (!in.Replacement || !replacementApproved(state)) {
+		return model.Decision{}, model.InvalidInputFault(
+			"the execution graph is already installed; only an approved replacement may extend it")
 	}
 	if len(in.Nodes) == 0 {
 		return model.Decision{}, model.InvalidInputFault("the execution graph is empty")
@@ -57,8 +64,10 @@ func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.De
 	for _, n := range in.Nodes {
 		for _, d := range n.Dependencies {
 			if !byID[d] {
-				return model.Decision{}, model.InvalidInputFault(
-					"node " + string(n.ID) + " depends on " + string(d) + ", which is not part of the graph")
+				if old := state.Nodes[d]; old == nil {
+					return model.Decision{}, model.InvalidInputFault(
+						"node " + string(n.ID) + " depends on " + string(d) + ", which is not part of the graph")
+				}
 			}
 		}
 	}
@@ -66,6 +75,15 @@ func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.De
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
 	b := &builder{state: state}
 	for _, n := range sorted {
+		if old := state.Nodes[n.ID]; old != nil {
+			// Replacement re-install: the logical Node identity must match
+			// exactly; any definition change is a new Node.
+			if old.Kind != n.Kind || !sameDependencies(old.Dependencies, n.Dependencies) {
+				return model.Decision{}, model.InvalidInputFault(
+					"replacement node " + string(n.ID) + " changes the definition of an existing node; use a new id")
+			}
+			continue
+		}
 		branch := ""
 		if n.Kind == model.NodeAgentTask {
 			branch = taskBranch(state.Workflow.ID, n.ID)
@@ -81,6 +99,20 @@ func decideGraphInstall(state model.State, in model.GraphInstallInput) (model.De
 	}
 	b.event(model.EventGraphInstalled, "", model.AttemptKey{}, "", "execution graph installed")
 	return b.decision(), nil
+}
+
+// sameDependencies reports whether two dependency lists are equal as sets
+// with the same order.
+func sameDependencies(a, b []model.NodeID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // decideDispatch is one serialized allocation routed by Node kind
@@ -168,28 +200,43 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 		return model.Decision{}, model.InvalidInputFault(
 			"allocation requires the verified integration head")
 	}
-	// A budgeted retry of an automatic fallback reuses the persisted
-	// successor Session (design 14.4): the settle Decision wrote its row
-	// with supersedes_session_id and the fallback Provider, and the
-	// successor Attempt references it — the allocation never creates a
-	// second fresh Session row, so the "one successor per Lost original"
-	// lineage stays intact in the Store.
+	// The prior terminal Attempt determines the successor's role: a
+	// DIRTY_TASK_WORKTREE failure reuses the exact Task Branch/Worktree
+	// with an independent Repair Session (PRD 已确认：DIRTY_TASK_WORKTREE 原
+	// 地 Repair), and an interrupted Attempt with a resumable Provider
+	// Session prefers resuming the original Session (PRD 已确认：Ctrl+C 两阶
+	// 段有限停止 step 6). A budgeted retry of an automatic fallback reuses
+	// the persisted successor Session (design 14.4) — the allocation never
+	// creates a second fresh Session row, so the "one successor per Lost
+	// original" lineage stays intact in the Store.
 	session := in.Session
 	reuse := false
+	resume := false
+	purpose := model.PurposeImplementation
 	if node.Status == model.NodeReady {
-		if s := findSessionState(state, session); s != nil {
+		prior := highestTerminalAttempt(state, node.ID)
+		if s := findSessionState(state, session); s != nil && s.Status == model.SessionStarting {
 			if s.Purpose != model.PurposeImplementation {
 				return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
 					"the reused successor session's purpose does not match the task")
 			}
-			if s.Status != model.SessionStarting {
-				return model.Decision{}, model.InvalidInputFault(
-					"the reused successor session is not starting")
-			}
 			reuse = true
+		} else if prior != nil && prior.Status == model.AttemptInterrupted && prior.Session != "" {
+			if s := findSessionState(state, prior.Session); s != nil &&
+				s.Status == model.SessionInterrupted && s.ProviderSessionID != "" {
+				// Prefer the original Session of the interrupted Attempt.
+				session = prior.Session
+				purpose = s.Purpose
+				resume = true
+			}
 		}
 	}
-	if !reuse {
+	if !reuse && !resume {
+		if prior := highestTerminalAttempt(state, node.ID); prior != nil &&
+			prior.FailureCode == model.CodeDirtyTaskWorktree {
+			// The dirty repair runs an independent Repair Session.
+			purpose = model.PurposeRepair
+		}
 		if err := validateFreshSession(state, session); err != nil {
 			return model.Decision{}, err
 		}
@@ -201,12 +248,12 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 	b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeRunning, RetryCharged: node.RetryCharged})
 	b.event(model.EventNodeReady, node.ID, key, "", "node ready")
 	b.event(model.EventNodeStarted, node.ID, key, "", "node started")
-	if !reuse {
+	if !reuse && !resume {
 		// The Session row precedes the Attempt row (the node_attempts
 		// session_id foreign key references it).
 		b.mutate(model.SessionAppendMutation{Session: model.Session{
 			ID:      session,
-			Purpose: model.PurposeImplementation,
+			Purpose: purpose,
 			Status:  model.SessionStarting,
 		}, Provider: in.Route})
 	}
@@ -218,6 +265,14 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 		StartedAt: state.Now,
 	}})
 	b.event(model.EventAttemptCreated, node.ID, key, "", "attempt created")
+	if in.Process != "" {
+		// The managed-process ledger: the chain's Process is RUNNING with
+		// the Session (the controlled stop may stop it, design 13.3).
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.Process, Session: session, Purpose: purpose,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
 	if node.Status == model.NodePending {
 		// The Task Base is the current verified Integration HEAD at
 		// readiness, recorded once and immutable (PRD Worktree 策略).
@@ -227,15 +282,24 @@ func decideDispatchAgentTask(state model.State, in model.DispatchInput) (model.D
 			Branch:   taskBranch(state.Workflow.ID, node.ID),
 			BaseHead: base,
 		})
+	} else if resume {
+		// The successor resumes the original Provider Session of the
+		// interrupted Attempt on the same Task Branch/Worktree.
+		b.effect(model.ProviderResumeIntent{
+			Session: session,
+			Purpose: purpose,
+			Process: in.Process,
+		})
 	} else {
 		// Budgeted retry: the Task Worktree already exists from the first
 		// allocation, so no worktree creation Effect is emitted — the
 		// coding Session starts directly inside it from the recorded Base.
 		b.effect(model.ProviderStartIntent{
 			Session: session,
-			Purpose: model.PurposeImplementation,
+			Purpose: purpose,
 			Route:   in.Route,
 			Node:    node.ID,
+			Process: in.Process,
 		})
 	}
 	return b.decision(), nil
@@ -290,8 +354,24 @@ func decideTaskWorktreeCreated(state model.State, in model.EffectResultInput) (m
 		Purpose: model.PurposeImplementation,
 		Route:   session.Provider,
 		Node:    node.ID,
+		Process: processOfAttempt(state, attempt.Key),
 	})
 	return b.decision(), nil
+}
+
+// processOfAttempt is the RUNNING managed Process bound to one Attempt's
+// Session ("" when the chain carries none).
+func processOfAttempt(state model.State, key model.AttemptKey) model.ProcessID {
+	attempt := state.Attempts[key]
+	if attempt == nil {
+		return ""
+	}
+	for _, p := range state.Processes {
+		if p.Session == attempt.Session && p.Status == model.ProcessStatusRunning {
+			return p.ID
+		}
+	}
+	return ""
 }
 
 // runningAttemptOf returns the RUNNING Attempt of one Node (at most one

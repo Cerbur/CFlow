@@ -176,6 +176,30 @@ func (e *RecoveryEngine) Reconcile(ctx context.Context, scope Scope) (Reconcilia
 			}
 		}
 	}
+	// 6. Quarantine audit facts: every Branch Quarantine Record pins its
+	// discovered HEAD through a unique append-only
+	// refs/cflow/<workflow>/quarantine/<quarantine-id> audit Ref. A
+	// missing Ref or a Ref at a different HEAD is drift the user must act
+	// on — the quarantine evidence must never vanish (PRD 已确认：漂移窗口
+	// Commit 的隔离与替代执行 step 1).
+	for _, q := range state.Quarantines {
+		if q.AuditRef == "" {
+			out.Faults = append(out.Faults, *model.NewFault(model.CodeDirtyWorktreeDrifted,
+				"recovery: quarantine record "+q.ID+" carries no audit ref"))
+			continue
+		}
+		facts, err := e.git.Observe(ctx, gitflow.RefLookup{Ref: q.AuditRef})
+		if err != nil {
+			out.Faults = append(out.Faults, *model.NewFault(model.CodeDirtyWorktreeDrifted,
+				"recovery: quarantine audit ref facts are unreadable: "+q.AuditRef))
+			continue
+		}
+		rf, ok := facts.(gitflow.RefFacts)
+		if !ok || !rf.Exists || rf.Value != q.ToHead {
+			out.Faults = append(out.Faults, *model.NewFault(model.CodeDirtyWorktreeDrifted,
+				"recovery: quarantine audit ref is missing or moved: "+q.AuditRef))
+		}
+	}
 
 	// 5-8. Per-Intent reconciliation: Artifact facts, Git facts,
 	// verification/review evidence, and the unfinished Effect Intents of

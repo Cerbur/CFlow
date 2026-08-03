@@ -80,6 +80,13 @@ func decideVerifyDispatch(state model.State, in model.DispatchInput) (model.Deci
 	if err != nil {
 		return model.Decision{}, err
 	}
+	if branchQuarantined(state, taskNode.Branch) || taskNode.Status == model.NodeFailed {
+		// A quarantined Branch can never re-enter Verify: the delivery
+		// chain is closed permanently (design 7.3 invariant 10, PRD 已确
+		// 认：漂移窗口 Commit 的隔离与替代执行 step 1).
+		return model.Decision{}, model.NewFault(model.CodeCommitDuringPolicyDriftWindow,
+			"the task branch is quarantined; verification is closed for it")
+	}
 	taskAttempt := succeededAttemptOf(state, taskNode.ID)
 	if taskAttempt == nil || taskAttempt.EndHead == "" {
 		return model.Decision{}, model.InvalidInputFault(
@@ -98,6 +105,13 @@ func decideVerifyDispatch(state model.State, in model.DispatchInput) (model.Deci
 	b.mutate(model.SessionAppendMutation{Session: model.Session{
 		ID: in.Session, Purpose: model.PurposeReview, Status: model.SessionStarting,
 	}, Provider: in.Route})
+	if in.Process != "" {
+		// The chain's managed process is RUNNING with the Reviewer Session.
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.Process, Session: in.Session, Purpose: model.PurposeReview,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
 	b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
 		Key:       key,
 		Session:   in.Session,
@@ -163,6 +177,7 @@ func decideVerificationRunEnded(state model.State, in model.EffectResultInput) (
 		Purpose: model.PurposeReview,
 		Route:   review.Provider,
 		Node:    node.ID,
+		Process: processOfAttempt(state, attempt.Key),
 	})
 	return b.decision(), nil
 }
@@ -258,6 +273,12 @@ func decideMergeDispatch(state model.State, in model.DispatchInput) (model.Decis
 	taskNode, err := taskNodeOf(state, node)
 	if err != nil {
 		return model.Decision{}, err
+	}
+	if branchQuarantined(state, taskNode.Branch) || taskNode.Status == model.NodeFailed {
+		// A quarantined Branch never merges into the trusted Integration
+		// chain (design 7.3 invariant 10, PRD 已确认 step 1).
+		return model.Decision{}, model.NewFault(model.CodeCommitDuringPolicyDriftWindow,
+			"the task branch is quarantined; the merge path is closed for it")
 	}
 	taskAttempt := succeededAttemptOf(state, taskNode.ID)
 	if taskAttempt == nil || taskAttempt.EndHead == "" {

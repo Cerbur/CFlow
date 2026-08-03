@@ -624,9 +624,14 @@ func TestInterruptionDoesNotChargeBudget(t *testing.T) {
 	got, err := decision.Decide(state, endAttempt("n-1", 1, model.OutcomeInterrupted, ""))
 	requireNoError(t, err)
 	requireNode(t, got, "n-1", model.NodeReady)
-	requireStatus(t, got, model.StageExecution, model.RuntimePaused)
-	requireRun(t, got, model.RunInterrupted, false)
 	requireEvent(t, got, model.EventAttemptInterrupted)
+	requireEvent(t, got, model.EventControlledStopRequested)
+	// The controlled stop opens: the Run enters STOPPING with the gate
+	// closed and the managed process receives its two-phase stop Effect;
+	// the Workflow converges PAUSED only after the process facts settle
+	// (PRD 已确认：Ctrl+C 两阶段有限停止).
+	requireRun(t, got, model.RunStopping, false)
+	requireEffect(t, got, model.ManagedProcessStopIntent{Process: "p-1"})
 	for _, m := range got.Mutations {
 		em, ok := m.(model.AttemptEndMutation)
 		if !ok || em.Key.Node != "n-1" {
@@ -641,6 +646,13 @@ func TestInterruptionDoesNotChargeBudget(t *testing.T) {
 			t.Fatalf("interruption charged node budget: %+v", nm)
 		}
 	}
+	// The process settles: the stop converges to INTERRUPTED + PAUSED in
+	// the same transaction.
+	state = apply(t, state, got)
+	got2, err := decision.Decide(state, model.EffectResultInput{Kind: model.ProcessStopped, Process: "p-1"})
+	requireNoError(t, err)
+	requireStatus(t, got2, model.StageExecution, model.RuntimePaused)
+	requireRun(t, got2, model.RunInterrupted, false)
 }
 
 func TestUserInterruptedCodeIsNotProviderFailure(t *testing.T) {
@@ -648,12 +660,16 @@ func TestUserInterruptedCodeIsNotProviderFailure(t *testing.T) {
 	got, err := decision.Decide(state, endAttempt("n-1", 1, model.OutcomeFailed, model.CodeUserInterrupted))
 	requireNoError(t, err)
 	requireNode(t, got, "n-1", model.NodeReady)
-	requireStatus(t, got, model.StageExecution, model.RuntimePaused)
+	requireRun(t, got, model.RunStopping, false)
 	for _, m := range got.Mutations {
 		if em, ok := m.(model.AttemptEndMutation); ok && em.Key.Node == "n-1" && em.RetryCharged {
 			t.Fatalf("USER_INTERRUPTED charged retry budget: %+v", em)
 		}
 	}
+	state = apply(t, state, got)
+	got2, err := decision.Decide(state, model.EffectResultInput{Kind: model.ProcessStopped, Process: "p-1"})
+	requireNoError(t, err)
+	requireStatus(t, got2, model.StageExecution, model.RuntimePaused)
 }
 
 func TestInterruptionDuringQuiescingBlocksNotPauses(t *testing.T) {
@@ -661,7 +677,26 @@ func TestInterruptionDuringQuiescingBlocksNotPauses(t *testing.T) {
 	got, err := decision.Decide(state, endAttempt("n-2", 1, model.OutcomeInterrupted, ""))
 	requireNoError(t, err)
 	requireStatus(t, got, model.StageExecution, model.RuntimeBlocked)
-	requireRun(t, got, model.RunInterrupted, false)
+	// The interrupt opens the controlled stop (STOPPING) and, with
+	// nothing left in flight, converges the Run to INTERRUPTED in the
+	// same transaction; the blocking Finding keeps the Workflow BLOCKED
+	// (PRD 已确认：并行失败后的 Quiescing rule 6).
+	stopping, interrupted := false, false
+	for _, m := range got.Mutations {
+		rm, ok := m.(model.RunMutation)
+		if !ok {
+			continue
+		}
+		if rm.Status == model.RunStopping {
+			stopping = true
+		}
+		if rm.Status == model.RunInterrupted {
+			interrupted = true
+		}
+	}
+	if !stopping || !interrupted {
+		t.Fatalf("decision must open STOPPING and converge INTERRUPTED, mutations = %+v", got.Mutations)
+	}
 }
 
 func TestCancelRequiresSettledProcesses(t *testing.T) {
@@ -807,12 +842,23 @@ func TestPauseStopsManagedProcesses(t *testing.T) {
 	requireNoError(t, err)
 	requireStatus(t, got, model.StageExecution, model.RuntimePaused)
 	requireRun(t, got, model.RunStopping, false)
+	requireEvent(t, got, model.EventControlledStopRequested)
 	requireEffect(t, got, model.ManagedProcessStopIntent{Process: "p-1"})
-	// the attempt settles as interrupted and never charges budget
+	// the attempt settles as interrupted and never charges budget; the Run
+	// stays STOPPING while the managed process is still settling
 	state = apply(t, state, got)
-	got2, err := decision.Decide(state, endAttempt("n-1", 1, model.OutcomeInterrupted, ""))
+	got1, err := decision.Decide(state, endAttempt("n-1", 1, model.OutcomeInterrupted, ""))
 	requireNoError(t, err)
-	requireNode(t, got2, "n-1", model.NodeReady)
+	requireNode(t, got1, "n-1", model.NodeReady)
+	for _, m := range got1.Mutations {
+		if em, ok := m.(model.AttemptEndMutation); ok && em.Key.Node == "n-1" && em.RetryCharged {
+			t.Fatalf("interruption charged retry budget: %+v", em)
+		}
+	}
+	// the process settles and the stop converges the Run INTERRUPTED
+	state = apply(t, state, got1)
+	got2, err := decision.Decide(state, model.EffectResultInput{Kind: model.ProcessStopped, Process: "p-1"})
+	requireNoError(t, err)
 	requireRun(t, got2, model.RunInterrupted, false)
 }
 

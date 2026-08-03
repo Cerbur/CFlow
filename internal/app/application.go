@@ -60,6 +60,34 @@ type Application struct {
 	// while every brief aggregate transaction stays serialized so no
 	// chain ever observes a stale aggregate version.
 	dispatchMu sync.Mutex
+
+	// Controlled-stop state (Task 17, design 13.3): the per-Application
+	// stop context is cancelled by the second Ctrl+C escalation so the
+	// two-phase stop skips the remaining grace; processSessions binds the
+	// Kernel's managed Process identities to the Sessions they run;
+	// processIdentities records the exact PID/start-token identity of each
+	// managed process for the orphan inspection; stopPolicy carries the
+	// injectable staged budgets (tests use tiny values, production the PRD
+	// 10s+2s+2s budget).
+	stopMu            sync.Mutex
+	stopCtx           context.Context
+	stopCancel        context.CancelFunc
+	processSessions   map[model.ProcessID]model.SessionID
+	processIdentities map[model.ProcessID]process.ProcessIdentity
+	stopPolicy        stopPolicy
+
+	// Commit Policy monitor state (PRD 已确认：Commit Policy 漂移立即安全
+	// 停止): policyDrift records that a Safety Stop was triggered (with the
+	// failure code the interrupted Attempts settle with); policyPreHeads
+	// fixes the pre-stop HEAD of every active Worktree; passCancel cancels
+	// every active chain of the pass; policyPollInterval is the monitor's
+	// injectable recompute period (production 1s).
+	policyMu           sync.Mutex
+	policyDrift        bool
+	policyCode         model.Code
+	policyPreHeads     map[string]policyWorktree
+	passCancel         context.CancelFunc
+	policyPollInterval time.Duration
 }
 
 // probe is the unexported protocol-order observation seam (design 22.1:
@@ -108,21 +136,25 @@ func New(opts Options) (*Application, error) {
 		ver = "0.0.0-dev"
 	}
 	a := &Application{
-		home:       opts.Home,
-		project:    opts.Project,
-		dbPath:     filepath.Join(opts.Home, "cflow.db"),
-		cflowVer:   ver,
-		now:        now,
-		ids:        ids,
-		redaction:  opts.Redaction,
-		supervisor: sup,
-		git:        opts.GitFlow,
-		prompts:    opts.Prompts,
-		agent:      opts.Agent,
-		stores:     map[model.WorkflowID]*store.Store{},
-		known:      map[model.WorkflowID]struct{}{},
-		procs:      map[model.ProcessID]process.Handle{},
-		artifacts:  map[model.WorkflowID]*artifact.Store{},
+		home:               opts.Home,
+		project:            opts.Project,
+		dbPath:             filepath.Join(opts.Home, "cflow.db"),
+		cflowVer:           ver,
+		now:                now,
+		ids:                ids,
+		redaction:          opts.Redaction,
+		supervisor:         sup,
+		git:                opts.GitFlow,
+		prompts:            opts.Prompts,
+		agent:              opts.Agent,
+		stores:             map[model.WorkflowID]*store.Store{},
+		known:              map[model.WorkflowID]struct{}{},
+		procs:              map[model.ProcessID]process.Handle{},
+		artifacts:          map[model.WorkflowID]*artifact.Store{},
+		processSessions:    map[model.ProcessID]model.SessionID{},
+		processIdentities:  map[model.ProcessID]process.ProcessIdentity{},
+		stopPolicy:         defaultStopPolicy(opts.StopPolicy),
+		policyPollInterval: opts.PolicyPollInterval,
 	}
 	if opts.Recoverer != nil {
 		a.recoverer = opts.Recoverer
@@ -192,6 +224,12 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryPlan(ctx, qq)
 	case ExecutionPreviewQuery:
 		return a.queryExecutionPreview(ctx, qq)
+	case PolicyConfirmationQuery:
+		return a.queryPolicyConfirmation(ctx, qq)
+	case CancelSummaryQuery:
+		return a.queryCancelSummary(ctx, qq)
+	case ReplacementPreviewQuery:
+		return a.queryReplacementPreview(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -327,6 +365,12 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 		return Outcome{}, orCtx(ctx, err)
 	}
 	defer releaseHolds(holds)
+	// The Recovery sweep completes unfinished stop/cancel/quiesce
+	// protocols before any other mutation (design 17: Recovery of a Stop,
+	// Cancel, Quiesce, or Safety Stop never reopens dispatch).
+	if err := a.reconcileSweep(ctx, st, wf); err != nil {
+		return Outcome{}, orCtx(ctx, err)
+	}
 	// The Project identity row must exist before the create Decision's
 	// workflow INSERT can reference it (PRD 核心数据库表).
 	if create, ok := cmd.(CreateWorkflowCommand); ok {
@@ -772,6 +816,64 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		// approved execution artifacts; the kernel Input placeholder is
 		// unused by the dispatch path.
 		return model.DispatchInput{}, wf, nil
+	case ReconcileCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.ReconcileInput{}, wf, nil
+	case CommitPolicyConfirmCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.PreflightRevision < 1 || c.PreflightHash == "" || c.Fingerprint == "" {
+			return nil, "", model.InvalidInputFault("the commit policy confirmation requires the exact new preflight revision, hash, and fingerprint")
+		}
+		return model.CommitPolicyApprovalInput{
+			PreflightRevision: c.PreflightRevision,
+			PreflightHash:     c.PreflightHash,
+			Fingerprint:       c.Fingerprint,
+		}, wf, nil
+	case ReplacementPreviewCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		// The successor execution is generated before the mutation locks:
+		// the Repair Specs, the successor Dynamic Workflow Revision, the
+		// fixed Reconciliation Manifest, and the fresh Commit Preflight.
+		input, err := a.replacementPreviewInput(ctx, wf)
+		if err != nil {
+			return nil, "", err
+		}
+		return input, wf, nil
+	case ApproveReplacementCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.PlanHash == "" || len(c.SpecHashes) == 0 || c.CatalogHash == "" ||
+			c.WorkflowHash == "" || c.PreflightRevision < 1 || c.PreflightHash == "" ||
+			c.Fingerprint == "" || len(c.QuarantineIDs) == 0 || c.SupersededApprovalID == "" ||
+			c.ManifestRevision < 1 || c.ManifestHash == "" {
+			return nil, "", model.InvalidInputFault("the replacement approval requires the exact displayed references")
+		}
+		return model.ReplacementApprovalInput{
+			PlanHash:             c.PlanHash,
+			SpecHashes:           append([]string(nil), c.SpecHashes...),
+			CatalogHash:          c.CatalogHash,
+			WorkflowHash:         c.WorkflowHash,
+			RoutingHash:          c.RoutingHash,
+			BudgetHash:           c.BudgetHash,
+			PreflightRevision:    c.PreflightRevision,
+			PreflightHash:        c.PreflightHash,
+			Fingerprint:          c.Fingerprint,
+			QuarantineIDs:        append([]string(nil), c.QuarantineIDs...),
+			SupersededApprovalID: c.SupersededApprovalID,
+			ManifestRevision:     c.ManifestRevision,
+			ManifestHash:         c.ManifestHash,
+		}, wf, nil
 	default:
 		return nil, "", model.InvalidInputFault("unsupported command")
 	}

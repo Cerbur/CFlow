@@ -126,6 +126,17 @@ func (ProjectDiscovery) isGitQuery() {}
 // Ignored additionally classifies ignored files (verification transient
 // output, design 16.2). Ignored files never count toward the Dirty
 // Fingerprint.
+// FingerprintObserve recomputes the effective Commit Policy fingerprint
+// without the signing probe (PRD 已确认：Commit Policy 漂移立即安全停止 step
+// 5: the periodic monitor reads only public effective configuration, never
+// Signer Secrets, and never runs a signature probe per poll). Revision
+// names the observation for its evidence identity.
+type FingerprintObserve struct {
+	Revision string
+}
+
+func (FingerprintObserve) isGitQuery() {}
+
 type GitStatus struct {
 	Dir          string // absolute canonical directory; empty means the bound directory
 	ExpectedHead string // full commit hash; empty means no expectation
@@ -268,6 +279,22 @@ func (RollbackMerge) isGitOperation() {}
 // GitFacts is the closed union of structured facts. Facts are data, never
 // formatted prose: callers make decisions, GitFlow reports truth.
 type GitFacts interface{ isGitFacts() }
+
+// FingerprintFacts is the probe-less Commit Policy observation (design
+// 15.6): the normalized fingerprint, the effective identity and signing
+// policy, and the evidence identity of the observation. It never carries
+// Signer Secrets.
+type FingerprintFacts struct {
+	Revision          string
+	PolicyFingerprint string
+	GitVersion        string
+	Author            Identity
+	Committer         Identity
+	Signing           SigningPolicy
+	EvidenceHash      string
+}
+
+func (FingerprintFacts) isGitFacts() {}
 
 // ProjectFacts is the discovery fact set (design 15.3).
 type ProjectFacts struct {
@@ -537,6 +564,8 @@ func (g *GitFlow) Observe(ctx context.Context, q GitQuery) (GitFacts, error) {
 		return g.refLookup(ctx, q)
 	case HistoryRange:
 		return g.historyRange(ctx, q)
+	case FingerprintObserve:
+		return g.fingerprintObserve(ctx, q)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git query")
 	}

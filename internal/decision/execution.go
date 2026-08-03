@@ -85,7 +85,9 @@ func decideAttemptEnded(state model.State, in model.EffectResultInput) (model.De
 				return decideAttemptFailure(state, node, attempt, in, model.CodeDirtyTaskWorktree, b)
 			}
 			if in.EndHead == "" || in.EndHead == attempt.StartHead {
-				return decideAttemptFailure(state, node, attempt, in, model.CodeMissingImplementationCommit, b)
+				if !repairCleanEndAccepted(state, attempt, node) {
+					return decideAttemptFailure(state, node, attempt, in, model.CodeMissingImplementationCommit, b)
+				}
 			}
 		}
 		if in.Evidence == (model.EvidenceRef{}) {
@@ -272,11 +274,16 @@ func closeDispatchForFailure(state model.State, b *builder, exclude model.Attemp
 }
 
 // settleInterrupted records an interrupted Attempt (never charging the
-// budget) and settles the Run: a persisted cancel intent completes
-// cancellation (Nodes go CANCELLED, never READY), a quiescing Run or a
-// blocking Finding Blocks (Ctrl+C never clears the original finding), and
-// an ordinary interruption returns the Node to READY and Pauses the
-// Workflow (PRD 状态机与持久化模型).
+// budget) and opens the controlled stop: a persisted cancel intent
+// completes cancellation (Nodes go CANCELLED, never READY); otherwise the
+// Run enters STOPPING with the persisted stop intent (CONTROLLED_STOP_
+// REQUESTED, or COMMIT_POLICY_SAFETY_STOP_REQUESTED with stop_reason
+// COMMIT_POLICY_DRIFT for a policy safety stop), the dispatch gate closes,
+// the managed processes receive their two-phase stop Effects, and once
+// nothing is in flight the Run converges INTERRUPTED with the Workflow
+// PAUSED — or BLOCKED when a blocking Finding or Quiescing blocker exists
+// (Ctrl+C never clears the original finding; PRD 已确认：Ctrl+C 两阶段有限停
+// 止 step 5).
 func settleInterrupted(state model.State, node *model.Node, attempt *model.Attempt, in model.EffectResultInput, b *builder) (model.Decision, error) {
 	b.mutate(model.AttemptEndMutation{
 		Key:                 attempt.Key,
@@ -290,8 +297,13 @@ func settleInterrupted(state model.State, node *model.Node, attempt *model.Attem
 	})
 	b.event(model.EventAttemptInterrupted, node.ID, attempt.Key, "", "attempt interrupted")
 
-	if state.Workflow.CancelIntent != nil && !hasRunningAttemptExcept(state, attempt.Key) && !hasRunningProcess(state) {
-		finishCancel(b, state, state.Workflow.CancelIntent)
+	// A persisted Cancel intent completes through finishCancel once
+	// nothing is running; the interrupted Node settles CANCELLED there,
+	// never READY.
+	if state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal() {
+		if !hasRunningAttemptExcept(state, attempt.Key) && !hasRunningProcess(state) {
+			finishCancel(b, state, state.Workflow.CancelIntent)
+		}
 		return b.decision(), nil
 	}
 	b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeReady, RetryCharged: node.RetryCharged})
@@ -300,23 +312,67 @@ func settleInterrupted(state model.State, node *model.Node, attempt *model.Attem
 	if run == nil || run.Status.IsTerminal() {
 		return b.decision(), nil
 	}
-	if run.Status == model.RunQuiescing || hasBlockingFinding(state) {
-		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunInterrupted, DispatchGate: false})
-		b.event(model.EventRunInterrupted, "", model.AttemptKey{}, "", "run interrupted")
-		b.mutate(wfMutStatus(state, model.RuntimeBlocked))
-		b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked")
-		return b.decision(), nil
+	if run.Status != model.RunStopping {
+		// The first interruption of the stop: atomically persist the stop
+		// intent, close the dispatch gate, and begin the two-phase stop of
+		// the managed processes (PRD 已确认：Ctrl+C 两阶段有限停止 step 1;
+		// 已确认：Commit Policy 漂移立即安全停止 step 1).
+		reason, kind := model.CodeUserInterrupted, model.EventControlledStopRequested
+		if in.FailureCode == model.CodeCommitPolicySafetyStopRequested {
+			reason, kind = model.CodeCommitPolicyDrift, model.EventCommitPolicySafetyStopRequested
+		}
+		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunStopping, DispatchGate: false, StopReason: reason})
+		b.event(kind, "", model.AttemptKey{}, "", "stop requested")
+		b.event(model.EventRunStopped, "", model.AttemptKey{}, "", "run stopping")
+		stopRunningProcesses(b, state)
 	}
-	b.mutate(model.RunMutation{ID: run.ID, Status: model.RunInterrupted, DispatchGate: false})
-	b.event(model.EventRunInterrupted, "", model.AttemptKey{}, "", "run interrupted")
-	b.mutate(wfMutStatus(state, model.RuntimePaused))
-	b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused")
+	// The stop may already be complete (no processes, no other attempts).
+	convergeStopping(b, state, attempt.Key, "", run.Status != model.RunStopping)
 	return b.decision(), nil
+}
+
+// convergeStopping completes a controlled stop once every managed process
+// and every other Attempt has settled: the Run becomes INTERRUPTED and
+// the Workflow PAUSED — or BLOCKED when a blocking Finding exists (the
+// Quiescing blocker or an earlier failure; Ctrl+C never clears it). A
+// persisted Cancel intent converges through finishCancel instead. It
+// never reopens dispatch. excludeAttempt and excludeProcess are the
+// entities this same Decision settles (their pre-mutation rows still look
+// RUNNING to the input State); transitioning reports that the caller's
+// own Decision performed the RUN→STOPPING transition (the input State
+// still shows the pre-transition Run).
+func convergeStopping(b *builder, state model.State, excludeAttempt model.AttemptKey, excludeProcess model.ProcessID, transitioning bool) {
+	run := activeRun(state)
+	if run == nil {
+		return
+	}
+	if !transitioning && run.Status != model.RunStopping {
+		return
+	}
+	if hasRunningProcessExcept(state, excludeProcess) || hasRunningAttemptExcept(state, excludeAttempt) {
+		return
+	}
+	if state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal() {
+		finishCancel(b, state, state.Workflow.CancelIntent)
+		return
+	}
+	// The persisted stop reason rides the convergence (the store row's
+	// stop_reason is replaced wholesale).
+	b.mutate(model.RunMutation{ID: run.ID, Status: model.RunInterrupted, DispatchGate: false, StopReason: run.StopReason})
+	b.event(model.EventRunInterrupted, "", model.AttemptKey{}, "", "run interrupted")
+	if hasBlockingFinding(state) {
+		b.mutate(wfMutStatus(state, model.RuntimeBlocked))
+		b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked after the stop")
+		return
+	}
+	b.mutate(wfMutStatus(state, model.RuntimePaused))
+	b.event(model.EventWorkflowPaused, "", model.AttemptKey{}, "", "workflow paused after the stop")
 }
 
 // settleAfterAttemptEnd completes the settlement protocols that a settled
 // Attempt may finish: convergence of a QUIESCING Run whose snapshot
-// Attempts have all settled, or completion of a persisted Cancel intent.
+// Attempts have all settled, completion of a persisted Cancel intent, and
+// convergence of a STOPPING Run whose processes and Attempts settled.
 func settleAfterAttemptEnd(state model.State, b *builder, ended model.AttemptKey) {
 	if !hasRunningAttemptExcept(state, ended) && !hasRunningProcess(state) {
 		if state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal() {
@@ -326,7 +382,9 @@ func settleAfterAttemptEnd(state model.State, b *builder, ended model.AttemptKey
 	}
 	if run := activeRun(state); run != nil && run.Status == model.RunQuiescing && !hasRunningAttemptExcept(state, ended) {
 		convergeQuiescing(b, state)
+		return
 	}
+	convergeStopping(b, state, ended, "", false)
 }
 
 // convergeQuiescing moves a QUIESCING Run whose snapshot Attempts have all
@@ -404,7 +462,12 @@ func sortedNodeIDs(state model.State) []model.NodeID {
 // decideProcessStopped settles one managed process and continues the stop
 // protocol: while a stop or cancel is in progress, the next running
 // process receives its stop Effect; once nothing is running, a persisted
-// cancel intent completes cancellation.
+// cancel intent completes cancellation and a STOPPING Run converges. A
+// process that survived the force-kill phase with its exact
+// PID/start-token identity is the orphan fact: the Workflow Blocks with
+// ORPHAN_CHILD_PROCESS and Project mutation is quarantined, or keeps the
+// Cancel intent with CANCEL_PENDING_ORPHAN_PROCESS until Recovery
+// completes it (PRD 已确认：Ctrl+C 两阶段有限停止 step 9; Cancel step 4).
 func decideProcessStopped(state model.State, in model.EffectResultInput) (model.Decision, error) {
 	p := findProcess(state, in.Process)
 	if p == nil {
@@ -415,15 +478,46 @@ func decideProcessStopped(state model.State, in model.EffectResultInput) (model.
 	}
 	b := &builder{state: state}
 	b.mutate(model.ProcessEndMutation{ID: p.ID, Status: model.ProcessStatusStopped, EndedAt: state.Now})
+	if in.Orphan {
+		settleOrphanProcess(state, b, in.Process)
+		return b.decision(), nil
+	}
 	if state.Workflow.CancelIntent != nil || activeRunStopping(state) {
 		stopRunningProcesses(b, state, in.Process)
 	}
-	if !hasRunningProcessExcept(state, in.Process) && !hasRunningAttempt(state) {
-		if state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal() {
-			finishCancel(b, state, state.Workflow.CancelIntent)
-		}
-	}
+	// The process this Decision settles is excluded: its pre-mutation row
+	// still looks RUNNING to the input State.
+	convergeStopping(b, state, model.AttemptKey{}, in.Process, false)
 	return b.decision(), nil
+}
+
+// settleOrphanProcess records the orphan fact of a force-killed process
+// that is still alive with its exact identity: the Workflow Blocks and
+// Project mutation is quarantined; a persisted Cancel keeps its intent so
+// Recovery can complete the cancellation once the process facts settle.
+func settleOrphanProcess(state model.State, b *builder, process model.ProcessID) {
+	code := model.CodeOrphanChildProcess
+	scope := model.ScopeRun
+	if state.Workflow.CancelIntent != nil && !state.Workflow.Runtime.IsTerminal() {
+		code = model.CodeCancelPendingOrphanProcess
+		scope = model.ScopeWorkflow
+	}
+	b.mutate(model.FindingAppendMutation{Finding: model.Finding{
+		ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+1)),
+		Code:     code,
+		Scope:    scope,
+		Subject:  string(process),
+		Blocking: true,
+		Text:     code.String(),
+		Seq:      state.NextEventSeq,
+	}})
+	b.event(model.EventFindingOpened, "", model.AttemptKey{}, code, "orphan process finding")
+	if run := activeRun(state); run != nil && !run.Status.IsTerminal() {
+		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunInterrupted, DispatchGate: false})
+		b.event(model.EventRunInterrupted, "", model.AttemptKey{}, "", "run interrupted by an orphan process")
+	}
+	b.mutate(wfMutStatus(state, model.RuntimeBlocked))
+	b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked by an orphan process")
 }
 
 func activeRunStopping(state model.State) bool {
@@ -435,10 +529,12 @@ func activeRunStopping(state model.State) bool {
 
 // decideReconcile is the Kernel's Recovery sweep: complete a persisted
 // cancel intent once everything is settled, converge a QUIESCING Run whose
-// snapshot Attempts have all settled, and Block a RUNNING Workflow that
-// carries a FAILED Node with no in-flight Attempts. It never reopens
-// dispatch and never resurrects failed Nodes or terminal Attempts
-// (PRD 状态机与持久化模型, design 17).
+// snapshot Attempts have all settled, converge a STOPPING Run whose
+// processes and Attempts settled (Recovery of a Stop or a Safety Stop can
+// never reopen dispatch), and Block a RUNNING Workflow that carries a
+// FAILED Node with no in-flight Attempts. It never reopens dispatch and
+// never resurrects failed Nodes or terminal Attempts (PRD 状态机与持久化模
+// 型, design 17).
 func decideReconcile(state model.State, in model.ReconcileInput) (model.Decision, error) {
 	b := &builder{state: state}
 
@@ -451,6 +547,7 @@ func decideReconcile(state model.State, in model.ReconcileInput) (model.Decision
 		convergeQuiescing(b, state)
 		return b.decision(), nil
 	}
+	convergeStopping(b, state, model.AttemptKey{}, "", false)
 	if state.Workflow.Runtime == model.RuntimeRunning && anyFailedNode(state) && !hasRunningAttempt(state) {
 		b.mutate(wfMutStatus(state, model.RuntimeBlocked))
 		b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked")
@@ -473,4 +570,61 @@ func decideAgentEvent(state model.State, in model.AgentEventInput) (model.Decisi
 	default:
 		return model.Decision{}, model.InvalidInputFault("unsupported agent event")
 	}
+}
+
+// repairCleanEndAccepted reports whether a repair Attempt may end at the
+// HEAD it started from: the repair Session removed the residuals and the
+// prior Attempt already produced a legal implementation Commit beyond the
+// Task Base, so no empty Commit is required (PRD 已确认：DIRTY_TASK_WORKTREE
+// 原地 Repair). Repair never fabricates success: an empty head or a
+// missing legal prior Commit is still rejected with
+// MISSING_IMPLEMENTATION_COMMIT.
+func repairCleanEndAccepted(state model.State, attempt *model.Attempt, node *model.Node) bool {
+	if attempt.StartHead == "" {
+		return false
+	}
+	repair := false
+	for i := range state.Sessions {
+		if state.Sessions[i].ID == attempt.Session && state.Sessions[i].Purpose == model.PurposeRepair {
+			repair = true
+			break
+		}
+	}
+	if !repair {
+		return false
+	}
+	prior := priorAttemptEndHead(state, node.ID, attempt.Key.Number)
+	return prior != "" && prior != node.BaseCommit
+}
+
+// priorAttemptEndHead is the end HEAD of the highest-numbered terminal
+// Attempt below number ("" when none).
+func priorAttemptEndHead(state model.State, node model.NodeID, number model.AttemptNumber) string {
+	var best model.AttemptNumber
+	var end string
+	for k, a := range state.Attempts {
+		if k.Node != node || k.Number >= number || !a.Status.IsTerminal() {
+			continue
+		}
+		if a.EndHead != "" && (end == "" || k.Number > best) {
+			best = k.Number
+			end = a.EndHead
+		}
+	}
+	return end
+}
+
+// highestTerminalAttempt returns the highest-numbered terminal Attempt of
+// one Node (nil when none).
+func highestTerminalAttempt(state model.State, node model.NodeID) *model.Attempt {
+	var best *model.Attempt
+	for k, a := range state.Attempts {
+		if k.Node != node || !a.Status.IsTerminal() {
+			continue
+		}
+		if best == nil || k.Number > best.Key.Number {
+			best = a
+		}
+	}
+	return best
 }

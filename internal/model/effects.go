@@ -29,13 +29,17 @@ func (ArtifactWriteIntent) isEffectIntent() {}
 // in its role lineage (design 14.4); the Runtime verifies the lineage
 // before any Provider call. Node fixes the allocated Attempt's Node for a
 // coding Session: the executor runs it only inside that Node's Task
-// Worktree (PRD Worktree 策略; Task 12).
+// Worktree (PRD Worktree 策略; Task 12). Process is the Application-
+// allocated managed Process identity the Kernel records as RUNNING with
+// the Session (the controlled-stop ledger, design 13.3); the executor
+// binds the live process facts to it.
 type ProviderStartIntent struct {
 	Session    SessionID
 	Purpose    AgentPurpose
 	Route      string
 	Supersedes string
 	Node       NodeID
+	Process    ProcessID
 }
 
 func (ProviderStartIntent) isEffectIntent() {}
@@ -44,6 +48,7 @@ func (ProviderStartIntent) isEffectIntent() {}
 type ProviderResumeIntent struct {
 	Session SessionID
 	Purpose AgentPurpose
+	Process ProcessID
 }
 
 func (ProviderResumeIntent) isEffectIntent() {}

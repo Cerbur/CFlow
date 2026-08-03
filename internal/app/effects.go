@@ -32,6 +32,11 @@ import (
 // arrives with Task 17 (design 13.3).
 const stopWaitBudget = 12 * time.Second
 
+// stopGraceBudget is the PRD drain window of the two-phase controlled
+// stop (design 13.3: drain valid framed events for up to 10 seconds
+// before terminating the process groups).
+const stopGraceBudget = 10 * time.Second
+
 // executeEffect runs one committed Effect Intent and returns the typed
 // Result evidence. restricted commands may only stop and reconcile
 // already managed processes (design 6.1). wf is the command's workflow
@@ -87,30 +92,44 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 	}
 }
 
-// stopManagedProcess runs the controlled stop of one managed process
-// (design 13.3 primitives): Terminate the exact process group, then Wait
-// within the bounded budget. The Result reports only the typed fact
-// (process-stopped); the Kernel settles the aggregate.
+// stopManagedProcess runs the two-phase controlled stop of one managed
+// process (design 13.3, PRD 已确认：Ctrl+C 两阶段有限停止): the Adapter
+// Cancel (Interrupt) with the 10-second grace drain, Terminate the exact
+// process group and wait 2 seconds, then ForceKill and inspect the exact
+// PID/start-token identity. The second Ctrl+C (EscalateStop) cancels the
+// stop context and skips the remaining grace. A matching identity still
+// alive after the force-kill phase is the orphan fact the Result carries;
+// the Kernel Blocks the Workflow and quarantines Project mutation. A
+// managed Process without a supervised handle (an in-process fake
+// Session) settled with its command context and is reported stopped.
 func (a *Application) stopManagedProcess(ctx context.Context, intent model.ManagedProcessStopIntent) (model.EffectResultInput, error) {
 	handle, ok := a.procs[intent.Process]
 	if !ok {
-		return model.EffectResultInput{}, model.NewFault(model.CodeStateInvariantViolation,
-			"managed process "+string(intent.Process)+" is not supervised by this runtime")
+		// No supervised handle: the Session settled with its context; the
+		// Kernel settles the process record from the typed stopped fact.
+		return model.EffectResultInput{Kind: model.ProcessStopped, Process: intent.Process}, nil
 	}
-	if err := a.supervisor.Signal(ctx, handle, process.Terminate); err != nil {
-		return model.EffectResultInput{}, err
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, stopWaitBudget)
-	defer cancel()
-	if _, err := a.supervisor.Wait(waitCtx, handle); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return model.EffectResultInput{}, model.NewFault(model.CodeStateInvariantViolation,
-				"managed process "+string(intent.Process)+" did not stop within the bounded budget")
+	// The stop runs on the Application's stop context — independent of the
+	// command context (the first Ctrl+C cancels the command so the
+	// Sessions abort; the stop itself keeps its grace) and cancelled by
+	// the second Ctrl+C escalation.
+	stopCtx, _ := a.stopContext(context.Background())
+	exit, err := process.Stop(stopCtx, a.supervisor, handle, a.stopPolicy)
+	orphan := false
+	if err != nil && errors.Is(err, process.ErrNotReaped) {
+		// The force-kill phase is over: the exact identity facts decide.
+		if id, ok := a.processIdentities[intent.Process]; ok {
+			fact, ierr := a.supervisor.Inspect(context.Background(), id)
+			if ierr == nil && fact.Running {
+				orphan = true
+			}
 		}
+	} else if err != nil {
 		return model.EffectResultInput{}, err
 	}
-	delete(a.procs, intent.Process)
-	return model.EffectResultInput{Kind: model.ProcessStopped, Process: intent.Process}, nil
+	_ = exit
+	a.unbindProcess(intent.Process)
+	return model.EffectResultInput{Kind: model.ProcessStopped, Process: intent.Process, Orphan: orphan}, nil
 }
 
 // restrictedAllowed reports whether one Effect may run on the restricted
@@ -475,7 +494,13 @@ func (a *Application) taskWorktreeCreate(ctx context.Context, wf model.WorkflowI
 	if err := a.ensureWorktreeParent(path); err != nil {
 		return model.EffectResultInput{}, err
 	}
-	res, err := a.git.Execute(ctx, gitflow.CreateTask{
+	// The creation runs on a context that is not cancelled: an aborted
+	// `git worktree add` removes its partial directory, which would lose
+	// the Coding Worktree the interruption must preserve (PRD 已确认：
+	// Ctrl+C 两阶段有限停止 step 7). The CAS-guarded creation completes;
+	// the interrupted pass settles the Attempt INTERRUPTED afterwards.
+	createCtx := context.WithoutCancel(ctx)
+	res, err := a.git.Execute(createCtx, gitflow.CreateTask{
 		Branch:   intent.Branch,
 		BaseHead: intent.BaseHead,
 		Path:     path,
@@ -514,6 +539,32 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	// Session start (design 12: an in-memory queued goroutine is not an
 	// in-flight Attempt).
 	a.probeStep("provider:" + string(intent.Node) + ":start")
+	// A pass interruption takes precedence over every Worktree judgment:
+	// the Attempt settles INTERRUPTED through the chain's stop protocol,
+	// never as a drift failure of an unobservable Worktree.
+	if err := ctx.Err(); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	// The successor of a terminal Attempt reuses the exact Task
+	// Branch/Worktree only when the Worktree's HEAD, status, and Dirty
+	// Fingerprint still match the prior Attempt's end evidence (PRD 已确
+	// 认：DIRTY_TASK_WORKTREE 原地 Repair: re-verify before starting repair;
+	// 已确认：Ctrl+C 两阶段有限停止 step 7: re-verify before resume). A
+	// mismatch fails the Attempt closed — DIRTY_WORKTREE_DRIFTED for a
+	// repair successor, INTERRUPTED_WORKTREE_DRIFTED for a resumed
+	// interrupted successor — and the Workflow Blocks; the Worktree is
+	// never auto-fixed.
+	if drift := a.reuseWorktreeDrift(ctx, wf, intent.Node); drift != "" {
+		head, dirty := a.driftEndFacts(ctx, wf, intent.Node)
+		return model.EffectResultInput{
+			Kind:                model.AttemptEnded,
+			Attempt:             a.runningAttemptKey(ctx, wf, intent.Node),
+			Outcome:             model.OutcomeFailed,
+			FailureCode:         model.Code(drift),
+			EndHead:             head,
+			EndDirtyFingerprint: dirty,
+		}, nil
+	}
 	// The successor Session of an automatic fallback receives the LOST
 	// original's immutable redacted Context Bundle in its start input
 	// and re-establishes the lineage through Supersedes (design 14.4,

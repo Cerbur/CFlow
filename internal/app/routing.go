@@ -38,10 +38,14 @@ import (
 const providerTrustBoundary = "agents run with the provider's default permissions and the user's existing provider configuration; CFlow provides no sandbox guarantee"
 
 // routedPurposes is the canonical Purpose order of an execution routing
-// policy: the Implementer lineage, then the independent Reviewer
-// lineage (the Reviewer Session of a Task runs on the Task's approved
-// route, design 16.2).
-var routedPurposes = []model.AgentPurpose{model.PurposeImplementation, model.PurposeReview}
+// policy: the Implementer lineage, then the independent Reviewer lineage
+// (the Reviewer Session of a Task runs on the Task's approved route,
+// design 16.2), then the independent Repair lineage (a DIRTY_TASK_WORKTREE
+// successor runs on the Task's approved route with the repair purpose,
+// PRD 已确认：DIRTY_TASK_WORKTREE 原地 Repair).
+var routedPurposes = []model.AgentPurpose{
+	model.PurposeImplementation, model.PurposeReview, model.PurposeRepair,
+}
 
 // resolvedConfig loads and resolves the strict local configuration
 // (design 20.1). An absent configuration file means "no configuration":

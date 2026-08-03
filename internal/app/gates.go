@@ -649,3 +649,68 @@ func (a *Application) observeWorktree(ctx context.Context, dir, expectedHead str
 	}
 	return st, nil
 }
+
+// reuseWorktreeDrift reports the drift failure code when the Task
+// Worktree of a successor Attempt no longer matches the prior Attempt's
+// end evidence ("" when the facts match and the reuse is safe): the
+// Worktree HEAD, status, and Dirty Fingerprint must equal the failed or
+// interrupted Attempt's end facts before a repair or a resume may reuse
+// the exact Branch/Worktree (PRD 已确认：DIRTY_TASK_WORKTREE 原地 Repair;
+// 已确认：Ctrl+C 两阶段有限停止 step 7). CFlow never auto-fixes the
+// Worktree; a mismatch Blocks with the typed drift code.
+func (a *Application) reuseWorktreeDrift(ctx context.Context, wf model.WorkflowID, node model.NodeID) string {
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return string(model.CodeDirtyWorktreeDrifted)
+	}
+	st := view.State
+	att := runningAttemptOfState(st, node)
+	if att == nil {
+		return ""
+	}
+	prior := priorAttemptFactsOf(st, node, att.Key.Number)
+	if prior == nil || prior.EndHead == "" {
+		return "" // the first Attempt: the Worktree is created fresh
+	}
+	status, err := a.observeWorktree(ctx, a.taskWorktreePath(wf, node), "")
+	if err != nil {
+		if ctx.Err() != nil {
+			return "" // the pass is interrupted: the stop protocol settles the attempt
+		}
+		return string(model.CodeDirtyWorktreeDrifted)
+	}
+	if status.Head != prior.EndHead || dirtyFingerprint(status.Dirty) != prior.EndDirtyFingerprint {
+		if prior.Status == model.AttemptInterrupted {
+			return string(model.CodeInterruptedWorktreeDrifted)
+		}
+		return string(model.CodeDirtyWorktreeDrifted)
+	}
+	return ""
+}
+
+// driftEndFacts observes the current Task Worktree end facts of one Node
+// for the failed Attempt result of a reuse drift ("" on an unreadable
+// Worktree).
+func (a *Application) driftEndFacts(ctx context.Context, wf model.WorkflowID, node model.NodeID) (head, dirty string) {
+	status, err := a.observeWorktree(ctx, a.taskWorktreePath(wf, node), "")
+	if err != nil {
+		return "", ""
+	}
+	return status.Head, dirtyFingerprint(status.Dirty)
+}
+
+// priorAttemptFactsOf returns the highest-numbered terminal Attempt below
+// number with its recorded end facts (nil when none).
+func priorAttemptFactsOf(st model.State, node model.NodeID, number model.AttemptNumber) *model.Attempt {
+	var best *model.Attempt
+	for k, a := range st.Attempts {
+		if k.Node != node || k.Number >= number || !a.Status.IsTerminal() {
+			continue
+		}
+		if best == nil || k.Number > best.Key.Number {
+			aa := a
+			best = aa
+		}
+	}
+	return best
+}

@@ -82,7 +82,9 @@ const queryApprovals = `
 	SELECT id, gate_type, seq, plan_revision, plan_sha256, specs_revision, specs_sha256,
 	       verification_catalog_revision, verification_catalog_sha256,
 	       dynamic_workflow_revision, dynamic_workflow_sha256,
-	       COALESCE(git_commit_policy_fingerprint, '')
+	       COALESCE(git_commit_preflight_revision, 0),
+	       COALESCE(git_commit_policy_fingerprint, ''),
+	       COALESCE(decision_context_json, '{}')
 	FROM approvals WHERE workflow_id = ? ORDER BY created_at, id`
 
 const queryFindings = `
@@ -108,7 +110,7 @@ const queryRuns = `
 	FROM runs WHERE workflow_id = ? ORDER BY id`
 
 const queryQuarantines = `
-	SELECT branch_name, head_commit, reason_code
+	SELECT id, branch_name, head_commit, audit_ref, reason_code
 	FROM branch_quarantines WHERE workflow_id = ? ORDER BY id`
 
 const queryApplyAttempts = `
@@ -319,9 +321,18 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		var kind string
 		var planRev, specsRev, catalogRev, workflowRev sql.NullInt64
 		var planHash, specsHash, catalogHash, workflowHash sql.NullString
+		var preflightRev sql.NullInt64
+		var decisionContext sql.NullString
 		if err := row.Scan(&ap.ID, &kind, &ap.Seq, &planRev, &planHash, &specsRev, &specsHash,
-			&catalogRev, &catalogHash, &workflowRev, &workflowHash, &ap.Fingerprint); err != nil {
+			&catalogRev, &catalogHash, &workflowRev, &workflowHash, &preflightRev,
+			&ap.Fingerprint, &decisionContext); err != nil {
 			return fmt.Errorf("scan approval: %w", err)
+		}
+		if preflightRev.Valid {
+			ap.PreflightRevision = int(preflightRev.Int64)
+		}
+		if decisionContext.Valid {
+			ap.DecisionContext = decisionContext.String
 		}
 		ap.Kind = gateToApprovalKind(kind)
 		ref := func(rev sql.NullInt64, hash sql.NullString, typ model.ArtifactType) {
@@ -412,7 +423,7 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 	if err := forEachRow(ctx, q, queryQuarantines, []any{workflow}, func(row rowScanner) error {
 		var qr model.Quarantine
 		var head string
-		if err := row.Scan(&qr.Branch, &head, &qr.Code); err != nil {
+		if err := row.Scan(&qr.ID, &qr.Branch, &head, &qr.AuditRef, &qr.Code); err != nil {
 			return fmt.Errorf("scan quarantine: %w", err)
 		}
 		qr.FromHead = head

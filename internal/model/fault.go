@@ -48,6 +48,16 @@ const (
 	CodeProviderSessionIDMissing       Code = "PROVIDER_SESSION_ID_MISSING"
 	CodeProviderAuthenticationRequired Code = "PROVIDER_AUTHENTICATION_REQUIRED"
 
+	// Controlled-stop facts (PRD 已确认：Ctrl+C 两阶段有限停止): an orphan
+	// that survived the force-kill phase quarantines Project mutation and
+	// Blocks the Workflow; a resume whose Worktree drifted from the
+	// interruption Checkpoint blocks with INTERRUPTED_WORKTREE_DRIFTED; a
+	// Cancel whose process facts cannot settle keeps its intent and Blocks
+	// with CANCEL_PENDING_ORPHAN_PROCESS until Recovery completes it.
+	CodeOrphanChildProcess         Code = "ORPHAN_CHILD_PROCESS"
+	CodeInterruptedWorktreeDrifted Code = "INTERRUPTED_WORKTREE_DRIFTED"
+	CodeCancelPendingOrphanProcess Code = "CANCEL_PENDING_ORPHAN_PROCESS"
+
 	// Local environment and data-safety failures (PRD 失败分类).
 	CodeInsecureCFLOWHomePermissions Code = "INSECURE_CFLOW_HOME_PERMISSIONS"
 	CodeSensitiveDataRedactionFailed Code = "SENSITIVE_DATA_REDACTION_FAILED"
@@ -75,6 +85,10 @@ const (
 	CodeCommitPolicyMismatch             Code = "COMMIT_POLICY_MISMATCH"
 	CodeGitIdentityNotConfigured         Code = "GIT_IDENTITY_NOT_CONFIGURED"
 	CodeGitSigningPreflightFailed        Code = "GIT_SIGNING_PREFLIGHT_FAILED"
+	// CodeCommitPolicyDrift is the Run stop_reason of a Policy Safety Stop
+	// (PRD 已确认：Commit Policy 漂移立即安全停止 step 1: stop_reason =
+	// COMMIT_POLICY_DRIFT). It is recorded on the Run, never charged.
+	CodeCommitPolicyDrift Code = "COMMIT_POLICY_DRIFT"
 
 	// Apply, Approval, and Cleanup failures.
 	CodeTargetHeadChanged          Code = "TARGET_HEAD_DRIFTED"
@@ -128,6 +142,9 @@ func Codes() []Code {
 		CodeProviderProtocolViolation,
 		CodeProviderSessionIDMissing,
 		CodeProviderAuthenticationRequired,
+		CodeOrphanChildProcess,
+		CodeInterruptedWorktreeDrifted,
+		CodeCancelPendingOrphanProcess,
 		CodeInsecureCFLOWHomePermissions,
 		CodeSensitiveDataRedactionFailed,
 		CodeDatabaseSchemaTooNew,
@@ -150,6 +167,7 @@ func Codes() []Code {
 		CodeCommitPolicyMismatch,
 		CodeGitIdentityNotConfigured,
 		CodeGitSigningPreflightFailed,
+		CodeCommitPolicyDrift,
 		CodeTargetHeadChanged,
 		CodeApprovalInputChanged,
 		CodeCleanupWorkflowNotTerminal,
@@ -340,6 +358,15 @@ var faultPolicies = []FaultPolicy{
 	// User interruption: no retry charge; the run stops and the Workflow
 	// pauses (or blocks when a blocking Finding is present).
 	p(CodeUserInterrupted, CatUserActionRequired, ScopeRun, false, true, StopAll, false),
+	// Orphan and drift facts of the controlled stop (PRD 已确认：Ctrl+C 两
+	// 阶段有限停止): an orphaned process that survived the force-kill phase
+	// quarantines Project mutation and Blocks; a resume whose Worktree
+	// drifted from the interruption Checkpoint never reuses the path and
+	// Blocks; a Cancel whose processes cannot settle keeps its intent and
+	// Blocks until Recovery completes the cancellation.
+	p(CodeOrphanChildProcess, CatUserActionRequired, ScopeRun, false, true, StopNone, false),
+	p(CodeInterruptedWorktreeDrifted, CatUserActionRequired, ScopeAttempt, false, true, StopAffected, false),
+	p(CodeCancelPendingOrphanProcess, CatUserActionRequired, ScopeWorkflow, false, true, StopNone, false),
 
 	// Provider protocol failures: never charged, dispatch closed
 	// (PRD 失败分类, 否，且不扣失败重试预算).
@@ -374,6 +401,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeCommitPolicySafetyStopRequested, CatSafetyStop, ScopeRun, false, true, StopAll, false),
 	p(CodeCommitPolicyInputChanged, CatInvalidInput, ScopeApproval, false, false, StopNone, false),
 	p(CodeCommitPolicyMismatch, CatUserActionRequired, ScopeAttempt, false, true, StopAffected, false),
+	p(CodeCommitPolicyDrift, CatSafetyStop, ScopeRun, false, true, StopAll, false),
 	p(CodeGitIdentityNotConfigured, CatUserActionRequired, ScopeWorkflow, false, true, StopAffected, false),
 	p(CodeGitSigningPreflightFailed, CatUserActionRequired, ScopeWorkflow, false, true, StopAffected, false),
 

@@ -21,6 +21,7 @@ package process
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"path/filepath"
 	"sync"
@@ -98,6 +99,90 @@ const (
 // handles; a zero Handle is never valid.
 type Handle struct {
 	id uint64
+}
+
+// StopPolicy is the staged budget of the two-phase controlled stop
+// (design 13.3, PRD 已确认：Ctrl+C 两阶段有限停止): the Adapter-cancel
+// grace, the post-Terminate wait, and the post-ForceKill wait.
+type StopPolicy struct {
+	// Grace is the drain window after the Adapter Cancel (Interrupt):
+	// valid framed events settle within it before termination. The PRD
+	// fixes it at 10 seconds.
+	Grace time.Duration
+	// TerminateWait is the bounded wait after the group Terminate before
+	// the force-kill phase (PRD: 2 seconds).
+	TerminateWait time.Duration
+	// ForceKillWait is the bounded wait after the group ForceKill before
+	// the PID/start-token identity facts are inspected.
+	ForceKillWait time.Duration
+}
+
+// DefaultStopPolicy is the PRD controlled-stop budget: 10 seconds of
+// grace, 2 seconds after Terminate, 2 seconds after ForceKill.
+func DefaultStopPolicy() StopPolicy {
+	return StopPolicy{Grace: 10 * time.Second, TerminateWait: 2 * time.Second, ForceKillWait: 2 * time.Second}
+}
+
+// ErrNotReaped is returned by Stop when the identity was still alive
+// after the force-kill phase (or the stop context cancelled the wait):
+// the caller must inspect the exact PID/start-token identity it recorded
+// at start and report the orphan fact when it still matches (design
+// 13.2: PID alone is never trusted).
+var ErrNotReaped = errors.New("process: not reaped within the stop budget")
+
+// Stop performs the two-phase controlled stop of one supervised process
+// group (design 13.3): Interrupt (the Adapter Cancel) and drain valid
+// events for the grace window, Terminate the remaining group and wait the
+// escalation window, then ForceKill what remains. A cancelled ctx (the
+// second Ctrl+C) skips the remaining waits and escalates to ForceKill
+// immediately. It returns the final Exit when the process was reaped;
+// ErrNotReaped means the identity may still be alive and the caller must
+// Inspect it (the orphan path).
+func Stop(ctx context.Context, sup Supervisor, h Handle, p StopPolicy) (Exit, error) {
+	if err := sup.Signal(ctx, h, Interrupt); err != nil {
+		return Exit{}, err
+	}
+	// The grace window drains valid framed events; the process may exit
+	// cooperatively within it (Adapter Cancel).
+	if _, err := waitExit(ctx, sup, h, p.Grace); err == nil {
+		return sup.Wait(ctx, h)
+	}
+	if ctx.Err() != nil {
+		// Second Ctrl+C: escalation skips Terminate and force-kills.
+		return forceKillStop(ctx, sup, h, p)
+	}
+	if err := sup.Signal(ctx, h, Terminate); err != nil {
+		return Exit{}, err
+	}
+	if _, err := waitExit(ctx, sup, h, p.TerminateWait); err == nil {
+		return sup.Wait(ctx, h)
+	}
+	return forceKillStop(ctx, sup, h, p)
+}
+
+// forceKillStop delivers ForceKill and waits the final window.
+func forceKillStop(ctx context.Context, sup Supervisor, h Handle, p StopPolicy) (Exit, error) {
+	if err := sup.Signal(ctx, h, ForceKill); err != nil {
+		return Exit{}, err
+	}
+	exit, err := waitExit(ctx, sup, h, p.ForceKillWait)
+	if err != nil {
+		return Exit{}, ErrNotReaped
+	}
+	return exit, nil
+}
+
+// waitExit waits for the process to be reaped within d; a nil error means
+// the process exited. A cancelled ctx returns the cancellation so the
+// staged protocol escalates.
+func waitExit(ctx context.Context, sup Supervisor, h Handle, d time.Duration) (Exit, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	exit, err := sup.Wait(waitCtx, h)
+	if err != nil {
+		return Exit{}, err
+	}
+	return exit, nil
 }
 
 // Events is the receive side of the supervisor's framed output pipeline.

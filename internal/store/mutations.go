@@ -437,14 +437,23 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 				workflowRev, workflowHash = r.Revision, r.Hash
 			}
 		}
+		decisionContext := a.DecisionContext
+		if decisionContext == "" {
+			decisionContext = "{}"
+		}
+		preflightRev := any(nil)
+		if a.PreflightRevision > 0 {
+			preflightRev = a.PreflightRevision
+		}
 		if _, err := q.ExecContext(ctx, `INSERT INTO approvals
 			(id, workflow_id, gate_type, decision, seq, plan_revision, plan_sha256,
 			 specs_revision, specs_sha256, verification_catalog_revision, verification_catalog_sha256,
-			 dynamic_workflow_revision, dynamic_workflow_sha256, git_commit_policy_fingerprint, created_at)
-			VALUES (?, ?, ?, 'APPROVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 dynamic_workflow_revision, dynamic_workflow_sha256, git_commit_preflight_revision,
+			 git_commit_policy_fingerprint, decision_context_json, created_at)
+			VALUES (?, ?, ?, 'APPROVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.ID, st.Workflow.ID, approvalGateType(a.Kind), a.Seq, planRev, planHash,
 			specsRev, specsHash, catalogRev, catalogHash, workflowRev, workflowHash,
-			nullIfEmpty(a.Fingerprint), nowText); err != nil {
+			preflightRev, nullIfEmpty(a.Fingerprint), decisionContext, nowText); err != nil {
 			return fmt.Errorf("insert approval: %w", err)
 		}
 		return nil
@@ -534,12 +543,13 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 
 	case model.QuarantineAppendMutation:
 		qm := m.Quarantine
-		id := fmt.Sprintf("quarantine-%s", qm.Branch)
-		auditRef := "refs/cflow/quarantine/" + id
+		if qm.ID == "" || qm.AuditRef == "" {
+			return fmt.Errorf("insert quarantine: the unique id and audit ref are required")
+		}
 		if _, err := q.ExecContext(ctx, `INSERT INTO branch_quarantines
 			(id, workflow_id, branch_name, head_commit, audit_ref, reason_code, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			id, st.Workflow.ID, qm.Branch, nullIfEmpty(qm.ToHead), auditRef,
+			qm.ID, st.Workflow.ID, qm.Branch, nullIfEmpty(qm.ToHead), qm.AuditRef,
 			string(qm.Code), nowText); err != nil {
 			return fmt.Errorf("insert quarantine: %w", err)
 		}
