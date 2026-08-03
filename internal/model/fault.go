@@ -95,6 +95,11 @@ const (
 	// invalid and can never enter an Artifact or Approval (PRD Worktree
 	// 策略, 约束 33).
 	CodeUnexpectedAgentMutation Code = "UNEXPECTED_AGENT_MUTATION"
+	// CodeDispatchGateClosed: the Run Dispatch Gate is closed (Pause,
+	// Quiesce, Cancel, or Safety Stop); an allocation request crossing the
+	// committed closure is refused without mutation (design 12, PRD 已确
+	// 认：并行失败后的 Quiescing).
+	CodeDispatchGateClosed Code = "DISPATCH_GATE_CLOSED"
 )
 
 // String renders the Code.
@@ -157,6 +162,7 @@ func Codes() []Code {
 		CodeSchemaInvalid,
 		CodeSessionIndependenceViolation,
 		CodeUnexpectedAgentMutation,
+		CodeDispatchGateClosed,
 	}
 }
 
@@ -386,6 +392,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeSchemaInvalid, CatInvalidInput, ScopeArtifact, false, false, StopNone, false),
 	p(CodeSessionIndependenceViolation, CatInvariantFailure, ScopeSession, false, true, StopAll, false),
 	p(CodeUnexpectedAgentMutation, CatSafetyStop, ScopeSession, false, true, StopAll, false),
+	p(CodeDispatchGateClosed, CatInvalidInput, ScopeRun, false, false, StopNone, false),
 }
 
 // Policy returns the compiled disposition for one Code. Every declared

@@ -27,12 +27,15 @@ func (ArtifactWriteIntent) isEffectIntent() {}
 // ProviderStartIntent starts a Provider Session for one Agent Purpose.
 // Supersedes is the Provider Session ID of the Session this run succeeds
 // in its role lineage (design 14.4); the Runtime verifies the lineage
-// before any Provider call.
+// before any Provider call. Node fixes the allocated Attempt's Node for a
+// coding Session: the executor runs it only inside that Node's Task
+// Worktree (PRD Worktree 策略; Task 12).
 type ProviderStartIntent struct {
 	Session    SessionID
 	Purpose    AgentPurpose
 	Route      string
 	Supersedes string
+	Node       NodeID
 }
 
 func (ProviderStartIntent) isEffectIntent() {}

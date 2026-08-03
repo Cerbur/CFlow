@@ -39,6 +39,16 @@ const (
 	maxFrameCount = 100000
 )
 
+// FileWrite is one deterministic fake file the scripted coding Session
+// materializes into its working directory when the Session finishes (Fake
+// coding execution, Task 12): the Coding Agent "writes" the file, exactly
+// as a real Agent would, before reporting the run. Paths are
+// working-directory-relative; escapes fail closed.
+type FileWrite struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
 // Script is one parsed Fake fixture. Frames are decoded lazily from the
 // raw lines at drain time, so malformed frames surface as protocol
 // violations at the event boundary exactly like a real byte stream.
@@ -53,6 +63,7 @@ type Script struct {
 	CrashAfter int    // 0 = never; stop the stream after this many frames
 	StopAfter  int    // 0 = never; block at this boundary until Cancel
 	Seed       bool   // the declared session pre-exists (resume target)
+	Writes     []FileWrite
 
 	rawLines [][]byte
 }
@@ -60,17 +71,18 @@ type Script struct {
 // scriptHeader is the strict fixture header shape. Unknown fields fail
 // the load.
 type scriptHeader struct {
-	Fixture       string `json:"fixture"`
-	ScriptVersion int    `json:"script_version"`
-	Provider      string `json:"provider"`
-	Dialect       string `json:"dialect"`
-	Purpose       string `json:"purpose"`
-	SessionID     string `json:"session_id"`
-	ExitCode      int    `json:"exit_code"`
-	Resume        string `json:"resume"`
-	CrashAfter    int    `json:"crash_after"`
-	StopAfter     int    `json:"stop_after"`
-	Seed          bool   `json:"seed"`
+	Fixture       string      `json:"fixture"`
+	ScriptVersion int         `json:"script_version"`
+	Provider      string      `json:"provider"`
+	Dialect       string      `json:"dialect"`
+	Purpose       string      `json:"purpose"`
+	SessionID     string      `json:"session_id"`
+	ExitCode      int         `json:"exit_code"`
+	Resume        string      `json:"resume"`
+	CrashAfter    int         `json:"crash_after"`
+	StopAfter     int         `json:"stop_after"`
+	Seed          bool        `json:"seed"`
+	Writes        []FileWrite `json:"writes"`
 }
 
 // wireFrame is the fake dialect wire shape (snake_case). The dialect
@@ -121,6 +133,7 @@ func ParseScript(data []byte) (*Script, error) {
 			sc.CrashAfter = h.CrashAfter
 			sc.StopAfter = h.StopAfter
 			sc.Seed = h.Seed
+			sc.Writes = append([]FileWrite(nil), h.Writes...)
 			start = 1
 		}
 	} else {
@@ -182,6 +195,14 @@ type Adapter struct {
 	mu      sync.Mutex
 	scripts []Script
 	runs    map[agent.ProviderSessionID]*run
+	used    map[agent.ProviderSessionID]purposeCount
+}
+
+// purposeCount tracks which purpose first claimed a declared provider
+// session id and how often that purpose has reused it.
+type purposeCount struct {
+	purpose model.AgentPurpose
+	count   int
 }
 
 // New constructs the Fake Adapter bound to the "fake" registry entry.
@@ -191,6 +212,7 @@ func New(reg *agent.ProviderRegistry) *Adapter {
 		reg:     reg,
 		binding: binding,
 		runs:    map[agent.ProviderSessionID]*run{},
+		used:    map[agent.ProviderSessionID]purposeCount{},
 	}
 }
 
@@ -289,7 +311,9 @@ func (a *Adapter) Detect(ctx context.Context) (agent.Installation, error) {
 	}, nil
 }
 
-// Start streams the script bound to the request's purpose.
+// Start streams the script bound to the request's purpose. The run
+// materializes its declared scripted writes into the request's working
+// directory when the Session finishes (Fake coding execution, Task 12).
 func (a *Adapter) Start(ctx context.Context, req agent.StartRequest) (agent.Run, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -299,11 +323,41 @@ func (a *Adapter) Start(ctx context.Context, req agent.StartRequest) (agent.Run,
 		return nil, model.NewFault(model.CodeProviderProtocolUnsupported,
 			"fake adapter has no script for the requested purpose")
 	}
-	r := newRun(a, *sc, agent.ProviderSessionID(sc.SessionID))
+	r := newRun(a, *sc, a.startKey(sc), req.CWD)
 	a.mu.Lock()
 	a.runs[r.key] = r
 	a.mu.Unlock()
 	return r, nil
+}
+
+// startKey returns the run's provider session id: the script's declared
+// id for its first run of that purpose, and a per-run suffix when the same
+// purpose reuses the id, so one shared per-purpose fixture can serve
+// several parallel Sessions (the Runtime never reuses a provider session
+// id; a real provider generates a fresh id per Session). A different
+// purpose claiming the id is left to the Runtime's session-independence
+// check, which the fixtures exercise.
+func (a *Adapter) startKey(sc *Script) agent.ProviderSessionID {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	base := agent.ProviderSessionID(sc.SessionID)
+	// A headerless single-script fixture carries no purpose: the fake
+	// cannot judge reuse and leaves the declared id verbatim, so the
+	// Runtime's session-independence checks stay exercisable.
+	if sc.Purpose == "" {
+		return base
+	}
+	rec := a.used[base]
+	if rec.count == 0 {
+		a.used[base] = purposeCount{purpose: sc.Purpose, count: 1}
+		return base
+	}
+	if rec.purpose != sc.Purpose {
+		return base
+	}
+	rec.count++
+	a.used[base] = rec
+	return agent.ProviderSessionID(fmt.Sprintf("%s-%d", base, rec.count))
 }
 
 // Resume replays the script's declared Resume outcome: "ok" streams the
@@ -322,7 +376,7 @@ func (a *Adapter) Resume(ctx context.Context, req agent.ResumeRequest) (agent.Ru
 	}
 	switch sc.Resume {
 	case "", "ok":
-		r := newRun(a, *sc, req.ProviderSessionID)
+		r := newRun(a, *sc, req.ProviderSessionID, req.CWD)
 		a.mu.Lock()
 		a.runs[r.key] = r
 		a.mu.Unlock()

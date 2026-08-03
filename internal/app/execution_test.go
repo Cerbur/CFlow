@@ -9,16 +9,19 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/compile"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/platform"
 )
 
 // ---------------------------------------------------------------------------
@@ -656,5 +659,382 @@ func TestRejectedProposalNotPromoted(t *testing.T) {
 		t.Fatal("compile with a dangling proposal reference succeeded")
 	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeSchemaInvalid {
 		t.Fatalf("compile error = %v, want SCHEMA_INVALID for the unknown command id", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 12: serialized dispatch, Task Worktrees, Fake coding execution
+// ---------------------------------------------------------------------------
+
+// implementationScript is the deterministic Fake coding Session output:
+// the script declares the files the Coding Agent writes into its working
+// directory (the Task Worktree) when the Session finishes. Coding output
+// never sets state: only the committed Attempt and the observed Git facts
+// matter.
+func implementationScript(sessionID string) string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"implementation","session_id":%s,"exit_code":0,"resume":"ok","writes":[{"path":"src/divide/divide.go","content":"package divide\n\n// Divide returns a/b.\nfunc Divide(a, b int) (int, error) {\n\treturn 0, nil\n}\n"}]}
+{"type":"session_started","session_id":%s,"at_ms":0}
+{"type":"assistant_message","session_id":%s,"text":"Implemented Divide.","at_ms":10}
+{"type":"session_finished","session_id":%s,"result":{"summary":"implemented"},"at_ms":20}`,
+		strconv.Quote(sessionID), strconv.Quote(sessionID), strconv.Quote(sessionID), strconv.Quote(sessionID))
+}
+
+// planningApproved drives the planning lifecycle through the Plan
+// Approval and returns the workflow identity (a test may adjust the
+// fixture configuration between planning and the execution gate).
+func (fx *planningFixture) planningApproved() model.WorkflowID {
+	fx.t.Helper()
+	return drivePlanningToApproval(fx.t, fx)
+}
+
+// executionGate drives the execution lifecycle (Specs, Compile, Dry Run,
+// Execution Approval) for one approved workflow and returns a fresh
+// Application with the dispatch probe installed.
+func (fx *planningFixture) executionGate(wf model.WorkflowID, scripts ...string) *Application {
+	fx.t.Helper()
+	pv := driveToExecutionGate(fx.t, fx, wf)
+	approveExecution(fx.t, fx, wf, pv)
+	a := fx.app(scripts...)
+	fx.probe = &callProbe{}
+	a.probe = fx.probe
+	fx.wf = wf
+	return a
+}
+
+// executionReady drives the real pipeline through the Execution Approval
+// and returns a fresh Application with the dispatch probe installed plus
+// the workflow identity.
+func (fx *planningFixture) executionReady(scripts ...string) (*Application, model.WorkflowID) {
+	fx.t.Helper()
+	wf := fx.planningApproved()
+	return fx.executionGate(wf, scripts...), wf
+}
+
+// dispatchPlanFor installs and dispatches one plan through the real
+// dispatch machinery (design 12), holding the mutation lock batch exactly
+// as Execute does.
+func (fx *planningFixture) dispatchPlanFor(a *Application, wf model.WorkflowID, plan *dispatchPlan) error {
+	fx.t.Helper()
+	ctx := context.Background()
+	st, err := a.ensureWriteStore(ctx, wf)
+	if err != nil {
+		return err
+	}
+	holds, err := a.acquireMutationLocks(ctx, wf)
+	if err != nil {
+		return err
+	}
+	defer releaseHolds(holds)
+	_, err = a.dispatchPass(ctx, st, wf, plan, false)
+	return err
+}
+
+// RunReadyTasks drives the pipeline to Execution Approval and then runs
+// one dispatch pass over the fixture plan (node "S01", the brief's
+// fixture identity), recording the protocol probe.
+func (fx *planningFixture) RunReadyTasks() {
+	fx.t.Helper()
+	a, wf := fx.executionReady(implementationScript("i1"))
+	if err := fx.dispatchPlanFor(a, wf, fixturePlan()); err != nil {
+		fx.t.Fatalf("dispatch: %v", err)
+	}
+}
+
+// RequireOrder asserts the probe recorded first strictly before second.
+func (fx *planningFixture) RequireOrder(first, second string) {
+	fx.t.Helper()
+	if fx.probe == nil {
+		fx.t.Fatal("no probe recorded: RunReadyTasks was not called")
+	}
+	steps := fx.probe.Calls()
+	fi, si := -1, -1
+	for i, s := range steps {
+		if s == first && fi < 0 {
+			fi = i
+		}
+		if s == second && si < 0 {
+			si = i
+		}
+	}
+	if fi < 0 {
+		fx.t.Fatalf("probe never recorded %q in %v", first, steps)
+	}
+	if si < 0 {
+		fx.t.Fatalf("probe never recorded %q in %v", second, steps)
+	}
+	if fi >= si {
+		fx.t.Fatalf("order violated: %q at %d must precede %q at %d in %v", first, fi, second, si, steps)
+	}
+}
+
+// fixturePlan is the default execution fixture plan: one independent Task
+// node "S01" (the brief's fixture identity) on the fake route.
+func fixturePlan() *dispatchPlan {
+	return &dispatchPlan{nodes: []dispatchNode{{
+		id: "S01", kind: model.NodeAgentTask, specID: "S01",
+		retry: 2, timeout: 1800, route: "fake",
+		writeScope: []string{"src/divide/**"},
+	}}}
+}
+
+// TestAttemptCommitsBeforeProviderStart (brief Step 1, verbatim): the
+// RUNNING Attempt row commits before the Coding Session starts, so an
+// in-memory queued goroutine is never an in-flight Attempt and no start
+// can cross a committed Dispatch Gate closure.
+func TestAttemptCommitsBeforeProviderStart(t *testing.T) {
+	fx := newExecutionFixture(t)
+	fx.RunReadyTasks()
+	fx.RequireOrder("attempt:S01:commit", "provider:S01:start")
+}
+
+// TestDispatchDefersSharedLockConflict: two Tasks sharing a resource lock
+// are statically incompatible (PRD 并行安全判断: resource_locks must be
+// disjoint); only the first dispatches in the pass and the second waits
+// for a later pass.
+func TestDispatchDefersSharedLockConflict(t *testing.T) {
+	fx := newExecutionFixture(t)
+	a, wf := fx.executionReady(implementationScript("i1"))
+	plan := &dispatchPlan{nodes: []dispatchNode{
+		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+			route: "fake", locks: []string{"db-shard-1"}},
+		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+			route: "fake", locks: []string{"db-shard-1"}},
+	}}
+	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
+		fx.t.Fatalf("dispatch: %v", err)
+	}
+	iv := fx.inspect(wf)
+	statusByID := map[model.NodeID]model.NodeStatus{}
+	runningAttempts := 0
+	for _, n := range iv.Nodes {
+		statusByID[n.ID] = n.Status
+	}
+	for _, at := range iv.Attempts {
+		if at.Status == model.AttemptRunning {
+			runningAttempts++
+		}
+	}
+	if statusByID["S01"] != model.NodeRunning {
+		t.Fatalf("S01 status = %s, want RUNNING (locked task dispatches first)", statusByID["S01"])
+	}
+	if statusByID["S02"] != model.NodePending {
+		t.Fatalf("S02 status = %s, want PENDING (locked conflict defers the second task)", statusByID["S02"])
+	}
+	if runningAttempts != 1 {
+		t.Fatalf("running attempts = %d, want 1", runningAttempts)
+	}
+}
+
+// TestDispatchHonorsConcurrencyCap: the user's configured concurrency
+// bound caps one pass; the excess eligible Task waits (PRD 并发上限).
+func TestDispatchHonorsConcurrencyCap(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := fx.planningApproved()
+	// The concurrency bound is the user's configuration (PRD 并发上限); it
+	// must be in place before the Compiler validates the skeleton.
+	if err := os.MkdirAll(fx.home, 0o700); err != nil {
+		fx.t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.home, "config.yaml"), []byte("concurrency: 1\n"), 0o600); err != nil {
+		fx.t.Fatalf("write config: %v", err)
+	}
+	a := fx.executionGate(wf, implementationScript("i1"))
+	plan := &dispatchPlan{nodes: []dispatchNode{
+		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+			route: "fake", writeScope: []string{"src/a/**"}},
+		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+			route: "fake", writeScope: []string{"src/b/**"}},
+	}}
+	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
+		fx.t.Fatalf("dispatch: %v", err)
+	}
+	iv := fx.inspect(wf)
+	statusByID := map[model.NodeID]model.NodeStatus{}
+	for _, n := range iv.Nodes {
+		statusByID[n.ID] = n.Status
+	}
+	if statusByID["S01"] != model.NodeRunning || statusByID["S02"] != model.NodePending {
+		t.Fatalf("statuses = %v, want S01 RUNNING and S02 PENDING under the cap of 1", statusByID)
+	}
+}
+
+// TestDispatchAfterPauseAllocatesNothing: a committed gate closure (the
+// Pause command) stops all further allocation; the pure Scheduler reads
+// the closed gate from the persisted aggregate and no queued goroutine
+// counts as running.
+func TestDispatchAfterPauseAllocatesNothing(t *testing.T) {
+	fx := newExecutionFixture(t)
+	a, wf := fx.executionReady(implementationScript("i1"))
+	if _, err := a.Execute(context.Background(), PauseWorkflowCommand{Workflow: wf}); err != nil {
+		fx.t.Fatalf("pause: %v", err)
+	}
+	if err := fx.dispatchPlanFor(a, wf, fixturePlan()); err != nil {
+		fx.t.Fatalf("dispatch: %v", err)
+	}
+	iv := fx.inspect(wf)
+	if len(iv.Attempts) != 0 {
+		t.Fatalf("attempts = %+v; no attempt may start across a committed closure", iv.Attempts)
+	}
+	if len(iv.Nodes) != 1 || iv.Nodes[0].Status != model.NodePending {
+		t.Fatalf("nodes = %+v, want the single node still PENDING", iv.Nodes)
+	}
+}
+
+// TestDispatchOneProjectWriter: the Project Writer lock serializes
+// mutating Runtimes; a dispatch on the same Project is refused while
+// another writer holds it.
+func TestDispatchOneProjectWriter(t *testing.T) {
+	fx := newExecutionFixture(t)
+	a, wf := fx.executionReady(implementationScript("i1"))
+	// Another mutating Runtime (a different goroutine, so the LockSet's
+	// per-goroutine lock order never trips) holds the mutation lock batch
+	// in the fixed order (design 18.1): the dispatch's Project Writer
+	// acquisition is refused as project-busy.
+	held := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		ls, err := a.lockSet()
+		if err != nil {
+			close(held)
+			return
+		}
+		holds := make([]*platform.Hold, 0, 3)
+		for _, take := range []func(context.Context) (*platform.Hold, error){
+			ls.SchemaShared,
+			func(ctx context.Context) (*platform.Hold, error) { return ls.ProjectWriter(ctx, a.project.Key) },
+			func(ctx context.Context) (*platform.Hold, error) {
+				return ls.WorkflowOwner(ctx, a.project.Key, string(wf))
+			},
+		} {
+			h, err := take(context.Background())
+			if err != nil {
+				releaseHolds(holds)
+				close(held)
+				return
+			}
+			holds = append(holds, h)
+		}
+		close(held)
+		<-release
+		releaseHolds(holds)
+	}()
+	<-held
+	_, err := a.Execute(context.Background(), DispatchCommand{Workflow: wf})
+	close(release)
+	if err == nil {
+		t.Fatal("dispatch succeeded while the project writer lock was held")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeDatabaseMigrationFailed {
+		t.Fatalf("dispatch error = %v, want the project-busy fault", err)
+	}
+}
+
+// TestDifferentProjectsDispatchConcurrently: two Projects' workflows
+// dispatch in parallel goroutines without contention (the lock namespaces
+// and store files are per-Project).
+func TestDifferentProjectsDispatchConcurrently(t *testing.T) {
+	fx1 := newExecutionFixture(t)
+	fx2 := newExecutionFixture(t)
+	a1, wf1 := fx1.executionReady(implementationScript("i1"))
+	a2, wf2 := fx2.executionReady(implementationScript("i1"))
+	type job struct {
+		a  *Application
+		fx *planningFixture
+		wf model.WorkflowID
+	}
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, j := range []job{{a1, fx1, wf1}, {a2, fx2, wf2}} {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			errs <- j.fx.dispatchPlanFor(j.a, j.wf, fixturePlan())
+		}(j)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			fx1.t.Fatalf("concurrent dispatch: %v", err)
+		}
+	}
+	for _, j := range []job{{a1, fx1, wf1}, {a2, fx2, wf2}} {
+		iv := j.fx.inspect(j.wf)
+		running := 0
+		for _, at := range iv.Attempts {
+			if at.Status == model.AttemptRunning {
+				running++
+			}
+		}
+		if running != 1 {
+			t.Fatalf("workflow %s running attempts = %d, want 1", j.wf, running)
+		}
+	}
+}
+
+// TestCodingOccursOnlyInTaskWorktree: the Fake coding Session's writes
+// land only in the Task Worktree; the user workspace, the Planning
+// Snapshot, and the Integration Worktree are untouched (PRD Worktree 策略).
+func TestCodingOccursOnlyInTaskWorktree(t *testing.T) {
+	fx := newExecutionFixture(t)
+	fx.RunReadyTasks()
+	base := filepath.Join(fx.home, "worktrees", ProjectFor(fx.root).Key, string(fx.wf))
+	coded := filepath.Join("src", "divide", "divide.go")
+	if !pathExists(filepath.Join(base, "tasks", "S01", coded)) {
+		t.Fatalf("the coded file must land in the Task Worktree %s", filepath.Join(base, "tasks", "S01", coded))
+	}
+	for _, root := range []string{
+		fx.root,
+		filepath.Join(base, "planning"),
+		filepath.Join(base, "integration"),
+	} {
+		if pathExists(filepath.Join(root, coded)) {
+			t.Fatalf("the coded file leaked into %s", root)
+		}
+	}
+}
+
+// TestTaskBaseIsVerifiedIntegrationHeadAtReadiness: the Task Base Commit
+// recorded at readiness is the Integration HEAD, and the Task Branch and
+// Worktree are created from it (PRD Worktree 策略).
+func TestTaskBaseIsVerifiedIntegrationHeadAtReadiness(t *testing.T) {
+	fx := newExecutionFixture(t)
+	fx.RunReadyTasks()
+	// The Task Base must equal the Integration Worktree's actual HEAD (the
+	// verified Integration HEAD at readiness, PRD Worktree 策略).
+	integrationPath := filepath.Join(fx.home, "worktrees", ProjectFor(fx.root).Key, string(fx.wf), "integration")
+	out, err := execGit(integrationPath, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("resolve integration head: %v", err)
+	}
+	head := strings.TrimSpace(string(out))
+	if head == "" {
+		t.Fatal("no integration head recorded")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var base, branch, worktree string
+	if err := db.QueryRow(
+		`SELECT task_base_commit, branch_name, worktree_path FROM tasks WHERE id = 'S01'`).
+		Scan(&base, &branch, &worktree); err != nil {
+		t.Fatalf("read task row: %v", err)
+	}
+	if base != head {
+		t.Fatalf("task base = %s, want the integration head %s", base, head)
+	}
+	if branch != "cflow/"+string(fx.wf)+"/task-S01" {
+		t.Fatalf("task branch = %q", branch)
+	}
+	if !pathExists(worktree) {
+		t.Fatalf("task worktree %s was not created", worktree)
+	}
+	out, err = execGit(fx.root, "rev-parse", "--verify", branch).CombinedOutput()
+	if err != nil {
+		t.Fatalf("resolve task branch: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != base {
+		t.Fatalf("task branch head = %s, want the recorded base %s", strings.TrimSpace(string(out)), base)
 	}
 }

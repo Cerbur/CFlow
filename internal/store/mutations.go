@@ -71,6 +71,16 @@ func applyMutation(st *model.State, m model.Mutation) error {
 		}
 		n.Status = m.Status
 		n.RetryCharged = m.RetryCharged
+	case model.NodeAppendMutation:
+		if _, exists := st.Nodes[m.Node.ID]; exists {
+			return fmt.Errorf("node %s is already installed", m.Node.ID)
+		}
+		n := m.Node
+		st.Nodes[n.ID] = &n
+	case model.TaskMutation:
+		// The Task projection row is Store-owned (branch, base commit,
+		// worktree path); the aggregate carries the branch through the
+		// nodes/tasks hydration join only.
 	case model.AttemptAppendMutation:
 		key := m.Attempt.Key
 		if _, exists := st.Attempts[key]; exists {
@@ -306,6 +316,57 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 			WHERE id = ? AND workflow_id = ?`,
 			string(m.Status), m.RetryCharged, nowText, m.Node, st.Workflow.ID); err != nil {
 			return fmt.Errorf("update node: %w", err)
+		}
+		return nil
+
+	case model.NodeAppendMutation:
+		n := m.Node
+		// The Task projection row precedes the Node row (the nodes.task_id
+		// foreign key references it) and carries the deterministic Task
+		// Branch. Non-task Nodes (verify, merge, checkpoint, final-verify)
+		// have no Task row.
+		var taskID any
+		if n.Branch != "" {
+			// The Task projection row: the spec_id column binds the
+			// UNIQUE(workflow_id, spec_id) row identity, so it carries the
+			// Node identity (the spec linkage itself lives in the approved
+			// Workflow Artifact).
+			if _, err := q.ExecContext(ctx, `INSERT INTO tasks
+				(id, workflow_id, spec_id, title, branch_name, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				n.ID, st.Workflow.ID, n.ID, "task "+string(n.ID), n.Branch, nowText, nowText); err != nil {
+				return fmt.Errorf("insert task: %w", err)
+			}
+			taskID = n.ID
+		}
+		if _, err := q.ExecContext(ctx, `INSERT INTO nodes
+			(id, workflow_id, task_id, node_type, status, max_retry_budget, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			n.ID, st.Workflow.ID, taskID, string(n.Kind), string(n.Status), n.RetryBudget, nowText, nowText); err != nil {
+			return fmt.Errorf("insert node: %w", err)
+		}
+		return nil
+
+	case model.TaskMutation:
+		// task_base_commit is recorded once at readiness and never
+		// replaced (PRD Worktree 策略: the Task never silently rebases);
+		// worktree_path records the created Task Worktree.
+		if m.BaseCommit != "" {
+			if _, err := q.ExecContext(ctx, `UPDATE tasks
+				SET task_base_commit = CASE WHEN task_base_commit IS NULL OR task_base_commit = '' THEN ? ELSE task_base_commit END,
+				    updated_at = ?
+				WHERE id = ? AND workflow_id = ?`,
+				m.BaseCommit, nowText, m.Node, st.Workflow.ID); err != nil {
+				return fmt.Errorf("record task base: %w", err)
+			}
+		}
+		if m.WorktreePath != "" {
+			if _, err := q.ExecContext(ctx, `UPDATE tasks
+				SET worktree_path = ?, updated_at = ?
+				WHERE id = ? AND workflow_id = ?`,
+				m.WorktreePath, nowText, m.Node, st.Workflow.ID); err != nil {
+				return fmt.Errorf("record task worktree: %w", err)
+			}
 		}
 		return nil
 

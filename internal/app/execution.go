@@ -349,6 +349,13 @@ func (a *Application) workflowCompile(ctx context.Context, wf model.WorkflowID, 
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
+	// The Spec Artifact body carries the spec set (one Spec object or a
+	// non-empty sequence); every Spec is compiled (Task 12, multi-Spec
+	// pipeline).
+	specBodies, err := splitSpecSetBody(specBody)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	catalogRef, catalogBody, err := resolve(model.ArtifactCatalog)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -362,7 +369,7 @@ func (a *Application) workflowCompile(ctx context.Context, wf model.WorkflowID, 
 		PlanRef:        planRef,
 		WorkflowID:     string(wf),
 		Revision:       revision,
-		SpecBodies:     [][]byte{specBody},
+		SpecBodies:     specBodies,
 		CatalogBody:    catalogBody,
 		CatalogRef:     catalogRef,
 		Patch:          intent.PatchBody,
@@ -518,9 +525,20 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 	if err != nil {
 		return nil, err
 	}
-	spec, err := compile.ParseSpec(specBody)
+	// The approved Spec set: one route preview per Spec, and the Budget
+	// previews of every agent_task Node bound to its Spec's approved
+	// budget (Task 12 multi-Spec pipeline).
+	specBodies, err := splitSpecSetBody(specBody)
 	if err != nil {
 		return nil, err
+	}
+	specs := make([]compile.Spec, 0, len(specBodies))
+	for _, body := range specBodies {
+		spec, err := compile.ParseSpec(body)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
 	}
 	catalogBody, err := store.Get(ctx, catalogRef)
 	if err != nil {
@@ -539,19 +557,25 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 		return nil, err
 	}
 
-	// Routes and budgets come from the approved Spec; the parallel
+	// Routes and budgets come from the approved Specs; the parallel
 	// groups come from the compiled DAG.
-	if spec.Route != nil {
-		pv.Routes = append(pv.Routes, RoutePreview{
-			NodeID: "task-" + spec.ID, Provider: spec.Route.Provider, Model: spec.Route.Model,
-		})
+	for _, s := range specs {
+		if s.Route != nil {
+			pv.Routes = append(pv.Routes, RoutePreview{
+				NodeID: "task-" + s.ID, Provider: s.Route.Provider, Model: s.Route.Model,
+			})
+		}
+	}
+	specByID := map[string]compile.Spec{}
+	for _, s := range specs {
+		specByID[s.ID] = s
 	}
 	for _, n := range wfIR.Nodes {
 		if n.Type != "agent_task" {
 			continue
 		}
 		budget := 0.0
-		if spec.Route != nil {
+		if spec, ok := specByID[n.SpecID]; ok && spec.Route != nil {
 			budget = spec.Route.Budget
 		}
 		pv.Budgets = append(pv.Budgets, BudgetPreview{

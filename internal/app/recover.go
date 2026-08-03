@@ -126,6 +126,10 @@ func effectBudget(st model.State, pending int, cmd model.Input) int {
 		n += 3
 	case model.ExecutionApprovalInput:
 		n += 2
+	case model.DispatchInput:
+		// One allocation chains the Task Worktree creation and the coding
+		// Session run (two Effects) before the settle Decision.
+		n += 2
 	}
 	for _, s := range st.Sessions {
 		if !s.Status.IsTerminal() {

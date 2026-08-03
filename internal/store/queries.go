@@ -150,9 +150,13 @@ const queryPendingEffects = `
 // (design 7.1, 8.1). A Workflow that does not exist returns the zero
 // State, which the Kernel treats as "not created yet". Maps are never nil
 // so decisions may append into them.
-func hydrate(ctx context.Context, q querier, workflow model.WorkflowID) (model.State, error) {
+// hydrate reconstructs the aggregate for one Workflow from the database
+// (design 7.1, 8.1). The injected clock fixes State.Now (design: the
+// Kernel stays deterministic because timestamps arrive through Now), so
+// the fixture clock drives every decision timestamp.
+func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func() time.Time) (model.State, error) {
 	st := model.State{
-		Now:      time.Now().UTC(),
+		Now:      now().UTC(),
 		Nodes:    map[model.NodeID]*model.Node{},
 		Attempts: map[model.AttemptKey]*model.Attempt{},
 	}

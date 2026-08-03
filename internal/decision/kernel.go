@@ -42,6 +42,10 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideExecutionDryRun(state, in)
 	case model.ExecutionApprovalInput:
 		return decideExecutionApproval(state, in)
+	case model.GraphInstallInput:
+		return decideGraphInstall(state, in)
+	case model.DispatchInput:
+		return decideDispatch(state, in)
 	case model.AgentEventInput:
 		return decideAgentEvent(state, in)
 	case model.ApplyCommandInput:

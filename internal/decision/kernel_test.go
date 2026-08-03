@@ -1515,3 +1515,248 @@ func TestPropertyQuarantinedRefsNeverRunnable(t *testing.T) {
 		TargetHead: "main-head", IntegrationHead: "int-9"})
 	assertFaultCode(t, err, model.CodeCommitDuringPolicyDriftWindow)
 }
+
+// ---------------------------------------------------------------------------
+// Task 12: serialized dispatch allocation (design 12)
+// ---------------------------------------------------------------------------
+
+// fixtureExecutionStage is a workflow at EXECUTION with an open dispatch
+// gate and the Integration HEAD recorded (the Execution Approval plus the
+// Integration Worktree creation completed).
+func fixtureExecutionStage() model.State {
+	st := workflowState(model.StageExecution, model.RuntimeRunning)
+	addRun(&st, model.RunRunning, true)
+	return st
+}
+
+// TestDispatchCommitsRunningAttemptBeforeEffects: one serialized
+// allocation commits the RUNNING Attempt, the Task Base at readiness, and
+// the Task Worktree creation Effect together; the Kernel revalidates the
+// committed gate before anything commits (design 12).
+func TestDispatchCommitsRunningAttemptBeforeEffects(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodePending, 2)
+	got, err := decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	requireNoError(t, err)
+	requireNode(t, got, "task-1", model.NodeRunning)
+	requireEvent(t, got, model.EventNodeStarted)
+	requireEvent(t, got, model.EventAttemptCreated)
+
+	foundAttempt := false
+	foundSession := false
+	foundBase := false
+	for _, m := range got.Mutations {
+		switch mm := m.(type) {
+		case model.AttemptAppendMutation:
+			if mm.Attempt.Key != (model.AttemptKey{Node: "task-1", Number: 1}) ||
+				mm.Attempt.Status != model.AttemptRunning ||
+				mm.Attempt.Session != "s-1" ||
+				mm.Attempt.StartHead != "int-1" {
+				t.Fatalf("attempt append = %+v", mm.Attempt)
+			}
+			foundAttempt = true
+		case model.SessionAppendMutation:
+			if mm.Session.ID != "s-1" || mm.Session.Purpose != model.PurposeImplementation ||
+				mm.Session.Status != model.SessionStarting || mm.Provider != "fake" {
+				t.Fatalf("session append = %+v (provider %q)", mm.Session, mm.Provider)
+			}
+			foundSession = true
+		case model.TaskMutation:
+			if mm.Node != "task-1" || mm.BaseCommit != "int-1" {
+				t.Fatalf("task mutation = %+v", mm)
+			}
+			foundBase = true
+		}
+	}
+	if !foundAttempt || !foundSession || !foundBase {
+		t.Fatalf("allocation missing attempt/session/base mutations: %+v", got.Mutations)
+	}
+	effect, ok := got.Effect.(model.TaskWorktreeCreateIntent)
+	if !ok {
+		t.Fatalf("allocation effect = %T, want TaskWorktreeCreateIntent", got.Effect)
+	}
+	if effect.Node != "task-1" || effect.BaseHead != "int-1" ||
+		effect.Branch != "cflow/wf-1/task-task-1" {
+		t.Fatalf("task worktree intent = %+v", effect)
+	}
+}
+
+// TestDispatchGateClosureRejectsQueuedAllocation: an allocation whose gate
+// closed between candidate computation and commit is refused with
+// DISPATCH_GATE_CLOSED and mutates nothing (PRD 已确认：并行失败后的
+// Quiescing: an in-memory queued goroutine is not an in-flight Attempt).
+func TestDispatchGateClosureRejectsQueuedAllocation(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodePending, 2)
+	// The committed gate closes (Pause, a failure closure, or a Quiesce)
+	// before the queued allocation commits.
+	state.Runs[0].Status = model.RunQuiescing
+	state.Runs[0].DispatchGate = false
+	_, err := decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	assertFaultCode(t, err, model.CodeDispatchGateClosed)
+
+	state.Runs[0].Status = model.RunRunning
+	state.Runs[0].DispatchGate = false
+	_, err = decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	assertFaultCode(t, err, model.CodeDispatchGateClosed)
+}
+
+// TestDispatchRejectsNonTaskKind: only agent-task Nodes are dispatched by
+// this build; Verify, Merge, Checkpoint, and FinalVerify Nodes arrive with
+// their Task 13 engines and are never silently skipped.
+func TestDispatchRejectsNonTaskKind(t *testing.T) {
+	for _, kind := range []model.NodeKind{
+		model.NodeVerify, model.NodeMerge, model.NodeCheckpoint, model.NodeFinalVerify,
+	} {
+		state := fixtureExecutionStage()
+		addNode(&state, "n-1", kind, model.NodePending, 0)
+		_, err := decision.Decide(state, model.DispatchInput{Node: "n-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+		assertFaultCode(t, err, model.CodeInvalidInput)
+	}
+}
+
+// TestDispatchRejectsRunningOrTerminalNodes: a Node that is already
+// RUNNING or terminal can never be allocated again; readiness is never
+// inferred from display status.
+func TestDispatchRejectsRunningOrTerminalNodes(t *testing.T) {
+	for _, status := range []model.NodeStatus{
+		model.NodeRunning, model.NodeSucceeded, model.NodeFailed, model.NodeCancelled, model.NodeSkipped,
+	} {
+		state := fixtureExecutionStage()
+		addNode(&state, "task-1", model.NodeAgentTask, status, 2)
+		_, err := decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+		assertFaultCode(t, err, model.CodeInvalidInput)
+	}
+}
+
+// TestDispatchRejectsBusySession: the allocation Session identity is
+// fixed by the Application before the Effect (design 6.2 rule 6); a reused
+// identity is rejected.
+func TestDispatchRejectsBusySession(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodePending, 2)
+	state.Sessions = append(state.Sessions, model.Session{ID: "s-1", Purpose: model.PurposePlanning})
+	_, err := decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	assertFaultCode(t, err, model.CodeInvalidInput)
+}
+
+// TestTaskWorktreeCreatedRequestsCodingSession: the Task Worktree result
+// records the created worktree and requests the coding Session in it; the
+// route comes from the allocated Session's Provider.
+func TestTaskWorktreeCreatedRequestsCodingSession(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodeRunning, 2)
+	key := addAttempt(&state, "task-1", 1, model.AttemptRunning)
+	state.Attempts[key].Session = "s-1"
+	state.Sessions = append(state.Sessions, model.Session{
+		ID: "s-1", Purpose: model.PurposeImplementation, Status: model.SessionStarting, Provider: "fake",
+	})
+	got, err := decision.Decide(state, model.EffectResultInput{
+		Kind: model.TaskWorktreeCreated, Attempt: key, WorktreePath: "/home/tasks/task-1",
+	})
+	requireNoError(t, err)
+	found := false
+	for _, m := range got.Mutations {
+		if tm, ok := m.(model.TaskMutation); ok && tm.Node == "task-1" && tm.WorktreePath == "/home/tasks/task-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("task worktree result misses the worktree path mutation: %+v", got.Mutations)
+	}
+	effect, ok := got.Effect.(model.ProviderStartIntent)
+	if !ok {
+		t.Fatalf("task worktree result effect = %T, want ProviderStartIntent", got.Effect)
+	}
+	if effect.Session != "s-1" || effect.Purpose != model.PurposeImplementation ||
+		effect.Route != "fake" || effect.Node != "task-1" {
+		t.Fatalf("coding session intent = %+v", effect)
+	}
+}
+
+// TestImplementationRunEndedSettlesSessionOnly: a settled coding Session
+// records its Session facts; the Coding Agent's output can never set
+// state and the Attempt stays RUNNING for the Task 13 Commit gate.
+func TestImplementationRunEndedSettlesSessionOnly(t *testing.T) {
+	state := fixtureExecutionStage()
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodeRunning, 2)
+	key := addAttempt(&state, "task-1", 1, model.AttemptRunning)
+	state.Attempts[key].Session = "s-1"
+	state.Sessions = append(state.Sessions, model.Session{
+		ID: "s-1", Purpose: model.PurposeImplementation, Status: model.SessionStarting, Provider: "fake",
+	})
+	got, err := decision.Decide(state, model.EffectResultInput{
+		Kind: model.ProviderRunEnded, Attempt: key,
+		Session: model.Session{ID: "s-1", ProviderSessionID: "p-1",
+			Purpose: model.PurposeImplementation, Status: model.SessionCompleted, Provider: "fake"},
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("settled coding session requests an effect: %+v", got.Effect)
+	}
+	for _, m := range got.Mutations {
+		if sem, ok := m.(model.SessionEndMutation); ok && sem.ID == "s-1" && sem.Status == model.SessionCompleted {
+			return
+		}
+	}
+	t.Fatalf("coding session result misses the session settlement: %+v", got.Mutations)
+}
+
+// TestGraphInstallRecordsApprovedDagPending: the graph install records
+// every approved node PENDING with its skeleton edges; a second install or
+// an install outside EXECUTION is refused.
+func TestGraphInstallRecordsApprovedDagPending(t *testing.T) {
+	state := fixtureExecutionStage()
+	got, err := decision.Decide(state, model.GraphInstallInput{Nodes: []model.InstallNode{
+		{ID: "task-1", Kind: model.NodeAgentTask, Dependencies: []model.NodeID{"merge-1"}, RetryBudget: 2},
+		{ID: "merge-1", Kind: model.NodeMerge},
+	}})
+	requireNoError(t, err)
+	requireEvent(t, got, model.EventGraphInstalled)
+	installed := map[model.NodeID]bool{}
+	for _, m := range got.Mutations {
+		nm, ok := m.(model.NodeAppendMutation)
+		if !ok {
+			continue
+		}
+		installed[nm.Node.ID] = true
+		if nm.Node.Status != model.NodePending {
+			t.Fatalf("installed node %s starts %s, want PENDING", nm.Node.ID, nm.Node.Status)
+		}
+		if nm.Node.Kind == model.NodeAgentTask && nm.Node.Branch != "cflow/wf-1/task-task-1" {
+			t.Fatalf("task node branch = %q", nm.Node.Branch)
+		}
+		if nm.Node.Kind != model.NodeAgentTask && nm.Node.Branch != "" {
+			t.Fatalf("non-task node %s carries a branch %q", nm.Node.ID, nm.Node.Branch)
+		}
+	}
+	if !installed["task-1"] || !installed["merge-1"] {
+		t.Fatalf("install missing nodes: %v", installed)
+	}
+
+	// The graph is already installed: a second install is refused.
+	installedState := fixtureExecutionStage()
+	addNode(&installedState, "task-1", model.NodeAgentTask, model.NodePending, 2)
+	_, err = decision.Decide(installedState, model.GraphInstallInput{Nodes: []model.InstallNode{
+		{ID: "task-2", Kind: model.NodeAgentTask},
+	}})
+	assertFaultCode(t, err, model.CodeInvalidInput)
+
+	// An install outside EXECUTION is refused.
+	planning := workflowState(model.StageWorkflowGeneration, model.RuntimeRunning)
+	_, err = decision.Decide(planning, model.GraphInstallInput{Nodes: []model.InstallNode{
+		{ID: "task-1", Kind: model.NodeAgentTask},
+	}})
+	assertFaultCode(t, err, model.CodeInvalidInput)
+}
+
+// TestGraphInstallRejectsDanglingDependencies: an install whose edges
+// reference nodes outside the graph would produce an unserializable DAG
+// and is refused.
+func TestGraphInstallRejectsDanglingDependencies(t *testing.T) {
+	state := fixtureExecutionStage()
+	_, err := decision.Decide(state, model.GraphInstallInput{Nodes: []model.InstallNode{
+		{ID: "task-1", Kind: model.NodeAgentTask, Dependencies: []model.NodeID{"merge-ghost"}},
+	}})
+	assertFaultCode(t, err, model.CodeInvalidInput)
+}

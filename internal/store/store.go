@@ -277,7 +277,7 @@ func (s *Store) View(ctx context.Context, q StoreQuery) (StoreView, error) {
 	if !s.exists {
 		return view, nil
 	}
-	st, err := hydrate(ctx, s.db, s.workflowID())
+	st, err := hydrate(ctx, s.db, s.workflowID(), s.now)
 	if err != nil {
 		return view, err
 	}
@@ -358,7 +358,7 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 	// Hydrate and compare-and-swap under the write lock: the aggregate
 	// version observed here is current because BEGIN IMMEDIATE excludes
 	// every other writer.
-	state, err := hydrate(ctx, tx, s.workflowID())
+	state, err := hydrate(ctx, tx, s.workflowID(), s.now)
 	if err != nil {
 		return model.CommittedDecision{}, err
 	}

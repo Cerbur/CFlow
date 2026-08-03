@@ -57,7 +57,11 @@ func ValidateBody(schemaName string, body []byte) error {
 
 // validateBody applies the type's embedded schema to an authored body. A
 // plan body carries its contract in the YAML front matter; the other
-// agent-authored bodies carry theirs in the whole document.
+// agent-authored bodies carry theirs in the whole document. The Spec
+// Artifact additionally accepts a spec set: a non-empty YAML/JSON
+// sequence whose items are Spec objects (the multi-Spec pipeline the
+// Scheduler consumes, Task 12), each validated against spec.json with the
+// same strict rules — the array form adds no relaxed fields.
 func validateBody(typ model.ArtifactType, body []byte) error {
 	name, ok := bodySchema[typ]
 	if !ok {
@@ -70,7 +74,44 @@ func validateBody(typ model.ArtifactType, body []byte) error {
 		}
 		return validateBodyJSON(name, front)
 	}
+	if typ == model.ArtifactSpec {
+		return validateSpecBody(body)
+	}
 	return validateBodyJSON(name, body)
+}
+
+// validateSpecBody validates a Spec Artifact body: one Spec object, or a
+// spec set whose every item satisfies spec.json.
+func validateSpecBody(body []byte) error {
+	value, err := yamlToValue(body)
+	if err != nil {
+		return schemaFault("spec.json", "body is not parseable YAML or JSON")
+	}
+	schema, err := loadSchema("spec.json")
+	if err != nil {
+		return schemaFault("spec.json", "embedded schema cannot be loaded")
+	}
+	switch v := value.(type) {
+	case []any:
+		if len(v) == 0 {
+			return schemaFault("spec.json", "spec set is empty")
+		}
+		for i, item := range v {
+			if _, ok := item.(map[string]any); !ok {
+				return schemaFault("spec.json", fmt.Sprintf("spec set item [%d] is not an object", i))
+			}
+			if err := validateValue(item, schema, fmt.Sprintf("[%d]", i)); err != nil {
+				return schemaFault("spec.json", err.Error())
+			}
+		}
+		return nil
+	case map[string]any:
+		if err := validateValue(v, schema, ""); err != nil {
+			return schemaFault("spec.json", err.Error())
+		}
+		return nil
+	}
+	return schemaFault("spec.json", "body must be a spec object or a non-empty spec set")
 }
 
 // validateBodyJSON parses a YAML/JSON body and validates it against the

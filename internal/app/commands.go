@@ -405,6 +405,16 @@ type ApproveExecutionCommand struct {
 	CommitPolicyHash string
 }
 
+// DispatchCommand runs one allocation pass of the approved execution
+// (design 12): the pure Scheduler computes the eligible Nodes from the
+// persisted graph and the Dispatch Gate; every RUNNING Attempt commits
+// before its Effects (Task Worktree creation, coding Session) submit, and
+// the Kernel revalidates the gate in the same transaction so no start can
+// cross a committed closure (Pause, Quiesce, Cancel, Safety Stop).
+type DispatchCommand struct {
+	Workflow model.WorkflowID
+}
+
 func (CreateWorkflowCommand) isCommand()     {}
 func (DiscussRequirementCommand) isCommand() {}
 func (GeneratePlanCommand) isCommand()       {}
@@ -419,6 +429,7 @@ func (GenerateSpecsCommand) isCommand()      {}
 func (CompileWorkflowCommand) isCommand()    {}
 func (ExecutionDryRunCommand) isCommand()    {}
 func (ApproveExecutionCommand) isCommand()   {}
+func (DispatchCommand) isCommand()           {}
 
 // ---------------------------------------------------------------------------
 // Outcome

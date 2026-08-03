@@ -72,6 +72,13 @@ type planningFixture struct {
 	discussSeq int
 	planSeq    int
 	checkSeq   int
+
+	// probe records the dispatch protocol steps of the execution fixture
+	// (Task 12): the RUNNING Attempt commit before the Coding Session
+	// start. It is installed on the dispatch Application only.
+	probe *callProbe
+	// wf is the workflow identity the execution fixture dispatched.
+	wf model.WorkflowID
 }
 
 func newPlanningFixture(t *testing.T) *planningFixture {

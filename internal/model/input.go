@@ -210,6 +210,9 @@ const (
 	// IntegrationWorktreeCreated reports the Integration Branch/Worktree
 	// created at the recorded Base Commit after the Execution Approval.
 	IntegrationWorktreeCreated EffectResultKind = "integration-worktree-created"
+	// TaskWorktreeCreated reports the Task Branch/Worktree created from the
+	// recorded Task Base (PRD Worktree 策略; Task 12).
+	TaskWorktreeCreated EffectResultKind = "task-worktree-created"
 )
 
 // Valid reports whether k is a declared Effect Result Kind.
@@ -219,7 +222,7 @@ func (k EffectResultKind) Valid() bool {
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
 		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
-		WorkflowCompiled, IntegrationWorktreeCreated:
+		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated:
 		return true
 	}
 	return false
@@ -298,6 +301,9 @@ type EffectResultInput struct {
 	// IntegrationHead is the HEAD of the created Integration Worktree
 	// (the recorded Base Commit at approval).
 	IntegrationHead string
+	// WorktreePath is the created Task Worktree path of a
+	// TaskWorktreeCreated result (PRD Worktree 策略; Task 12).
+	WorktreePath string
 }
 
 func (EffectResultInput) isInput() {}
@@ -309,6 +315,47 @@ func (EffectResultInput) isInput() {}
 type ReconcileInput struct{}
 
 func (ReconcileInput) isInput() {}
+
+// GraphInstallInput installs the execution graph of the approved compiled
+// Dynamic Workflow (design 12). The Node definitions arrive from the
+// approved Workflow Artifact (the Runtime parses it; the Kernel records
+// the DAG PENDING). Dependencies are the deterministic skeleton edges; the
+// Scheduler computes readiness from them plus the persisted Node status,
+// never from Task display status.
+type GraphInstallInput struct {
+	Nodes []InstallNode
+}
+
+func (GraphInstallInput) isInput() {}
+
+// InstallNode is one Node of the approved Dynamic Workflow: its kind, its
+// skeleton dependencies, and the approved Retry Budget.
+type InstallNode struct {
+	ID           NodeID
+	Kind         NodeKind
+	Dependencies []NodeID
+	RetryBudget  int
+}
+
+// DispatchInput is one serialized allocation (design 12): the Application
+// computed the eligible Node with the pure Scheduler, and the Kernel
+// revalidates the readiness facts against the committed aggregate in the
+// same transaction that commits the RUNNING Attempt. A queued goroutine is
+// never an in-flight Attempt: only the committed row is (PRD 已确认：并行
+// 失败后的 Quiescing). Session is the Application-allocated Session
+// identity, Route the approved route of the Task's Spec, and BaseHead the
+// current verified Integration HEAD observed by the Runtime at readiness
+// (the immutable Task Base the Task Branch and Worktree are created from,
+// PRD Worktree 策略); all three are fixed before any Effect (design 6.2
+// rule 6).
+type DispatchInput struct {
+	Node     NodeID
+	Session  SessionID
+	Route    string
+	BaseHead string
+}
+
+func (DispatchInput) isInput() {}
 
 // ApplyCommandKind is the user Apply mutation (design 6.1).
 type ApplyCommandKind string

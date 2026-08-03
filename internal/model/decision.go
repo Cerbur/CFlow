@@ -105,6 +105,30 @@ type NodeStatusMutation struct {
 
 func (NodeStatusMutation) isMutation() {}
 
+// NodeAppendMutation installs one Node of the approved Dynamic Workflow
+// (the graph install, design 12). The Node starts PENDING; readiness is
+// computed by the Scheduler from dependency and gate facts plus the
+// persisted status, never from Task display status. The Branch is the
+// deterministic Task Branch of an agent-task Node ("" for other kinds);
+// the Store materializes the Task projection row from it.
+type NodeAppendMutation struct {
+	Node Node
+}
+
+func (NodeAppendMutation) isMutation() {}
+
+// TaskMutation records the Task projection facts the Kernel owns: the
+// immutable Task Base Commit fixed at readiness and the created Task
+// Worktree path (PRD Worktree 策略). A recorded Base is never replaced:
+// the Task never silently rebases onto a different baseline.
+type TaskMutation struct {
+	Node         NodeID
+	BaseCommit   string
+	WorktreePath string
+}
+
+func (TaskMutation) isMutation() {}
+
 // AttemptAppendMutation appends a fresh Attempt record (identity
 // (node, attempt_number), never reused).
 type AttemptAppendMutation struct {
@@ -288,6 +312,7 @@ const (
 	EventRunBlocked               EventKind = "RUN_BLOCKED"
 	EventRunSucceeded             EventKind = "RUN_SUCCEEDED"
 	EventRunCancelled             EventKind = "RUN_CANCELLED"
+	EventGraphInstalled           EventKind = "GRAPH_INSTALLED"
 	EventApplyAttemptCreated      EventKind = "APPLY_ATTEMPT_CREATED"
 	EventApplySucceeded           EventKind = "APPLY_SUCCEEDED"
 	EventApplyFailed              EventKind = "APPLY_FAILED"
@@ -312,6 +337,7 @@ func (k EventKind) Valid() bool {
 		EventFindingOpened, EventQuarantineRecorded,
 		EventRunStarted, EventRunQuiescing, EventRunStopped, EventRunInterrupted, EventRunBlocked,
 		EventRunSucceeded, EventRunCancelled,
+		EventGraphInstalled,
 		EventApplyAttemptCreated, EventApplySucceeded, EventApplyFailed, EventApplyBlocked,
 		EventCleanupAttemptCreated, EventCleanupItemRequested, EventCleanupItemCompleted, EventCleanupItemFailed:
 		return true

@@ -61,8 +61,7 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 	case model.IntegrationWorktreeCreateIntent:
 		return a.integrationWorktreeCreate(ctx, e)
 	case model.TaskWorktreeCreateIntent:
-		// STUB (Task 12/13): Task Worktrees.
-		return model.EffectResultInput{}, stubEffect(e)
+		return a.taskWorktreeCreate(ctx, wf, e)
 	case model.WorkflowCompileIntent:
 		return a.workflowCompile(ctx, wf, e)
 	case model.GitCommitInspectIntent, model.GitAuditRefCreateIntent:
@@ -166,6 +165,10 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 		if r.Kind != model.IntegrationWorktreeCreated || r.IntegrationHead == "" {
 			return model.InvariantFault(fmt.Errorf("integration worktree result does not match its intent"))
 		}
+	case model.TaskWorktreeCreateIntent:
+		if r.Kind != model.TaskWorktreeCreated || r.WorktreePath == "" {
+			return model.InvariantFault(fmt.Errorf("task worktree result does not match its intent"))
+		}
 	}
 	return nil
 }
@@ -231,6 +234,9 @@ func (a *Application) planningWorktreeCreate(ctx context.Context, intent model.P
 func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, intent model.ProviderStartIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
 	if rt == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	if intent.Purpose == model.PurposeImplementation {
+		return a.codingProviderStart(ctx, wf, intent, cmd, rt)
 	}
 	prompt, ok := a.planningPrompt(cmd)
 	if !ok {
@@ -326,6 +332,93 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		return model.EffectResultInput{}, err
 	}
 	return a.runOutcome(cmd, run)
+}
+
+// taskWorktreeCreate creates the Task Branch/Worktree from the recorded
+// Task Base (PRD Worktree 策略, design 15.2): the branch must not exist
+// and the expected HEAD is the immutable Task Base fixed at readiness, so
+// the Task never silently rebases onto a different baseline.
+func (a *Application) taskWorktreeCreate(ctx context.Context, wf model.WorkflowID, intent model.TaskWorktreeCreateIntent) (model.EffectResultInput, error) {
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	path := a.taskWorktreePath(wf, intent.Node)
+	if err := a.ensureWorktreeParent(path); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := a.git.Execute(ctx, gitflow.CreateTask{
+		Branch:   intent.Branch,
+		BaseHead: intent.BaseHead,
+		Path:     path,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	tv, ok := res.(gitflow.TaskWorktreeResult)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("task worktree result has an unexpected type"))
+	}
+	return model.EffectResultInput{
+		Kind:         model.TaskWorktreeCreated,
+		Attempt:      model.AttemptKey{Node: intent.Node},
+		WorktreePath: tv.Worktree,
+	}, nil
+}
+
+// codingProviderStart runs the coding Session of one allocated Task
+// inside its Task Worktree. The Coding Agent receives only the approved
+// context (the Spec, the Verification Catalog it references, and the
+// Worktree facts), and its output can never set lifecycle state: the
+// result carries the Runtime-observed Git facts of the Worktree, which
+// the Commit gate (Task 13) judges, never the Agent's prose (design 7.3
+// invariant 1, PRD Worktree 策略).
+func (a *Application) codingProviderStart(ctx context.Context, wf model.WorkflowID, intent model.ProviderStartIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	// Prompts are addressed by Agent Purpose (design 14.5): the coding
+	// Session always runs the TASK_IMPLEMENTATION prompt, whatever input
+	// the effect loop is feeding.
+	prompt, ok := a.promptForPurpose(model.PurposeImplementation)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the implementation purpose")
+	}
+	cwd := a.taskWorktreePath(wf, intent.Node)
+	// The RUNNING Attempt already committed; only now may the Coding
+	// Session start (design 12: an in-memory queued goroutine is not an
+	// in-flight Attempt).
+	a.probeStep("provider:" + string(intent.Node) + ":start")
+	res, err := rt.Start(ctx, agent.StartRequest{
+		Purpose:   intent.Purpose,
+		Provider:  intent.Route,
+		Prompt:    prompt.Body,
+		Input:     a.sessionInput(ctx, wf, cmd),
+		CWD:       cwd,
+		SessionID: intent.Session,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	// Git evidence collection: the Worktree's HEAD and dirty state after
+	// the coding Session are the facts the Commit gate judges (PRD
+	// Worktree 策略: coding occurs only in the Task Worktree).
+	end, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out, err := a.runOutcome(cmd, res)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out.EndHead = end.Head
+	out.EndDirtyFingerprint = dirtyFingerprint(end.Dirty)
+	return out, nil
+}
+
+// dirtyFingerprint renders the Git-visible dirty fingerprint of one
+// working tree ("" when clean).
+func dirtyFingerprint(d gitflow.DirtyFingerprint) string {
+	if d.Combined == "" {
+		return ""
+	}
+	return "sha256:" + d.Combined
 }
 
 // artifactWrite persists one Artifact Revision through the immutable
@@ -470,6 +563,11 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 			Spec:           string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
 			EligibleRoutes: eligibleRouteNames(),
 		}
+	case model.DispatchInput:
+		// The coding Session receives only the approved context: the Spec
+		// set, the Verification Catalog it references, and the Task
+		// Worktree facts (PRD Worktree 策略; design 12).
+		return a.codingSessionInput(ctx, wf, cmd.(model.DispatchInput).Node)
 	}
 	if _, ok := cmd.(model.GeneratePlanInput); !ok {
 		if _, ok := cmd.(model.CheckPlanInput); !ok {

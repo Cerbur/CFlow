@@ -9,6 +9,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"cflow.local/cflow/internal/agent"
@@ -22,20 +25,24 @@ import (
 // run is one scripted event stream. It holds a copy of its script so
 // later LoadScript calls can never move it. established tracks the
 // session id claimed by the first session_started frame so compact
-// frames can inherit it.
+// frames can inherit it. cwd is the working directory the scripted
+// coding writes materialize into; materialized guards the once-only
+// materialization at the terminal Session frame.
 type run struct {
-	ad          *Adapter
-	script      Script
-	key         agent.ProviderSessionID
-	idx         int
-	established agent.ProviderSessionID
-	stopCh      chan struct{}
-	stopOne     sync.Once
-	ended       bool
+	ad           *Adapter
+	script       Script
+	key          agent.ProviderSessionID
+	cwd          string
+	idx          int
+	established  agent.ProviderSessionID
+	stopCh       chan struct{}
+	stopOne      sync.Once
+	ended        bool
+	materialized bool
 }
 
-func newRun(ad *Adapter, sc Script, key agent.ProviderSessionID) *run {
-	return &run{ad: ad, script: sc, key: key, stopCh: make(chan struct{})}
+func newRun(ad *Adapter, sc Script, key agent.ProviderSessionID, cwd string) *run {
+	return &run{ad: ad, script: sc, key: key, cwd: cwd, stopCh: make(chan struct{})}
 }
 
 // Next yields the next unified event, io.EOF at the stream end, a
@@ -94,6 +101,25 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 		if compact && wf.SessionID == "" && r.established != "" {
 			wf.SessionID = string(r.established)
 		}
+		// A suffix run (the adapter uniquified the declared id so several
+		// parallel Sessions can share one per-purpose fixture) carries its
+		// own provider session id on every explicit frame.
+		if wf.SessionID != "" && r.key != agent.ProviderSessionID(r.script.SessionID) {
+			wf.SessionID = string(r.key)
+		}
+		// The scripted coding Session materializes its declared writes
+		// into the run's working directory when it finishes (Fake coding
+		// execution, Task 12): coding output never sets lifecycle state,
+		// it writes files in the Task Worktree only.
+		if wf.Type == "session_finished" {
+			if err := r.materializeWrites(); err != nil {
+				return agent.Event{}, &agent.ProtocolError{
+					Code:    model.CodeProviderProtocolViolation,
+					Frame:   line,
+					Message: "fake: " + err.Error(),
+				}
+			}
+		}
 		ev, err := wireToEvent(wf, line)
 		if err != nil {
 			return agent.Event{}, err
@@ -103,6 +129,50 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 		}
 		return ev, nil
 	}
+}
+
+// materializeWrites writes the script's declared files into the run's
+// working directory, exactly once, at the terminal Session frame. A path
+// that escapes the working directory fails closed: the fixture never
+// writes outside the directory it was given.
+func (r *run) materializeWrites() error {
+	r.ad.mu.Lock()
+	if r.materialized {
+		r.ad.mu.Unlock()
+		return nil
+	}
+	r.materialized = true
+	writes := append([]FileWrite(nil), r.script.Writes...)
+	r.ad.mu.Unlock()
+	for _, w := range writes {
+		if err := materializeWrite(r.cwd, w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// materializeWrite writes one declared file under cwd. Absolute paths and
+// ".." escapes are rejected; directories are created 0700 and the file
+// 0600 through the security guard so the Fake never creates a world-
+// readable artifact.
+func materializeWrite(cwd string, w FileWrite) error {
+	if cwd == "" {
+		return fmt.Errorf("scripted write requires a working directory")
+	}
+	if w.Path == "" {
+		return fmt.Errorf("scripted write carries an empty path")
+	}
+	clean := filepath.Clean(filepath.FromSlash(w.Path))
+	if filepath.IsAbs(clean) || clean == ".." ||
+		strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("scripted write path %q escapes the working directory", w.Path)
+	}
+	dir := filepath.Dir(filepath.Join(cwd, clean))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("scripted write cannot create %s: %w", dir, err)
+	}
+	return os.WriteFile(filepath.Join(cwd, clean), []byte(w.Content), 0o600)
 }
 
 // end unregisters the run exactly once.

@@ -85,6 +85,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageWorkflowGeneration {
 				return decidePatchProposed(state, in, created)
 			}
+		case model.PurposeImplementation:
+			// A settled coding Session records its Session facts only; the
+			// Attempt's outcome is judged from Git evidence by the Commit
+			// gate (Task 13), never from the Agent's output (design 7.3
+			// invariant 1).
+			if state.Workflow.Stage == model.StageExecution {
+				return decideImplementationRunEnded(state, in, created)
+			}
 		}
 		return model.Decision{}, model.InvariantFault(fmt.Errorf(
 			"provider run completed in an unexpected stage %s for purpose %s",
@@ -306,13 +314,14 @@ type specOutput struct {
 	ProposedCommands []map[string]any `yaml:"proposed_commands"`
 }
 
-// decideSpecsGenerated judges the Spec Generation output. The demo
-// pipeline binds exactly one Spec per generation (the artifact model
-// tracks one active Spec Revision); the output must be structured and
-// bounded, and the Spec body is re-serialized canonically. The Runtime
-// already validated the proposed commands into the Catalog reference the
-// Result carries; the Kernel records that revision and requests the
-// immutable Spec write.
+// decideSpecsGenerated judges the Spec Generation output. The pipeline
+// binds one active Spec Revision whose body carries the Spec set: one
+// Spec object or a non-empty sequence of Spec objects (the multi-Spec
+// pipeline the Scheduler consumes, Task 12; the Compiler absorbs N
+// Specs). Every Spec is validated individually and the set is
+// re-serialized canonically. The Runtime already validated the proposed
+// commands into the Catalog reference the Result carries; the Kernel
+// records that revision and requests the immutable Spec write.
 func decideSpecsGenerated(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
 	if len(in.Body) == 0 || len(in.Body) > maxSpecOutput {
 		return invalidOutput(state, in, created, "spec generation output is empty or exceeds the bounded size", false)
@@ -321,13 +330,18 @@ func decideSpecsGenerated(state model.State, in model.EffectResultInput, created
 	if err := yaml.Unmarshal(in.Body, &out); err != nil {
 		return invalidOutput(state, in, created, "spec generation output is not a structured document", false)
 	}
-	if len(out.Specs) != 1 {
+	if len(out.Specs) == 0 {
 		return invalidOutput(state, in, created,
-			"spec generation output must carry exactly one spec (the demo pipeline binds one active spec revision)", false)
+			"spec generation output must carry at least one spec", false)
 	}
-	specBody, err := validateSpecOutput(out.Specs[0])
+	for _, m := range out.Specs {
+		if _, err := validateSpecOutput(m); err != nil {
+			return invalidOutput(state, in, created, err.Error(), false)
+		}
+	}
+	specBody, err := yaml.Marshal(out.Specs)
 	if err != nil {
-		return invalidOutput(state, in, created, err.Error(), false)
+		return invalidOutput(state, in, created, "spec output cannot be serialized", false)
 	}
 	b := &builder{state: state}
 	if in.CatalogRef.Type == model.ArtifactCatalog && in.CatalogRef.Revision >= 1 && in.CatalogRef.Hash != "" {

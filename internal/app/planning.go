@@ -161,11 +161,39 @@ func (a *Application) planningPrompt(cmd model.Input) (agent.Prompt, bool) {
 		purpose = "SPEC_GENERATION"
 	case model.WorkflowCompilationInput:
 		purpose = "WORKFLOW_OPTIMIZATION"
+	case model.DispatchInput:
+		purpose = "TASK_IMPLEMENTATION"
 	}
 	if purpose == "" {
 		return agent.Prompt{}, false
 	}
 	return reg.Lookup(purpose)
+}
+
+// promptForPurpose resolves the embedded prompt of one Agent Purpose
+// (design 14.5: prompts are addressed by Agent Purpose).
+func (a *Application) promptForPurpose(purpose model.AgentPurpose) (agent.Prompt, bool) {
+	reg := a.promptRegistry()
+	if reg == nil {
+		return agent.Prompt{}, false
+	}
+	name := ""
+	switch purpose {
+	case model.PurposePlanning:
+		name = "REQUIREMENT_DISCUSSION"
+	case model.PurposePlanCheck:
+		name = "PLAN_CHECK"
+	case model.PurposeSpecGeneration:
+		name = "SPEC_GENERATION"
+	case model.PurposeWorkflowOptimization:
+		name = "WORKFLOW_OPTIMIZATION"
+	case model.PurposeImplementation:
+		name = "TASK_IMPLEMENTATION"
+	}
+	if name == "" {
+		return agent.Prompt{}, false
+	}
+	return reg.Lookup(name)
 }
 
 // promptRegistry returns the embedded Prompt Registry, loading it once.

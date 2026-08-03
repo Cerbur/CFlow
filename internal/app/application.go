@@ -260,7 +260,7 @@ func (a *Application) readAggregate(ctx context.Context, wf model.WorkflowID, sq
 	a.probeStep("lock")
 	a.probeLockKind(platform.LockSchema)
 	st, err := store.Open(ctx, store.OpenOptions{
-		Path: a.dbPath, Workflow: wf, ReadOnly: true, CflowVersion: a.cflowVer,
+		Path: a.dbPath, Workflow: wf, ReadOnly: true, CflowVersion: a.cflowVer, Now: a.now,
 	})
 	if err != nil {
 		return store.StoreView{}, err
@@ -312,7 +312,12 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 			return Outcome{}, orCtx(ctx, model.InvalidInputFault("workflow name is required and bounded"))
 		}
 	}
-	out, err := a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
+	var out Outcome
+	if _, ok := cmd.(DispatchCommand); ok {
+		out, err = a.executeDispatch(ctx, st, wf, restricted)
+	} else {
+		out, err = a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
+	}
 	if err != nil {
 		return Outcome{}, orCtx(ctx, err)
 	}
@@ -701,6 +706,15 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			BudgetHash:       c.BudgetHash,
 			CommitPolicyHash: c.CommitPolicyHash,
 		}, wf, nil
+	case DispatchCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		// The dispatch pass derives its own per-Node inputs from the
+		// approved execution artifacts; the kernel Input placeholder is
+		// unused by the dispatch path.
+		return model.DispatchInput{}, wf, nil
 	default:
 		return nil, "", model.InvalidInputFault("unsupported command")
 	}
