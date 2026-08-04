@@ -74,6 +74,22 @@ fi
 # CGO-disabled build and binary hash
 # ---------------------------------------------------------------------------
 
+# The release metadata (design 23): the applied schema version, the embedded
+# registry hashes, and the enabled Provider binding hashes, derived from the
+# embedded registries by scripts/release-metadata. gate2 records them so the
+# Gate 3 validation can prove the evidence is exact and current.
+RELEASE_METADATA="$(go run ./scripts/release-metadata)"
+eval "$RELEASE_METADATA"
+SCHEMA_VERSION="$schema_version"
+REG_MIGRATION="$migration"
+REG_ARTIFACT="$artifact"
+REG_PROVIDER="$provider"
+REG_PROMPT="$prompt"
+BINDING_CODEX="$codex"
+BINDING_CLAUDE="$claude"
+
+# The CGO-disabled build is reproducible: -trimpath strips the build
+# directory, so the same source and toolchain produce the same binary.
 BIN="$ARTIFACT_DIR/cflow"
 CGO_ENABLED=0 go build -trimpath -o "$BIN" ./cmd/cflow
 BINARY_SHA256="$(shasum -a 256 "$BIN" | awk '{print $1}')"
@@ -103,8 +119,18 @@ MANIFEST="$ARTIFACT_DIR/gate2-manifest.txt"
   echo "source_commit: $SOURCE_COMMIT"
   echo "source_subject: $SOURCE_SUBJECT"
   echo "git_clean: $GIT_CLEAN"
+  echo "source_dirty: false"
   echo "binary_sha256: $BINARY_SHA256"
   echo "go_version: $GO_VERSION"
+  echo "schema_version: $SCHEMA_VERSION"
+  echo "registries:"
+  echo "  migration: $REG_MIGRATION"
+  echo "  artifact: $REG_ARTIFACT"
+  echo "  provider: $REG_PROVIDER"
+  echo "  prompt: $REG_PROMPT"
+  echo "provider_bindings:"
+  echo "  codex: $BINDING_CODEX"
+  echo "  claude: $BINDING_CLAUDE"
   echo "checks:"
   echo "  gate1: $GATE1"
   echo "  fault_recovery_matrix: $FAULT_RECOVERY"
