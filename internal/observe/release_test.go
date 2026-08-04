@@ -299,6 +299,76 @@ func dogfoodPreflightFixture(t *testing.T) DogfoodPreflight {
 	}
 }
 
+// TestParseGateManifestAttribution: the parser must attribute indented
+// section members to checks:/provider_bindings:/registries: and every
+// top-level key to the manifest fields — a trailing top-level key (like
+// the gate scripts' fixture_node/fixture_npm lines after provider_bindings:)
+// must never leak into a section.
+func TestParseGateManifestAttribution(t *testing.T) {
+	data := `candidate: Internal Core Candidate
+generated_at: 2026-08-04T12:00:00Z
+source_commit: abcd1234
+source_subject: fixture subject
+git_clean: true
+source_dirty: false
+binary_sha256: ` + strings.Repeat("1", 64) + `
+go_version: go version go1.26.5 darwin/arm64
+schema_version: 3
+registries:
+  migration: m-hash
+  artifact: a-hash
+  provider: p-hash
+  prompt: t-hash
+provider_bindings:
+  codex: c-hash
+  claude: d-hash
+fixture_node: v26.3.1
+fixture_npm: 11.16.0
+checks:
+  gofmt: pass
+  internal_race: pass
+  fake_e2e: pass
+  full_suite: pass
+  vet: pass
+`
+	m, err := ParseGateManifest([]byte(data))
+	if err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if m.Candidate != Gate1CandidateLabel || m.SourceCommit != "abcd1234" || m.SourceDirty {
+		t.Fatalf("manifest identity = %+v", m)
+	}
+	if m.BinarySHA256 != strings.Repeat("1", 64) || m.SchemaVersion != "3" {
+		t.Fatalf("manifest binary/schema = %s/%s", m.BinarySHA256, m.SchemaVersion)
+	}
+	if m.Registries != (RegistryHashes{Migration: "m-hash", Artifact: "a-hash", Provider: "p-hash", Prompt: "t-hash"}) {
+		t.Fatalf("manifest registries = %+v", m.Registries)
+	}
+	if m.ProviderBindings["codex"] != "c-hash" || m.ProviderBindings["claude"] != "d-hash" {
+		t.Fatalf("manifest provider bindings = %+v", m.ProviderBindings)
+	}
+	// The top-level fixture keys must not be attributed to a section.
+	if _, ok := m.ProviderBindings["fixture_node"]; ok {
+		t.Fatalf("fixture_node leaked into provider bindings: %+v", m.ProviderBindings)
+	}
+	for _, check := range []string{"gofmt", "internal_race", "fake_e2e", "full_suite", "vet"} {
+		if m.Checks[check] != "pass" {
+			t.Fatalf("check %s = %q, want pass", check, m.Checks[check])
+		}
+	}
+	// The parsed manifest validates against the matching candidate facts.
+	if err := ValidateReleaseEvidence(m, ReleaseFacts{
+		SourceCommit:     "abcd1234",
+		SourceDirty:      false,
+		SchemaVersion:    "3",
+		Registries:       RegistryHashes{Migration: "m-hash", Artifact: "a-hash", Provider: "p-hash", Prompt: "t-hash"},
+		BinarySHA256:     strings.Repeat("1", 64),
+		ProviderBindings: map[string]string{"codex": "c-hash", "claude": "d-hash"},
+	}); err != nil {
+		t.Fatalf("parsed manifest rejected against matching facts: %v", err)
+	}
+}
+
 // TestValidateDogfoodPreflightAcceptsValidFacts: the deterministic preflight
 // facts of a genuine dogfood run validate.
 func TestValidateDogfoodPreflightAcceptsValidFacts(t *testing.T) {

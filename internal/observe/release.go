@@ -305,17 +305,21 @@ func ValidateDogfoodPreflight(p DogfoodPreflight) error {
 
 // ParseGateManifest parses the redacted text Manifest the gate scripts
 // write into the typed GateManifest. An unparseable or label-less manifest
-// is a Fault with CodeEvidenceSubjectChanged.
+// is a Fault with CodeEvidenceSubjectChanged. Section members are the
+// indented lines under checks:/provider_bindings:/registries:; top-level
+// keys are always attributed to the manifest fields, so a trailing
+// top-level key can never leak into a section.
 func ParseGateManifest(data []byte) (GateManifest, error) {
 	var m GateManifest
 	m.Checks = map[string]string{}
 	m.ProviderBindings = map[string]string{}
 	section := ""
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+	for _, raw := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(raw) == "" || strings.HasPrefix(strings.TrimSpace(raw), "#") {
 			continue
 		}
+		indented := strings.HasPrefix(raw, " ") || strings.HasPrefix(raw, "\t")
+		line := strings.TrimSpace(raw)
 		if strings.HasSuffix(line, ":") {
 			section = strings.TrimSuffix(line, ":")
 			continue
@@ -325,6 +329,16 @@ func ParseGateManifest(data []byte) (GateManifest, error) {
 			continue
 		}
 		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		if indented {
+			switch section {
+			case "checks":
+				m.Checks[key] = val
+				continue
+			case "provider_bindings":
+				m.ProviderBindings[key] = val
+				continue
+			}
+		}
 		switch key {
 		case "candidate":
 			m.Candidate = val
@@ -346,13 +360,6 @@ func ParseGateManifest(data []byte) (GateManifest, error) {
 			m.Registries.Provider = val
 		case "prompt":
 			m.Registries.Prompt = val
-		default:
-			switch section {
-			case "checks":
-				m.Checks[key] = val
-			case "provider_bindings":
-				m.ProviderBindings[key] = val
-			}
 		}
 	}
 	if m.Candidate == "" {
