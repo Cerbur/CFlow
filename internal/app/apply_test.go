@@ -323,10 +323,12 @@ func (af *applyFixture) CommitApply(attempt model.ApplyAttempt) error {
 // ConfirmPolicy runs the explicit Commit Policy / Apply Catalog
 // confirmation (ConfirmApplyPolicy) for the blocked attempt. The
 // confirmation re-opens the staging, so the Apply Verification Session
-// script must be loaded.
-func (af *applyFixture) ConfirmPolicy() error {
+// script must be loaded; a staging run that must resolve a conflicted
+// Apply Worktree also needs the restricted Merge Resolution script.
+func (af *applyFixture) ConfirmPolicy(scripts ...string) error {
 	af.t.Helper()
-	_, err := af.applyApp(applyVerificationPassScript()).Execute(context.Background(), ConfirmApplyPolicyCommand{Workflow: af.wf})
+	scripts = append([]string{applyVerificationPassScript()}, scripts...)
+	_, err := af.applyApp(scripts...).Execute(context.Background(), ConfirmApplyPolicyCommand{Workflow: af.wf})
 	return err
 }
 
@@ -730,6 +732,63 @@ func TestApplyPolicyConfirmationBindsAttemptAndHeads(t *testing.T) {
 		fx.RequireTargetAtLateAdvance()
 		fx.RequireWorkflowCompleted()
 	})
+}
+
+// TestApplyConfirmedPolicyThenConflictRetryCompletes (review finding #1:
+// the confirmed-policy + text-conflict intersection): a Target advance
+// with a conflicting file blocks the first staging; a policy drift then
+// blocks the request gate; the user confirms (the confirmation re-binds
+// the policy and the confirm's own staging re-run hits the same text
+// conflict, blocked without a resolution session because the worktree
+// did not exist at confirmation time); and a plain `cflow apply` retry
+// re-opens the confirmed attempt — the gate recognizes the recorded
+// confirmation and never re-blocks (COMMIT_POLICY_CONFIRMATION_REQUIRED),
+// the ONE restricted Merge Resolution Session resolves the conflict in
+// the isolated Apply Worktree, and the delivery completes. The deadlock
+// the review found is closed: the Target is exactly the verified staging
+// head and the Workflow stays COMPLETED.
+func TestApplyConfirmedPolicyThenConflictRetryCompletes(t *testing.T) {
+	fx := completedWorkflowForApply(t)
+	// The Target advances with a file that conflicts with the Integration
+	// output (the Apply Worktree is the only place that ever merges).
+	fx.advanceTarget("src/divide/divide.go", targetDivideSource)
+	// The policy drifts before the first request: the fresh attempt records
+	// the drifted fingerprint and the gate blocks before any staging.
+	fx.fx.git("config", "user.name", "Other User")
+	err := fx.prepareErr()
+	assertFaultCode(t, err, model.CodeCommitPolicyConfirmationRequired)
+	if got := fx.latestApply(); got == nil || got.Status != model.ApplyBlocked {
+		t.Fatalf("apply = %+v, want a BLOCKED attempt", got)
+	}
+	fx.RequireWorkflowCompleted()
+	// The confirmation re-binds the fresh policy; its staging re-run merges
+	// the Integration Branch at the advanced Target HEAD and hits the text
+	// conflict (no resolution session was allocated: the Apply Worktree did
+	// not exist at confirmation time).
+	err = fx.ConfirmPolicy()
+	assertFaultCode(t, err, model.CodeMergeConflict)
+	if got := fx.latestApply().Status; got != model.ApplyBlocked {
+		t.Fatalf("apply = %s after the confirm's conflict, want BLOCKED", got)
+	}
+	fx.RequireWorkflowCompleted()
+	// The plain retry re-opens the SAME confirmed attempt: the gate now
+	// recognizes the recorded confirmation (never COMMIT_POLICY_
+	// CONFIRMATION_REQUIRED) and the ONE restricted Merge Resolution
+	// Session resolves the conflict inside the Apply Worktree.
+	attempt := fx.PrepareApplyResolution()
+	fx.PassStagingVerification(attempt)
+	if err := fx.CommitApply(attempt); err != nil {
+		t.Fatalf("commit apply after the confirmed-policy resolution: %v", err)
+	}
+	if got := fx.targetHead(); got != fx.applyBranchHead() {
+		t.Fatalf("target = %s, want the verified staging head %s", got, fx.applyBranchHead())
+	}
+	// The resolution audit Ref pins the one restricted attempt.
+	ref := fmt.Sprintf("refs/cflow/%s/apply/%s/resolution", fx.wf, attempt.ID)
+	if out := strings.TrimSpace(fx.fx.git("rev-parse", ref)); out == "" {
+		t.Fatalf("resolution audit ref %s is missing", ref)
+	}
+	fx.RequireWorkflowCompleted()
 }
 
 // TestApplySigningPreflightFailureBlocksConfirmation: when the drift

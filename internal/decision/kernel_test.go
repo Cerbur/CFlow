@@ -1099,6 +1099,109 @@ func TestApplyPolicyConfirmationBindsAttemptAndHeads(t *testing.T) {
 	}
 }
 
+// TestApplyPolicyGateBlockLeavesNoPhantomSession (review finding #2): the
+// policy-drift gate fires BEFORE the request's independent Apply
+// Verification Session and the ONE restricted Merge Resolution Session
+// allocations materialize, so a gate-blocked decision records no
+// SessionStarting or Running rows — the block never orphans the just
+// allocated review session/process.
+func TestApplyPolicyGateBlockLeavesNoPhantomSession(t *testing.T) {
+	state := fixtureCompleted()
+	state.Workflow.ExecutionFacts.Fingerprint = "fp-approved"
+	got, err := decision.Decide(state, model.ApplyCommandInput{
+		Kind: model.ApplyRequest, TargetHead: "main-head", IntegrationHead: "int-9",
+		Preflight:     model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash: "cp-1", Fingerprint: "fp-drifted",
+		ReviewSession: "rev-1", ReviewRoute: "fake", ReviewProcess: "p-1",
+		ResolutionSession: "res-1", ResolutionProcess: "rp-1",
+	})
+	requireNoError(t, err)
+	requireEvent(t, got, model.EventApplyBlocked)
+	state = apply(t, state, got)
+	if got := state.ApplyAttempts[0].Status; got != model.ApplyBlocked {
+		t.Fatalf("apply = %s, want BLOCKED", got)
+	}
+	if len(state.Sessions) != 0 {
+		t.Fatalf("the gate block left %d session rows (want none): %+v", len(state.Sessions), state.Sessions)
+	}
+	if len(state.Processes) != 0 {
+		t.Fatalf("the gate block left %d process rows (want none): %+v", len(state.Processes), state.Processes)
+	}
+	// A repeated gate block (a re-opened attempt whose policy is still
+	// unconfirmed) must also leave no rows.
+	state.Workflow.ExecutionFacts.Fingerprint = "fp-approved"
+	got2, err := decision.Decide(state, model.ApplyCommandInput{
+		Kind: model.ApplyRequest, TargetHead: "main-head", IntegrationHead: "int-9",
+		Preflight:     model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash: "cp-1", Fingerprint: "fp-drifted",
+		ReviewSession: "rev-2", ReviewRoute: "fake", ReviewProcess: "p-2",
+		ResolutionSession: "res-2", ResolutionProcess: "rp-2",
+	})
+	requireNoError(t, err)
+	state = apply(t, state, got2)
+	if len(state.Sessions) != 0 || len(state.Processes) != 0 {
+		t.Fatalf("the repeated gate block left %d session / %d process rows", len(state.Sessions), len(state.Processes))
+	}
+}
+
+// TestApplyPolicyConfirmationCarriesResolutionSession (review finding #1,
+// second part): when the confirmation's staging re-run must resolve a
+// conflicted Apply Worktree, the input carries the ONE restricted Merge
+// Resolution Session and the decision records its Session/Process and
+// passes it to the staging intent, so the confirm itself completes the
+// conflict without an extra retry.
+func TestApplyPolicyConfirmationCarriesResolutionSession(t *testing.T) {
+	state := fixtureCompleted()
+	request := model.ApplyCommandInput{Kind: model.ApplyRequest, TargetHead: "main-head",
+		IntegrationHead: "int-9",
+		Preflight:       model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash:   "cp-1", Fingerprint: "fp-1",
+		ReviewSession: "rev-1", ReviewRoute: "fake", ReviewProcess: "p-1"}
+	got, err := decision.Decide(state, request)
+	requireNoError(t, err)
+	state = apply(t, state, got)
+
+	// the attempt blocks on a merge conflict (the worktree holds the
+	// conflicted merge the confirmation must resolve)
+	blocked, err := decision.Decide(state, model.EffectResultInput{
+		Kind: model.ApplyStagingFailed, ApplyAttempt: "apply-1", FailureCode: model.CodeMergeConflict})
+	requireNoError(t, err)
+	state = apply(t, state, blocked)
+
+	confirm := model.ApplyPolicyConfirmationInput{Attempt: "apply-1", TargetHead: "main-head",
+		IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 2, Hash: "cp-2"},
+		PreflightHash: "cp-2", Fingerprint: "fp-1",
+		ReviewSession: "rev-2", ReviewRoute: "fake", ReviewProcess: "p-2",
+		ResolutionSession: "res-2", ResolutionProcess: "rp-2"}
+	got2, err := decision.Decide(state, confirm)
+	requireNoError(t, err)
+	requireEffect(t, got2, model.ApplyStagingCreateIntent{
+		Apply: "apply-1", TargetHead: "main-head", IntegrationHead: "int-9",
+		ResolutionSession: "res-2"})
+	state = apply(t, state, got2)
+	var resSession *model.Session
+	for i := range state.Sessions {
+		if state.Sessions[i].ID == "res-2" {
+			resSession = &state.Sessions[i]
+		}
+	}
+	if resSession == nil || resSession.Purpose != model.PurposeRepair || resSession.Status != model.SessionStarting {
+		t.Fatalf("resolution session = %+v, want a Starting repair session", resSession)
+	}
+	var resProcess *model.ProcessRecord
+	for i := range state.Processes {
+		if state.Processes[i].ID == "rp-2" {
+			resProcess = &state.Processes[i]
+		}
+	}
+	if resProcess == nil || resProcess.Purpose != model.PurposeRepair || resProcess.Status != model.ProcessStatusRunning {
+		t.Fatalf("resolution process = %+v, want a Running repair process", resProcess)
+	}
+	if got := state.ApplyAttempts[0].Status; got != model.ApplyStaging {
+		t.Fatalf("apply = %s after the confirmed resolution allocation, want STAGING", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------

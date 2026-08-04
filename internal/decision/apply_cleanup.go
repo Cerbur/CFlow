@@ -80,6 +80,25 @@ func applyRequest(state model.State, in model.ApplyCommandInput) (model.Decision
 		// through ExecuteApply).
 		return b.decision(), nil
 	}
+	// The policy gate runs before the session/process allocations: a gate
+	// block never allocates — and never orphans — the independent Apply
+	// Verification Session or the ONE restricted Merge Resolution Session
+	// (a blocked decision records no SessionStarting/Running rows). The
+	// gate blocks when the attempt's recorded Commit Policy fingerprint
+	// differs from the Execution Approval's, unless an append-only
+	// confirmation already bound this exact attempt (PRD 约束 40-41: the
+	// approval is the immutable record; a later re-drift still fails
+	// closed in the staging executor, which revalidates the live
+	// fingerprint). The Workflow stays COMPLETED and the Target unchanged;
+	// an attempt that already passed its staging is never re-blocked.
+	if facts := state.Workflow.ExecutionFacts; facts != nil && facts.Fingerprint != "" && att.Fingerprint != facts.Fingerprint {
+		if !applyConfirmationRecorded(state, att.ID) {
+			b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
+			b.event(model.EventApplyBlocked, "", model.AttemptKey{}, model.CodeCommitPolicyConfirmationRequired,
+				"commit policy drifted since the execution approval; apply blocked until the exact confirmation")
+			return b.decision(), nil
+		}
+	}
 	if !sessionExists(state, in.ReviewSession) {
 		// The independent Apply Verification Session is appended once per
 		// staging run: a fresh allocation for a new or re-opened attempt,
@@ -111,18 +130,6 @@ func applyRequest(state model.State, in model.ApplyCommandInput) (model.Decision
 			ID: in.ResolutionProcess, Session: in.ResolutionSession, Purpose: model.PurposeRepair,
 			Status: model.ProcessStatusRunning, StartedAt: state.Now,
 		}})
-	}
-	if facts := state.Workflow.ExecutionFacts; facts != nil && facts.Fingerprint != "" && att.Fingerprint != facts.Fingerprint {
-		// The observed Commit Policy differs from the approved one:
-		// the attempt blocks before any staging; the user's explicit
-		// confirmation re-binds the attempt with the fresh Preflight
-		// (PRD 约束 41). The Workflow stays COMPLETED and the Target
-		// unchanged. An attempt that already passed its staging is
-		// never re-blocked by this gate.
-		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
-		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, model.CodeCommitPolicyConfirmationRequired,
-			"commit policy drifted since the execution approval; apply blocked until the exact confirmation")
-		return b.decision(), nil
 	}
 	b.effect(model.ApplyStagingCreateIntent{
 		Apply:             att.ID,
@@ -427,10 +434,31 @@ func decideApplyPolicyConfirm(state model.State, in model.ApplyPolicyConfirmatio
 			Status: model.ProcessStatusRunning, StartedAt: state.Now,
 		}})
 	}
+	// The confirmation's staging re-run mirrors the request's ONE
+	// restricted Merge Resolution allocation (the command builder mirrors
+	// applyResolutionNeeded): a worktree that still holds a conflicted
+	// merge gets the resolution session, so the confirm itself can
+	// complete the conflict without an extra retry.
+	if in.ResolutionSession != "" {
+		if err := validateFreshSession(state, in.ResolutionSession); err != nil {
+			return model.Decision{}, err
+		}
+		if in.ResolutionProcess == "" {
+			return model.Decision{}, model.InvalidInputFault("the resolution allocation requires a process identity")
+		}
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID: in.ResolutionSession, Purpose: model.PurposeRepair, Status: model.SessionStarting,
+		}, Provider: in.ReviewRoute})
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.ResolutionProcess, Session: in.ResolutionSession, Purpose: model.PurposeRepair,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
 	b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyStaging})
 	b.event(model.EventApplyRestarted, "", model.AttemptKey{}, "", "apply attempt re-opened after the confirmation")
 	b.effect(model.ApplyStagingCreateIntent{
 		Apply: att.ID, TargetHead: att.TargetHead, IntegrationHead: att.IntegrationHead,
+		ResolutionSession: in.ResolutionSession,
 	})
 	return b.decision(), nil
 }
@@ -452,6 +480,29 @@ func settleApplySessionNeverStarted(b *builder, state model.State) {
 func sessionExists(state model.State, id model.SessionID) bool {
 	for _, s := range state.Sessions {
 		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// applyConfirmationRecorded reports whether an append-only Commit Policy
+// or APPLY_CATALOG approval already bound the exact Apply Attempt (PRD
+// 约束 40-41, Apply Command Identity Drift). The confirmation is the
+// immutable record; the request's policy gate must never re-block a
+// confirmed attempt — a later re-drift still fails closed in the staging
+// executor, which revalidates the live fingerprint against the attempt.
+func applyConfirmationRecorded(state model.State, att model.ApplyAttemptID) bool {
+	for i := len(state.Approvals) - 1; i >= 0; i-- {
+		ap := state.Approvals[i]
+		if ap.Kind != model.ApprovalCommitPolicy && ap.Kind != model.ApprovalApplyCatalog {
+			continue
+		}
+		var ctx map[string]string
+		if err := json.Unmarshal([]byte(ap.DecisionContext), &ctx); err != nil {
+			continue
+		}
+		if ctx["attempt"] == string(att) {
 			return true
 		}
 	}

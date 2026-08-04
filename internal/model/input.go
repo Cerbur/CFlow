@@ -656,10 +656,15 @@ type ApplyPolicyConfirmationInput struct {
 	CatalogRef      CatalogRef
 
 	// ReviewSession/ReviewRoute/ReviewProcess allocate the independent
-	// Apply Verification Session of the confirmation's staging re-run.
-	ReviewSession SessionID
-	ReviewRoute   string
-	ReviewProcess ProcessID
+	// Apply Verification Session of the confirmation's staging re-run;
+	// ResolutionSession/ResolutionProcess allocate the ONE restricted
+	// Merge Resolution Session when the Apply Worktree of the blocked
+	// attempt still holds a conflicted merge ("" when none).
+	ReviewSession     SessionID
+	ReviewRoute       string
+	ReviewProcess     ProcessID
+	ResolutionSession SessionID
+	ResolutionProcess ProcessID
 }
 
 func (ApplyPolicyConfirmationInput) isInput() {}

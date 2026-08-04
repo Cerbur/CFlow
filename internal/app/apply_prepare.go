@@ -202,17 +202,29 @@ func (a *Application) prepareApplyPolicyConfirm(ctx context.Context, wf model.Wo
 	if err != nil {
 		return nil, "", err
 	}
+	// The confirmation's staging re-run mirrors the request's ONE
+	// restricted Merge Resolution allocation: a worktree that still holds
+	// a conflicted merge gets the resolution session, so the confirm
+	// itself can complete the conflict without an extra retry.
+	var resolutionSession model.SessionID
+	var resolutionProcess model.ProcessID
+	if a.applyResolutionNeeded(ctx, resolved, st) {
+		resolutionSession = model.SessionID(a.ids(model.IDSession))
+		resolutionProcess = model.ProcessID(a.ids(model.IDProcess))
+	}
 	return model.ApplyPolicyConfirmationInput{
-		Attempt:         att.ID,
-		TargetHead:      head,
-		IntegrationHead: integrationHead,
-		Preflight:       model.ArtifactRef{Workflow: resolved, Type: model.ArtifactReport, Revision: next, Hash: preflight.EvidenceHash},
-		PreflightHash:   preflight.EvidenceHash,
-		Fingerprint:     preflight.Fingerprint,
-		CatalogRef:      catalogRef,
-		ReviewSession:   model.SessionID(a.ids(model.IDSession)),
-		ReviewRoute:     reviewRoute,
-		ReviewProcess:   model.ProcessID(a.ids(model.IDProcess)),
+		Attempt:           att.ID,
+		TargetHead:        head,
+		IntegrationHead:   integrationHead,
+		Preflight:         model.ArtifactRef{Workflow: resolved, Type: model.ArtifactReport, Revision: next, Hash: preflight.EvidenceHash},
+		PreflightHash:     preflight.EvidenceHash,
+		Fingerprint:       preflight.Fingerprint,
+		CatalogRef:        catalogRef,
+		ReviewSession:     model.SessionID(a.ids(model.IDSession)),
+		ReviewRoute:       reviewRoute,
+		ReviewProcess:     model.ProcessID(a.ids(model.IDProcess)),
+		ResolutionSession: resolutionSession,
+		ResolutionProcess: resolutionProcess,
 	}, resolved, nil
 }
 
