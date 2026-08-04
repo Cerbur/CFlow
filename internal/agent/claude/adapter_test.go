@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1474,15 +1473,13 @@ func TestDetectExecutableHashDrift(t *testing.T) {
 	}
 }
 
-// versionTripleRE extracts the first X.Y.Z triple (the same shape the
-// adapter's own version probe parses).
-var versionTripleRE = regexp.MustCompile(`[0-9]+\.[0-9]+\.[0-9]+`)
-
 // TestDetectRealClaudeCapturedBinding (opt-in smoke detection, brief Step
 // 5): when the real claude binary is installed, detection runs only the
-// read-only version probe and must report SUPPORTED exactly for the
-// captured binding (2.1.220), and never SUPPORTED for a binding whose
-// range excludes the captured baseline. Skipped when claude is absent.
+// read-only version probe and must report SUPPORTED for a version within
+// the captured binding's supported range (PRD Protocol Compatibility:
+// SUPPORTED is range-based, never exact-version — a CLI auto-update within
+// the range stays SUPPORTED), and never SUPPORTED for a binding whose
+// range excludes the installed version. Skipped when claude is absent.
 func TestDetectRealClaudeCapturedBinding(t *testing.T) {
 	path, err := exec.LookPath("claude")
 	if err != nil {
@@ -1496,12 +1493,11 @@ func TestDetectRealClaudeCapturedBinding(t *testing.T) {
 	if inst.Compatibility != agent.CompatibilitySupported {
 		t.Fatalf("the installed claude at %s must be SUPPORTED for the captured binding, got %s", path, inst.Compatibility)
 	}
-	want := versionTripleRE.FindString(readFixture(t, "help.txt"))
-	if inst.CLIVersion != want {
-		t.Fatalf("installed claude %q does not match the captured binding %q", inst.CLIVersion, want)
+	if !claude.VersionInRange(inst.CLIVersion, b.VersionRange) {
+		t.Fatalf("installed claude %q must be within the supported range %q", inst.CLIVersion, b.VersionRange)
 	}
 
-	// SUPPORTED only for the captured binding: an out-of-range binding
+	// SUPPORTED is reserved for in-range bindings: an out-of-range binding
 	// must never report SUPPORTED for the same binary.
 	outOfRange := b
 	outOfRange.VersionRange = ">=3.0.0 <4.0.0"
@@ -1509,7 +1505,7 @@ func TestDetectRealClaudeCapturedBinding(t *testing.T) {
 	inst2, err := ad2.Detect(context.Background())
 	requireNoError(t, err)
 	if inst2.Compatibility == agent.CompatibilitySupported {
-		t.Fatal("SUPPORTED is reserved for the captured binding; an out-of-range binding must not be supported")
+		t.Fatal("SUPPORTED is reserved for in-range bindings; an out-of-range binding must not be supported")
 	}
 	if inst2.Compatibility != agent.CompatibilityUnknownVersion {
 		t.Fatalf("compatibility = %s, want UNKNOWN_VERSION", inst2.Compatibility)

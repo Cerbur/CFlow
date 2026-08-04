@@ -56,6 +56,19 @@ func (v version) compare(o version) int {
 	return 0
 }
 
+// VersionInRange reports whether the first semantic version triple of
+// text satisfies the binding's supported version range (PRD Protocol
+// Compatibility: SUPPORTED is range-based — a CLI auto-update within the
+// captured binding's supported range stays SUPPORTED). Unparseable text
+// or constraint fails closed.
+func VersionInRange(text, constraint string) bool {
+	v, ok := parseVersion(text)
+	if !ok {
+		return false
+	}
+	return inRange(v, constraint)
+}
+
 // inRange reports whether v satisfies every space-separated constraint of
 // the binding's version range, e.g. ">=1.0.0 <3.0.0". A token is an
 // operator (<, <=, >, >=) followed by a version; a bare version means

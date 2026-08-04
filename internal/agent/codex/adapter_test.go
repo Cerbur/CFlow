@@ -1283,9 +1283,11 @@ func TestDetectExecutableHashDrift(t *testing.T) {
 
 // TestDetectRealCodexCapturedBinding (opt-in smoke detection, brief Step
 // 5): when the real codex binary is installed, detection runs only the
-// read-only version probe and must report SUPPORTED exactly for the
-// captured binding (0.141.0), and never SUPPORTED for a binding whose
-// range excludes the captured baseline. Skipped when codex is absent.
+// read-only version probe and must report SUPPORTED for a version within
+// the captured binding's supported range (PRD Protocol Compatibility:
+// SUPPORTED is range-based, never exact-version — a CLI auto-update within
+// the range stays SUPPORTED), and never SUPPORTED for a binding whose
+// range excludes the installed version. Skipped when codex is absent.
 func TestDetectRealCodexCapturedBinding(t *testing.T) {
 	path, err := exec.LookPath("codex")
 	if err != nil {
@@ -1299,12 +1301,11 @@ func TestDetectRealCodexCapturedBinding(t *testing.T) {
 	if inst.Compatibility != agent.CompatibilitySupported {
 		t.Fatalf("the installed codex at %s must be SUPPORTED for the captured binding, got %s", path, inst.Compatibility)
 	}
-	want := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(readFixture(t, "help.txt")), "codex-cli "))
-	if inst.CLIVersion != want {
-		t.Fatalf("installed codex %q does not match the captured binding %q", inst.CLIVersion, want)
+	if !codex.VersionInRange(inst.CLIVersion, b.VersionRange) {
+		t.Fatalf("installed codex %q must be within the supported range %q", inst.CLIVersion, b.VersionRange)
 	}
 
-	// SUPPORTED only for the captured binding: an out-of-range binding
+	// SUPPORTED is reserved for in-range bindings: an out-of-range binding
 	// must never report SUPPORTED for the same binary.
 	outOfRange := b
 	outOfRange.VersionRange = ">=2.0.0 <3.0.0"
@@ -1312,7 +1313,7 @@ func TestDetectRealCodexCapturedBinding(t *testing.T) {
 	inst2, err := ad2.Detect(context.Background())
 	requireNoError(t, err)
 	if inst2.Compatibility == agent.CompatibilitySupported {
-		t.Fatal("SUPPORTED is reserved for the captured binding; an out-of-range binding must not be supported")
+		t.Fatal("SUPPORTED is reserved for in-range bindings; an out-of-range binding must not be supported")
 	}
 	if inst2.Compatibility != agent.CompatibilityUnknownVersion {
 		t.Fatalf("compatibility = %s, want UNKNOWN_VERSION", inst2.Compatibility)
