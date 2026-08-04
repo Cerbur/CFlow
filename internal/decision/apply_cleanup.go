@@ -666,6 +666,18 @@ func cleanupExecute(state model.State, in model.CleanupCommandInput) (model.Deci
 		return model.Decision{}, model.NewFault(model.CodeCleanupActiveProcess,
 			"cleanup requires no managed processes")
 	}
+	// The execution re-confirms no Project Mutation Quarantine and no
+	// active Apply (PRD 已确认：Cleanup 仅删除安全干净的衍生目录; the Workflow
+	// is terminal, but a quarantine or an in-flight Apply makes the facts
+	// unsafe to remove).
+	if projectMutationQuarantined(state) {
+		return model.Decision{}, model.NewFault(model.CodeCleanupQuarantined,
+			"cleanup requires no project mutation quarantine")
+	}
+	if hasActiveApply(state) {
+		return model.Decision{}, model.NewFault(model.CodeCleanupActiveApply,
+			"cleanup requires no in-flight apply attempt")
+	}
 	var next *model.CleanupItem
 	switch att.Status {
 	case model.CleanupStatusAwaitingConfirmation:

@@ -249,9 +249,16 @@ func CreateSensitiveDir(path string) error {
 // be identical to its canonical form); a path not owned by the effective
 // user; and — when HomeRoot or WorkspaceRoot is set — the root itself or
 // a strict ancestor of it (a deletion that would reach outside the
-// scratch area). It never repairs a mode and never follows a symlink; the
-// deletion walk itself must not descend through dir-internal symlinks
-// (os.RemoveAll removes the symlink without following it).
+// scratch area). When HomeRoot is set, the target must also resolve inside
+// a dedicated scratch/cache area (<home>/scratch/ or <home>/cache/) and
+// never equal or lie inside an Evidence/state tree (runs/, logs/,
+// sessions/, context-bundles/, artifacts/, evidence/, verification/,
+// reports/, projects/, worktrees/, locks/, schemas/ — the PRD: runs/run-id
+// itself, Logs, Verification, Final Report, Session, Context Bundle, and
+// other Evidence dirs are NEVER scratch targets). It never repairs a mode
+// and never follows a symlink; the deletion walk itself must not descend
+// through dir-internal symlinks (os.RemoveAll removes the symlink without
+// following it).
 func CheckCleanupScratch(req CleanupScratchRequest) (PathFacts, error) {
 	p := req.Path
 	if p == "" {
@@ -310,7 +317,46 @@ func CheckCleanupScratch(req CleanupScratchRequest) (PathFacts, error) {
 			facts.InsideRoot = true
 		}
 	}
+	// The Evidence/state trees of a managed home are NEVER scratch targets
+	// (PRD: runs/<run-id>/ itself, Logs, Verification, Final Report,
+	// Session, Context Bundle, and other Evidence dirs are never scratch).
+	if req.HomeRoot != "" {
+		home, err := canonicalize(req.HomeRoot)
+		if err != nil {
+			return PathFacts{}, err
+		}
+		for _, name := range preservedTreeNames {
+			denied := filepath.Join(home, name)
+			if canon == denied || strings.HasPrefix(canon, denied+string(filepath.Separator)) {
+				return PathFacts{}, insecureFault("scratch target is inside a preserved evidence or state tree")
+			}
+		}
+		// A scratch target must resolve inside a dedicated scratch/cache
+		// area: <home>/scratch/ or <home>/cache/. This structurally forbids
+		// every Evidence/state tree and any other managed location.
+		allowed := false
+		for _, name := range []string{"scratch", "cache"} {
+			root := filepath.Join(home, name)
+			if canon == root || strings.HasPrefix(canon, root+string(filepath.Separator)) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return PathFacts{}, insecureFault("scratch target must resolve inside the dedicated scratch area")
+		}
+	}
 	return facts, nil
+}
+
+// preservedTreeNames are the CFLOW_HOME Evidence/state trees that a Cleanup
+// scratch target can never equal or lie inside (PRD: runs/<run-id>/ itself,
+// Logs, Verification, Final Report, Session, Context Bundle, and other
+// Evidence dirs are NEVER scratch targets).
+var preservedTreeNames = []string{
+	"runs", "logs", "sessions", "context-bundles", "artifacts",
+	"evidence", "verification", "reports", "projects", "worktrees",
+	"locks", "schemas",
 }
 
 // OwnerIsEffectiveUser reports whether the final path component is owned

@@ -108,6 +108,14 @@ const (
 	CodeCleanupTargetDirty         Code = "CLEANUP_TARGET_DIRTY"
 	CodeCleanupFactsChanged        Code = "CLEANUP_FACT_MISMATCH"
 	CodeCleanupItemFailed          Code = "CLEANUP_ITEM_FAILED"
+	// CodeCleanupActiveApply: an Apply Attempt is in flight (staging,
+	// awaiting the explicit delivery, or running); the Cleanup execution
+	// re-confirms no active Apply before removing anything (design 17.4).
+	CodeCleanupActiveApply Code = "CLEANUP_ACTIVE_APPLY"
+	// CodeCleanupQuarantined: the Project's mutation is quarantined (a
+	// persisted Branch Quarantine or a Project-mutation Blocking Finding);
+	// the Cleanup execution re-confirms no Project Mutation Quarantine.
+	CodeCleanupQuarantined Code = "CLEANUP_QUARANTINED"
 
 	// Design codes (compiler, session independence, snapshot isolation).
 	CodeWorkflowPatchForbidden       Code = "WORKFLOW_PATCH_FORBIDDEN"
@@ -193,6 +201,8 @@ func Codes() []Code {
 		CodeCleanupTargetDirty,
 		CodeCleanupFactsChanged,
 		CodeCleanupItemFailed,
+		CodeCleanupActiveApply,
+		CodeCleanupQuarantined,
 		CodeWorkflowPatchForbidden,
 		CodeWorkflowPatchApplied,
 		CodeSchemaInvalid,
@@ -435,6 +445,8 @@ var faultPolicies = []FaultPolicy{
 	p(CodeCleanupTargetDirty, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),
 	p(CodeCleanupFactsChanged, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),
 	p(CodeCleanupItemFailed, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),
+	p(CodeCleanupActiveApply, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),
+	p(CodeCleanupQuarantined, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),
 
 	// Design codes.
 	p(CodeWorkflowPatchForbidden, CatInvalidInput, ScopeWorkflowRevision, false, false, StopNone, false),

@@ -193,6 +193,43 @@ func hasRunningProcess(state model.State) bool {
 	return false
 }
 
+// hasActiveApply reports whether an Apply Attempt is in flight (staging,
+// awaiting the explicit delivery, or running). The Cleanup execution
+// re-confirms no active Apply before removing anything (design 17.4).
+func hasActiveApply(state model.State) bool {
+	for _, att := range state.ApplyAttempts {
+		switch att.Status {
+		case model.ApplyStaging, model.ApplyAwaitingConfirmation, model.ApplyRunning:
+			return true
+		}
+	}
+	return false
+}
+
+// projectMutationQuarantined reports whether the Project's mutation is
+// quarantined: a persisted Branch Quarantine (drift-window Commits) or a
+// Blocking Finding whose code quarantines Project mutation. The Cleanup
+// execution re-confirms no Project Mutation Quarantine before removing
+// anything (design 17.4).
+func projectMutationQuarantined(state model.State) bool {
+	if len(state.Quarantines) > 0 {
+		return true
+	}
+	for _, f := range state.Findings {
+		if !f.Blocking {
+			continue
+		}
+		switch f.Code {
+		case model.CodeOrphanChildProcess,
+			model.CodeCancelPendingOrphanProcess,
+			model.CodeCommitDuringPolicyDriftWindow,
+			model.CodeInsecureCFLOWHomePermissions:
+			return true
+		}
+	}
+	return false
+}
+
 // hasRunningProcessExcept reports whether any process other than exclude
 // is still RUNNING.
 func hasRunningProcessExcept(state model.State, exclude model.ProcessID) bool {

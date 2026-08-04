@@ -492,12 +492,13 @@ func TestCheckPathAcceptsFileWithoutRoot(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestCheckCleanupScratchAcceptsExactScratchUnderHome: an exact canonical
-// scratch directory inside CFLOW_HOME passes the guard.
+// scratch directory inside the dedicated CFLOW_HOME scratch area passes
+// the guard.
 func TestCheckCleanupScratchAcceptsExactScratchUnderHome(t *testing.T) {
 	root := tempRoot(t)
 	home := filepath.Join(root, "cflow")
 	mkdir(t, home, 0o700)
-	scratch := filepath.Join(home, "runs", "run-1", "tmp")
+	scratch := filepath.Join(home, "scratch", "run-1", "tmp")
 	mkdirAll(t, scratch, 0o700)
 	repo := filepath.Join(root, "repo")
 	mkdir(t, repo, 0o700)
@@ -510,6 +511,15 @@ func TestCheckCleanupScratchAcceptsExactScratchUnderHome(t *testing.T) {
 	}
 	if !facts.InsideRoot {
 		t.Fatalf("exact scratch must resolve inside home")
+	}
+
+	// The dedicated cache area is equally valid scratch.
+	cache := filepath.Join(home, "cache", "run-2", "tmp")
+	mkdirAll(t, cache, 0o700)
+	if _, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+		Path: cache, HomeRoot: home, WorkspaceRoot: repo,
+	}); err != nil {
+		t.Fatalf("exact cache scratch rejected: %v", err)
 	}
 }
 
@@ -530,6 +540,45 @@ func TestCheckCleanupScratchRejectsRootsAndBroadAncestors(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatalf("scratch path %q must be rejected", bad)
+		}
+	}
+	// A scratch target outside the dedicated scratch/cache area of the home
+	// is never accepted (a foreign subdirectory is not an exact scratch
+	// target).
+	foreign := filepath.Join(home, "some-other-dir")
+	mkdir(t, foreign, 0o700)
+	if _, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+		Path: foreign, HomeRoot: home, WorkspaceRoot: repo,
+	}); err == nil {
+		t.Fatalf("scratch path %q outside the dedicated scratch area must be rejected", foreign)
+	}
+}
+
+// TestCheckCleanupScratchRejectsEvidenceAndStateTrees: the Evidence and
+// state trees of CFLOW_HOME (runs/, logs/, sessions/, context-bundles/,
+// artifacts/, evidence/, verification/, reports/, projects/, worktrees/,
+// locks/, schemas/) are NEVER scratch targets — an exact path inside any of
+// them is refused (PRD: runs/<run-id>/ itself, Logs, Verification, Final
+// Report, Session, Context Bundle, and other Evidence dirs are never
+// scratch).
+func TestCheckCleanupScratchRejectsEvidenceAndStateTrees(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "cflow")
+	mkdir(t, home, 0o700)
+	repo := filepath.Join(root, "repo")
+	mkdir(t, repo, 0o700)
+
+	for _, name := range []string{
+		"runs", "logs", "sessions", "context-bundles", "artifacts",
+		"evidence", "verification", "reports", "projects", "worktrees",
+		"locks", "schemas",
+	} {
+		dir := filepath.Join(home, name, "deep", "leaf")
+		mkdirAll(t, dir, 0o700)
+		if _, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+			Path: dir, HomeRoot: home, WorkspaceRoot: repo,
+		}); err == nil {
+			t.Fatalf("scratch target inside the preserved %s/ tree must be rejected", name)
 		}
 	}
 }

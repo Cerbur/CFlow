@@ -1356,6 +1356,52 @@ func TestCleanupItemFailureBlocksAttemptPreservingWorkflow(t *testing.T) {
 	}
 }
 
+// TestCleanupExecuteRejectsActiveApply: the execution re-confirms no
+// active Apply (design 17.4) — a completed Workflow with an Apply Attempt
+// in staging, awaiting confirmation, or running refuses with
+// CLEANUP_ACTIVE_APPLY and deletes nothing.
+func TestCleanupExecuteRejectsActiveApply(t *testing.T) {
+	state := fixtureCompleted()
+	items := cleanupItems()
+	got, err := decision.Decide(state, model.CleanupCommandInput{Kind: model.CleanupDryRun, Items: items})
+	requireNoError(t, err)
+	state = apply(t, state, got)
+	manifest := state.CleanupAttempts[0].Manifest
+
+	for _, status := range []model.ApplyStatus{
+		model.ApplyStaging, model.ApplyAwaitingConfirmation, model.ApplyRunning,
+	} {
+		active := state
+		active.ApplyAttempts = []model.ApplyAttempt{{ID: "apply-1", Number: 1, Status: status}}
+		_, err := decision.Decide(active, model.CleanupCommandInput{Kind: model.CleanupExecute, Manifest: manifest, Items: items})
+		assertFaultCode(t, err, model.CodeCleanupActiveApply)
+	}
+}
+
+// TestCleanupExecuteRejectsProjectMutationQuarantine: the execution
+// re-confirms no Project Mutation Quarantine (design 17.4) — a completed
+// Workflow carrying a Branch Quarantine or a Project-mutation Blocking
+// Finding refuses with CLEANUP_QUARANTINED and deletes nothing.
+func TestCleanupExecuteRejectsProjectMutationQuarantine(t *testing.T) {
+	state := fixtureCompleted()
+	items := cleanupItems()
+	got, err := decision.Decide(state, model.CleanupCommandInput{Kind: model.CleanupDryRun, Items: items})
+	requireNoError(t, err)
+	state = apply(t, state, got)
+	manifest := state.CleanupAttempts[0].Manifest
+
+	quarantined := state
+	quarantined.Quarantines = []model.Quarantine{{ID: "q-1", Branch: "cflow/wf-1/task-S01",
+		AuditRef: "refs/cflow/wf-1/quarantine/q-1", Code: model.CodeCommitDuringPolicyDriftWindow}}
+	_, err = decision.Decide(quarantined, model.CleanupCommandInput{Kind: model.CleanupExecute, Manifest: manifest, Items: items})
+	assertFaultCode(t, err, model.CodeCleanupQuarantined)
+
+	finding := state
+	finding.Findings = []model.Finding{{ID: "finding-1", Code: model.CodeOrphanChildProcess, Blocking: true}}
+	_, err = decision.Decide(finding, model.CleanupCommandInput{Kind: model.CleanupExecute, Manifest: manifest, Items: items})
+	assertFaultCode(t, err, model.CodeCleanupQuarantined)
+}
+
 // ---------------------------------------------------------------------------
 // determinism
 // ---------------------------------------------------------------------------
