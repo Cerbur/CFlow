@@ -725,3 +725,135 @@ func contains(ss []string, want string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// mapSQLError stable classification (Task 21 ledger obligation (a)): the
+// model has no dedicated local-contention or stale-writer Code, so
+// SQLITE_BUSY maps to DATABASE_MIGRATION_FAILED and a stale aggregate
+// version to INVALID_INPUT; every other database failure is the invariant
+// default. These tests pin the mapping and the compiled disposition fast
+// (in-package, a bounded busy timeout) — the release matrix rows
+// (store_sqlite_busy, store_stale_version, store_db_failure_*) assert the
+// same through the real 5s timeout and the fresh-restart facts.
+// ---------------------------------------------------------------------------
+
+// openStoreWithBusy opens a store over path with an in-package bounded
+// busy timeout (the seam only test constructors reach).
+func openStoreWithBusy(t *testing.T, path string, busy time.Duration) *Store {
+	t.Helper()
+	s, err := Open(context.Background(), OpenOptions{Path: path, Workflow: "wf-1", CflowVersion: "0.0.0-dev", busyTimeout: busy})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	seedProjectRow(t, s)
+	return s
+}
+
+// assertDisposition checks one Code's compiled disposition (design 8.2).
+func assertDisposition(t *testing.T, code model.Code, category model.FaultCategory, closeDispatch bool) {
+	t.Helper()
+	pol, ok := model.Policy(code)
+	if !ok {
+		t.Fatalf("no compiled policy for %s", code)
+	}
+	if pol.Category != category || pol.CloseDispatch != closeDispatch {
+		t.Fatalf("policy(%s) = %+v, want category %s closeDispatch %v", code, pol, category, closeDispatch)
+	}
+}
+
+func TestSQLiteBusyClassifiedAsDatabaseMigrationFailed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cflow.db")
+	s := openStoreWithBusy(t, path, 150*time.Millisecond)
+	mustTransact(t, s, 0, fixtureDecision)
+
+	// A peer connection holds BEGIN IMMEDIATE: the store's write contends
+	// for the bounded busy timeout and returns the stable local-contention
+	// Fault — never an unbounded loop (PRD 决策: SQLITE_BUSY 有界).
+	raw, err := sql.Open("sqlite", fileDSN(path, false, time.Second))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	defer raw.Close()
+	hold, err := raw.Begin()
+	if err != nil {
+		t.Fatalf("raw begin: %v", err)
+	}
+	start := time.Now()
+	_, err = s.Transact(context.Background(), 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{Mutations: []model.Mutation{model.NodeAppendMutation{Node: model.Node{
+			ID: "n1", Kind: model.NodeAgentTask, Status: model.NodeReady,
+		}}}}, nil
+	})
+	elapsed := time.Since(start)
+	_ = hold.Rollback()
+	assertFaultCode(t, err, model.CodeDatabaseMigrationFailed)
+	assertDisposition(t, model.CodeDatabaseMigrationFailed, model.CatInvariantFailure, true)
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("busy contention returned in %v, want a bounded wait", elapsed)
+	}
+	// The failed write committed nothing.
+	view := mustView(t, s)
+	if len(view.State.Nodes) != 0 || view.AggregateVersion != 1 {
+		t.Fatalf("busy failure left partial state: %+v", view.State.Nodes)
+	}
+}
+
+func TestStaleAggregateVersionClassifiedInvalidInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cflow.db")
+	a := openStoreWithBusy(t, path, time.Second)
+	mustTransact(t, a, 0, fixtureDecision)
+	b := openStoreWithBusy(t, path, time.Second)
+
+	// A commits version 1 -> 2 (a node) while B still holds the stale
+	// expectation and tries to write a second node.
+	mustTransact(t, a, 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{Mutations: []model.Mutation{model.NodeAppendMutation{Node: model.Node{
+			ID: "n1", Kind: model.NodeAgentTask, Status: model.NodeReady,
+		}}}}, nil
+	})
+	_, err := b.Transact(context.Background(), 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{Mutations: []model.Mutation{model.NodeAppendMutation{Node: model.Node{
+			ID: "n2", Kind: model.NodeAgentTask, Status: model.NodeReady,
+		}}}}, nil
+	})
+	assertFaultCode(t, err, model.CodeInvalidInput)
+	assertDisposition(t, model.CodeInvalidInput, model.CatInvalidInput, false)
+	// The stale writer added nothing: exactly A's node remains.
+	view := mustView(t, a)
+	if len(view.State.Nodes) != 1 || view.AggregateVersion != 2 {
+		t.Fatalf("stale writer mutated the aggregate: %+v", view.State.Nodes)
+	}
+}
+
+func TestOtherDatabaseFailureClassifiedInvariant(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cflow.db")
+	s := openStoreWithBusy(t, path, time.Second)
+	mustTransact(t, s, 0, fixtureDecision)
+
+	// A database failure that is neither contention nor a constraint (a
+	// trigger raises on the nodes insert) reaches the mapSQLError default
+	// path and is classified coherently as the invariant default; the
+	// failed transaction commits nothing.
+	raw, err := sql.Open("sqlite", fileDSN(path, false, time.Second))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TRIGGER cflow_probe_block_insert BEFORE INSERT ON nodes
+		BEGIN SELECT RAISE(FAIL, 'probe: nodes insert blocked'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	raw.Close()
+
+	_, err = s.Transact(context.Background(), 1, func(state model.State) (model.Decision, error) {
+		return model.Decision{Mutations: []model.Mutation{model.NodeAppendMutation{Node: model.Node{
+			ID: "n1", Kind: model.NodeAgentTask, Status: model.NodeReady,
+		}}}}, nil
+	})
+	assertFaultCode(t, err, model.CodeStateInvariantViolation)
+	assertDisposition(t, model.CodeStateInvariantViolation, model.CatInvariantFailure, true)
+	view := mustView(t, s)
+	if len(view.State.Nodes) != 0 || view.AggregateVersion != 1 {
+		t.Fatalf("database failure left partial state: %+v", view.State.Nodes)
+	}
+}

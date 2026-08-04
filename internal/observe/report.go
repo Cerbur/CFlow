@@ -539,8 +539,11 @@ func cleanupPosture(st model.State) ReportCleanup {
 	return ReportCleanup{Status: "DRY_RUN_ONLY", Detail: "cleanup manifest " + last.Manifest.String() + " produced; execute lands with a later task"}
 }
 
-// risksOf assembles the Remaining Risks: every open Finding plus the
-// non-apply posture.
+// risksOf assembles the Remaining Risks: every open Finding, every
+// unsettled managed Session/Process record, plus the non-apply posture.
+// The Final Report never hides an open row: a Session or Process that a
+// kernel decision allocated but never settled (the repair/phantom-row
+// class) surfaces here instead of silently vanishing from the lifecycle.
 func risksOf(st model.State) []string {
 	var out []string
 	for _, f := range st.Findings {
@@ -555,6 +558,26 @@ func risksOf(st model.State) []string {
 			out = append(out, fmt.Sprintf("run %s ended %s", r.ID, r.Status))
 		}
 	}
+	out = append(out, unsettledRowsOf(st)...)
 	out = append(out, "the protected apply to the target branch has not run")
+	return out
+}
+
+// unsettledRowsOf lists every managed Session and Process record that is
+// still non-terminal at report time (design 21: report generation is a pure
+// read, so an unsettled row can never be repaired here — it must be
+// surfaced for the user and the Runtime to act on).
+func unsettledRowsOf(st model.State) []string {
+	var out []string
+	for _, s := range st.Sessions {
+		if !s.Status.IsTerminal() {
+			out = append(out, fmt.Sprintf("session %s (%s) is still %s", s.ID, s.Purpose, s.Status))
+		}
+	}
+	for _, p := range st.Processes {
+		if p.Status == model.ProcessStatusRunning {
+			out = append(out, fmt.Sprintf("process %s (%s) is still %s", p.ID, p.Purpose, p.Status))
+		}
+	}
 	return out
 }

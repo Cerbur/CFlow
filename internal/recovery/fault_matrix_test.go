@@ -299,3 +299,71 @@ func hasBlockingFinding(st model.State, code model.Code) bool {
 	}
 	return false
 }
+
+// TestReleaseDispositionMatrix covers the Task 21 matrix disposition rows
+// not already pinned by recovery_test.go, through the real Store and Git
+// facts: the Apply staging re-run (safe_to_retry), the managed process stop
+// of a still-running process (safe_to_retry), and a quarantine whose audit
+// ref is missing (a DIRTY_WORKTREE_DRIFTED blocking fault — the evidence
+// must never vanish). The release matrix harness drives the same rows.
+func TestReleaseDispositionMatrix(t *testing.T) {
+	t.Run("apply staging recoverable", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		fx.mutate(t, model.ApplyAppendMutation{ApplyAttempt: model.ApplyAttempt{
+			ID: "apply-1", Number: 1, Status: model.ApplyStaging,
+			TargetHead: fx.taskHead, IntegrationHead: fx.taskHead, StartedAt: fx.now(),
+		}})
+		fx.seedIntent(model.ApplyStagingCreateIntent{Apply: "apply-1"})
+		out := mustReconcile(t, fx)
+		requireDisposition(t, out, recovery.SafeToRetry)
+	})
+
+	t.Run("process stop of a running process", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		fx.mutate(t,
+			model.SessionAppendMutation{Session: model.Session{ID: "s1", Purpose: model.PurposeRepair, Status: model.SessionActive}, Provider: "fake"},
+			model.ProcessAppendMutation{Process: model.ProcessRecord{ID: "rp-1", Session: "s1", Purpose: model.PurposeRepair, Status: model.ProcessStatusRunning, StartedAt: fx.now()}},
+		)
+		fx.seedIntent(model.ManagedProcessStopIntent{Process: "rp-1"})
+		out := mustReconcile(t, fx)
+		requireDisposition(t, out, recovery.SafeToRetry)
+	})
+
+	t.Run("quarantine missing audit ref blocks", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		fx.mutate(t, model.QuarantineAppendMutation{Quarantine: model.Quarantine{
+			ID: "quarantine-1", AuditRef: "refs/cflow/" + testWF + "/quarantine/quarantine-1",
+			Branch: fx.taskBranch, FromHead: fx.baseHead, ToHead: fx.taskHead,
+			Code: model.CodeCommitDuringPolicyDriftWindow,
+		}})
+		out := mustReconcile(t, fx)
+		if len(out.Faults) == 0 {
+			t.Fatalf("a quarantine without its audit ref must block reconciliation")
+		}
+		for _, f := range out.Faults {
+			if f.Code != model.CodeDirtyWorktreeDrifted {
+				t.Fatalf("quarantine fault code = %s, want DIRTY_WORKTREE_DRIFTED", f.Code)
+			}
+		}
+		// Reconcile is read-only: the quarantine evidence is never dropped.
+		if st := viewState(t, fx); len(st.Quarantines) != 1 {
+			t.Fatalf("the quarantine evidence was dropped: %d rows", len(st.Quarantines))
+		}
+	})
+}
+
+// viewState re-opens the persisted aggregate after a Reconcile (Reconcile
+// never mutates anything, so the evidence must survive unchanged).
+func viewState(t *testing.T, fx *recoveryFixture) model.State {
+	t.Helper()
+	st, err := store.Open(context.Background(), store.OpenOptions{Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	view, err := st.View(context.Background(), store.StoreQuery{})
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	return view.State
+}

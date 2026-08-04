@@ -1369,3 +1369,29 @@ func TestTypedInputCarriesContextBundleRef(t *testing.T) {
 		t.Fatalf("fresh typed input carries a bundle ref: %s", fresh)
 	}
 }
+
+// TestMatrixProtocolDispositionsAgree (Task 21): the protocol fault Codes
+// this adapter surface produces carry the compiled release disposition the
+// fault matrix rows assert — PROVIDER_PROTOCOL_VIOLATION is a SAFETY_STOP
+// that closes the Dispatch Gate and never charges a Retry (PRD 失败分类:
+// 否，且不扣失败重试预算).
+func TestMatrixProtocolDispositionsAgree(t *testing.T) {
+	for _, tc := range []struct {
+		code     model.Code
+		category model.FaultCategory
+		close    bool
+	}{
+		{model.CodeProviderProtocolViolation, model.CatSafetyStop, true},
+		{model.CodeProviderProtocolUnsupported, model.CatUserActionRequired, true},
+		{model.CodeProviderSessionIDMissing, model.CatUserActionRequired, true},
+		{model.CodeProviderBindingChanged, model.CatSafetyStop, true},
+	} {
+		pol, ok := model.Policy(tc.code)
+		if !ok {
+			t.Fatalf("no compiled policy for %s", tc.code)
+		}
+		if pol.Category != tc.category || pol.CloseDispatch != tc.close {
+			t.Fatalf("policy(%s) = %+v, want category %s close %v", tc.code, pol, tc.category, tc.close)
+		}
+	}
+}

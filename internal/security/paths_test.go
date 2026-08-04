@@ -622,3 +622,67 @@ func TestCheckCleanupScratchRejectsWrongOwner(t *testing.T) {
 		t.Fatal("a non-owned scratch target must be rejected")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Release fault matrix rows (Task 21): the path/symlink/permission failures
+// fail closed with the compiled INSECURE_CFLOW_HOME_PERMISSIONS disposition
+// (SAFETY_STOP, dispatch closed) and the guard never repairs or removes the
+// unsafe object. The release matrix harness (tests/integration) drives the
+// same rows through the observable post-restart facts.
+// ---------------------------------------------------------------------------
+
+func requireInsecureDisposition(t *testing.T, err error) {
+	t.Helper()
+	code, ok := model.CodeOf(err)
+	if !ok || code != model.CodeInsecureCFLOWHomePermissions {
+		t.Fatalf("code = %v, want INSECURE_CFLOW_HOME_PERMISSIONS", err)
+	}
+	pol, ok := model.Policy(code)
+	if !ok || pol.Category != model.CatSafetyStop || !pol.CloseDispatch {
+		t.Fatalf("policy(%s) = %+v, want SAFETY_STOP with dispatch closed", code, pol)
+	}
+}
+
+func TestMatrixPathSymlinkEscapeFailsClosed(t *testing.T) {
+	root := tempRoot(t)
+	real := filepath.Join(root, "real")
+	mkdir(t, real, 0o700)
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	_, err := security.CheckPath(security.PathRequest{Path: link, Kind: security.KindDir})
+	requireInsecureDisposition(t, err)
+	// The guard never repairs or removes the symlink.
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the guard removed or resolved the symlink: %v", err)
+	}
+}
+
+func TestMatrixPathGroupWritableFailsClosed(t *testing.T) {
+	root := tempRoot(t)
+	dir := filepath.Join(root, "shared")
+	mkdir(t, dir, 0o775)
+	before, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+	_, err = security.CheckPath(security.PathRequest{Path: dir, Kind: security.KindDir})
+	requireInsecureDisposition(t, err)
+	// The unsafe mode is reported, never repaired (umask may have stripped
+	// bits at creation; the guard must leave whatever it found untouched).
+	if after, statErr := os.Stat(dir); statErr != nil || after.Mode() != before.Mode() {
+		t.Fatalf("the guard repaired the mode: before %o after %o err %v", before.Mode(), after.Mode(), statErr)
+	}
+}
+
+func TestMatrixHomeUnsafeModeFailsClosed(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "home")
+	mkdir(t, home, 0o755)
+	_, err := security.CheckHome(security.HomeRequest{Path: home})
+	requireInsecureDisposition(t, err)
+	if fi, err := os.Stat(home); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("the guard repaired the home mode: %v", err)
+	}
+}

@@ -8,6 +8,7 @@ package process_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
@@ -425,4 +426,95 @@ func TestSupervisorNoGoroutineLeaks(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("goroutine leak: baseline=%d now=%d", baseline, runtime.NumGoroutine())
+}
+
+// ---------------------------------------------------------------------------
+// Release fault matrix rows (Task 21): the two-phase controlled-stop
+// escalation and the orphan-not-reaped fact (design 13.3). The matrix rows
+// process_stop_escalation / process_stop_orphan drive the same facts through
+// the harness; these pin them at the Supervisor seam.
+// ---------------------------------------------------------------------------
+
+func signalsMatch(got, want []process.Signal) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestSupervisorStopEscalatesAndReaps: a group that ignores Interrupt and
+// Terminate escalates to ForceKill; once it exits the stop reaps the exit
+// fact (the controlled-stop protocol never hangs and never skips a stage).
+func TestSupervisorStopEscalatesAndReaps(t *testing.T) {
+	fake, supervisor := process.NewFakeSupervisor()
+	h, events, err := supervisor.Start(context.Background(), process.ProcessSpec{Executable: "/fixture/worker"})
+	requireNoError(t, err)
+	policy := process.StopPolicy{Grace: 200 * time.Millisecond, TerminateWait: 200 * time.Millisecond, ForceKillWait: 400 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() {
+		_, err := process.Stop(context.Background(), supervisor, h, policy)
+		done <- err
+	}()
+	want := []process.Signal{process.Interrupt, process.Terminate, process.ForceKill}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if signalsMatch(fake.Signals(h), want) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !signalsMatch(fake.Signals(h), want) {
+		t.Fatalf("stop escalation = %v, want %v", fake.Signals(h), want)
+	}
+	fake.ExitGroup(h, 137)
+	select {
+	case err := <-done:
+		requireNoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop hung after the escalation")
+	}
+	exit, err := supervisor.Wait(context.Background(), h)
+	requireNoError(t, err)
+	if exit.Code != 137 {
+		t.Fatalf("reaped exit = %+v, want code 137", exit)
+	}
+	drain(t, events)
+}
+
+// TestSupervisorStopOrphanNotReaped: a group that never exits returns
+// ErrNotReaped after the full escalation — the orphan fact the caller must
+// inspect by exact PID/start-token identity (design 13.2: PID alone is
+// never trusted).
+func TestSupervisorStopOrphanNotReaped(t *testing.T) {
+	fake, supervisor := process.NewFakeSupervisor()
+	h, events, err := supervisor.Start(context.Background(), process.ProcessSpec{Executable: "/fixture/worker"})
+	requireNoError(t, err)
+	policy := process.StopPolicy{Grace: 50 * time.Millisecond, TerminateWait: 50 * time.Millisecond, ForceKillWait: 50 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() {
+		_, err := process.Stop(context.Background(), supervisor, h, policy)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, process.ErrNotReaped) {
+			t.Fatalf("stop = %v, want ErrNotReaped for a group that never exits", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop hung on a never-exiting group")
+	}
+	if !signalsMatch(fake.Signals(h), []process.Signal{process.Interrupt, process.Terminate, process.ForceKill}) {
+		t.Fatalf("orphan stop signals = %v, want the full escalation", fake.Signals(h))
+	}
+	// Reap the orphan so the supervisor drains cleanly.
+	fake.ExitGroup(h, 137)
+	if _, err := supervisor.Wait(context.Background(), h); err != nil {
+		t.Fatalf("reap orphan: %v", err)
+	}
+	drain(t, events)
 }

@@ -382,3 +382,57 @@ func runCorpusCase(t *testing.T, revision string, tc corpusCase) string {
 	}
 	return out.String()
 }
+
+// ---------------------------------------------------------------------------
+// Release fault matrix rows (Task 21, ledger obligation (c)): the redaction
+// fail-closed and short-body deferred minors. These mirror the matrix rows
+// redaction_fail_closed / redaction_short_body at the unit level.
+// ---------------------------------------------------------------------------
+
+// TestMatrixRedactionFailClosedUnparseableRule: a rule that cannot compile
+// poisons the Redactor; every later call fails closed with
+// SENSITIVE_DATA_REDACTION_FAILED and no output is emitted under an
+// incomplete policy (PRD 脱敏 6).
+func TestMatrixRedactionFailClosedUnparseableRule(t *testing.T) {
+	r := security.NewRedactor(security.Registry{Revision: "matrix-1", Rules: []security.Rule{
+		{ID: "unparseable", Category: "secret", Pattern: `(`},
+	}})
+	frame, err := r.WriteFrame([]byte("token=sk-abc123456\n"))
+	requireFaultCode(t, err, model.CodeSensitiveDataRedactionFailed)
+	if frame.Text != "" {
+		t.Fatalf("a poisoned redactor emitted output %q", frame.Text)
+	}
+	if _, err := r.Flush(); err == nil {
+		t.Fatal("Flush after the poison succeeded")
+	}
+	pol, _ := model.Policy(model.CodeSensitiveDataRedactionFailed)
+	if pol.Category != model.CatSafetyStop || !pol.CloseDispatch {
+		t.Fatalf("policy(%s) = %+v, want SAFETY_STOP with dispatch closed", model.CodeSensitiveDataRedactionFailed, pol)
+	}
+}
+
+// TestMatrixRedactionShortBodyFlushesFullyRedacted: a short body (the whole
+// stream within the withholding window) with a trailing secret emits the
+// placeholder and never the raw value — the withheld tail flushes fully
+// redacted (the short-body deferred minor).
+func TestMatrixRedactionShortBodyFlushesFullyRedacted(t *testing.T) {
+	r := security.NewRedactor(testRegistry("sk-[A-Za-z0-9]+"))
+	first, err := r.WriteFrame([]byte("credential=sk-abc123456789\n"))
+	requireNoError(t, err)
+	flush, err := r.Flush()
+	requireNoError(t, err)
+	out := first.Text + flush.Text
+	if strings.Contains(out, "sk-abc123456789") {
+		t.Fatalf("short body leaked the raw secret: %q", out)
+	}
+	if !strings.Contains(out, "[REDACTED]") {
+		t.Fatalf("short body produced no placeholder: %q", out)
+	}
+	// The stream ends redacted and the redactor is reusable for a new
+	// stream (no poison from the flush).
+	second := security.NewRedactor(testRegistry("sk-[A-Za-z0-9]+"))
+	out2 := redactAll(t, second, []byte("plain text\n"))
+	if strings.Contains(out2, "[REDACTED]") {
+		t.Fatalf("a clean stream was over-redacted: %q", out2)
+	}
+}

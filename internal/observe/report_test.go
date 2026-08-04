@@ -372,3 +372,39 @@ func TestEventExportIsStable(t *testing.T) {
 		t.Fatalf("event export is not stable:\n%q\n---\nwant\n%q", combined, want)
 	}
 }
+
+// TestReportSurfacesUnsettledRepairRow (Task 21 ledger obligation (b)): a
+// PurposeRepair resolution Session/Process the Apply request path allocated
+// but never settled (the phantom-row class) must surface in the report's
+// Remaining Risks instead of silently vanishing — the Final Report never
+// hides an open row, and the workflow's PASSED result is not contradicted.
+func TestReportSurfacesUnsettledRepairRow(t *testing.T) {
+	in := reportInputFixture()
+	in.State.Sessions = append(in.State.Sessions, model.Session{
+		ID: "rs-1", Purpose: model.PurposeRepair, Status: model.SessionStarting, Provider: "fake",
+	})
+	in.State.Processes = append(in.State.Processes, model.ProcessRecord{
+		ID: "rp-1", Session: "rs-1", Purpose: model.PurposeRepair,
+		Status: model.ProcessStatusRunning, StartedAt: reportNow,
+	})
+	r, err := GenerateReport(in)
+	if err != nil {
+		t.Fatalf("generate report: %v", err)
+	}
+	if r.Result != "PASSED" {
+		t.Fatalf("result = %s, want PASSED", r.Result)
+	}
+	foundProcess := false
+	foundSession := false
+	for _, risk := range r.Risks {
+		if strings.Contains(risk, "rp-1") && strings.Contains(risk, "RUNNING") {
+			foundProcess = true
+		}
+		if strings.Contains(risk, "rs-1") && strings.Contains(risk, "STARTING") {
+			foundSession = true
+		}
+	}
+	if !foundProcess || !foundSession {
+		t.Fatalf("the unsettled repair rows are missing from Risks: %+v", r.Risks)
+	}
+}

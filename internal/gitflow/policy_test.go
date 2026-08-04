@@ -325,3 +325,29 @@ func TestVerifyCommitSigningMismatchSignedPolicy(t *testing.T) {
 		t.Fatalf("unsigned-vs-signed code = %s, want COMMIT_POLICY_MISMATCH", code)
 	}
 }
+
+// TestMatrixPreflightFailuresCarryReleaseDisposition (Task 21): the Git
+// identity/signing/policy preflight failures the matrix rows
+// (git_identity_not_configured, git_signing_preflight_failed,
+// git_verify_policy_mismatch) assert carry the compiled release disposition:
+// USER_ACTION_REQUIRED with the Dispatch Gate closed, never charging a Retry.
+func TestMatrixPreflightFailuresCarryReleaseDisposition(t *testing.T) {
+	for _, code := range []model.Code{
+		model.CodeGitIdentityNotConfigured,
+		model.CodeGitSigningPreflightFailed,
+		model.CodeCommitPolicyMismatch,
+		model.CodeCommitPolicyDrift,
+		model.CodeCommitDuringPolicyDriftWindow,
+	} {
+		pol, ok := model.Policy(code)
+		if !ok {
+			t.Fatalf("no compiled policy for %s", code)
+		}
+		if pol.Retry.ChargesBudget {
+			t.Fatalf("policy(%s) charges a retry: %+v", code, pol)
+		}
+		if !pol.CloseDispatch {
+			t.Fatalf("policy(%s) keeps dispatch open: %+v", code, pol)
+		}
+	}
+}

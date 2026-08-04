@@ -1,0 +1,346 @@
+# Release Fault Matrix (Task 21): every PRD fault scenario has a
+# deterministic setup, an injected point, an expected Fault/disposition, a
+# retry charge, a dispatch behavior, persistent evidence, and a recovery
+# result. Each row is executable test data: the harness
+# TestReleaseFaultMatrix (tests/integration/fault_matrix_test.go) runs one
+# registered injector per row and FAILS when a row is unhandled (never a
+# silent skip) or when the observed facts disagree with this table.
+#
+# Field contract (each row carries exactly these keys):
+#   id                   stable row identity (asserted in failure text).
+#   setup                named deterministic fixture ("v1_database",
+#                        "registered_project", "artifact_store",
+#                        "fake_supervisor", "provider_*", "clean_repo",
+#                        "running_merge", "apply_attempt",
+#                        "completed_workflow", "temp_home", "redactor").
+#   inject               named fault injection point (must map to a
+#                        registered harness injector; an unregistered
+#                        point FAILS the harness listing the row id).
+#   expected_code        the stable model Code of the produced Fault, a
+#                        recovery Disposition outcome, or "" when the
+#                        scenario settles without a Fault.
+#   expected_disposition one Fault Category (INVALID_INPUT,
+#                        RETRYABLE_ATTEMPT_FAILURE, USER_ACTION_REQUIRED,
+#                        SAFETY_STOP, INVARIANT_FAILURE), a recovery
+#                        Disposition (already_completed, safe_to_retry,
+#                        blocked_drift, fatal_invariant), or a documented
+#                        synthetic outcome (escalated, orphan_not_reaped,
+#                        phantom_surfaced).
+#   retry_charge         whether the failure charges the Node Retry Budget.
+#   dispatch             open (dispatch stays open), closed (dispatch gate
+#                        closed), or closed_until_reconciled (closed until
+#                        the Recovery sweep settles the ledger).
+#   evidence             the externally observable facts that must persist
+#                        after the restart, named per row.
+- id: migration_crash_before_backup_manifest
+  setup: v1_database
+  inject: migration_crash_before_manifest
+  expected_code: DATABASE_MIGRATION_INCOMPLETE
+  expected_disposition: INVARIANT_FAILURE
+  retry_charge: false
+  dispatch: closed
+  evidence: [backup_preserved, db_untouched]
+- id: migration_crash_after_backup_manifest
+  setup: v1_database
+  inject: migration_crash_after_manifest
+  expected_code: ""
+  expected_disposition: safe_to_retry
+  retry_charge: false
+  dispatch: open
+  evidence: [chain_applied, backup_reused]
+- id: migration_checksum_mutated
+  setup: v1_database
+  inject: migration_checksum_mutated
+  expected_code: MIGRATION_CHECKSUM_MISMATCH
+  expected_disposition: INVARIANT_FAILURE
+  retry_charge: false
+  dispatch: closed
+  evidence: [db_untouched, no_migration]
+- id: migration_schema_too_new
+  setup: v1_database
+  inject: migration_schema_too_new
+  expected_code: DATABASE_SCHEMA_TOO_NEW
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [readonly_fails_closed]
+- id: migration_path_missing
+  setup: v1_database
+  inject: migration_path_missing
+  expected_code: DATABASE_MIGRATION_PATH_MISSING
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [db_preserved]
+- id: migration_version_guard_mismatch
+  setup: v1_database
+  inject: migration_guard_mismatch
+  expected_code: DATABASE_MIGRATION_INCOMPLETE
+  expected_disposition: INVARIANT_FAILURE
+  retry_charge: false
+  dispatch: closed
+  evidence: [db_untouched]
+- id: store_sqlite_busy
+  setup: registered_project
+  inject: store_sqlite_busy
+  expected_code: DATABASE_MIGRATION_FAILED
+  expected_disposition: INVARIANT_FAILURE
+  retry_charge: false
+  dispatch: closed
+  evidence: [contention_fault, no_partial_commit]
+- id: store_stale_version
+  setup: registered_project
+  inject: store_stale_version
+  expected_code: INVALID_INPUT
+  expected_disposition: INVALID_INPUT
+  retry_charge: false
+  dispatch: open
+  evidence: [cas_rejected, no_mutation]
+- id: store_constraint_fails_atomically
+  setup: registered_project
+  inject: store_constraint_atomic
+  expected_code: STATE_INVARIANT_VIOLATION
+  expected_disposition: INVARIANT_FAILURE
+  retry_charge: false
+  dispatch: closed
+  evidence: [no_partial_commit, aggregate_unchanged]
+- id: store_db_failure_default_classification
+  setup: registered_project
+  inject: store_db_failure
+  expected_code: STATE_INVARIANT_VIOLATION
+  expected_disposition: INVARIANT_FAILURE
+  retry_charge: false
+  dispatch: closed
+  evidence: [no_partial_commit, aggregate_unchanged]
+- id: artifact_write_crash_before_rename
+  setup: artifact_store
+  inject: artifact_crash_before_rename
+  expected_code: ""
+  expected_disposition: safe_to_retry
+  retry_charge: false
+  dispatch: open
+  evidence: [target_installed, verified_readback, temp_ignored]
+- id: artifact_target_contended
+  setup: artifact_store
+  inject: artifact_target_contended
+  expected_code: INVALID_INPUT
+  expected_disposition: INVALID_INPUT
+  retry_charge: false
+  dispatch: open
+  evidence: [existing_file_untouched]
+- id: artifact_schema_unsupported
+  setup: artifact_store
+  inject: artifact_schema_unsupported
+  expected_code: ARTIFACT_SCHEMA_UNSUPPORTED
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [nothing_written]
+- id: artifact_old_revision_readable
+  setup: artifact_store
+  inject: artifact_old_revision
+  expected_code: ""
+  expected_disposition: already_completed
+  retry_charge: false
+  dispatch: open
+  evidence: [byte_identical, mode_0600]
+- id: artifact_content_mutated
+  setup: artifact_store
+  inject: artifact_content_mutated
+  expected_code: INSECURE_CFLOW_HOME_PERMISSIONS
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [read_fails_closed]
+- id: process_stop_escalation
+  setup: fake_supervisor
+  inject: process_stop_escalation
+  expected_code: ""
+  expected_disposition: escalated
+  retry_charge: false
+  dispatch: closed
+  evidence: [signals_escalated, reaped]
+- id: process_stop_orphan
+  setup: fake_supervisor
+  inject: process_stop_orphan
+  expected_code: ""
+  expected_disposition: orphan_not_reaped
+  retry_charge: false
+  dispatch: closed
+  evidence: [identity_not_reaped, stops_escalate]
+- id: provider_protocol_violation
+  setup: provider_codex
+  inject: provider_protocol_violation
+  expected_code: PROVIDER_PROTOCOL_VIOLATION
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [no_raw_frame_persisted, session_untrusted]
+- id: provider_session_id_missing
+  setup: provider_claude
+  inject: provider_session_id_missing
+  expected_code: PROVIDER_SESSION_ID_MISSING
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [no_event_persisted, offending_frame_carried]
+- id: provider_protocol_unsupported
+  setup: provider_claude
+  inject: provider_protocol_unsupported
+  expected_code: PROVIDER_PROTOCOL_UNSUPPORTED
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [no_process_started]
+- id: provider_binding_drift
+  setup: provider_codex
+  inject: provider_binding_drift
+  expected_code: PROVIDER_PROTOCOL_BINDING_CHANGED
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [no_process_started, drift_pinned]
+- id: git_identity_not_configured
+  setup: clean_repo
+  inject: git_identity_missing
+  expected_code: GIT_IDENTITY_NOT_CONFIGURED
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [nothing_mutated]
+- id: git_verify_policy_mismatch
+  setup: committed_repo
+  inject: git_verify_policy_mismatch
+  expected_code: COMMIT_POLICY_MISMATCH
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [commit_refused]
+- id: git_signing_preflight_failed
+  setup: clean_repo
+  inject: git_signing_preflight_failed
+  expected_code: GIT_SIGNING_PREFLIGHT_FAILED
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [nothing_mutated]
+- id: effect_merge_after_external_before_result
+  setup: running_merge
+  inject: recovery_merge_completed
+  expected_code: ""
+  expected_disposition: already_completed
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [merge_commit_and_intent, merge_not_repeated]
+- id: effect_merge_absent
+  setup: running_merge
+  inject: recovery_merge_absent
+  expected_code: ""
+  expected_disposition: safe_to_retry
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [intent_pending, premerge_head_matches]
+- id: effect_merge_foreign
+  setup: running_merge
+  inject: recovery_merge_foreign
+  expected_code: ""
+  expected_disposition: blocked_drift
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [foreign_merge_evidence]
+- id: effect_audit_ref_moved
+  setup: running_merge
+  inject: recovery_audit_ref_moved
+  expected_code: ""
+  expected_disposition: blocked_drift
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [ref_moved_evidence]
+- id: effect_artifact_orphan
+  setup: artifact_store
+  inject: recovery_artifact_orphan
+  expected_code: ""
+  expected_disposition: blocked_drift
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [orphan_directory]
+- id: effect_apply_staging_recoverable
+  setup: apply_attempt
+  inject: recovery_apply_staging
+  expected_code: ""
+  expected_disposition: safe_to_retry
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [attempt_ledger]
+- id: effect_process_stop_recoverable
+  setup: running_merge
+  inject: recovery_process_stop
+  expected_code: ""
+  expected_disposition: safe_to_retry
+  retry_charge: false
+  dispatch: closed_until_reconciled
+  evidence: [process_row_persists, dispatch_never_reopens]
+- id: quarantine_audit_ref_missing
+  setup: running_merge
+  inject: recovery_quarantine_missing
+  expected_code: DIRTY_WORKTREE_DRIFTED
+  expected_disposition: USER_ACTION_REQUIRED
+  retry_charge: false
+  dispatch: closed
+  evidence: [quarantine_evidence_preserved]
+- id: report_export_interrupted
+  setup: completed_workflow
+  inject: report_export_interrupted
+  expected_code: ""
+  expected_disposition: already_completed
+  retry_charge: false
+  dispatch: open
+  evidence: [report_generates, events_rebuildable, no_mutation]
+- id: apply_resolution_phantom_row
+  setup: completed_workflow
+  inject: apply_phantom_row
+  expected_code: ""
+  expected_disposition: phantom_surfaced
+  retry_charge: false
+  dispatch: open
+  evidence: [repair_row_persists, report_risk_mentions_repair]
+- id: path_symlink_escape
+  setup: temp_home
+  inject: path_symlink_escape
+  expected_code: INSECURE_CFLOW_HOME_PERMISSIONS
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [mode_never_repaired]
+- id: path_group_writable
+  setup: temp_home
+  inject: path_group_writable
+  expected_code: INSECURE_CFLOW_HOME_PERMISSIONS
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [mode_never_repaired]
+- id: path_home_unsafe_mode
+  setup: temp_home
+  inject: path_home_unsafe_mode
+  expected_code: INSECURE_CFLOW_HOME_PERMISSIONS
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [mode_never_repaired]
+- id: redaction_fail_closed
+  setup: redactor
+  inject: redaction_fail_closed
+  expected_code: SENSITIVE_DATA_REDACTION_FAILED
+  expected_disposition: SAFETY_STOP
+  retry_charge: false
+  dispatch: closed
+  evidence: [nothing_persisted, poisoned_after_failure]
+- id: redaction_short_body
+  setup: redactor
+  inject: redaction_short_body
+  expected_code: ""
+  expected_disposition: already_completed
+  retry_charge: false
+  dispatch: open
+  evidence: [placeholder_emitted, raw_absent]
