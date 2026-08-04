@@ -157,6 +157,80 @@ func TestDogfoodPreflight(t *testing.T) {
 	}
 }
 
+// TestDogfoodCandidateMatchesReleaseBuild proves the dogfood candidate is
+// built with the exact release metadata linker flags the release pipeline
+// stamps (scripts/check-cross-build.sh, scripts/gate3.sh): two identical-
+// ldflags builds are byte-identical, so the immutable dogfood candidate
+// SHA-256 equals the release candidate's for the same source and toolchain
+// (the Gate 3 validation rejects a different binary with
+// EVIDENCE_SUBJECT_CHANGED), and the built candidate's version output
+// carries the pinned source Commit and registry hashes — the assertion the
+// real dogfood run relies on in a git worktree, where the Go toolchain
+// stamps no VCS metadata.
+func TestDogfoodCandidateMatchesReleaseBuild(t *testing.T) {
+	repo := dogfoodRepoRoot(t)
+	ldflags := dogfoodReleaseLDFlags(t, repo)
+	binA := dogfoodBuildWithFlags(t, repo, t.TempDir(), ldflags)
+	binB := dogfoodBuildWithFlags(t, repo, t.TempDir(), ldflags)
+	sumA, sumB := sha256.Sum256(readBinary(t, binA)), sha256.Sum256(readBinary(t, binB))
+	if hex.EncodeToString(sumA[:]) != hex.EncodeToString(sumB[:]) {
+		t.Fatalf("identical release ldflags produced different candidate hashes %x vs %x", sumA, sumB)
+	}
+	ver, err := exec.Command(binA, "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("candidate version: %v", err)
+	}
+	sourceCommit := strings.TrimSpace(git(repo, "rev-parse", "HEAD"))
+	for _, want := range []string{
+		sourceCommit,
+		"migration=" + metadataValue(t, repo, "migration"),
+		"artifact=" + metadataValue(t, repo, "artifact"),
+		"provider=" + metadataValue(t, repo, "provider"),
+		"prompt=" + metadataValue(t, repo, "prompt"),
+	} {
+		if !strings.Contains(string(ver), want) {
+			t.Fatalf("candidate version output misses %q:\n%s", want, ver)
+		}
+	}
+}
+
+// readBinary reads one built candidate binary.
+func readBinary(t *testing.T, path string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read candidate: %v", err)
+	}
+	return body
+}
+
+// metadataValue returns one release-metadata value (migration, artifact,
+// provider, prompt, schema_version), resolved from the repository root.
+func metadataValue(t *testing.T, repo, key string) string {
+	t.Helper()
+	return releaseMetadataValues(t, repo)[key]
+}
+
+// releaseMetadataValues runs scripts/release-metadata from the repository
+// root (the same source the release pipeline uses) and returns its
+// key=value map.
+func releaseMetadataValues(t *testing.T, repo string) map[string]string {
+	t.Helper()
+	values := map[string]string{}
+	cmd := exec.Command("go", "run", "./scripts/release-metadata")
+	cmd.Dir = repo
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("release metadata: %v\n%s", err, out)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if key, val, ok := strings.Cut(line, "="); ok {
+			values[key] = val
+		}
+	}
+	return values
+}
+
 // ---------------------------------------------------------------------------
 // the opt-in real self-Dogfood (brief Step 4; approval-gated)
 // ---------------------------------------------------------------------------
@@ -185,12 +259,55 @@ func dogfoodRequireClean(t *testing.T, repo string) {
 	}
 }
 
+// dogfoodReleaseLDFlags derives the release metadata linker flags exactly as
+// the release pipeline stamps them (scripts/check-cross-build.sh and
+// scripts/gate3.sh): the version, the source Commit, the dirty flag, the
+// applied schema version, and the migration/Artifact/Provider/prompt
+// registry hashes from scripts/release-metadata. The dogfood candidate is
+// built with these identical flags so its immutable SHA-256 equals the
+// release candidate's for the same source and toolchain — otherwise the
+// Gate 3 validation would reject the dogfood evidence with
+// EVIDENCE_SUBJECT_CHANGED (a different binary hash), and in a git worktree
+// (where the Go toolchain stamps no VCS metadata) the version output would
+// report an unset source Commit.
+func dogfoodReleaseLDFlags(t *testing.T, repo string) string {
+	t.Helper()
+	values := releaseMetadataValues(t, repo)
+	version := os.Getenv("CFLOW_RELEASE_VERSION")
+	if version == "" {
+		version = "0.1.0-demo3"
+	}
+	dirty := 0
+	if out := strings.TrimSpace(git(repo, "status", "--porcelain")); out != "" {
+		dirty = 1
+	}
+	sourceCommit := strings.TrimSpace(git(repo, "rev-parse", "HEAD"))
+	return fmt.Sprintf("-X cflow.local/cflow/internal/observe.Version=%s"+
+		" -X cflow.local/cflow/internal/observe.SourceCommit=%s"+
+		" -X cflow.local/cflow/internal/observe.sourceDirty=%d"+
+		" -X cflow.local/cflow/internal/observe.schemaVersion=%s"+
+		" -X cflow.local/cflow/internal/observe.MigrationHash=%s"+
+		" -X cflow.local/cflow/internal/observe.ArtifactHash=%s"+
+		" -X cflow.local/cflow/internal/observe.ProviderHash=%s"+
+		" -X cflow.local/cflow/internal/observe.PromptHash=%s",
+		version, sourceCommit, dirty, values["schema_version"], values["migration"],
+		values["artifact"], values["provider"], values["prompt"])
+}
+
 // dogfoodBuildCandidate builds the candidate binary from the current source
-// (CGO disabled, trimmed) into a directory outside the repository.
+// (CGO disabled, trimmed) with the release metadata linker flags, into a
+// directory outside the repository.
 func dogfoodBuildCandidate(t *testing.T, repo, dir string) string {
 	t.Helper()
+	return dogfoodBuildWithFlags(t, repo, dir, dogfoodReleaseLDFlags(t, repo))
+}
+
+// dogfoodBuildWithFlags builds the candidate binary with the given linker
+// flags into a directory outside the repository.
+func dogfoodBuildWithFlags(t *testing.T, repo, dir, ldflags string) string {
+	t.Helper()
 	bin := filepath.Join(dir, "cflow")
-	cmd := exec.Command("go", "build", "-trimpath", "-o", bin, "./cmd/cflow")
+	cmd := exec.Command("go", "build", "-trimpath", "-ldflags", ldflags, "-o", bin, "./cmd/cflow")
 	cmd.Dir = repo
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
