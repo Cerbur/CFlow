@@ -66,23 +66,41 @@ func dispositionDispatch(code string) (string, string) {
 	return string(pol.Category), d
 }
 
+// retryChargeOf derives the observed retry charge from the compiled
+// fault-policy table (design 8.2), so the probe measures production policy
+// truth for retry charge exactly as it does for disposition and dispatch.
+// A Code with no compiled policy (the recovery-disposition and no-fault
+// rows) never charges a Retry. A policy regression that starts charging
+// the Retry Budget on any matrix Code flips the derived value and fails
+// assertRow against the table.
+func retryChargeOf(code string) bool {
+	if code == "" {
+		return false
+	}
+	pol, ok := model.Policy(model.Code(code))
+	if !ok {
+		return false
+	}
+	return pol.Retry.ChargesBudget
+}
+
 // faultRow builds the observed facts of a fault-producing injector.
 func faultRow(err error, evidence ...string) rowResult {
 	code := faultCodeOf(err)
 	d, dispatch := dispositionDispatch(code)
-	return rowResult{Code: code, Disposition: d, RetryCharge: false, Dispatch: dispatch, Evidence: evidenceOf(evidence...)}
+	return rowResult{Code: code, Disposition: d, RetryCharge: retryChargeOf(code), Dispatch: dispatch, Evidence: evidenceOf(evidence...)}
 }
 
 // noFaultRow builds the observed facts of a cleanly-settling injector.
 func noFaultRow(disposition string, evidence ...string) rowResult {
-	return rowResult{Code: "", Disposition: disposition, RetryCharge: false, Dispatch: "open", Evidence: evidenceOf(evidence...)}
+	return rowResult{Code: "", Disposition: disposition, RetryCharge: retryChargeOf(""), Dispatch: "open", Evidence: evidenceOf(evidence...)}
 }
 
 // recoveryRow builds the observed facts of a recovery-disposition probe: an
 // unfinished Effect Intent in the ledger keeps dispatch closed until the
 // Application settles it (design 17.2).
 func recoveryRow(disposition string, evidence ...string) rowResult {
-	return rowResult{Code: "", Disposition: disposition, RetryCharge: false, Dispatch: "closed_until_reconciled", Evidence: evidenceOf(evidence...)}
+	return rowResult{Code: "", Disposition: disposition, RetryCharge: retryChargeOf(""), Dispatch: "closed_until_reconciled", Evidence: evidenceOf(evidence...)}
 }
 
 // canonTemp resolves an owner-only canonical temp root (t.TempDir() is
@@ -337,8 +355,9 @@ func injectMigrationCrashBeforeManifest(t *testing.T, _ matrixRow) rowResult {
 	if rawUserVersion(t, path) == 1 {
 		ev["db_untouched"] = true
 	}
-	d, dispatch := dispositionDispatch(faultCodeOf(err))
-	return rowResult{Code: faultCodeOf(err), Disposition: d, RetryCharge: false, Dispatch: dispatch, Evidence: ev}
+	code := faultCodeOf(err)
+	d, dispatch := dispositionDispatch(code)
+	return rowResult{Code: code, Disposition: d, RetryCharge: retryChargeOf(code), Dispatch: dispatch, Evidence: ev}
 }
 
 func injectMigrationCrashAfterManifest(t *testing.T, _ matrixRow) rowResult {
@@ -889,7 +908,7 @@ func injectProcessStopEscalation(t *testing.T, _ matrixRow) rowResult {
 	drainFakeEvents(t, events)
 	// The controlled stop closes dispatch: no new allocation crosses the
 	// committed stop boundary.
-	return rowResult{Code: "", Disposition: "escalated", RetryCharge: false, Dispatch: "closed", Evidence: evidenceOf("signals_escalated", "reaped")}
+	return rowResult{Code: "", Disposition: "escalated", RetryCharge: retryChargeOf(""), Dispatch: "closed", Evidence: evidenceOf("signals_escalated", "reaped")}
 }
 
 func injectProcessStopOrphan(t *testing.T, _ matrixRow) rowResult {
@@ -919,7 +938,7 @@ func injectProcessStopOrphan(t *testing.T, _ matrixRow) rowResult {
 	fake.ExitGroup(h, 137)
 	sup.Wait(context.Background(), h)
 	drainFakeEvents(t, events)
-	return rowResult{Code: "", Disposition: "orphan_not_reaped", RetryCharge: false, Dispatch: "closed", Evidence: ev}
+	return rowResult{Code: "", Disposition: "orphan_not_reaped", RetryCharge: retryChargeOf(""), Dispatch: "closed", Evidence: ev}
 }
 
 func signalsEqual(a, b []process.Signal) bool {

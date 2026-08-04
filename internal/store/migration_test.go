@@ -760,6 +760,9 @@ func assertDisposition(t *testing.T, code model.Code, category model.FaultCatego
 	if pol.Category != category || pol.CloseDispatch != closeDispatch {
 		t.Fatalf("policy(%s) = %+v, want category %s closeDispatch %v", code, pol, category, closeDispatch)
 	}
+	if pol.Retry.ChargesBudget {
+		t.Fatalf("policy(%s) charges a retry budget: %+v", code, pol)
+	}
 }
 
 func TestSQLiteBusyClassifiedAsDatabaseMigrationFailed(t *testing.T) {

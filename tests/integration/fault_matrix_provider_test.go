@@ -215,7 +215,7 @@ func injectProviderProtocolViolation(t *testing.T, _ matrixRow) rowResult {
 			ev["session_untrusted"] = true
 		}
 		d, dispatch := dispositionDispatch(code)
-		return rowResult{Code: code, Disposition: d, RetryCharge: false, Dispatch: dispatch, Evidence: ev}
+		return rowResult{Code: code, Disposition: d, RetryCharge: retryChargeOf(code), Dispatch: dispatch, Evidence: ev}
 	case <-time.After(30 * time.Second):
 		t.Fatal("runtime Start hung on the protocol violation")
 		return rowResult{}
@@ -251,7 +251,7 @@ func injectProviderSessionIDMissing(t *testing.T, _ matrixRow) rowResult {
 	}
 	code := string(pe.Code)
 	d, dispatch := dispositionDispatch(code)
-	return rowResult{Code: code, Disposition: d, RetryCharge: false, Dispatch: dispatch, Evidence: ev}
+	return rowResult{Code: code, Disposition: d, RetryCharge: retryChargeOf(code), Dispatch: dispatch, Evidence: ev}
 }
 
 func injectProviderProtocolUnsupported(t *testing.T, _ matrixRow) rowResult {
@@ -781,7 +781,7 @@ func injectRecoveryQuarantineMissing(t *testing.T, _ matrixRow) rowResult {
 		}
 	}
 	d, dispatch := dispositionDispatch(code)
-	return rowResult{Code: code, Disposition: d, RetryCharge: false, Dispatch: dispatch, Evidence: ev}
+	return rowResult{Code: code, Disposition: d, RetryCharge: retryChargeOf(code), Dispatch: dispatch, Evidence: ev}
 }
 
 func hasDisposition(out recovery.ReconciliationOutcome, kind string, want recovery.Disposition) bool {
@@ -917,7 +917,7 @@ func injectApplyPhantomRow(t *testing.T, _ matrixRow) rowResult {
 	if r.Result != "PASSED" {
 		t.Fatalf("result = %s, want PASSED with the phantom row surfaced", r.Result)
 	}
-	return rowResult{Code: "", Disposition: "phantom_surfaced", RetryCharge: false, Dispatch: "open", Evidence: ev}
+	return rowResult{Code: "", Disposition: "phantom_surfaced", RetryCharge: retryChargeOf(""), Dispatch: "open", Evidence: ev}
 }
 
 // ---------------------------------------------------------------------------

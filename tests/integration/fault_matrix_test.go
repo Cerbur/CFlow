@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"cflow.local/cflow/internal/model"
 	yaml "go.yaml.in/yaml/v3"
 )
 
@@ -127,6 +128,38 @@ func TestReleaseFaultMatrix(t *testing.T) {
 			got := faultInjectors[row.Inject](t, row)
 			assertRow(t, row, got)
 		})
+	}
+}
+
+// TestMatrixRetryChargeDerivesFromPolicy asserts every matrix row that names
+// a Fault Code declares a retry_charge equal to the compiled fault-policy
+// table's charge (design 8.2). The rowResult constructors derive the
+// observed RetryCharge from model.Policy — the matrix measures production
+// policy truth — so a policy regression that starts charging the Retry
+// Budget on any matrix Code flips the derived value and fails both this
+// integrity check and the row's assertRow comparison.
+func TestMatrixRetryChargeDerivesFromPolicy(t *testing.T) {
+	// The derivation is live, not hardcoded: a retryable Code charges, a
+	// no-Code row never does.
+	if !retryChargeOf(string(model.CodeAgentProcessCrashed)) {
+		t.Fatalf("retryChargeOf(AGENT_PROCESS_CRASHED) = false, want true (the derivation is not live)")
+	}
+	if retryChargeOf("") {
+		t.Fatalf("retryChargeOf(\"\") = true, want false")
+	}
+	rows := loadMatrix(t)
+	for _, row := range rows {
+		if row.ExpectedCode == "" {
+			continue
+		}
+		pol, ok := model.Policy(model.Code(row.ExpectedCode))
+		if !ok {
+			t.Fatalf("row %s names an unknown code %q", row.ID, row.ExpectedCode)
+		}
+		if pol.Retry.ChargesBudget != row.RetryCharge {
+			t.Fatalf("row %s retry_charge = %v but the compiled policy for %s charges %v",
+				row.ID, row.RetryCharge, row.ExpectedCode, pol.Retry.ChargesBudget)
+		}
 	}
 }
 
