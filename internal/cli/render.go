@@ -297,6 +297,23 @@ func renderOutcome(w io.Writer, cmd app.Command, out app.Outcome, reg security.R
 				it.Index, it.Kind, r.text(it.CanonicalPath), r.orDash(it.Branch), r.orDash(it.ExpectedHead))
 		}
 		fmt.Fprintf(w, "manifest: %s\n", c.Manifest)
+	case app.ExecuteCleanupCommand:
+		if out.Cleanup == nil {
+			fmt.Fprintln(w, "no cleanup attempt")
+			return
+		}
+		c := out.Cleanup
+		fmt.Fprintf(w, "cleanup %s: %s\n", c.ID, c.Status)
+		for _, it := range c.Items {
+			line := fmt.Sprintf("  [%d] %s %s -> %s", it.Index, it.Kind, r.text(it.CanonicalPath), it.Status)
+			if it.Status == model.CleanupItemFailed {
+				line += " failure=" + string(it.FailureCode)
+			}
+			fmt.Fprintln(w, line)
+		}
+		if c.Status == model.CleanupStatusBlocked {
+			fmt.Fprintf(w, "cleanup blocked with partial results; every unremoved item stays preserved. run `cleanup --execute %s` to reconcile and continue the remaining items\n", c.ID)
+		}
 	case app.CreateWorkflowCommand:
 		fmt.Fprintf(w, "workflow %s created\n", out.Workflow)
 		fmt.Fprintf(w, "  stage: %s\n", out.Stage)

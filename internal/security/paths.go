@@ -63,6 +63,17 @@ type PathRequest struct {
 	Kind Kind
 }
 
+// CleanupScratchRequest names an exact scratch deletion target for the
+// safe-cleanup guard (design 17.4): the exact canonical path, the
+// canonical CFLOW_HOME root, and the user's canonical Workspace root.
+// HomeRoot and WorkspaceRoot are optional; when set they drive the
+// broad-ancestor rejection.
+type CleanupScratchRequest struct {
+	Path          string
+	HomeRoot      string
+	WorkspaceRoot string
+}
+
 // PathFacts is the proven posture of a safe managed path.
 type PathFacts struct {
 	CanonicalPath string
@@ -229,6 +240,90 @@ func CreateSensitiveDir(path string) error {
 		return insecureFault("created directory was not born with owner-only mode")
 	}
 	return nil
+}
+
+// CheckCleanupScratch validates one exact scratch deletion target (design
+// 17.4, PRD Cleanup Failure Codes): it fails closed on an empty path, a
+// path that is not absolute, the filesystem root, `~`, or an unresolved
+// variable token; any symlink component or a final symlink (the path must
+// be identical to its canonical form); a path not owned by the effective
+// user; and — when HomeRoot or WorkspaceRoot is set — the root itself or
+// a strict ancestor of it (a deletion that would reach outside the
+// scratch area). It never repairs a mode and never follows a symlink; the
+// deletion walk itself must not descend through dir-internal symlinks
+// (os.RemoveAll removes the symlink without following it).
+func CheckCleanupScratch(req CleanupScratchRequest) (PathFacts, error) {
+	p := req.Path
+	if p == "" {
+		return PathFacts{}, model.InvalidInputFault("scratch path is empty")
+	}
+	// `~`, `/`, and unresolved-variable tokens are never an exact canonical
+	// target: the CLI must resolve them before the guard.
+	if strings.ContainsAny(p, "$`~") {
+		return PathFacts{}, model.InvalidInputFault("scratch path carries an unresolved variable or home token")
+	}
+	clean := filepath.Clean(p)
+	if !filepath.IsAbs(clean) {
+		return PathFacts{}, model.InvalidInputFault("scratch path must be absolute")
+	}
+	if clean == string(filepath.Separator) {
+		return PathFacts{}, model.InvalidInputFault("scratch path is the filesystem root")
+	}
+	// Canonical identity (no symlink component), real type, and
+	// owner-only safe ancestors.
+	info, canon, err := checkFinal(clean)
+	if err != nil {
+		return PathFacts{}, err
+	}
+	if err := checkOwner(info); err != nil {
+		return PathFacts{}, err
+	}
+	facts := PathFacts{
+		CanonicalPath: canon,
+		OwnerUID:      ownerUID(info),
+		EffectiveUID:  os.Geteuid(),
+		Mode:          info.Mode(),
+	}
+	switch {
+	case info.IsDir():
+		facts.Kind = KindDir
+	case info.Mode().IsRegular():
+		facts.Kind = KindFile
+	default:
+		return PathFacts{}, insecureFault("scratch target is not a directory or regular file")
+	}
+	// The target may not be a managed root or a broad ancestor of one.
+	for _, root := range []string{req.HomeRoot, req.WorkspaceRoot} {
+		if root == "" {
+			continue
+		}
+		r, err := canonicalize(root)
+		if err != nil {
+			return PathFacts{}, err
+		}
+		switch {
+		case canon == r:
+			return PathFacts{}, insecureFault("scratch target is a managed root")
+		case strings.HasPrefix(r, canon+string(filepath.Separator)):
+			return PathFacts{}, insecureFault("scratch target is a broad ancestor of a managed root")
+		case strings.HasPrefix(canon, r+string(filepath.Separator)):
+			facts.InsideRoot = true
+		}
+	}
+	return facts, nil
+}
+
+// OwnerIsEffectiveUser reports whether the final path component is owned
+// by the effective user. It is the cleanup owner gate: git-managed
+// Worktrees carry git's own directory modes, so the mode is deliberately
+// not part of this check (the mode check lives with the parent-safety
+// walk for CFlow-created sensitive paths).
+func OwnerIsEffectiveUser(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	return ownerUID(info) == os.Geteuid(), nil
 }
 
 // ---------------------------------------------------------------------------

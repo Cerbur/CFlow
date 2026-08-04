@@ -486,3 +486,90 @@ func TestCheckPathAcceptsFileWithoutRoot(t *testing.T) {
 		t.Fatalf("containment facts must be false without a root: %+v", facts)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the safe-cleanup scratch guard (design 17.4)
+// ---------------------------------------------------------------------------
+
+// TestCheckCleanupScratchAcceptsExactScratchUnderHome: an exact canonical
+// scratch directory inside CFLOW_HOME passes the guard.
+func TestCheckCleanupScratchAcceptsExactScratchUnderHome(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "cflow")
+	mkdir(t, home, 0o700)
+	scratch := filepath.Join(home, "runs", "run-1", "tmp")
+	mkdirAll(t, scratch, 0o700)
+	repo := filepath.Join(root, "repo")
+	mkdir(t, repo, 0o700)
+
+	facts, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+		Path: scratch, HomeRoot: home, WorkspaceRoot: repo,
+	})
+	if err != nil {
+		t.Fatalf("exact scratch rejected: %v", err)
+	}
+	if !facts.InsideRoot {
+		t.Fatalf("exact scratch must resolve inside home")
+	}
+}
+
+// TestCheckCleanupScratchRejectsRootsAndBroadAncestors: the filesystem
+// root, `~`, an unresolved-variable token, the HomeRoot, the
+// WorkspaceRoot, and a broad ancestor of either are never an exact scratch
+// target.
+func TestCheckCleanupScratchRejectsRootsAndBroadAncestors(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "cflow")
+	mkdir(t, home, 0o700)
+	repo := filepath.Join(root, "repo")
+	mkdir(t, repo, 0o700)
+
+	for _, bad := range []string{"", "/", "~", "$HOME/x", home, repo, filepath.Dir(repo)} {
+		_, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+			Path: bad, HomeRoot: home, WorkspaceRoot: repo,
+		})
+		if err == nil {
+			t.Fatalf("scratch path %q must be rejected", bad)
+		}
+	}
+}
+
+// TestCheckCleanupScratchRejectsSymlinkEscape: a scratch target that
+// resolves through a symlink (inside or outside) is never removed.
+func TestCheckCleanupScratchRejectsSymlinkEscape(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "cflow")
+	mkdir(t, home, 0o700)
+	link := filepath.Join(home, "escape")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	repo := filepath.Join(root, "repo")
+	mkdir(t, repo, 0o700)
+	_, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+		Path: link, HomeRoot: home, WorkspaceRoot: repo,
+	})
+	if err == nil {
+		t.Fatal("a symlink scratch target must be rejected")
+	}
+}
+
+// TestCheckCleanupScratchRejectsWrongOwner: a target owned by another user
+// fails the owner gate. /etc/passwd is root-owned on every POSIX system;
+// when running as root the guard still fails closed.
+func TestCheckCleanupScratchRejectsWrongOwner(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "cflow")
+	mkdir(t, home, 0o700)
+	if _, err := os.Lstat("/etc/passwd"); err != nil {
+		t.Skipf("no /etc/passwd: %v", err)
+	}
+	repo := filepath.Join(root, "repo")
+	mkdir(t, repo, 0o700)
+	_, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+		Path: "/etc/passwd", HomeRoot: home, WorkspaceRoot: repo,
+	})
+	if err == nil {
+		t.Fatal("a non-owned scratch target must be rejected")
+	}
+}

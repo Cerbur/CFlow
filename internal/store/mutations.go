@@ -646,9 +646,18 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		return nil
 
 	case model.CleanupMutation:
+		// ended_at is set only when the attempt settles terminal; a RUNNING
+		// or AWAITING_CONFIRMATION transition leaves it NULL (the zero-time
+		// string is never persisted).
+		ended := any(nil)
+		switch m.Status {
+		case model.CleanupStatusSucceeded, model.CleanupStatusFailed,
+			model.CleanupStatusBlocked, model.CleanupStatusCancelled:
+			ended = m.EndedAt.UTC().Format(time.RFC3339Nano)
+		}
 		if _, err := q.ExecContext(ctx, `UPDATE cleanup_attempts
 			SET status = ?, ended_at = ? WHERE id = ? AND workflow_id = ?`,
-			string(m.Status), m.EndedAt.UTC().Format(time.RFC3339Nano), m.ID, st.Workflow.ID); err != nil {
+			string(m.Status), ended, m.ID, st.Workflow.ID); err != nil {
 			return fmt.Errorf("update cleanup attempt: %w", err)
 		}
 		return nil

@@ -282,3 +282,115 @@ func (g *GitFlow) validateWorktreePath(ctx context.Context, path string) (string
 	}
 	return clean, nil
 }
+
+// ---------------------------------------------------------------------------
+// Worktree removal and the safe-clean gate (design 17.4)
+// ---------------------------------------------------------------------------
+
+// removeWorktree removes one managed Worktree through the exact,
+// non-force `git worktree remove <path>` form. The path must be absolute
+// and canonical and must be a registered Worktree; a dirty, locked, or
+// occupied Worktree is refused with CLEANUP_TARGET_DIRTY and is never
+// force-removed (`git worktree prune` is never run and `--force` never
+// appears). The caller records the expected registry entry before the
+// removal and re-observes the registry afterwards, so a crash between the
+// removal and the Result settles from the actual state.
+func (g *GitFlow) removeWorktree(ctx context.Context, op RemoveWorktree) (GitResult, error) {
+	if op.Path == "" {
+		return nil, model.InvalidInputFault("gitflow: worktree removal requires an exact path")
+	}
+	clean := filepath.Clean(op.Path)
+	if !filepath.IsAbs(clean) {
+		return nil, model.InvalidInputFault("gitflow: worktree removal path must be absolute")
+	}
+	// The path must be a registered Worktree (the compare-and-swap the
+	// caller recorded): a foreign path is never removed.
+	if _, err := g.verifiedEntry(ctx, clean); err != nil {
+		return nil, err
+	}
+	env := childEnv()
+	_, errOut, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "worktree", "remove", clean)
+	if err != nil {
+		return nil, err
+	}
+	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeCleanupTargetDirty,
+			"gitflow: worktree removal refused (dirty, locked, or occupied): "+string(errOut))
+	}
+	return WorktreeRemovedResult{Path: clean}, nil
+}
+
+// worktreeInProgress observes the state markers of one managed Worktree's
+// gitdir: an unfinished merge/rebase/cherry-pick/revert/bisect or an
+// administrative lock file. The safe-clean gate refuses a target carrying
+// either (git worktree remove would refuse the Worktree anyway; the gate
+// refuses before any deletion is attempted, design 17.4). The exact
+// Worktree must be registered; its gitdir is resolved with
+// `git rev-parse --git-dir` inside the Worktree (the porcelain registry
+// does not carry the gitdir).
+func (g *GitFlow) worktreeInProgress(ctx context.Context, q WorktreeInProgress) (GitFacts, error) {
+	if q.Path == "" {
+		return nil, model.InvalidInputFault("gitflow: a worktree path is required")
+	}
+	clean := filepath.Clean(q.Path)
+	if !filepath.IsAbs(clean) {
+		return nil, model.InvalidInputFault("gitflow: worktree path must be absolute")
+	}
+	wf, err := g.worktreeList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	registered := false
+	for _, e := range wf.Entries {
+		if e.Path == clean {
+			registered = true
+			break
+		}
+	}
+	if !registered {
+		return nil, model.NewFault(model.CodeCleanupFactsChanged,
+			"gitflow: the worktree is not registered")
+	}
+	out, _, exit, err := g.run(ctx, clean, childEnv(), defaultGitTimeout, "rev-parse", "--git-dir")
+	if err != nil {
+		return nil, err
+	}
+	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.InvalidInputFault("gitflow: the worktree gitdir cannot be resolved")
+	}
+	gitDir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(clean, gitDir)
+	}
+	inProgress, locked, reason := worktreeStateMarkers(gitDir)
+	return WorktreeInProgressFacts{InProgress: inProgress, Locked: locked, Reason: reason}, nil
+}
+
+// worktreeStateMarkers scans one worktree gitdir for the state files an
+// in-progress Git operation or a lock leaves behind. inProgress markers
+// are the merge/rebase/cherry-pick/revert/bisect state files; locked is
+// any administrative *.lock file (index.lock, HEAD.lock, ...). Reason
+// names the first marker found, for diagnostics.
+func worktreeStateMarkers(gitDir string) (inProgress, locked bool, reason string) {
+	markers := []string{
+		"MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE",
+		"CHERRY_PICK_HEAD", "REVERT_HEAD",
+		"BISECT_LOG", "BISECT_START",
+		"rebase-merge", "rebase-apply", "sequencer",
+	}
+	for _, m := range markers {
+		if _, err := os.Lstat(filepath.Join(gitDir, m)); err == nil {
+			return true, false, m
+		}
+	}
+	entries, err := os.ReadDir(gitDir)
+	if err != nil {
+		return false, false, ""
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".lock") {
+			return false, true, e.Name()
+		}
+	}
+	return false, false, ""
+}

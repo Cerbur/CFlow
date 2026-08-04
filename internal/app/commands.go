@@ -478,10 +478,24 @@ type CancelWorkflowCommand struct {
 }
 
 // DryRunCommand produces the immutable Cleanup Dry Run Manifest (design
-// 17.4). Items carry the freshly observed candidate facts.
+// 17.4). Items carry the explicitly provided exact scratch targets; the
+// managed Worktrees registered in SQLite for the Workflow are collected
+// by the Application. The default command only creates the Manifest — it
+// deletes nothing.
 type DryRunCommand struct {
 	Workflow model.WorkflowID
 	Items    []model.CleanupItem
+}
+
+// ExecuteCleanupCommand is the second explicit confirmation that executes
+// one immutable Cleanup Dry Run Manifest (design 17.4, PRD 已确认：Cleanup
+// 仅删除安全干净的衍生目录). Manifest binds the exact Manifest ID and hash
+// the user confirmed; the Application re-observes every item's facts and
+// the Kernel revalidates them against that exact Manifest before any
+// deletion. There is no --force, no wildcard, no bulk or age GC.
+type ExecuteCleanupCommand struct {
+	Workflow model.WorkflowID
+	Manifest model.ArtifactRef
 }
 
 // GenerateSpecsCommand runs the Spec Generation Session (PRD Agent 角色:
@@ -652,6 +666,7 @@ func (PauseWorkflowCommand) isCommand()       {}
 func (ResumeWorkflowCommand) isCommand()      {}
 func (CancelWorkflowCommand) isCommand()      {}
 func (DryRunCommand) isCommand()              {}
+func (ExecuteCleanupCommand) isCommand()      {}
 func (GenerateSpecsCommand) isCommand()       {}
 func (CompileWorkflowCommand) isCommand()     {}
 func (ExecutionDryRunCommand) isCommand()     {}

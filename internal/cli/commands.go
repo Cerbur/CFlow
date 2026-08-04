@@ -314,17 +314,71 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 		},
 		{
 			Use:   "cleanup [workflow-id]",
-			Short: "produce the cleanup dry-run manifest (execute lands with a later task)",
+			Short: "produce the cleanup dry-run manifest, or execute one with an explicit confirmation",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				// The cleanup dry-run entry (PRD 必须提供的 CLI); the
-				// exact-confirmation execute protocol lands with Task 20
-				// and returns the stable NOT_YET_AVAILABLE finding.
-				if execute, _ := cmd.Flags().GetString("execute"); execute != "" {
-					return model.NewFault(model.CodeNotYetAvailable,
-						"cleanup --execute is not yet available; the exact-confirmation cleanup protocol lands with a later task")
+				// The safe cleanup (PRD 必须提供的 CLI, design 17.4): the
+				// default command produces ONLY the immutable Dry Run
+				// Manifest and deletes nothing; `--execute <manifest-id>` is
+				// the SECOND explicit confirmation binding the exact
+				// Manifest ID and hash, which then removes the exact managed
+				// Worktrees and scratch paths recorded in it. There is no
+				// --force, no wildcard, and no bulk or age GC.
+				ctx, stop := commandContext(cmd, nil)
+				defer stop()
+				a, err := openApplication(ctx, deps)
+				if err != nil {
+					return err
 				}
-				return executeMutation(cmd, deps, app.DryRunCommand{Workflow: workflowArg(args)})
+				wf := workflowArg(args)
+				execute, _ := cmd.Flags().GetString("execute")
+				if execute != "" {
+					iv, err := a.Query(ctx, app.InspectQuery{Workflow: wf})
+					if err != nil {
+						return err
+					}
+					var att *model.CleanupAttempt
+					for i := range iv.(app.InspectView).CleanupAttempts {
+						if string(iv.(app.InspectView).CleanupAttempts[i].ID) == execute {
+							att = &iv.(app.InspectView).CleanupAttempts[i]
+						}
+					}
+					if att == nil {
+						return model.InvalidInputFault("no cleanup manifest with id " + execute)
+					}
+					switch att.Status {
+					case model.CleanupStatusAwaitingConfirmation, model.CleanupStatusRunning:
+					default:
+						return model.InvalidInputFault(
+							"cleanup manifest " + execute + " cannot be executed from " + string(att.Status))
+					}
+					// The second explicit confirmation binds the exact
+					// Manifest ID and hash; branches, refs, commits,
+					// artifacts, sessions, logs, and all evidence stay
+					// preserved.
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"execute cleanup manifest %s (sha256 %s, %d exact targets)?\n  this removes ONLY the recorded managed worktrees and scratch paths; every branch, ref, commit, artifact, session, log, and evidence stays preserved. [y/N] ",
+						att.ID, shortHash(att.Manifest.Hash), len(att.Items))
+					line, err := readLine(cmd)
+					if err != nil {
+						return err
+					}
+					if !strings.EqualFold(strings.TrimSpace(line), "y") {
+						return model.InvalidInputFault("cleanup aborted")
+					}
+					out, err := a.Execute(ctx, app.ExecuteCleanupCommand{Workflow: wf, Manifest: att.Manifest})
+					if err != nil {
+						return err
+					}
+					renderOutcome(cmd.OutOrStdout(), app.ExecuteCleanupCommand{}, out, deps.Redaction)
+					return nil
+				}
+				scratch, _ := cmd.Flags().GetStringArray("scratch")
+				items := make([]model.CleanupItem, 0, len(scratch))
+				for _, p := range scratch {
+					items = append(items, model.CleanupItem{Kind: model.CleanupScratch, CanonicalPath: p})
+				}
+				return executeMutation(cmd, deps, app.DryRunCommand{Workflow: wf, Items: items})
 			},
 		},
 		{
@@ -604,7 +658,9 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 		findCommand(cmds, name).Flags().String("provider", "fake", "provider route")
 	}
 	findCommand(cmds, "workflow-create").Flags().Bool("yes", false, "assume yes for the dirty-workspace confirmation")
-	findCommand(cmds, "cleanup").Flags().String("execute", "", "execute a produced cleanup manifest (not yet available)")
+	cleanupCmd := findCommand(cmds, "cleanup")
+	cleanupCmd.Flags().String("execute", "", "execute the cleanup manifest with this id (second explicit confirmation)")
+	cleanupCmd.Flags().StringArray("scratch", nil, "an exact scratch path to include in the cleanup dry-run manifest (repeatable)")
 	applyCmd := findCommand(cmds, "apply")
 	applyCmd.Flags().Bool("execute", false, "the explicit delivery: the compare-and-swap fast-forward of the target branch")
 	applyCmd.Flags().Bool("confirm", false, "the explicit commit-policy / apply-catalog confirmation of a blocked apply attempt")
@@ -700,6 +756,8 @@ func workflowOf(command app.Command) model.WorkflowID {
 	case app.CancelWorkflowCommand:
 		return c.Workflow
 	case app.DryRunCommand:
+		return c.Workflow
+	case app.ExecuteCleanupCommand:
 		return c.Workflow
 	case app.GenerateSpecsCommand:
 		return c.Workflow

@@ -636,15 +636,24 @@ func cleanupDryRun(state model.State, in model.CleanupCommandInput) (model.Decis
 	return b.decision(), nil
 }
 
-// cleanupExecute revalidates the freshly observed facts against the exact
-// confirmed Manifest before requesting the first pending item. Any drift
-// is CLEANUP_FACT_MISMATCH; a dirty target is CLEANUP_TARGET_DIRTY
-// (PRD Cleanup Failure Codes, design 17.4).
+// cleanupExecute is the explicit confirmation and execution: the app
+// re-observes every item's facts and the Kernel revalidates them against
+// the exact confirmed Manifest (design 17.4). The first execution
+// (AWAITING_CONFIRMATION) revalidates the manifest hash and every item's
+// facts — any drift is CLEANUP_FACT_MISMATCH, a dirty target is
+// CLEANUP_TARGET_DIRTY — then requests the first pending item. A RUNNING
+// attempt is the crash recovery: an interruption left an item REQUESTED,
+// so the first unsettled item is re-requested and the executor re-observes
+// every fact per item and settles from the actual state (an already-removed
+// target reports Removed; a still-present target is re-checked and removed;
+// nothing beyond the already-Requested set is ever started).
 func cleanupExecute(state model.State, in model.CleanupCommandInput) (model.Decision, error) {
 	att := lastCleanupAttempt(state)
-	if att == nil || att.Status != model.CleanupStatusAwaitingConfirmation {
-		return model.Decision{}, model.InvalidInputFault("no cleanup attempt awaiting confirmation")
+	if att == nil {
+		return model.Decision{}, model.InvalidInputFault("no cleanup attempt to execute")
 	}
+	// The confirmation binds the exact Manifest identity and hash; a
+	// changed Manifest is CLEANUP_FACT_MISMATCH with no deletion.
 	if in.Manifest != att.Manifest {
 		return model.Decision{}, model.NewFault(model.CodeCleanupFactsChanged,
 			"cleanup manifest identity or hash changed since the dry run")
@@ -657,31 +666,50 @@ func cleanupExecute(state model.State, in model.CleanupCommandInput) (model.Deci
 		return model.Decision{}, model.NewFault(model.CodeCleanupActiveProcess,
 			"cleanup requires no managed processes")
 	}
-	if model.CleanupManifestHash(in.Items) != att.Manifest.Hash {
-		return model.Decision{}, model.NewFault(model.CodeCleanupFactsChanged,
-			"observed cleanup facts no longer match the confirmed manifest")
-	}
-	manifestItems := map[int]model.CleanupItem{}
-	for _, it := range att.Items {
-		manifestItems[it.Index] = it
-	}
-	for _, it := range in.Items {
-		mi, ok := manifestItems[it.Index]
-		if !ok || it.Kind != mi.Kind || it.CanonicalPath != mi.CanonicalPath ||
-			it.Branch != mi.Branch || it.ExpectedHead != mi.ExpectedHead || it.Fingerprint != mi.Fingerprint {
+	var next *model.CleanupItem
+	switch att.Status {
+	case model.CleanupStatusAwaitingConfirmation:
+		if model.CleanupManifestHash(in.Items) != att.Manifest.Hash {
 			return model.Decision{}, model.NewFault(model.CodeCleanupFactsChanged,
-				"cleanup item facts drifted from the confirmed manifest")
+				"observed cleanup facts no longer match the confirmed manifest")
 		}
-		if it.Dirty {
-			return model.Decision{}, model.NewFault(model.CodeCleanupTargetDirty,
-				"cleanup target is dirty")
+		manifestItems := map[int]model.CleanupItem{}
+		for _, it := range att.Items {
+			manifestItems[it.Index] = it
 		}
-	}
-	next := firstPendingItem(att)
-	if next == nil {
-		return model.Decision{}, model.InvalidInputFault("cleanup manifest has no pending items")
+		for _, it := range in.Items {
+			mi, ok := manifestItems[it.Index]
+			if !ok || it.Kind != mi.Kind || it.CanonicalPath != mi.CanonicalPath ||
+				it.Branch != mi.Branch || it.ExpectedHead != mi.ExpectedHead || it.Fingerprint != mi.Fingerprint {
+				return model.Decision{}, model.NewFault(model.CodeCleanupFactsChanged,
+					"cleanup item facts drifted from the confirmed manifest")
+			}
+			if it.Dirty {
+				return model.Decision{}, model.NewFault(model.CodeCleanupTargetDirty,
+					"cleanup target is dirty")
+			}
+		}
+		next = firstPendingItem(att)
+		if next == nil {
+			return model.Decision{}, model.InvalidInputFault("cleanup manifest has no pending items")
+		}
+	case model.CleanupStatusRunning:
+		// Crash recovery: re-request the first unsettled item. The executor
+		// re-observes every fact per item and settles from the actual
+		// state — an already-removed target reports Removed without
+		// pretending it was deleted now; a still-present target is
+		// re-validated and removed (design 17.4 partial recovery).
+		next = firstUnsettledItem(att)
+		if next == nil {
+			return model.Decision{}, model.InvalidInputFault(
+				"cleanup manifest has no unsettled items to recover")
+		}
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"cleanup attempt " + string(att.Status) + " cannot be executed")
 	}
 	b := &builder{state: state}
+	b.mutate(model.CleanupMutation{ID: att.ID, Status: model.CleanupStatusRunning})
 	b.mutate(model.CleanupItemMutation{Attempt: att.ID, Index: next.Index, Status: model.CleanupItemRequested})
 	b.event(model.EventCleanupItemRequested, "", model.AttemptKey{}, "", "cleanup item requested")
 	requestCleanupEffect(b, att, next)
@@ -744,6 +772,19 @@ func findCleanupAttempt(state model.State, id model.CleanupAttemptID) *model.Cle
 func firstPendingItem(att *model.CleanupAttempt) *model.CleanupItem {
 	for i := range att.Items {
 		if att.Items[i].Status == model.CleanupItemPending {
+			return &att.Items[i]
+		}
+	}
+	return nil
+}
+
+// firstUnsettledItem returns the first item that is not terminal
+// (REQUESTED in flight or PENDING), the crash-recovery continuation point
+// of a RUNNING Cleanup Attempt. Terminal items — COMPLETED or FAILED —
+// are never reopened.
+func firstUnsettledItem(att *model.CleanupAttempt) *model.CleanupItem {
+	for i := range att.Items {
+		if !att.Items[i].Status.IsTerminal() {
 			return &att.Items[i]
 		}
 	}

@@ -750,11 +750,9 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 	case CancelWorkflowCommand:
 		return a.workflowCommand(model.CancelWorkflow, c.Workflow, c.Reason)
 	case DryRunCommand:
-		wf, err := a.resolveMutationWorkflow(c.Workflow)
-		if err != nil {
-			return nil, "", err
-		}
-		return model.CleanupCommandInput{Kind: model.CleanupDryRun, Items: c.Items}, wf, nil
+		return a.prepareCleanupDryRun(ctx, c)
+	case ExecuteCleanupCommand:
+		return a.prepareCleanupExecute(ctx, c)
 	case GenerateSpecsCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

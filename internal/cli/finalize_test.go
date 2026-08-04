@@ -85,15 +85,16 @@ func TestApplyRequiresCompletedWorkflowAtCLI(t *testing.T) {
 	}
 }
 
-// TestCleanupExecuteReturnsNotYetAvailable: the cleanup dry-run entry
-// renders the manifest path; `cleanup --execute` is the Task 20 protocol
-// and returns the stable NOT_YET_AVAILABLE finding.
-func TestCleanupExecuteReturnsNotYetAvailable(t *testing.T) {
+// TestCleanupExecuteUnknownManifestIsInvalid: the explicit cleanup
+// execution (Task 20) binds the exact Manifest ID/hash; an unknown
+// manifest id is invalid input (exit class 2), never a claim that a
+// deletion ran.
+func TestCleanupExecuteUnknownManifestIsInvalid(t *testing.T) {
 	home, _ := seedCLIProject(t)
 	out, code := runCLIWithError(t, home, "cleanup", "wf-1", "--execute", "plan-1")
-	requireExit(t, out, code, 3)
-	if !strings.Contains(out, string(model.CodeNotYetAvailable)) {
-		t.Fatalf("cleanup --execute output missing NOT_YET_AVAILABLE:\n%s", out)
+	requireExit(t, out, code, 2)
+	if !strings.Contains(out, "no cleanup manifest with id plan-1") {
+		t.Fatalf("cleanup --execute output missing the unknown-manifest gate:\n%s", out)
 	}
 }
 

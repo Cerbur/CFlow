@@ -465,7 +465,7 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 			return fmt.Errorf("scan cleanup attempt: %w", err)
 		}
 		c.Manifest = model.ArtifactRef{Workflow: workflow, Type: model.ArtifactCleanupManifest,
-			Revision: 0, Hash: planHash}
+			Revision: 1, Hash: planHash}
 		c.StartedAt = parseTime(startedAt)
 		c.EndedAt = parseTime(endedAt)
 		st.CleanupAttempts = append(st.CleanupAttempts, c)

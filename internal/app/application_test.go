@@ -366,7 +366,9 @@ func TestDryRunOnNonTerminalWorkflowBlocked(t *testing.T) {
 
 // TestDryRunProducesImmutableManifest: on a completed Workflow the dry run
 // commits one Cleanup Attempt with an immutable Manifest reference and
-// pending items (design 17.4).
+// pending items (design 17.4). The managed Worktrees are auto-collected;
+// the explicitly provided targets are exact scratch paths (a Worktree item
+// can never be injected by the caller).
 func TestDryRunProducesImmutableManifest(t *testing.T) {
 	app, _ := fixtureApplication(t)
 	// Cleanup requires a terminal workflow with no managed processes:
@@ -375,11 +377,14 @@ func TestDryRunProducesImmutableManifest(t *testing.T) {
 		t.Fatalf("settle fixture process: %v", err)
 	}
 	completeFixtureWorkflow(t, app)
+	scratch := filepath.Join(app.home, "scratch", "run-1", "tmp")
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		t.Fatalf("mkdir scratch: %v", err)
+	}
 	out, err := app.Execute(context.Background(), DryRunCommand{
 		Workflow: "workflow-1",
 		Items: []model.CleanupItem{{
-			Index: 0, Kind: model.CleanupWorktree, CanonicalPath: "/tmp/fixture-worktree",
-			Branch: "main", ExpectedHead: "abc123",
+			Index: 0, Kind: model.CleanupScratch, CanonicalPath: scratch,
 		}},
 	})
 	requireNoError(t, err)

@@ -84,10 +84,10 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return a.applyStagingCreate(ctx, wf, e, rt)
 	case model.ApplyFastForwardIntent:
 		return a.applyFastForward(ctx, wf, e)
-	case model.CleanupWorktreeRemoveIntent, model.CleanupScratchRemoveIntent:
-		// STUB (Task 20): Cleanup revalidates each item against the
-		// confirmed Manifest before removing anything.
-		return model.EffectResultInput{}, stubEffect(e)
+	case model.CleanupWorktreeRemoveIntent:
+		return a.cleanupWorktreeRemove(ctx, wf, e)
+	case model.CleanupScratchRemoveIntent:
+		return a.cleanupScratchRemove(ctx, wf, e)
 	default:
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("unknown effect intent %T", intent))
 	}
@@ -221,6 +221,19 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 	case model.GitAuditRefCreateIntent:
 		if r.Kind != model.GitAuditRefCreated {
 			return model.InvariantFault(fmt.Errorf("audit ref result does not match its intent"))
+		}
+	case model.CleanupWorktreeRemoveIntent, model.CleanupScratchRemoveIntent:
+		var att model.CleanupAttemptID
+		var index int
+		switch e := intent.(type) {
+		case model.CleanupWorktreeRemoveIntent:
+			att, index = e.Cleanup, e.Item
+		case model.CleanupScratchRemoveIntent:
+			att, index = e.Cleanup, e.Item
+		}
+		if (r.Kind != model.CleanupItemRemovedResult && r.Kind != model.CleanupItemFailedResult) ||
+			r.CleanupAttempt != att || r.ItemIndex != index {
+			return model.InvariantFault(fmt.Errorf("cleanup item result does not match its intent"))
 		}
 	}
 	return nil

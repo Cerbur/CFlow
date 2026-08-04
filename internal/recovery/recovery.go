@@ -229,9 +229,9 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 	base := IntentDisposition{ID: pe.ID, Intent: pe.Intent}
 	switch intent := pe.Intent.(type) {
 	case model.IntegrationMergeIntent:
-		return e.classifyMerge(ctx, wf, base, intent)
+		return e.classifyMerge(ctx, wf, state, base, intent)
 	case model.IntegrationRollbackIntent:
-		return e.classifyRollback(ctx, wf, base, intent)
+		return e.classifyRollback(ctx, wf, state, base, intent)
 	case model.GitAuditRefCreateIntent:
 		return e.classifyAuditRef(ctx, base, intent)
 	case model.TaskWorktreeCreateIntent:
@@ -265,8 +265,11 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		return e.classifyApplyStaging(ctx, base, state, intent.Apply)
 	case model.ApplyFastForwardIntent:
 		return e.classifyApplyDelivery(base, state, intent.Apply)
-	case model.CleanupWorktreeRemoveIntent, model.CleanupScratchRemoveIntent,
-		model.ProviderCancelIntent:
+	case model.CleanupWorktreeRemoveIntent:
+		return e.classifyCleanupWorktree(ctx, base, state, intent)
+	case model.CleanupScratchRemoveIntent:
+		return e.classifyCleanupScratch(base, state, intent)
+	case model.ProviderCancelIntent:
 		return base.with(FatalInvariant,
 			"the effect is not reconcilable by this build; authoritative evidence is missing"), nil
 	default:
@@ -279,8 +282,16 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 // 理): the expected pre-merge HEAD is the compare-and-swap value, the
 // verified Task Commit must be contained by the new Integration HEAD,
 // and a Git-clean Worktree is required — a completed merge is never
-// repeated.
-func (e *RecoveryEngine) classifyMerge(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.IntegrationMergeIntent) (IntentDisposition, error) {
+// repeated. A terminal Workflow whose Integration Worktree was removed by
+// a Cleanup no longer owes its historical merge: the subject is gone, the
+// merge is never pretended present or re-run.
+func (e *RecoveryEngine) classifyMerge(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.IntegrationMergeIntent) (IntentDisposition, error) {
+	if state.Workflow.Runtime.IsTerminal() {
+		if present, err := e.worktreeRegistered(ctx, e.integrationPath(wf)); err == nil && !present {
+			return base.with(AlreadyCompleted,
+				"the integration worktree was removed by cleanup; the historical merge is not owed"), nil
+		}
+	}
 	status, err := e.integrationStatus(ctx, wf, "")
 	if err != nil {
 		return base.with(FatalInvariant, "integration worktree facts are unreadable: "+err.Error()), nil
@@ -310,8 +321,16 @@ func (e *RecoveryEngine) classifyMerge(ctx context.Context, wf model.WorkflowID,
 }
 
 // classifyRollback classifies one unfinished IntegrationRollbackIntent:
-// the recorded pre-merge HEAD is the expected value.
-func (e *RecoveryEngine) classifyRollback(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.IntegrationRollbackIntent) (IntentDisposition, error) {
+// the recorded pre-merge HEAD is the expected value. A terminal Workflow
+// whose Integration Worktree was removed by Cleanup no longer owes its
+// historical rollback.
+func (e *RecoveryEngine) classifyRollback(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.IntegrationRollbackIntent) (IntentDisposition, error) {
+	if state.Workflow.Runtime.IsTerminal() {
+		if present, err := e.worktreeRegistered(ctx, e.integrationPath(wf)); err == nil && !present {
+			return base.with(AlreadyCompleted,
+				"the integration worktree was removed by cleanup; the historical rollback is not owed"), nil
+		}
+	}
 	status, err := e.integrationStatus(ctx, wf, intent.Head)
 	if err != nil {
 		return base.with(BlockedDrift, "integration worktree facts are unreadable: "+err.Error()), nil
@@ -465,6 +484,71 @@ func findApplyAttempt(state model.State, id model.ApplyAttemptID) *model.ApplyAt
 	return nil
 }
 
+// classifyCleanupWorktree classifies one unfinished cleanup Worktree
+// removal from the exact target's registry state (design 17.4 partial
+// recovery): a settled item is already completed; an item whose exact
+// target is absent from the Git Worktree Registry was already removed
+// (never pretended present); a target still registered at the exact
+// expected Branch/HEAD is safely re-runnable (the removal never ran); a
+// target that drifted is blocked. The pending Intent ledger only ever
+// holds the already-Requested item, so recovery never starts a new
+// deletion beyond that set.
+func (e *RecoveryEngine) classifyCleanupWorktree(ctx context.Context, base IntentDisposition, state model.State, intent model.CleanupWorktreeRemoveIntent) (IntentDisposition, error) {
+	item, ok := cleanupItemOf(state, intent.Cleanup, intent.Item)
+	if !ok {
+		return base.with(FatalInvariant, "the cleanup attempt or item is missing from the aggregate"), nil
+	}
+	if item.Status.IsTerminal() {
+		return base.with(AlreadyCompleted, "the cleanup item already settled"), nil
+	}
+	entries, err := e.worktreeEntries(ctx)
+	if err != nil {
+		return base.with(BlockedDrift, "the worktree registry is unreadable"), nil
+	}
+	entry, present := entries[item.CanonicalPath]
+	switch {
+	case !present:
+		return base.with(AlreadyCompleted, "the target worktree is already absent from the registry"), nil
+	case entry.Branch == item.Branch && !entry.Detached && entry.Head == item.ExpectedHead:
+		return base.with(SafeToRetry, "the target worktree still matches the confirmed manifest; the removal is re-runnable"), nil
+	default:
+		return base.with(BlockedDrift, "the target worktree drifted from the confirmed manifest"), nil
+	}
+}
+
+// classifyCleanupScratch classifies one unfinished cleanup scratch removal
+// from the exact target's filesystem state: an absent exact target was
+// already removed; a still-present exact target is safely re-runnable.
+func (e *RecoveryEngine) classifyCleanupScratch(base IntentDisposition, state model.State, intent model.CleanupScratchRemoveIntent) (IntentDisposition, error) {
+	item, ok := cleanupItemOf(state, intent.Cleanup, intent.Item)
+	if !ok {
+		return base.with(FatalInvariant, "the cleanup attempt or item is missing from the aggregate"), nil
+	}
+	if item.Status.IsTerminal() {
+		return base.with(AlreadyCompleted, "the cleanup item already settled"), nil
+	}
+	if _, err := os.Lstat(item.CanonicalPath); os.IsNotExist(err) {
+		return base.with(AlreadyCompleted, "the exact scratch target is already absent"), nil
+	} else if err != nil {
+		return base.with(BlockedDrift, "the scratch target cannot be inspected"), nil
+	}
+	return base.with(SafeToRetry, "the exact scratch target is still present and removable"), nil
+}
+
+// cleanupItemOf returns one Cleanup item of one Cleanup Attempt.
+func cleanupItemOf(state model.State, att model.CleanupAttemptID, index int) (model.CleanupItem, bool) {
+	for i := range state.CleanupAttempts {
+		if state.CleanupAttempts[i].ID != att {
+			continue
+		}
+		if index < 0 || index >= len(state.CleanupAttempts[i].Items) {
+			return model.CleanupItem{}, false
+		}
+		return state.CleanupAttempts[i].Items[index], true
+	}
+	return model.CleanupItem{}, false
+}
+
 // classifyProviderSession classifies one unfinished Provider start/resume
 // intent from the Session ledger: a terminal Session proves the run
 // settled; an open Session means the effect (a live run) is absent.
@@ -598,6 +682,17 @@ func (e *RecoveryEngine) worktreeEntries(ctx context.Context) (map[string]gitflo
 		entries[entry.Path] = entry
 	}
 	return entries, nil
+}
+
+// worktreeRegistered reports whether one exact path is in the Git Worktree
+// Registry.
+func (e *RecoveryEngine) worktreeRegistered(ctx context.Context, path string) (bool, error) {
+	entries, err := e.worktreeEntries(ctx)
+	if err != nil {
+		return false, err
+	}
+	_, ok := entries[path]
+	return ok, nil
 }
 
 // verificationManifest is the persisted evidence shape the Application

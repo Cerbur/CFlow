@@ -82,6 +82,15 @@ func decideComplete(state model.State, in model.CompleteWorkflowInput) (model.De
 		b.mutate(model.RunMutation{ID: run.ID, Status: model.RunSucceeded, DispatchGate: false})
 		b.event(model.EventRunSucceeded, "", model.AttemptKey{}, "", "run succeeded")
 	}
+	// Every managed process has settled by the time the Workflow completes:
+	// the records are marked stopped so a terminal Workflow carries no
+	// active process (the Cleanup gate, design 17.4, requires no managed
+	// processes; the records remain the durable ledger of the runs).
+	for _, p := range state.Processes {
+		if p.Status == model.ProcessStatusRunning {
+			b.mutate(model.ProcessEndMutation{ID: p.ID, Status: model.ProcessStatusStopped, EndedAt: state.Now})
+		}
+	}
 	return b.decision(), nil
 }
 

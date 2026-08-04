@@ -137,6 +137,16 @@ type FingerprintObserve struct {
 
 func (FingerprintObserve) isGitQuery() {}
 
+// WorktreeInProgress observes whether a managed Worktree carries an
+// in-progress merge/rebase/cherry-pick/revert/bisect or an administrative
+// lock file (design 17.4: the safe-clean gate refuses a target with an
+// unfinished Git operation or a lock; git worktree remove would refuse it).
+type WorktreeInProgress struct {
+	Path string // exact canonical Worktree path
+}
+
+func (WorktreeInProgress) isGitQuery() {}
+
 type GitStatus struct {
 	Dir          string // absolute canonical directory; empty means the bound directory
 	ExpectedHead string // full commit hash; empty means no expectation
@@ -321,6 +331,22 @@ type RollbackMerge struct {
 
 func (RollbackMerge) isGitOperation() {}
 
+// RemoveWorktree removes one managed Worktree through the exact,
+// non-force `git worktree remove <path>` form (design 17.4, PRD 已确认：
+// Cleanup 仅删除安全干净的衍生目录). The caller records the expected
+// registry entry and the safe-clean facts before calling; GitFlow
+// re-verifies the path is a registered Worktree and runs the removal
+// WITHOUT --force — a dirty, locked, or occupied Worktree is refused with
+// CLEANUP_TARGET_DIRTY and is never force-removed. The post-removal
+// verification lives with the caller (the executor re-observes the
+// registry and the directory), so a crash after the removal leaves the
+// Intent pending and recovery settles from the actual state.
+type RemoveWorktree struct {
+	Path string // exact canonical Worktree path
+}
+
+func (RemoveWorktree) isGitOperation() {}
+
 // GitFacts is the closed union of structured facts. Facts are data, never
 // formatted prose: callers make decisions, GitFlow reports truth.
 type GitFacts interface{ isGitFacts() }
@@ -410,6 +436,16 @@ type WorktreeFacts struct {
 }
 
 func (WorktreeFacts) isGitFacts() {}
+
+// WorktreeInProgressFacts reports whether one managed Worktree carries an
+// in-progress Git operation or an administrative lock file.
+type WorktreeInProgressFacts struct {
+	InProgress bool   // an unfinished merge/rebase/cherry-pick/revert/bisect
+	Locked     bool   // an administrative *.lock file
+	Reason     string // the state file or lock file name, for diagnostics
+}
+
+func (WorktreeInProgressFacts) isGitFacts() {}
 
 // WorktreeEntry is one registry entry (git worktree list --porcelain).
 type WorktreeEntry struct {
@@ -610,6 +646,14 @@ type UpdateRefResult struct {
 
 func (UpdateRefResult) isGitResult() {}
 
+// WorktreeRemovedResult reports the exact path whose Worktree was removed
+// (a crash after the removal settles from the actual registry state).
+type WorktreeRemovedResult struct {
+	Path string
+}
+
+func (WorktreeRemovedResult) isGitResult() {}
+
 // ---------------------------------------------------------------------------
 // Observe / Execute dispatch
 // ---------------------------------------------------------------------------
@@ -631,6 +675,8 @@ func (g *GitFlow) Observe(ctx context.Context, q GitQuery) (GitFacts, error) {
 		return g.historyRange(ctx, q)
 	case FingerprintObserve:
 		return g.fingerprintObserve(ctx, q)
+	case WorktreeInProgress:
+		return g.worktreeInProgress(ctx, q)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git query")
 	}
@@ -663,6 +709,8 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.completeMerge(ctx, op)
 	case RollbackMerge:
 		return g.rollbackMerge(ctx, op)
+	case RemoveWorktree:
+		return g.removeWorktree(ctx, op)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git operation")
 	}
