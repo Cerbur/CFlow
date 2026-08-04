@@ -470,11 +470,25 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 	targetRef := "refs/heads/" + targetBranch
 
 	// The staging head is the Apply Branch ref (the authoritative git
-	// fact; never persisted).
+	// fact; the reviewed rendering is persisted on the attempt, 004).
 	stagingHead, err := a.observedRefHead(ctx, "refs/heads/"+a.applyBranchName(wf, att.Number))
 	if err != nil {
 		code, _ := model.CodeOf(err)
 		return fail(code, err.Error()), nil
+	}
+
+	// The delivery's subject is the REVIEWED staging head: the recorded
+	// StagingHead is the only rendering of the Apply Branch ref the
+	// review verified, and every other pre-delivery gate (workspace,
+	// fingerprint, catalog, integration head) passes independently of the
+	// staging ref's content. A locally tampered Apply Branch ref must
+	// never fast-forward the Target to an unreviewed head, so a moved
+	// ref fails closed as an evidence subject change — before the
+	// crash-recovery observation (a Target already at a tampered head is
+	// never reported delivered) and before the compare-and-swap.
+	if att.StagingHead != "" && stagingHead != att.StagingHead {
+		return fail(model.CodeEvidenceSubjectChanged,
+			"the apply branch head no longer matches the recorded staging head"), nil
 	}
 
 	// The observed Target decides the crash recovery first: a Target

@@ -272,14 +272,14 @@
   retry_charge: false
   dispatch: closed_until_reconciled
   evidence: [attempt_ledger]
-- id: effect_process_stop_recoverable
+- id: effect_process_stop_unverified
   setup: running_merge
   inject: recovery_process_stop
-  expected_code: ""
-  expected_disposition: safe_to_retry
+  expected_code: DIRTY_WORKTREE_DRIFTED
+  expected_disposition: USER_ACTION_REQUIRED
   retry_charge: false
-  dispatch: closed_until_reconciled
-  evidence: [process_row_persists, dispatch_never_reopens]
+  dispatch: closed
+  evidence: [process_row_persists, dispatch_never_reopens, unverified_running_fails_closed, user_action_demanded]
 - id: quarantine_audit_ref_missing
   setup: running_merge
   inject: recovery_quarantine_missing

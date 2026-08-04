@@ -630,14 +630,24 @@ func (e *RecoveryEngine) classifyWorkflowCompile(ctx context.Context, wf model.W
 }
 
 // classifyProcessStop classifies one unfinished ManagedProcessStopIntent:
-// a process that is not running is already stopped.
+// the ledger's process row is the only fact, and a RUNNING row is never
+// verifiable — the model records no OS identity (design 13.2: PID plus
+// start token stays in the process adapter), so a restarting Runtime
+// cannot Inspect the row. Claiming the process stopped would silently
+// settle a provider child that may have survived a killed cflow and can
+// keep writing to its Worktree, so an unverified RUNNING row fails
+// closed: the disposition is blocked_drift and the mutation blocks with
+// a user-action fault demanding manual confirmation of the process's OS
+// state before anything resumes. A settled row (EXITED/STOPPED) or an
+// absent record is already stopped.
 func (e *RecoveryEngine) classifyProcessStop(base IntentDisposition, state model.State, id model.ProcessID) (IntentDisposition, error) {
 	for _, p := range state.Processes {
 		if p.ID != id {
 			continue
 		}
 		if p.Status == model.ProcessStatusRunning {
-			return base.with(SafeToRetry, "the managed process is still running; the stop is re-runnable"), nil
+			return base.with(BlockedDrift,
+				"the managed process "+string(id)+" is RUNNING but its OS identity was not persisted; confirm the process is gone before retrying"), nil
 		}
 		return base.with(AlreadyCompleted, "the managed process is no longer running"), nil
 	}

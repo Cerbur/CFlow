@@ -452,6 +452,57 @@ func TestApplyTargetCASPreventsLateAdvance(t *testing.T) {
 	fx.RequireWorkflowCompleted()
 }
 
+// TestApplyBlocksTamperedApplyBranchHead: the delivery's subject is the
+// REVIEWED staging head — the recorded StagingHead is the only rendering
+// of the Apply Branch ref the review verified, and every other
+// pre-delivery gate (workspace, fingerprint, catalog, integration head)
+// passes independently of the staging ref's content. A locally tampered
+// Apply Branch ref must never fast-forward the Target to an unreviewed
+// head: the delivery fails closed with EVIDENCE_SUBJECT_CHANGED — both
+// before the compare-and-swap (a fabricated head the CAS would deliver)
+// and before the crash-recovery observation (a Target already at a
+// tampered head must never be reported delivered) — and the Target stays
+// exactly at the recorded head.
+func TestApplyBlocksTamperedApplyBranchHead(t *testing.T) {
+	applyRef := func(fx *applyFixture, attempt model.ApplyAttempt) string {
+		return fmt.Sprintf("refs/heads/cflow/%s/apply-%d", fx.wf, attempt.Number)
+	}
+	t.Run("compare-and-swap would deliver an unreviewed head", func(t *testing.T) {
+		fx := completedWorkflowForApply(t)
+		attempt := fx.PrepareApply()
+		fx.PassStagingVerification(attempt)
+		// Tamper: fabricate a child Commit of the verified staging head
+		// (a locally created commit the review never saw) and point the
+		// Apply Branch ref at it.
+		staging := fx.applyBranchHead()
+		tampered := strings.TrimSpace(fx.fx.git("commit-tree", staging+"^{tree}", "-p", staging, "-m", "tampered unreviewed head"))
+		fx.fx.git("update-ref", applyRef(fx, attempt), tampered)
+		err := fx.CommitApply(attempt)
+		assertFaultCode(t, err, model.CodeEvidenceSubjectChanged)
+		if got := fx.targetHead(); got != attempt.TargetHead {
+			t.Fatalf("target = %s after the tampered apply branch, want exactly the recorded head %s", got, attempt.TargetHead)
+		}
+		fx.RequireWorkflowCompleted()
+	})
+	t.Run("crash recovery never reports a tampered subject delivered", func(t *testing.T) {
+		fx := completedWorkflowForApply(t)
+		attempt := fx.PrepareApply()
+		fx.PassStagingVerification(attempt)
+		// Tamper: point the Apply Branch ref at the current Target head.
+		// A Target already at the tampered head would otherwise look like
+		// the delivered outcome (the crash-recovery observation) and
+		// settle SUCCEEDED without any comparison against the reviewed
+		// subject.
+		fx.fx.git("update-ref", applyRef(fx, attempt), attempt.TargetHead)
+		err := fx.CommitApply(attempt)
+		assertFaultCode(t, err, model.CodeEvidenceSubjectChanged)
+		if got := fx.targetHead(); got != attempt.TargetHead {
+			t.Fatalf("target = %s, want exactly the recorded head %s", got, attempt.TargetHead)
+		}
+		fx.RequireWorkflowCompleted()
+	})
+}
+
 // ---------------------------------------------------------------------------
 // the case list
 // ---------------------------------------------------------------------------

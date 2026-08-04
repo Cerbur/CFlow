@@ -211,6 +211,7 @@ var migrationMeta = []struct {
 	{1, "cflow-001-initial", "001_initial.sql"},
 	{2, "cflow-002-cleanup-apply", "002_cleanup_apply.sql"},
 	{3, "cflow-003-integration-head", "003_integration_head.sql"},
+	{4, "cflow-004-apply-staging-head", "004_apply_staging_head.sql"},
 }
 
 func migrationSHA(t *testing.T, file string) string {
@@ -264,7 +265,7 @@ func v1DB(t *testing.T) string {
 func v1WithBackup(t *testing.T, phase string) (string, string) {
 	t.Helper()
 	path := v1DB(t)
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-003-integration-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
 	if err := os.MkdirAll(backupDir, 0o700); err != nil {
 		t.Fatalf("backup dir: %v", err)
 	}
@@ -287,13 +288,14 @@ func v1WithBackup(t *testing.T, phase string) (string, string) {
 		}
 		manifest := map[string]any{
 			"source_version": 1,
-			"target_version": 3,
+			"target_version": 4,
 			"cflow_version":  "0.0.0-dev",
 			"database_hash":  sha256Hex(buf),
 			"database_size":  len(buf),
 			"migrations": []map[string]string{
 				{"migration_id": "cflow-002-cleanup-apply", "migration_sha256": migrationSHA(t, "002_cleanup_apply.sql")},
 				{"migration_id": "cflow-003-integration-head", "migration_sha256": migrationSHA(t, "003_integration_head.sql")},
+				{"migration_id": "cflow-004-apply-staging-head", "migration_sha256": migrationSHA(t, "004_apply_staging_head.sql")},
 			},
 			"backup_path":   backupPath,
 			"manifest_path": filepath.Join(backupDir, "backup-manifest.json"),

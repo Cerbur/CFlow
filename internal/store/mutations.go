@@ -589,16 +589,19 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 
 	case model.ApplyMutation:
 		// A facts-only mutation (the staging head) carries no status: the
-		// transition columns stay unchanged then.
+		// transition columns stay unchanged then. The staging head is
+		// persisted (004): the explicit delivery re-asserts the live Apply
+		// Branch ref against the recorded reviewed head.
 		status := string(m.Status)
 		ended := m.EndedAt.UTC().Format(time.RFC3339Nano)
 		if status == "" {
 			ended = ""
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE apply_attempts
-			SET status = COALESCE(NULLIF(?, ''), status), ended_at = COALESCE(NULLIF(?, ''), ended_at)
+			SET status = COALESCE(NULLIF(?, ''), status), ended_at = COALESCE(NULLIF(?, ''), ended_at),
+			    staging_head = COALESCE(NULLIF(?, ''), staging_head)
 			WHERE id = ? AND workflow_id = ?`,
-			status, ended, m.ID, st.Workflow.ID); err != nil {
+			status, ended, m.StagingHead, m.ID, st.Workflow.ID); err != nil {
 			return fmt.Errorf("update apply attempt: %w", err)
 		}
 		return nil

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -669,6 +670,68 @@ func TestCancelOrphanKeepsIntent(t *testing.T) {
 	}
 	if len(fx.state.Quarantines) != 0 {
 		fx.t.Fatalf("the cancel must never quarantine; quarantine = %+v", fx.state.Quarantines)
+	}
+}
+
+// TestStopConcurrentBindRace exercises the managed-process map reads of
+// the stop executor against concurrent bind/unbind writes (design 13.3,
+// Task 16 live parallelism): a stop effect in one chain races the
+// provider-start bind of another. The reads are guarded by the same lock
+// the bind/unbind writes take, so a concurrent map read/write panic can
+// never fire; run with -race. The orphan-path stops re-bind their
+// identity first (the write side) and never reap the fake process, so
+// the force-kill phase always walks the processIdentities read.
+func TestStopConcurrentBindRace(t *testing.T) {
+	fake, sup := process.NewFakeSupervisor()
+	h, events, err := sup.Start(context.Background(), process.ProcessSpec{Executable: "/fixture/worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := <-events
+	a := stopFixtureApp(t, sup, h, first.Identity)
+	// The escalation: every stop skips the grace and force-kills.
+	_, cancel := a.stopContext(context.Background())
+	cancel()
+	stop := func(pid model.ProcessID) {
+		res, err := a.stopManagedProcess(context.Background(), model.ManagedProcessStopIntent{Process: pid})
+		if err != nil {
+			t.Errorf("stop %s: %v", pid, err)
+			return
+		}
+		if res.Kind != model.ProcessStopped {
+			t.Errorf("stop %s kind = %s, want ProcessStopped", pid, res.Kind)
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		// The provider-start bind of another chain: churn the write side.
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			a.bindProcess("churn", "session-churn", h, first.Identity)
+			a.unbindProcess("churn")
+		}
+	}()
+	go func() {
+		// The no-handle path reads a.procs.
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			stop("nohandle")
+		}
+	}()
+	go func() {
+		// The orphan path: bind (write side) then stop — the never-exited
+		// fake process makes the executor read a.processIdentities.
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			a.bindProcess("orphan", "session-orphan", h, first.Identity)
+			stop("orphan")
+		}
+	}()
+	wg.Wait()
+	// Reap the fake group so the supervisor settles cleanly.
+	go fake.ExitGroup(h, 137)
+	for range events {
 	}
 }
 

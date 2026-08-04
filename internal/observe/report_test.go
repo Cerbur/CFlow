@@ -118,10 +118,11 @@ func reportInputFixture() ReportInput {
 				Purpose: "final_verify", Passed: true, Hash: "final-manifest-1"},
 		},
 		Migration: ReportMigration{
-			SchemaVersion: 3, ChecksumsVerified: true,
+			SchemaVersion: 4, ChecksumsVerified: true,
 			Applied: []AppliedMigration{{Version: 1, ID: "cflow-001-initial"},
 				{Version: 2, ID: "cflow-002-cleanup-apply"},
-				{Version: 3, ID: "cflow-003-integration-head"}},
+				{Version: 3, ID: "cflow-003-integration-head"},
+				{Version: 4, ID: "cflow-004-apply-staging-head"}},
 			BackupVerified: true,
 		},
 		Security: ReportSecurity{
@@ -264,7 +265,7 @@ func TestReportRendersMigrationAndSecurityPosture(t *testing.T) {
 	}
 	md := strings.ToLower(RenderMarkdown(r, security.Registry{}))
 	for _, want := range []string{
-		"schema: 3", "cflow-003-integration-head", "checksums verified",
+		"schema: 4", "cflow-004-apply-staging-head", "checksums verified",
 		"backup verified", "0700", "0600", "r4", "raw provider frames persisted: no",
 		"at-rest encryption: none",
 	} {

@@ -63,9 +63,11 @@ type ApplyAttempt struct {
 	EndedAt         time.Time
 
 	// StagingHead is the verified combined staging head the delivery
-	// fast-forwards the Target to. It is an in-memory rendering of the
-	// Apply Branch ref: the authoritative git fact the delivery
-	// re-observes, so a crash never loses it.
+	// fast-forwards the Target to. It is the recorded rendering of the
+	// Apply Branch ref the review verified (persisted by the Store, 004):
+	// the delivery re-observes the authoritative git ref and fails closed
+	// with EVIDENCE_SUBJECT_CHANGED when the two differ, so a locally
+	// tampered Apply Branch ref can never deliver an unreviewed head.
 	StagingHead string
 	// ReviewSession, ReviewRoute, and ReviewProcess bind the independent
 	// Apply Verification Session the request allocated (design 14.4: the

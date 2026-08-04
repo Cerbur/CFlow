@@ -628,6 +628,63 @@ func TestRecoveryProviderSessionDispositions(t *testing.T) {
 	requireDisposition(t, out, recovery.SafeToRetry)
 }
 
+// TestRecoveryProcessStopDispositions: a crash-restart leaves the stop
+// Intent unfinished with the process row RUNNING. The row records no OS
+// identity (design 13.2: PID plus start token stays in the process
+// adapter) and the restarting Runtime has no handle, so the stopped
+// settlement is never verifiable — the disposition fails closed with
+// blocked_drift and a user-action fault, so a restarted CLI can never
+// silently settle a provider child that may have survived the killed
+// cflow and keep writing to its Worktree. A settled row is already
+// stopped.
+func TestRecoveryProcessStopDispositions(t *testing.T) {
+	seedProcess := func(fx *recoveryFixture, id model.ProcessID, status model.ProcessStatus) {
+		fx.t.Helper()
+		st, err := store.Open(context.Background(), store.OpenOptions{
+			Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now,
+		})
+		if err != nil {
+			fx.t.Fatalf("open store: %v", err)
+		}
+		defer st.Close()
+		view, err := st.View(context.Background(), store.StoreQuery{})
+		if err != nil {
+			fx.t.Fatalf("view: %v", err)
+		}
+		if _, err := st.Transact(context.Background(), view.AggregateVersion, func(state model.State) (model.Decision, error) {
+			return model.Decision{Mutations: []model.Mutation{
+				model.SessionAppendMutation{Session: model.Session{
+					ID: "session-1", Purpose: model.PurposeRepair, Status: model.SessionActive,
+				}, Provider: "fake"},
+				model.ProcessAppendMutation{Process: model.ProcessRecord{
+					ID: id, Session: "session-1", Purpose: model.PurposeRepair,
+					Status: status, StartedAt: fx.now(),
+				}},
+			}}, nil
+		}); err != nil {
+			fx.t.Fatalf("seed process: %v", err)
+		}
+	}
+
+	running := newRecoveryFixture(t)
+	seedProcess(running, "rp-1", model.ProcessStatusRunning)
+	running.seedIntent(model.ManagedProcessStopIntent{Process: "rp-1"})
+	out := mustReconcile(t, running)
+	requireDisposition(t, out, recovery.BlockedDrift)
+	if len(out.Faults) == 0 {
+		t.Fatalf("an unverified RUNNING process row must produce a user-action fault")
+	}
+	if got := out.Faults[0].Code; got != model.CodeDirtyWorktreeDrifted {
+		t.Fatalf("fault code = %s, want %s", got, model.CodeDirtyWorktreeDrifted)
+	}
+
+	settled := newRecoveryFixture(t)
+	seedProcess(settled, "rp-2", model.ProcessStatusStopped)
+	settled.seedIntent(model.ManagedProcessStopIntent{Process: "rp-2"})
+	out = mustReconcile(t, settled)
+	requireDisposition(t, out, recovery.AlreadyCompleted)
+}
+
 // TestRecoveryEmptyLedgerReconcilesCleanly: an empty ledger produces no
 // dispositions and no faults — the hook never blocks normal operation.
 func TestRecoveryEmptyLedgerReconcilesCleanly(t *testing.T) {

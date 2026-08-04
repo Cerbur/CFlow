@@ -104,7 +104,13 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 // managed Process without a supervised handle (an in-process fake
 // Session) settled with its command context and is reported stopped.
 func (a *Application) stopManagedProcess(ctx context.Context, intent model.ManagedProcessStopIntent) (model.EffectResultInput, error) {
+	// The managed-process maps are written by bindProcess/unbindProcess
+	// (a provider-start bind of another concurrent chain, Task 16 live
+	// parallelism): the reads take the same lock so a stop effect never
+	// races a concurrent map write.
+	a.mu.Lock()
 	handle, ok := a.procs[intent.Process]
+	a.mu.Unlock()
 	if !ok {
 		// No supervised handle: the Session settled with its context; the
 		// Kernel settles the process record from the typed stopped fact.
@@ -119,7 +125,12 @@ func (a *Application) stopManagedProcess(ctx context.Context, intent model.Manag
 	orphan := false
 	if err != nil && errors.Is(err, process.ErrNotReaped) {
 		// The force-kill phase is over: the exact identity facts decide.
-		if id, ok := a.processIdentities[intent.Process]; ok {
+		// The read is guarded like the bind/unbind writes: a concurrent
+		// provider-start bind may be rewriting the identity map.
+		a.mu.Lock()
+		id, ok := a.processIdentities[intent.Process]
+		a.mu.Unlock()
+		if ok {
 			fact, ierr := a.supervisor.Inspect(context.Background(), id)
 			if ierr == nil && fact.Running {
 				orphan = true

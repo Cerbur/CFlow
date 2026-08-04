@@ -750,18 +750,27 @@ func injectRecoveryProcessStop(t *testing.T, _ matrixRow) rowResult {
 	)
 	fx.seedIntent(model.ManagedProcessStopIntent{Process: "rp-1"})
 	out := fx.mustReconcile()
+	code := ""
 	ev := evidenceOf("process_row_persists", "dispatch_never_reopens")
-	if hasDisposition(out, "processStop.Intent", recovery.SafeToRetry) {
-		ev["process_row_persists"] = true
+	// hasDisposition matches on fmt.Sprintf("%T", intent), so the probe
+	// uses the exact type name (the short names used elsewhere in this
+	// suite never match %T; this probe is the live disposition check).
+	if hasDisposition(out, "model.ManagedProcessStopIntent", recovery.BlockedDrift) {
+		ev["unverified_running_fails_closed"] = true
 	}
-	// The stop is safely re-runnable, not drift: Reconcile produced no Fault
-	// (a Fault would demand user action instead of the closed-until-reconciled
-	// ledger the Application settles). Reconcile is read-only, so it can never
-	// reopen dispatch on its own.
-	if len(out.Faults) == 0 {
-		ev["dispatch_never_reopens"] = true
+	// The unverified RUNNING row fails closed: a crash-restarting Runtime
+	// has no OS identity to Inspect, so claiming the process stopped would
+	// silently settle a provider child that may have survived the killed
+	// cflow. Reconcile produced a user-action Fault (manual confirmation)
+	// and is read-only, so it can never reopen dispatch on its own.
+	if len(out.Faults) > 0 {
+		code = string(out.Faults[0].Code)
+		if code == "DIRTY_WORKTREE_DRIFTED" {
+			ev["user_action_demanded"] = true
+		}
 	}
-	return recoveryRow("safe_to_retry", "process_row_persists", "dispatch_never_reopens")
+	d, dispatch := dispositionDispatch(code)
+	return rowResult{Code: code, Disposition: d, RetryCharge: retryChargeOf(code), Dispatch: dispatch, Evidence: ev}
 }
 
 func injectRecoveryQuarantineMissing(t *testing.T, _ matrixRow) rowResult {
@@ -857,11 +866,12 @@ func reportFromStore(t *testing.T, path, home string) (observe.Report, store.Sto
 		Build:       observe.BuildInfo{Version: "0.0.0-dev"},
 		GeneratedAt: now(),
 		State:       view.State,
-		Migration: observe.ReportMigration{SchemaVersion: 3, ChecksumsVerified: true,
+		Migration: observe.ReportMigration{SchemaVersion: 4, ChecksumsVerified: true,
 			Applied: []observe.AppliedMigration{
 				{Version: 1, ID: "cflow-001-initial"},
 				{Version: 2, ID: "cflow-002-cleanup-apply"},
 				{Version: 3, ID: "cflow-003-integration-head"},
+				{Version: 4, ID: "cflow-004-apply-staging-head"},
 			}},
 		Security: observe.ReportSecurity{HomeMode: "0700", FileMode: "0600"},
 		EventExport: observe.ReportEventExport{Path: filepath.Join(home, "events.jsonl"),

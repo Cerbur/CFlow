@@ -119,7 +119,7 @@ const queryApplyAttempts = `
 	       COALESCE(git_commit_preflight_revision, 0),
 	       COALESCE(git_commit_preflight_sha256, ''),
 	       COALESCE(git_commit_policy_fingerprint, ''),
-	       started_at, COALESCE(ended_at, '')
+	       started_at, COALESCE(ended_at, ''), COALESCE(staging_head, '')
 	FROM apply_attempts WHERE workflow_id = ? ORDER BY id`
 
 const queryCleanupAttempts = `
@@ -443,7 +443,7 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		var preflightHash sql.NullString
 		var startedAt, endedAt string
 		if err := row.Scan(&a.ID, &a.Number, &a.Status, &a.TargetHead, &a.IntegrationHead, &preflightType,
-			&preflightRev, &preflightHash, &a.Fingerprint, &startedAt, &endedAt); err != nil {
+			&preflightRev, &preflightHash, &a.Fingerprint, &startedAt, &endedAt, &a.StagingHead); err != nil {
 			return fmt.Errorf("scan apply attempt: %w", err)
 		}
 		a.Preflight = model.ArtifactRef{Workflow: workflow, Type: model.ArtifactType(preflightType),

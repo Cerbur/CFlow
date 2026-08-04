@@ -303,9 +303,12 @@ func hasBlockingFinding(st model.State, code model.Code) bool {
 // TestReleaseDispositionMatrix covers the Task 21 matrix disposition rows
 // not already pinned by recovery_test.go, through the real Store and Git
 // facts: the Apply staging re-run (safe_to_retry), the managed process stop
-// of a still-running process (safe_to_retry), and a quarantine whose audit
-// ref is missing (a DIRTY_WORKTREE_DRIFTED blocking fault — the evidence
-// must never vanish). The release matrix harness drives the same rows.
+// of a still-running process (blocked_drift — the row carries no OS
+// identity, so the stopped settlement can never be verified and the
+// crash-restarting Runtime fails closed with a user-action fault), and a
+// quarantine whose audit ref is missing (a DIRTY_WORKTREE_DRIFTED blocking
+// fault — the evidence must never vanish). The release matrix harness
+// drives the same rows.
 func TestReleaseDispositionMatrix(t *testing.T) {
 	t.Run("apply staging recoverable", func(t *testing.T) {
 		fx := newRecoveryFixture(t)
@@ -318,7 +321,7 @@ func TestReleaseDispositionMatrix(t *testing.T) {
 		requireDisposition(t, out, recovery.SafeToRetry)
 	})
 
-	t.Run("process stop of a running process", func(t *testing.T) {
+	t.Run("process stop of a running process fails closed", func(t *testing.T) {
 		fx := newRecoveryFixture(t)
 		fx.mutate(t,
 			model.SessionAppendMutation{Session: model.Session{ID: "s1", Purpose: model.PurposeRepair, Status: model.SessionActive}, Provider: "fake"},
@@ -326,7 +329,15 @@ func TestReleaseDispositionMatrix(t *testing.T) {
 		)
 		fx.seedIntent(model.ManagedProcessStopIntent{Process: "rp-1"})
 		out := mustReconcile(t, fx)
-		requireDisposition(t, out, recovery.SafeToRetry)
+		requireDisposition(t, out, recovery.BlockedDrift)
+		if len(out.Faults) == 0 {
+			t.Fatalf("an unverified RUNNING process row must produce a user-action fault")
+		}
+		for _, f := range out.Faults {
+			if f.Code != model.CodeDirtyWorktreeDrifted {
+				t.Fatalf("process stop fault code = %s, want DIRTY_WORKTREE_DRIFTED", f.Code)
+			}
+		}
 	})
 
 	t.Run("quarantine missing audit ref blocks", func(t *testing.T) {
