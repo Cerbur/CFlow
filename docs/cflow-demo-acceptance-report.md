@@ -27,10 +27,10 @@ release build configuration (`-trimpath`, `CGO_ENABLED=0`).
 | Metadata | Value |
 |---|---|
 | Version | `0.1.0-demo3` |
-| Source Commit | `12e47e0d4cd752573358851104bc2808c15e16e1` (`fix: stamp release metadata into the dogfood candidate`) |
+| Source Commit | `48252832f61839854bf3d5007b4e8322ecd7e72c` (`fix: harden apply cas, orphan processes, and process map races`) |
 | Source dirty | `false` (Git-clean workspace) |
-| Schema version | `3` (embedded migration chain `001..003`) |
-| Migration registry hash | `f0fd7059f8050b76443e9c26db5e40df035128e237cb6fd55a914d933b57461a` |
+| Schema version | `4` (embedded migration chain `001..004`) |
+| Migration registry hash | `9e1408b44ca60a42fbb00ca0f3c9aac8adf9e183c24df9e61a924dcd0fa993c5` |
 | Artifact compatibility hash | `4b574d27fb5b52decbbc472f3280490f77f66a7d64b9d9e9ab866a5d2b620bb9` |
 | Provider registry hash | `5a15d8052dac090e139cc783e04f0f2f49eb9c938db53c69743a3b11aa5f9b8f` |
 | Prompt registry hash | `d18562d2f278345ca9d5e527c80c30143c56468b1fea7072ca08329785b863d4` |
@@ -48,17 +48,17 @@ byte-for-byte with the candidate binary. `scripts/check-cross-build.sh` and
 `scripts/gate3.sh <artifact-dir>` reruns Gate 1 and Gate 2, the
 cross-platform matrix, the native race tests, the release-evidence
 validation, and the recursive secret scan. The authoritative manifest it
-wrote (source Commit `12e47e0d4cd752573358851104bc2808c15e16e1`, elapsed
-425s) is:
+wrote at the final source Commit `48252832f61839854bf3d5007b4e8322ecd7e72c`
+(elapsed 858s) is:
 
 ```
 candidate: Demo Complete Candidate
 git_clean: true
 source_dirty: false
-binary_sha256: 7e1b167e2236106f501123625367c59d616141237f741149178b585baf26d548
-schema_version: 3
+binary_sha256: 2d0ec9f76f7cdb924f23584e48e811c9bd78f0d722b1af858bf8c280ce521b41
+schema_version: 4
 registries:
-  migration: f0fd7059f8050b76443e9c26db5e40df035128e237cb6fd55a914d933b57461a
+  migration: 9e1408b44ca60a42fbb00ca0f3c9aac8adf9e183c24df9e61a924dcd0fa993c5
   artifact: 4b574d27fb5b52decbbc472f3280490f77f66a7d64b9d9e9ab866a5d2b620bb9
   provider: 5a15d8052dac090e139cc783e04f0f2f49eb9c938db53c69743a3b11aa5f9b8f
   prompt: d18562d2f278345ca9d5e527c80c30143c56468b1fea7072ca08329785b863d4
@@ -75,7 +75,7 @@ checks:
 ```
 
 The full manifest (with `generated_at` and the pending-state wording) is
-recorded in `test-artifacts/gate3-rerun/gate3-manifest.txt`.
+recorded in `test-artifacts/gate3-final/gate3-manifest.txt`.
 
 The release-evidence validation (`observe.ValidateReleaseEvidence`,
 `internal/observe/release_test.go`) rejects a Gate manifest recorded by a
@@ -89,17 +89,17 @@ workspace.
 
 `scripts/check-cross-build.sh` compiled the CGO-disabled single binary for
 all four supported Runtime platforms and recorded the SHA-256 per platform
-from the authoritative post-commit run (source Commit `12e47e0`):
+from the authoritative final run (source Commit `4825283`):
 
 | Platform | SHA-256 |
 |---|---|
-| darwin/amd64 | `766385b17db4d7cb1e9e8fa6a0c3c3bebc62c774ee22b6fd45e840175d13f028` |
-| darwin/arm64 | `7e1b167e2236106f501123625367c59d616141237f741149178b585baf26d548` |
-| linux/amd64 | `40991d3c1020ad33e5008830f62ece3d92688c4668bde871d81608ba1fc09137` |
-| linux/arm64 | `dfac56d9fd19c554e6b0016e5519364141339caef6af7985478c8defc261ad21` |
+| darwin/amd64 | `aed8e90512668db9ab3ddd9bc82532caed57528aca0a88f3bbb91f1da74cb286` |
+| darwin/arm64 | `2d0ec9f76f7cdb924f23584e48e811c9bd78f0d722b1af858bf8c280ce521b41` |
+| linux/amd64 | `91694ab905935d7df7176e32a22312b9ad3435f727308fc141e273d0463ee4c7` |
+| linux/arm64 | `ccbc91127c81fd3163306c3c9c190fb053683357b198136fa728a39ed47f20e4` |
 
 The darwin/arm64 cross-build hash equals the Gate 3 candidate binary hash
-(`7e1b167e…`): the native release candidate is byte-identical to the
+(`2d0ec9f7…`): the native release candidate is byte-identical to the
 darwin/arm64 matrix build, direct reproducibility evidence. Every platform
 binary was inspected with `go version -m` (proving `-trimpath=true` and
 `CGO_ENABLED=0`), and the native binary's `version` output proved the pinned
@@ -178,11 +178,11 @@ when the user authorizes the run.
 | `go vet ./...` | 0 | seconds |
 | `go test ./...` | 0 | minutes |
 | `./scripts/check-cross-build.sh <artifact-dir>` | 0 | ~2-3 minutes |
-| `./scripts/gate3.sh <artifact-dir>` | 0 | 425 seconds (~7 min) |
+| `./scripts/gate3.sh <artifact-dir>` | 0 | 858 seconds (~14 min) |
 | `git status --porcelain` | 0 (empty) | seconds |
 
-The authoritative gate3 manifest (source Commit `12e47e0`, `elapsed_seconds:
-425`) is recorded in `test-artifacts/gate3-rerun/gate3-manifest.txt`.
+The authoritative gate3 manifest (source Commit `4825283`, `elapsed_seconds:
+858`) is recorded in `test-artifacts/gate3-final/gate3-manifest.txt`.
 
 ## 9. Known limits
 
