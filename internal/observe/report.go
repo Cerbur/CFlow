@@ -244,7 +244,7 @@ func GenerateReport(in ReportInput) (Report, error) {
 		Migration:   in.Migration,
 		Security:    in.Security,
 		EventExport: in.EventExport,
-		Apply:       ReportApply{Status: "NOT_RUN", Detail: "the protected apply (Gate 3) has not run"},
+		Apply:       applyPosture(st),
 		Cleanup:     cleanupPosture(st),
 	}
 	if st.Plan != nil {
@@ -508,6 +508,29 @@ func findingsOf(st model.State) []ReportFinding {
 }
 
 // cleanupPosture derives the Cleanup status from the CleanupAttempts.
+// applyPosture renders the Apply outcome (Task 18 seam): NOT_RUN until
+// an Apply Attempt exists; afterwards the attempt's status and the exact
+// recorded Target facts. The report never claims an apply that did not
+// happen.
+func applyPosture(st model.State) ReportApply {
+	if len(st.ApplyAttempts) == 0 {
+		return ReportApply{Status: "NOT_RUN", Detail: "the protected apply has not run"}
+	}
+	att := st.ApplyAttempts[len(st.ApplyAttempts)-1]
+	return ReportApply{
+		Status: string(att.Status),
+		Detail: fmt.Sprintf("attempt %s; target %s at %s", att.ID, st.Workflow.TargetBranch, shortHead(att.TargetHead)),
+	}
+}
+
+// shortHead renders a full commit hash in the bounded report form.
+func shortHead(head string) string {
+	if len(head) > 12 {
+		return head[:12]
+	}
+	return head
+}
+
 func cleanupPosture(st model.State) ReportCleanup {
 	if len(st.CleanupAttempts) == 0 {
 		return ReportCleanup{Status: "NOT_RUN", Detail: "no cleanup dry run produced"}

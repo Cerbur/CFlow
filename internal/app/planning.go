@@ -195,6 +195,12 @@ func (a *Application) promptForPurpose(purpose model.AgentPurpose) (agent.Prompt
 		name = "TASK_REPAIR"
 	case model.PurposeFinalVerification:
 		name = "FINAL_VERIFICATION"
+	case model.PurposeApplyVerification:
+		// The independent Apply Verification Session reviews the combined
+		// Target + Integration result: the same semantic-review prompt the
+		// Final Reviewer uses (the session is always a fresh Session; the
+		// Prompt Registry carries no apply-specific body).
+		name = "FINAL_VERIFICATION"
 	}
 	if name == "" {
 		return agent.Prompt{}, false

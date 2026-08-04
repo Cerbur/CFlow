@@ -246,18 +246,63 @@ type VerifyCommit struct {
 
 func (VerifyCommit) isGitOperation() {}
 
-// MergeIntegration performs one serial --no-ff Integration merge of
-// branch into the managed Integration Worktree at path (design 15.5).
-// The merge is compare-and-swap guarded: the caller records the expected
+// MergeIntegration performs one serial --no-ff merge of branch into the
+// managed Worktree at path (design 15.5; the same primitive serves the
+// serial Integration merges and the isolated Apply staging merge). The
+// merge is compare-and-swap guarded: the caller records the expected
 // pre-merge HEAD with a GitStatus observation; a text conflict returns a
 // typed MergeConflictResult (never an error) and leaves the worktree in
-// the conflicted merge state for the RollbackMerge operation.
+// the conflicted merge state for the RollbackMerge operation. Message
+// overrides the Merge Commit subject ("" uses the default).
 type MergeIntegration struct {
-	Path   string // canonical Integration Worktree path
-	Branch string // Task Branch refname (without refs/heads/ prefix)
+	Path    string // canonical managed Worktree path
+	Branch  string // Branch refname (without refs/heads/ prefix)
+	Message string // optional Merge Commit subject override
 }
 
 func (MergeIntegration) isGitOperation() {}
+
+// CreateApply creates the isolated Apply Branch/Worktree from the
+// recorded Target HEAD (PRD 已确认：显式受保护 Apply step 2): the staging
+// merge never runs in the user's working tree. The branch must not
+// already exist and the destination path must be outside every existing
+// worktree.
+type CreateApply struct {
+	Branch   string // refname (without refs/heads/ prefix)
+	BaseHead string // full commit hash, the recorded Target HEAD
+	Path     string // canonical destination worktree path
+}
+
+func (CreateApply) isGitOperation() {}
+
+// UpdateRef performs the final compare-and-swap fast-forward of one ref
+// (PRD 已确认：显式受保护 Apply step 6): the expected old value is
+// re-observed, the new head must be a descendant of the expected head (a
+// fast-forward; there is no force-update form anywhere in this path),
+// and the ref is updated only with `git update-ref <ref> <new>
+// <expected>` — the atomic expected-value form. The observed actual ref
+// is the reported outcome.
+type UpdateRef struct {
+	Ref      string // full refname (refs/heads/<target>)
+	New      string // full commit hash, the verified staging head
+	Expected string // full commit hash, the recorded Target HEAD
+}
+
+func (UpdateRef) isGitOperation() {}
+
+// CompleteMerge finishes a conflicted Apply staging merge inside the
+// managed Apply Worktree (design 15.5: the ONE restricted Merge
+// Resolution Attempt): the exact conflict files are staged (scope-bound)
+// and the merge commit is created with the recorded parents. Any
+// change outside the conflict files fails closed; the Merge Commit must
+// carry both parents and the Worktree must be clean afterwards.
+type CompleteMerge struct {
+	Path          string   // canonical Apply Worktree path
+	ConflictFiles []string // the exact conflicted paths (write scope)
+	Message       string   // Merge Commit subject
+}
+
+func (CompleteMerge) isGitOperation() {}
 
 // RollbackMerge restores the managed Integration Worktree to the
 // recorded pre-merge HEAD (design 15.5, PRD 已确认：Merge Conflict 处理).
@@ -545,6 +590,26 @@ type RollbackResult struct {
 
 func (RollbackResult) isGitResult() {}
 
+// ApplyWorktreeResult reports the created or reused Apply
+// Branch/Worktree with its verified state.
+type ApplyWorktreeResult struct {
+	Worktree string
+	Branch   string
+	Head     string
+}
+
+func (ApplyWorktreeResult) isGitResult() {}
+
+// UpdateRefResult reports the observed actual value of the ref after the
+// compare-and-swap (the outcome is reported from the observation, never
+// assumed).
+type UpdateRefResult struct {
+	Ref      string
+	Observed string
+}
+
+func (UpdateRefResult) isGitResult() {}
+
 // ---------------------------------------------------------------------------
 // Observe / Execute dispatch
 // ---------------------------------------------------------------------------
@@ -590,6 +655,12 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.verifyCommit(ctx, op)
 	case MergeIntegration:
 		return g.mergeIntegration(ctx, op)
+	case CreateApply:
+		return g.createApply(ctx, op)
+	case UpdateRef:
+		return g.updateRef(ctx, op)
+	case CompleteMerge:
+		return g.completeMerge(ctx, op)
 	case RollbackMerge:
 		return g.rollbackMerge(ctx, op)
 	default:

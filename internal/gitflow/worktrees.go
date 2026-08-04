@@ -136,6 +136,52 @@ func (g *GitFlow) createTask(ctx context.Context, op CreateTask) (GitResult, err
 	return TaskWorktreeResult{Worktree: path, Branch: op.Branch, Head: entry.Head}, nil
 }
 
+// createApply creates the isolated Apply Branch/Worktree from the
+// recorded Target HEAD (design 15.2: user Apply → isolated Apply
+// Branch/Worktree). The same expected-state compare-and-swap guards the
+// creation as every other Worktree primitive: base commit exists, branch
+// absent, destination path absent and outside every existing worktree,
+// and the resulting registry entry verified after creation. The user's
+// target branch is never touched.
+func (g *GitFlow) createApply(ctx context.Context, op CreateApply) (GitResult, error) {
+	if err := validateBranchName(op.Branch); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.BaseHead); err != nil {
+		return nil, err
+	}
+	path, err := g.validateWorktreePath(ctx, op.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.requireCommit(ctx, op.BaseHead); err != nil {
+		return nil, err
+	}
+	ref := "refs/heads/" + op.Branch
+	if exists, err := g.refExists(ctx, ref); err != nil {
+		return nil, err
+	} else if exists {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: apply branch already exists")
+	}
+	env := childEnv()
+	if _, _, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "worktree", "add", "-b", op.Branch, path, op.BaseHead); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: apply worktree could not be created")
+	}
+	entry, err := g.verifiedEntry(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Detached || entry.Branch != op.Branch || entry.Head != op.BaseHead {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: apply worktree does not match the expected state")
+	}
+	return ApplyWorktreeResult{Worktree: path, Branch: op.Branch, Head: entry.Head}, nil
+}
+
 // createAuditRef creates one append-only audit ref with expected-absent
 // semantics (PRD Recovery: Expected-Absent `git update-ref`). An existing
 // ref is never overwritten or moved.
@@ -147,11 +193,11 @@ func (g *GitFlow) createAuditRef(ctx context.Context, op CreateAuditRef) (GitRes
 		return nil, err
 	}
 	env := childEnv()
-	if _, _, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "update-ref", op.Ref, op.Head, ""); err != nil {
+	if _, errOut, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "update-ref", op.Ref, op.Head, ""); err != nil {
 		return nil, err
 	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
 		return nil, model.NewFault(model.CodeStateInvariantViolation,
-			"gitflow: audit ref already exists")
+			"gitflow: audit ref already exists: "+string(errOut))
 	}
 	facts, err := g.refLookup(ctx, RefLookup{Ref: op.Ref})
 	if err != nil {

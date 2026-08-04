@@ -8,10 +8,10 @@ package app
 // facts, and the Kernel decides.
 //
 // Effects whose full semantics arrive with later tasks (ProviderCancel:
-// Task 17; Integration*: Task 13; VerificationRun: Task 11; Apply*:
-// Task 19; Cleanup*: Task 20; GitCommitInspect | GitAuditRefCreate:
-// Task 13) have typed executor stubs that fail closed without pretending
-// to run the external operation. A stub firing is an invariant failure.
+// Task 17; Cleanup*: Task 20) have typed executor stubs that fail closed
+// without pretending to run the external operation. A stub firing is an
+// invariant failure. The protected Apply (Task 19) executors live in the
+// same-package apply.go split.
 
 import (
 	"context"
@@ -80,9 +80,10 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return a.integrationRollback(ctx, wf, e)
 	case model.VerificationRunIntent:
 		return a.verificationRun(ctx, wf, e)
-	case model.ApplyStagingCreateIntent, model.ApplyFastForwardIntent:
-		// STUB (Task 19): the protected Apply compare-and-swap protocol.
-		return model.EffectResultInput{}, stubEffect(e)
+	case model.ApplyStagingCreateIntent:
+		return a.applyStagingCreate(ctx, wf, e, rt)
+	case model.ApplyFastForwardIntent:
+		return a.applyFastForward(ctx, wf, e)
 	case model.CleanupWorktreeRemoveIntent, model.CleanupScratchRemoveIntent:
 		// STUB (Task 20): Cleanup revalidates each item against the
 		// confirmed Manifest before removing anything.
@@ -302,6 +303,13 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 		// the exact Plan/Spec/Catalog/Workflow refs and the Integration
 		// HEAD it verifies.
 		return a.finalReviewProviderStart(ctx, wf, intent, cmd, rt)
+	}
+	if intent.Purpose == model.PurposeApplyVerification {
+		// The independent Apply Verification Session (PRD 已确认：显式受保
+		// 护 Apply step 4): a non-coding Session inside the Apply
+		// Worktree, bound to the exact refs and the deterministic apply
+		// verification manifest.
+		return a.applyReviewProviderStart(ctx, wf, intent, cmd, rt)
 	}
 	prompt, ok := a.planningPrompt(cmd)
 	if !ok {

@@ -194,11 +194,15 @@ func parsePorcelainV2(out []byte) (staged, unstaged, untracked, ignored []PathEn
 			}
 			untracked = append(untracked, PathEntry{Path: cleanRel(parts[1]), X: '?', Y: '?'})
 		case strings.HasPrefix(f, "u "):
-			parts := strings.SplitN(f, " ", 10)
-			if len(parts) != 10 || len(parts[1]) != 2 {
+			// u XY sub mH mI mW hH hI path — the unmerged entry's stage
+			// hashes vary across git versions (two or three stage
+			// hashes), so the path is the final field, never a fixed
+			// column.
+			fields := strings.Fields(f)
+			if len(fields) < 10 || len(fields[1]) != 2 {
 				return nil, nil, nil, nil, unparsableStatus()
 			}
-			e := PathEntry{Path: cleanRel(parts[9]), X: parts[1][0], Y: parts[1][1], Mode: parts[4]}
+			e := PathEntry{Path: cleanRel(fields[len(fields)-1]), X: fields[1][0], Y: fields[1][1], Mode: fields[4]}
 			classify(e, &staged, &unstaged)
 		case strings.HasPrefix(f, "1 "):
 			parts := strings.SplitN(f, " ", 9)

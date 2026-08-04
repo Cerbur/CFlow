@@ -72,16 +72,16 @@ func TestRetryRequiresTaskID(t *testing.T) {
 	requireExit(t, out, code, 2)
 }
 
-// TestApplyReturnsNotYetAvailable (brief case list: the apply preflight
-// entry): until the Gate 3 protected Apply lands, `cflow apply` returns
-// the stable NOT_YET_AVAILABLE finding with exit class 3 (safe user
-// action required), never claiming a success or an apply.
-func TestApplyReturnsNotYetAvailable(t *testing.T) {
+// TestApplyRequiresCompletedWorkflowAtCLI: the protected Apply (PRD 已确
+// 认：显式受保护 Apply) is a post-completion delivery; `cflow apply` on a
+// workflow that is not completed refuses with INVALID_INPUT (exit class
+// 2), never claiming an apply.
+func TestApplyRequiresCompletedWorkflowAtCLI(t *testing.T) {
 	home, _ := seedCLIProject(t)
 	out, code := runCLIWithError(t, home, "apply", "wf-1")
-	requireExit(t, out, code, 3)
-	if !strings.Contains(out, string(model.CodeNotYetAvailable)) {
-		t.Fatalf("apply output missing NOT_YET_AVAILABLE:\n%s", out)
+	requireExit(t, out, code, 2)
+	if !strings.Contains(out, "apply requires a completed workflow") {
+		t.Fatalf("apply output missing the completed-workflow gate:\n%s", out)
 	}
 }
 

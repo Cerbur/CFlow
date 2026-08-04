@@ -1,30 +1,58 @@
 package decision
 
 import (
+	"encoding/json"
 	"fmt"
+	"time"
 
 	"cflow.local/cflow/internal/model"
 )
 
-// decideApply handles the user Apply interaction: a post-completion,
-// user-initiated delivery attempt that revalidates Integration output and
-// may fast-forward the Target Branch (CONTEXT.md: Apply). Apply success
-// never alters the Workflow's completed state (design 7.3 invariant 12).
+// The protected Apply protocol (PRD 已确认：显式受保护 Apply, design 15.5):
+// Apply is a SEPARATE Attempt after Workflow completion that never
+// reopens the completed Workflow state. The request records the Target
+// HEAD, the Integration HEAD, and the Commit Policy facts; the staging
+// runs only in an isolated Apply Worktree (the executor's concern); the
+// independent Apply Verification Session's verdict is judged here; the
+// explicit delivery re-binds the exact facts; and the final
+// compare-and-swap fast-forward result is settled from the observed
+// actual Target ref. A failure never changes the Target Branch or the
+// completed Workflow state. A Target Drift always starts a NEW Attempt
+// from the new heads; the old verification conclusions are never reused.
+//
+// Commit Policy drift (PRD 约束 40-41) blocks the Attempt with
+// COMMIT_POLICY_CONFIRMATION_REQUIRED before any staging; the explicit
+// confirmation binds the exact Attempt, the Target/Integration heads,
+// and the fresh Preflight Revision/hash/fingerprint, and any later
+// change voids the input. A Target Drift that changed the
+// Wrapper/Manifest/Executable identity blocks with COMMAND_IDENTITY_CHANGED
+// and only an append-only APPLY_CATALOG approval of the newly
+// discovered, validated, and fixed Catalog Revision may continue
+// (PRD 已确认：Apply Command Identity Drift).
+
+// decideApply handles the user Apply interaction: the request (Prepare)
+// and the explicit delivery (Execute) are the closed command kinds; the
+// policy/catalog confirmation is the separate ApplyPolicyConfirmation
+// input.
 func decideApply(state model.State, in model.ApplyCommandInput) (model.Decision, error) {
 	switch in.Kind {
 	case model.ApplyRequest:
 		return applyRequest(state, in)
-	case model.ApplyConfirm:
-		return applyConfirm(state, in)
+	case model.ApplyExecute:
+		return applyExecute(state, in)
 	default:
 		return model.Decision{}, model.InvalidInputFault("unsupported apply command")
 	}
 }
 
-// applyRequest opens a new Apply Attempt against a completed Workflow.
-// The Integration output may not come from a quarantined Branch, and the
-// attempt records the exact Target/Integration HEAD and Commit Policy
-// Preflight facts its confirmation must re-bind.
+// applyRequest opens (or re-opens) one Apply Attempt against a completed
+// Workflow. The Integration output may not come from a quarantined
+// Branch. The attempt records the exact Target/Integration HEAD and the
+// Commit Policy Preflight facts its delivery must re-bind, allocates the
+// independent Apply Verification Session, and requests the isolated
+// staging. When the recorded Commit Policy fingerprint differs from the
+// approved Execution facts, the attempt blocks at
+// COMMIT_POLICY_CONFIRMATION_REQUIRED before any staging (PRD 约束 40-41).
 func applyRequest(state model.State, in model.ApplyCommandInput) (model.Decision, error) {
 	if state.Workflow.Stage != model.StageCompleted || state.Workflow.Runtime != model.RuntimeSucceeded {
 		return model.Decision{}, model.InvalidInputFault("apply requires a completed workflow")
@@ -36,40 +64,255 @@ func applyRequest(state model.State, in model.ApplyCommandInput) (model.Decision
 	if in.TargetHead == "" || in.IntegrationHead == "" {
 		return model.Decision{}, model.InvalidInputFault("apply requires target and integration HEAD values")
 	}
+	if in.PreflightHash == "" || in.Fingerprint == "" {
+		return model.Decision{}, model.InvalidInputFault("apply requires the commit-policy preflight facts")
+	}
+	if in.ReviewSession == "" || in.ReviewRoute == "" || in.ReviewProcess == "" {
+		return model.Decision{}, model.InvalidInputFault("apply requires the independent apply verification session allocation")
+	}
 	b := &builder{state: state}
+	last := lastApplyAttempt(state)
+	att, created, stagingWillRun := applyAttemptFor(state, in, last, b)
+	_ = created
+	if !stagingWillRun {
+		// A request against an already verified or in-flight attempt is a
+		// no-op: no session allocation is appended (the delivery runs
+		// through ExecuteApply).
+		return b.decision(), nil
+	}
+	if !sessionExists(state, in.ReviewSession) {
+		// The independent Apply Verification Session is appended once per
+		// staging run: a fresh allocation for a new or re-opened attempt,
+		// the persisted SessionStarting record for an interrupted staging
+		// re-run.
+		if err := validateFreshSession(state, in.ReviewSession); err != nil {
+			return model.Decision{}, err
+		}
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID: in.ReviewSession, Purpose: model.PurposeApplyVerification, Status: model.SessionStarting,
+			Provider: in.ReviewRoute,
+		}, Provider: in.ReviewRoute})
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.ReviewProcess, Session: in.ReviewSession, Purpose: model.PurposeApplyVerification,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
+	if in.ResolutionSession != "" {
+		if err := validateFreshSession(state, in.ResolutionSession); err != nil {
+			return model.Decision{}, err
+		}
+		if in.ResolutionProcess == "" {
+			return model.Decision{}, model.InvalidInputFault("the resolution allocation requires a process identity")
+		}
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID: in.ResolutionSession, Purpose: model.PurposeRepair, Status: model.SessionStarting,
+		}, Provider: in.ReviewRoute})
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.ResolutionProcess, Session: in.ResolutionSession, Purpose: model.PurposeRepair,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
+	if facts := state.Workflow.ExecutionFacts; facts != nil && facts.Fingerprint != "" && att.Fingerprint != facts.Fingerprint {
+		// The observed Commit Policy differs from the approved one:
+		// the attempt blocks before any staging; the user's explicit
+		// confirmation re-binds the attempt with the fresh Preflight
+		// (PRD 约束 41). The Workflow stays COMPLETED and the Target
+		// unchanged. An attempt that already passed its staging is
+		// never re-blocked by this gate.
+		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
+		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, model.CodeCommitPolicyConfirmationRequired,
+			"commit policy drifted since the execution approval; apply blocked until the exact confirmation")
+		return b.decision(), nil
+	}
+	b.effect(model.ApplyStagingCreateIntent{
+		Apply:             att.ID,
+		TargetHead:        att.TargetHead,
+		IntegrationHead:   att.IntegrationHead,
+		ResolutionSession: in.ResolutionSession,
+	})
+	return b.decision(), nil
+}
+
+// applyAttemptFor decides the attempt the request operates on: a blocked
+// attempt whose recorded heads still match the fresh observations is
+// re-opened (the user's explicit retry of the same attempt); an attempt
+// already staging, awaiting confirmation, or running with matching heads
+// is a no-op (the retry of an unsettled or verified staging; the
+// delivery runs through ExecuteApply); anything else — including every
+// drifted head — starts a NEW attempt from the fresh heads (PRD: a
+// drifted Target always starts a new Attempt; the old verification
+// conclusions are never reused). created reports whether a new attempt
+// was appended; stagingWillRun reports whether the staging effect will
+// run (false for the no-op of an already verified or in-flight attempt).
+func applyAttemptFor(state model.State, in model.ApplyCommandInput, last *model.ApplyAttempt, b *builder) (model.ApplyAttempt, bool, bool) {
+	if last != nil && in.TargetHead == last.TargetHead && in.IntegrationHead == last.IntegrationHead {
+		switch last.Status {
+		case model.ApplyAwaitingConfirmation, model.ApplyRunning:
+			// The staging already passed and awaits the explicit delivery,
+			// or the delivery is in flight: the request is a no-op.
+			return *last, false, false
+		case model.ApplyStaging:
+			// A staging interrupted before its result: re-run the staging
+			// against the same recorded facts (the executor re-observes
+			// every git fact; the Apply Worktree is reused).
+			att := *last
+			att.ReviewSession = in.ReviewSession
+			att.ReviewRoute = in.ReviewRoute
+			att.ReviewProcess = in.ReviewProcess
+			return att, false, true
+		case model.ApplyBlocked:
+			// The explicit retry of the same blocked attempt.
+			att := *last
+			att.Status = model.ApplyStaging
+			att.EndedAt = time.Time{}
+			att.ReviewSession = in.ReviewSession
+			att.ReviewRoute = in.ReviewRoute
+			att.ReviewProcess = in.ReviewProcess
+			b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyStaging})
+			b.event(model.EventApplyRestarted, "", model.AttemptKey{}, "", "apply attempt re-opened for staging")
+			return att, false, true
+		}
+	}
+	// A fresh attempt: the recorded heads are the fresh observations.
+	number := len(state.ApplyAttempts) + 1
 	att := model.ApplyAttempt{
-		ID:              model.ApplyAttemptID(fmt.Sprintf("apply-%d", len(state.ApplyAttempts)+1)),
+		ID:              model.ApplyAttemptID(fmt.Sprintf("apply-%d", number)),
+		Number:          number,
 		Status:          model.ApplyStaging,
 		TargetHead:      in.TargetHead,
 		IntegrationHead: in.IntegrationHead,
 		Preflight:       in.Preflight,
 		PreflightHash:   in.PreflightHash,
 		Fingerprint:     in.Fingerprint,
+		ReviewSession:   in.ReviewSession,
+		ReviewRoute:     in.ReviewRoute,
+		ReviewProcess:   in.ReviewProcess,
 		StartedAt:       state.Now,
 	}
 	b.mutate(model.ApplyAppendMutation{ApplyAttempt: att})
 	b.event(model.EventApplyAttemptCreated, "", model.AttemptKey{}, "", "apply attempt created")
-	b.effect(model.ApplyStagingCreateIntent{Apply: att.ID, TargetHead: in.TargetHead, IntegrationHead: in.IntegrationHead})
+	return att, true, true
+}
+
+// decideApplyStagingResult settles one staging effect result. A passing
+// staging (the isolated Apply Worktree holds the verified combined
+// result and the deterministic apply verification passed) requests the
+// independent Apply Verification Session; the verdict is judged by
+// decideApplyReviewRunEnded. A failed staging blocks the attempt with
+// the typed code and settles the never-started review Session.
+func decideApplyStagingResult(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	att := findApplyAttempt(state, in.ApplyAttempt)
+	if att == nil || att.Status != model.ApplyStaging {
+		return model.Decision{}, model.InvalidInputFault("unknown or non-staging apply attempt")
+	}
+	b := &builder{state: state}
+	switch in.Kind {
+	case model.ApplyStagingSucceeded:
+		if in.EndHead == "" || in.ManifestHash == "" {
+			return model.Decision{}, model.InvariantFault(fmt.Errorf(
+				"apply staging success carries no staging head or verification manifest"))
+		}
+		b.mutate(model.ApplyMutation{ID: att.ID, StagingHead: in.EndHead})
+		// The independent Apply Verification Session runs next. Its
+		// allocation facts are derived from the persisted Session and
+		// Process records (the attempt's in-memory fields do not survive
+		// the store round-trip).
+		session, route, process := applyReviewFacts(state)
+		b.effect(model.ProviderStartIntent{
+			Session: session, Purpose: model.PurposeApplyVerification,
+			Route: route, Process: process,
+		})
+	case model.ApplyStagingFailed:
+		code := in.FailureCode
+		if code == "" {
+			code = model.CodeStateInvariantViolation
+		}
+		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
+		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, code, "apply staging blocked")
+		settleApplySessionNeverStarted(b, state)
+	default:
+		return model.Decision{}, model.InvalidInputFault("unsupported apply staging result")
+	}
 	return b.decision(), nil
 }
 
-// applyConfirm is the exact compare-and-swap confirmation: it re-binds
-// the Apply Attempt, the Target HEAD, the Integration HEAD, and the exact
-// Preflight Revision/hash/fingerprint. A drifted Target or Integration
-// HEAD is TARGET_HEAD_DRIFTED; a drifted Preflight hash or fingerprint is
-// COMMIT_POLICY_INPUT_CHANGED (PRD 约束 40-41, design 15.5).
-func applyConfirm(state model.State, in model.ApplyCommandInput) (model.Decision, error) {
+// decideApplyReviewRunEnded judges the independent Apply Verification
+// Session's verdict (design 16.2: review never replaces deterministic
+// verification; the Kernel judges the verdict). The review Session must
+// be independent — its provider session id can never be shared — and the
+// deterministic apply verification manifest must ride the result. A PASS
+// leaves the attempt awaiting the explicit delivery; anything else
+// blocks it. The completed Workflow is never altered.
+func decideApplyReviewRunEnded(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
+	for _, s := range state.Sessions {
+		if s.ID != created.ID && s.ProviderSessionID != "" && s.ProviderSessionID == in.Session.ProviderSessionID {
+			return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+				"the apply verification session reuses an existing session's provider session id")
+		}
+	}
+	att := applyAttemptStaging(state)
+	if att == nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("apply review has no staging attempt"))
+	}
+	if in.ManifestHash == "" {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("apply review carries no deterministic verification manifest"))
+	}
+	verdict, err := parseReviewVerdict(in.Body)
+	b := &builder{state: state}
+	b.mutate(sessionEnd(state, created, in))
+	if err != nil || !verdict {
+		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
+		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, model.CodeSemanticReviewFailed,
+			"apply verification review failed")
+		return b.decision(), nil
+	}
+	b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyAwaitingConfirmation})
+	b.event(model.EventApplyVerified, "", model.AttemptKey{}, "", "apply staging verified")
+	return b.decision(), nil
+}
+
+// decideApplyReviewFailed settles a failed or cancelled Apply
+// Verification Session: the attempt blocks with the typed code and the
+// completed Workflow stays untouched.
+func decideApplyReviewFailed(state model.State, in model.EffectResultInput, created *model.Session, code model.Code) (model.Decision, error) {
+	att := applyAttemptStaging(state)
+	if att == nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("apply review failure has no staging attempt"))
+	}
+	b := &builder{state: state}
+	b.mutate(sessionEnd(state, created, in))
+	b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
+	b.event(model.EventApplyBlocked, "", model.AttemptKey{}, code, "apply verification review failed")
+	return b.decision(), nil
+}
+
+// applyExecute is the explicit delivery (ExecuteApply): the strict
+// re-bind of the Apply Attempt, the Target/Integration heads, and the
+// exact Preflight facts, then the final compare-and-swap fast-forward.
+// A RUNNING attempt is the crash-recovery re-delivery: the executor
+// re-observes every fact from git and settles from the actual ref, so
+// the re-bind is skipped (the observed Target may already be the
+// delivered staging head).
+func applyExecute(state model.State, in model.ApplyCommandInput) (model.Decision, error) {
 	att := lastApplyAttempt(state)
-	if att == nil || att.Status != model.ApplyAwaitingConfirmation {
-		return model.Decision{}, model.InvalidInputFault("no apply attempt awaiting confirmation")
+	if att == nil {
+		return model.Decision{}, model.InvalidInputFault("no apply attempt to execute")
 	}
-	if in.TargetHead != att.TargetHead || in.IntegrationHead != att.IntegrationHead {
-		return model.Decision{}, model.NewFault(model.CodeTargetHeadChanged,
-			"target or integration HEAD drifted since the apply staging")
-	}
-	if in.PreflightHash != att.PreflightHash || in.Fingerprint != att.Fingerprint {
-		return model.Decision{}, model.NewFault(model.CodeCommitPolicyInputChanged,
-			"commit-policy preflight facts changed since the apply staging")
+	switch att.Status {
+	case model.ApplyAwaitingConfirmation:
+		if in.TargetHead != att.TargetHead || in.IntegrationHead != att.IntegrationHead {
+			return model.Decision{}, model.NewFault(model.CodeTargetHeadChanged,
+				"target or integration HEAD drifted since the apply staging")
+		}
+		if in.PreflightHash != att.PreflightHash || in.Fingerprint != att.Fingerprint {
+			return model.Decision{}, model.NewFault(model.CodeCommitPolicyInputChanged,
+				"commit-policy preflight facts changed since the apply staging")
+		}
+	case model.ApplyRunning:
+		// Crash recovery: no re-bind; the executor re-observes.
+	default:
+		return model.Decision{}, model.InvalidInputFault(
+			"apply attempt " + string(att.Status) + " cannot be executed")
 	}
 	b := &builder{state: state}
 	b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyRunning})
@@ -77,34 +320,177 @@ func applyConfirm(state model.State, in model.ApplyCommandInput) (model.Decision
 	return b.decision(), nil
 }
 
-// decideApplyResult settles one Apply Effect Result. Success marks the
-// Apply Attempt SUCCEEDED without touching the completed Workflow.
+// decideApplyResult settles the final compare-and-swap result. Success
+// marks the Apply SUCCEEDED with the observed actual Target ref; failure
+// blocks the attempt with the typed code. Neither ever alters the
+// completed Workflow.
 func decideApplyResult(state model.State, in model.EffectResultInput) (model.Decision, error) {
 	att := findApplyAttempt(state, in.ApplyAttempt)
-	if att == nil {
-		return model.Decision{}, model.InvalidInputFault("unknown apply attempt")
+	if att == nil || att.Status != model.ApplyRunning {
+		return model.Decision{}, model.InvalidInputFault("unknown or non-running apply attempt")
 	}
 	b := &builder{state: state}
 	switch in.Kind {
-	case model.ApplyStagingSucceeded:
-		if att.Status != model.ApplyStaging {
-			return model.Decision{}, model.InvalidInputFault("apply attempt is not staging")
-		}
-		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyAwaitingConfirmation})
 	case model.ApplyFastForwardSucceeded:
-		if att.Status != model.ApplyRunning {
-			return model.Decision{}, model.InvalidInputFault("apply attempt is not running")
+		if in.ObservedHead == "" {
+			return model.Decision{}, model.InvariantFault(fmt.Errorf("apply delivery carries no observed head"))
 		}
-		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplySucceeded, EndedAt: state.Now})
-		b.event(model.EventApplySucceeded, "", model.AttemptKey{}, "", "apply succeeded")
+		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplySucceeded, EndedAt: state.Now, StagingHead: in.ObservedHead})
+		b.event(model.EventApplySucceeded, "", model.AttemptKey{}, "", "apply delivered "+in.ObservedHead)
 	case model.ApplyFastForwardFailed:
-		if att.Status != model.ApplyRunning {
-			return model.Decision{}, model.InvalidInputFault("apply attempt is not running")
+		code := in.FailureCode
+		if code == "" {
+			code = model.CodeTargetHeadChanged
 		}
 		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
-		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, "", "apply blocked")
+		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, code, "apply delivery blocked")
+	default:
+		return model.Decision{}, model.InvalidInputFault("unsupported apply delivery result")
 	}
 	return b.decision(), nil
+}
+
+// decideApplyPolicyConfirm is the user's explicit confirmation of a
+// blocked Apply Attempt (PRD 约束 40-41, Apply Command Identity Drift):
+// it binds the exact Apply Attempt, the Target/Integration heads, and
+// the fresh Preflight Revision/hash/fingerprint. Any change since the
+// attempt was recorded voids the input. When the block was a
+// COMMAND_IDENTITY_CHANGED the confirmation carries the newly
+// discovered, validated, and fixed Apply Verification Catalog Revision
+// and records the append-only APPLY_CATALOG approval; otherwise it
+// records the Commit Policy confirmation. The attempt then re-opens for
+// a full staging re-run; the Workflow's completed state and its history
+// Execution Approval are never changed.
+func decideApplyPolicyConfirm(state model.State, in model.ApplyPolicyConfirmationInput) (model.Decision, error) {
+	att := findApplyAttempt(state, in.Attempt)
+	if att == nil || att.Status != model.ApplyBlocked {
+		return model.Decision{}, model.InvalidInputFault("no blocked apply attempt to confirm")
+	}
+	if in.TargetHead != att.TargetHead || in.IntegrationHead != att.IntegrationHead {
+		return model.Decision{}, model.NewFault(model.CodeTargetHeadChanged,
+			"a bound HEAD changed since the apply attempt was recorded; the confirmation input is void")
+	}
+	if in.Fingerprint != att.Fingerprint {
+		return model.Decision{}, model.NewFault(model.CodeCommitPolicyInputChanged,
+			"the commit policy changed again; the confirmation input is void")
+	}
+	if in.PreflightHash == "" || in.Fingerprint == "" || in.Preflight.Revision < 1 || in.Preflight.Hash == "" {
+		return model.Decision{}, model.InvalidInputFault(
+			"the confirmation requires the exact new preflight revision, hash, and fingerprint")
+	}
+	b := &builder{state: state}
+	kind := model.ApprovalCommitPolicy
+	refs := []model.ArtifactRef{in.Preflight}
+	ctx := map[string]string{
+		"attempt": string(in.Attempt), "target_head": in.TargetHead,
+		"integration_head": in.IntegrationHead,
+	}
+	if in.CatalogRef.Revision >= 1 && in.CatalogRef.Hash != "" {
+		kind = model.ApprovalApplyCatalog
+		ctx["catalog_revision"] = fmt.Sprintf("%d", in.CatalogRef.Revision)
+		ctx["catalog_hash"] = in.CatalogRef.Hash
+		refs = append(refs, model.ArtifactRef{
+			Workflow: state.Workflow.ID, Type: model.ArtifactCatalog,
+			Revision: in.CatalogRef.Revision, Hash: in.CatalogRef.Hash,
+		})
+	}
+	decisionContext, _ := json.Marshal(ctx)
+	b.mutate(model.ApprovalAppendMutation{Approval: model.Approval{
+		ID:                model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
+		Kind:              kind,
+		Seq:               state.NextEventSeq,
+		Refs:              refs,
+		Fingerprint:       in.Fingerprint,
+		PreflightRevision: in.Preflight.Revision,
+		DecisionContext:   string(decisionContext),
+	}})
+	b.mutate(model.ApplyConfirmationMutation{
+		ID: att.ID, Preflight: in.Preflight, PreflightHash: in.PreflightHash, Fingerprint: in.Fingerprint,
+	})
+	b.event(model.EventCommitPolicyConfirmed, "", model.AttemptKey{}, "", "apply policy confirmation recorded")
+	// The attempt re-opens and the full staging re-runs with the
+	// confirmed facts (the executor revalidates the fingerprint and the
+	// Catalog identity against the confirmed references). The
+	// confirmation's staging run carries its own independent Apply
+	// Verification Session allocation (the blocked staging's session was
+	// settled cancelled; a fresh one is appended).
+	if !sessionExists(state, in.ReviewSession) {
+		if err := validateFreshSession(state, in.ReviewSession); err != nil {
+			return model.Decision{}, err
+		}
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID: in.ReviewSession, Purpose: model.PurposeApplyVerification, Status: model.SessionStarting,
+			Provider: in.ReviewRoute,
+		}, Provider: in.ReviewRoute})
+		b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+			ID: in.ReviewProcess, Session: in.ReviewSession, Purpose: model.PurposeApplyVerification,
+			Status: model.ProcessStatusRunning, StartedAt: state.Now,
+		}})
+	}
+	b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyStaging})
+	b.event(model.EventApplyRestarted, "", model.AttemptKey{}, "", "apply attempt re-opened after the confirmation")
+	b.effect(model.ApplyStagingCreateIntent{
+		Apply: att.ID, TargetHead: att.TargetHead, IntegrationHead: att.IntegrationHead,
+	})
+	return b.decision(), nil
+}
+
+// settleApplySessionNeverStarted settles the apply-verification Session
+// and Process records the request allocated when the staging failed
+// before the review could run (derived from the persisted records).
+func settleApplySessionNeverStarted(b *builder, state model.State) {
+	session, _, process := applyReviewFacts(state)
+	if session != "" {
+		b.mutate(model.SessionEndMutation{ID: session, Status: model.SessionCancelled, EndedAt: state.Now})
+	}
+	if process != "" {
+		b.mutate(model.ProcessEndMutation{ID: process, Status: model.ProcessStatusStopped, EndedAt: state.Now})
+	}
+}
+
+// sessionExists reports whether a Session identity is already recorded.
+func sessionExists(state model.State, id model.SessionID) bool {
+	for _, s := range state.Sessions {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// applyReviewFacts derives the independent Apply Verification Session
+// allocation from the persisted records: the latest apply-verification
+// Session that has not started and its Provider route, plus the matching
+// running Process.
+func applyReviewFacts(state model.State) (model.SessionID, string, model.ProcessID) {
+	var session model.SessionID
+	route := ""
+	for i := range state.Sessions {
+		if state.Sessions[i].Purpose == model.PurposeApplyVerification &&
+			state.Sessions[i].Status == model.SessionStarting {
+			session = state.Sessions[i].ID
+			route = state.Sessions[i].Provider
+		}
+	}
+	var process model.ProcessID
+	for i := range state.Processes {
+		if state.Processes[i].Purpose == model.PurposeApplyVerification &&
+			state.Processes[i].Status == model.ProcessStatusRunning {
+			process = state.Processes[i].ID
+		}
+	}
+	return session, route, process
+}
+
+// applyAttemptStaging returns the apply attempt currently in the staging
+// phase (nil when none).
+func applyAttemptStaging(state model.State) *model.ApplyAttempt {
+	for i := range state.ApplyAttempts {
+		if state.ApplyAttempts[i].Status == model.ApplyStaging {
+			return &state.ApplyAttempts[i]
+		}
+	}
+	return nil
 }
 
 func lastApplyAttempt(state model.State) *model.ApplyAttempt {

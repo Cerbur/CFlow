@@ -152,11 +152,20 @@ type WorkflowCompileIntent struct {
 func (WorkflowCompileIntent) isEffectIntent() {}
 
 // ApplyStagingCreateIntent stages the Integration output in an isolated
-// Apply Worktree.
+// Apply Worktree (PRD 已确认：显式受保护 Apply steps 1-4): the executor
+// revalidates the user workspace and the Commit Policy, creates the
+// Apply Branch/Worktree from the recorded Target HEAD, merges the
+// Integration Branch with --no-ff (the ONE restricted Merge Resolution
+// Session when ResolutionSession is set), verifies the Merge Commit
+// against the Preflight, and runs the full deterministic apply
+// verification. The user's working tree is never touched.
 type ApplyStagingCreateIntent struct {
 	Apply           ApplyAttemptID
 	TargetHead      string
 	IntegrationHead string
+	// ResolutionSession is the ONE restricted Merge Resolution Session
+	// allocated for this staging run ("" when none).
+	ResolutionSession SessionID
 }
 
 func (ApplyStagingCreateIntent) isEffectIntent() {}

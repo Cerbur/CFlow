@@ -114,7 +114,7 @@ const queryQuarantines = `
 	FROM branch_quarantines WHERE workflow_id = ? ORDER BY id`
 
 const queryApplyAttempts = `
-	SELECT id, status, COALESCE(target_head_at_start, ''), COALESCE(integration_head, ''),
+	SELECT id, attempt_number, status, COALESCE(target_head_at_start, ''), COALESCE(integration_head, ''),
 	       COALESCE(git_commit_preflight_type, 'commit-preflight'),
 	       COALESCE(git_commit_preflight_revision, 0),
 	       COALESCE(git_commit_preflight_sha256, ''),
@@ -442,7 +442,7 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		var preflightRev sql.NullInt64
 		var preflightHash sql.NullString
 		var startedAt, endedAt string
-		if err := row.Scan(&a.ID, &a.Status, &a.TargetHead, &a.IntegrationHead, &preflightType,
+		if err := row.Scan(&a.ID, &a.Number, &a.Status, &a.TargetHead, &a.IntegrationHead, &preflightType,
 			&preflightRev, &preflightHash, &a.Fingerprint, &startedAt, &endedAt); err != nil {
 			return fmt.Errorf("scan apply attempt: %w", err)
 		}

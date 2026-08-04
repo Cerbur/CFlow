@@ -108,6 +108,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageFinalVerification {
 				return decideReviewRunEnded(state, in, created)
 			}
+		case model.PurposeApplyVerification:
+			// The independent Apply Verification Session (PRD 已确认：显式
+			// 受保护 Apply step 4): the semantic Review of the combined
+			// Target + Integration result inside the Apply Worktree of a
+			// completed Workflow.
+			if state.Workflow.Stage == model.StageCompleted && applyAttemptStaging(state) != nil {
+				return decideApplyReviewRunEnded(state, in, created)
+			}
 		}
 		return model.Decision{}, model.InvariantFault(fmt.Errorf(
 			"provider run completed in an unexpected stage %s for purpose %s",
@@ -141,6 +149,13 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 		// the FINAL_VERIFICATION stage (Task 18).
 		if state.Workflow.Stage == model.StageFinalVerification {
 			return settleExecutionSessionFailure(state, in, created, code)
+		}
+	case model.PurposeApplyVerification:
+		// A failed or cancelled Apply Verification Session blocks the
+		// Apply Attempt with the compiled failure code; the completed
+		// Workflow stays untouched.
+		if state.Workflow.Stage == model.StageCompleted && applyAttemptStaging(state) != nil {
+			return decideApplyReviewFailed(state, in, created, code)
 		}
 	}
 	// A failed or cancelled run outside the execution stages — a planning

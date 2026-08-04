@@ -316,6 +316,8 @@ func renderOutcome(w io.Writer, cmd app.Command, out app.Outcome, reg security.R
 		fmt.Fprintf(w, "workflow %s\n", out.Workflow)
 		fmt.Fprintln(w, "plan approved")
 		fmt.Fprintf(w, "  stage: %s\n", out.Stage)
+	case app.PrepareApplyCommand, app.ExecuteApplyCommand, app.ConfirmApplyPolicyCommand:
+		renderApplyOutcome(w, out, r)
 	default:
 		fmt.Fprintf(w, "workflow %s %s\n", out.Workflow, strings.ToLower(string(out.Runtime)))
 		fmt.Fprintf(w, "  stage: %s\n", out.Stage)
@@ -488,4 +490,29 @@ func ids2(ids []model.SessionID) []string {
 // secrets, but the renderer stays uniform).
 func redactPath(red security.Registry, path string) string {
 	return path
+}
+
+// renderApplyOutcome renders the protected Apply outcome: the attempt
+// status, the recorded Target facts, the verified staging head, and the
+// explicit delivery hint (PRD 已确认：显式受保护 Apply).
+func renderApplyOutcome(w io.Writer, out app.Outcome, r *renderer) {
+	if out.Apply == nil {
+		fmt.Fprintln(w, "no apply attempt produced")
+		return
+	}
+	att := out.Apply
+	fmt.Fprintf(w, "apply attempt %s: %s\n", att.ID, att.Status)
+	fmt.Fprintf(w, "  target head: %s\n", r.orDash(att.TargetHead))
+	fmt.Fprintf(w, "  integration head: %s\n", r.orDash(att.IntegrationHead))
+	if att.StagingHead != "" {
+		fmt.Fprintf(w, "  staging head: %s\n", r.text(att.StagingHead))
+	}
+	switch att.Status {
+	case model.ApplyAwaitingConfirmation:
+		fmt.Fprintln(w, "  staging verified; run 'cflow apply --execute' to deliver the verified result to the target branch")
+	case model.ApplyBlocked:
+		fmt.Fprintln(w, "  apply blocked; the target branch is unchanged (fix the reported cause, confirm the policy, or start a new attempt)")
+	case model.ApplySucceeded:
+		fmt.Fprintf(w, "  delivered: the target branch fast-forwarded to the verified staging head\n")
+	}
 }

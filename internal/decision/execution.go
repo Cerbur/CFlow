@@ -16,7 +16,9 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return decideAttemptEnded(state, in)
 	case model.ProcessStopped:
 		return decideProcessStopped(state, in)
-	case model.ApplyStagingSucceeded, model.ApplyFastForwardSucceeded, model.ApplyFastForwardFailed:
+	case model.ApplyStagingSucceeded, model.ApplyStagingFailed:
+		return decideApplyStagingResult(state, in)
+	case model.ApplyFastForwardSucceeded, model.ApplyFastForwardFailed:
 		return decideApplyResult(state, in)
 	case model.CleanupItemRemovedResult, model.CleanupItemFailedResult:
 		return decideCleanupResult(state, in)

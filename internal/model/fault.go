@@ -90,8 +90,18 @@ const (
 	// COMMIT_POLICY_DRIFT). It is recorded on the Run, never charged.
 	CodeCommitPolicyDrift Code = "COMMIT_POLICY_DRIFT"
 
-	// Apply, Approval, and Cleanup failures.
+	// Apply, Approval, and Cleanup failures. The protected Apply
+	// (PRD 已确认：显式受保护 Apply) gates the user workspace and the
+	// delivery with typed codes: a dirty workspace is APPLY_TARGET_DIRTY,
+	// a wrong attached Branch or a detached HEAD is
+	// APPLY_TARGET_BRANCH_CHANGED, and a Target Drift that changed the
+	// Wrapper/Manifest/Executable identity is COMMAND_IDENTITY_CHANGED
+	// (Target unchanged; only an explicit APPLY_CATALOG approval may
+	// continue).
 	CodeTargetHeadChanged          Code = "TARGET_HEAD_DRIFTED"
+	CodeApplyTargetDirty           Code = "APPLY_TARGET_DIRTY"
+	CodeApplyTargetBranchChanged   Code = "APPLY_TARGET_BRANCH_CHANGED"
+	CodeCommandIdentityChanged     Code = "COMMAND_IDENTITY_CHANGED"
 	CodeApprovalInputChanged       Code = "APPROVAL_INPUT_CHANGED"
 	CodeCleanupWorkflowNotTerminal Code = "CLEANUP_WORKFLOW_NOT_TERMINAL"
 	CodeCleanupActiveProcess       Code = "CLEANUP_ACTIVE_PROCESS"
@@ -174,6 +184,9 @@ func Codes() []Code {
 		CodeGitSigningPreflightFailed,
 		CodeCommitPolicyDrift,
 		CodeTargetHeadChanged,
+		CodeApplyTargetDirty,
+		CodeApplyTargetBranchChanged,
+		CodeCommandIdentityChanged,
 		CodeApprovalInputChanged,
 		CodeCleanupWorkflowNotTerminal,
 		CodeCleanupActiveProcess,
@@ -413,6 +426,9 @@ var faultPolicies = []FaultPolicy{
 
 	// Apply, Approval, and Cleanup.
 	p(CodeTargetHeadChanged, CatUserActionRequired, ScopeApply, false, true, StopAffected, false),
+	p(CodeApplyTargetDirty, CatUserActionRequired, ScopeApply, false, true, StopAffected, false),
+	p(CodeApplyTargetBranchChanged, CatUserActionRequired, ScopeApply, false, true, StopAffected, false),
+	p(CodeCommandIdentityChanged, CatUserActionRequired, ScopeApply, false, true, StopAffected, false),
 	p(CodeApprovalInputChanged, CatInvalidInput, ScopeApproval, false, false, StopNone, false),
 	p(CodeCleanupWorkflowNotTerminal, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),
 	p(CodeCleanupActiveProcess, CatUserActionRequired, ScopeCleanup, false, false, StopNone, false),

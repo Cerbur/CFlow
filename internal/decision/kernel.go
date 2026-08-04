@@ -60,6 +60,8 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideAgentEvent(state, in)
 	case model.ApplyCommandInput:
 		return decideApply(state, in)
+	case model.ApplyPolicyConfirmationInput:
+		return decideApplyPolicyConfirm(state, in)
 	case model.CleanupCommandInput:
 		return decideCleanup(state, in)
 	default:

@@ -261,8 +261,11 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		return e.classifyProcessStop(base, state, intent.Process)
 	case model.GitCommitInspectIntent:
 		return base.with(SafeToRetry, "a commit observation is safely re-runnable"), nil
-	case model.ApplyStagingCreateIntent, model.ApplyFastForwardIntent,
-		model.CleanupWorktreeRemoveIntent, model.CleanupScratchRemoveIntent,
+	case model.ApplyStagingCreateIntent:
+		return e.classifyApplyStaging(ctx, base, state, intent.Apply)
+	case model.ApplyFastForwardIntent:
+		return e.classifyApplyDelivery(base, state, intent.Apply)
+	case model.CleanupWorktreeRemoveIntent, model.CleanupScratchRemoveIntent,
 		model.ProviderCancelIntent:
 		return base.with(FatalInvariant,
 			"the effect is not reconcilable by this build; authoritative evidence is missing"), nil
@@ -405,6 +408,61 @@ func (e *RecoveryEngine) classifyVerification(ctx context.Context, wf model.Work
 		return base.with(BlockedDrift, "the verification evidence manifest does not match the intent identity"), nil
 	}
 	return base.with(SafeToRetry, "no verification evidence exists; the run is safely re-runnable"), nil
+}
+
+// classifyApplyStaging classifies one unfinished ApplyStagingCreateIntent
+// from the Apply Attempt ledger (design 17.2, PRD 已确认：显式受保护
+// Apply): a staging the attempt no longer owes is already completed; a
+// staging the attempt still owes is safely re-runnable — the staging
+// executor re-observes every git fact and reuses the Apply Worktree, so
+// the re-run is exactly the retry the PRD prescribes. A missing attempt
+// is an invariant failure.
+func (e *RecoveryEngine) classifyApplyStaging(ctx context.Context, base IntentDisposition, state model.State, apply model.ApplyAttemptID) (IntentDisposition, error) {
+	att := findApplyAttempt(state, apply)
+	if att == nil {
+		return base.with(FatalInvariant, "the apply attempt is missing from the aggregate"), nil
+	}
+	switch att.Status {
+	case model.ApplyStaging:
+		return base.with(SafeToRetry,
+			"the apply staging is re-runnable; the executor re-observes every fact and reuses the apply worktree"), nil
+	case model.ApplyAwaitingConfirmation, model.ApplyRunning, model.ApplySucceeded,
+		model.ApplyBlocked, model.ApplyFailed, model.ApplyCancelled:
+		return base.with(AlreadyCompleted, "the apply staging is no longer owed"), nil
+	}
+	return base.with(FatalInvariant, "the apply attempt carries an unknown status"), nil
+}
+
+// classifyApplyDelivery classifies one unfinished ApplyFastForwardIntent
+// from the Apply Attempt ledger: only a RUNNING attempt owes the
+// compare-and-swap (safely re-runnable — the executor observes the
+// actual ref and never re-swaps a delivered Target); every other status
+// proves the delivery settled already or is inconsistent.
+func (e *RecoveryEngine) classifyApplyDelivery(base IntentDisposition, state model.State, apply model.ApplyAttemptID) (IntentDisposition, error) {
+	att := findApplyAttempt(state, apply)
+	if att == nil {
+		return base.with(FatalInvariant, "the apply attempt is missing from the aggregate"), nil
+	}
+	switch att.Status {
+	case model.ApplyRunning:
+		return base.with(SafeToRetry,
+			"the apply delivery is re-runnable; the executor observes the actual target ref and never re-swaps a delivered target"), nil
+	case model.ApplySucceeded, model.ApplyBlocked, model.ApplyFailed, model.ApplyCancelled:
+		return base.with(AlreadyCompleted, "the apply delivery is no longer owed"), nil
+	case model.ApplyStaging, model.ApplyAwaitingConfirmation:
+		return base.with(FatalInvariant, "the apply delivery intent precedes its state"), nil
+	}
+	return base.with(FatalInvariant, "the apply attempt carries an unknown status"), nil
+}
+
+// findApplyAttempt returns one Apply Attempt of the aggregate.
+func findApplyAttempt(state model.State, id model.ApplyAttemptID) *model.ApplyAttempt {
+	for i := range state.ApplyAttempts {
+		if state.ApplyAttempts[i].ID == id {
+			return &state.ApplyAttempts[i]
+		}
+	}
+	return nil
 }
 
 // classifyProviderSession classifies one unfinished Provider start/resume

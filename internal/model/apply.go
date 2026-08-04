@@ -40,12 +40,19 @@ func (s ApplyStatus) Valid() bool {
 // String renders the Apply Status.
 func (s ApplyStatus) String() string { return string(s) }
 
-// ApplyAttempt is one Apply execution record. Its confirmation binds the
-// Apply Attempt, the Target HEAD, the Integration HEAD, and the exact
-// Preflight Revision/hash/fingerprint; a completed Workflow's state is
-// never altered by Apply (PRD 约束 39-41).
+// ApplyAttempt is one Apply execution record (PRD 已确认：显式受保护
+// Apply, design 15.5): a post-completion, user-initiated delivery attempt
+// that stages the Integration output in an isolated Apply Worktree and,
+// after full revalidation and the independent Apply Verification
+// Session, fast-forwards the Target Branch with a compare-and-swap.
+// Number is the 1-based attempt ordinal (the `apply-<n>` identity and the
+// Apply Branch suffix). The confirmation binds the Apply Attempt, the
+// Target HEAD, the Integration HEAD, and the exact Preflight
+// Revision/hash/fingerprint; a completed Workflow's state is never
+// altered by Apply (PRD 约束 39-41).
 type ApplyAttempt struct {
 	ID              ApplyAttemptID
+	Number          int
 	Status          ApplyStatus
 	TargetHead      string
 	IntegrationHead string
@@ -54,6 +61,20 @@ type ApplyAttempt struct {
 	Fingerprint     string
 	StartedAt       time.Time
 	EndedAt         time.Time
+
+	// StagingHead is the verified combined staging head the delivery
+	// fast-forwards the Target to. It is an in-memory rendering of the
+	// Apply Branch ref: the authoritative git fact the delivery
+	// re-observes, so a crash never loses it.
+	StagingHead string
+	// ReviewSession, ReviewRoute, and ReviewProcess bind the independent
+	// Apply Verification Session the request allocated (design 14.4: the
+	// reviewer can never share the implementer's lineage). They are the
+	// in-memory allocation facts of one command chain; the persisted
+	// Session row carries the lineage.
+	ReviewSession SessionID
+	ReviewRoute   string
+	ReviewProcess ProcessID
 }
 
 // CleanupStatus is the status of one Cleanup Attempt. Cleanup first

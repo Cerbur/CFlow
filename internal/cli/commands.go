@@ -329,15 +329,29 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 		},
 		{
 			Use:   "apply [workflow-id]",
-			Short: "apply preflight entry (the protected apply lands with a later task)",
+			Short: "stage and deliver the verified integration result to the target branch",
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				// The Gate 3 protected Apply (Target compare-and-swap,
-				// design 18) lands with a later task; until then the
-				// command returns the stable NOT_YET_AVAILABLE finding
-				// and never claims an apply.
-				return model.NewFault(model.CodeNotYetAvailable,
-					"the protected apply to the target branch is not yet available; the workflow stays on the integration branch")
+				// The protected Apply (PRD 已确认：显式受保护 Apply): the
+				// plain command runs the full staging (isolated Apply
+				// Worktree, policy revalidation, --no-ff merge,
+				// deterministic apply verification, independent Apply
+				// Verification Session); --execute is the explicit
+				// delivery through the compare-and-swap fast-forward;
+				// --confirm is the explicit Commit Policy / APPLY_CATALOG
+				// confirmation of a blocked attempt.
+				execute, _ := cmd.Flags().GetBool("execute")
+				confirm, _ := cmd.Flags().GetBool("confirm")
+				switch {
+				case execute && confirm:
+					return model.InvalidInputFault("--execute and --confirm are exclusive")
+				case execute:
+					return executeMutation(cmd, deps, app.ExecuteApplyCommand{Workflow: workflowArg(args)})
+				case confirm:
+					return executeMutation(cmd, deps, app.ConfirmApplyPolicyCommand{Workflow: workflowArg(args)})
+				default:
+					return executeMutation(cmd, deps, app.PrepareApplyCommand{Workflow: workflowArg(args)})
+				}
 			},
 		},
 		{
@@ -591,6 +605,9 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 	}
 	findCommand(cmds, "workflow-create").Flags().Bool("yes", false, "assume yes for the dirty-workspace confirmation")
 	findCommand(cmds, "cleanup").Flags().String("execute", "", "execute a produced cleanup manifest (not yet available)")
+	applyCmd := findCommand(cmds, "apply")
+	applyCmd.Flags().Bool("execute", false, "the explicit delivery: the compare-and-swap fast-forward of the target branch")
+	applyCmd.Flags().Bool("confirm", false, "the explicit commit-policy / apply-catalog confirmation of a blocked apply attempt")
 	return cmds
 }
 
@@ -701,6 +718,12 @@ func workflowOf(command app.Command) model.WorkflowID {
 	case app.ApproveReplacementCommand:
 		return c.Workflow
 	case app.RetryCommand:
+		return c.Workflow
+	case app.PrepareApplyCommand:
+		return c.Workflow
+	case app.ExecuteApplyCommand:
+		return c.Workflow
+	case app.ConfirmApplyPolicyCommand:
 		return c.Workflow
 	}
 	return ""

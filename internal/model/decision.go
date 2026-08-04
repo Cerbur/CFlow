@@ -227,14 +227,32 @@ type ApplyAppendMutation struct {
 
 func (ApplyAppendMutation) isMutation() {}
 
-// ApplyMutation sets one Apply Attempt's status.
+// ApplyMutation sets one Apply Attempt's status and, when the staging
+// verification passed, records the verified staging head (in-memory
+// rendering of the Apply Branch ref; the delivery re-observes the git
+// fact).
 type ApplyMutation struct {
-	ID      ApplyAttemptID
-	Status  ApplyStatus
-	EndedAt time.Time
+	ID          ApplyAttemptID
+	Status      ApplyStatus
+	EndedAt     time.Time
+	StagingHead string
 }
 
 func (ApplyMutation) isMutation() {}
+
+// ApplyConfirmationMutation records the user's explicit Commit Policy /
+// Apply Catalog confirmation facts on one Apply Attempt (PRD 约束 40-41,
+// Apply Command Identity Drift): the append-only Approval row is the
+// immutable record; this mutation updates the attempt's persisted
+// Preflight identity and fingerprint the staging revalidation re-binds.
+type ApplyConfirmationMutation struct {
+	ID            ApplyAttemptID
+	Preflight     ArtifactRef
+	PreflightHash string
+	Fingerprint   string
+}
+
+func (ApplyConfirmationMutation) isMutation() {}
 
 // CleanupAppendMutation appends one Cleanup Attempt with its immutable
 // Manifest.
@@ -324,6 +342,8 @@ const (
 	EventRunCancelled             EventKind = "RUN_CANCELLED"
 	EventGraphInstalled           EventKind = "GRAPH_INSTALLED"
 	EventApplyAttemptCreated      EventKind = "APPLY_ATTEMPT_CREATED"
+	EventApplyRestarted           EventKind = "APPLY_RESTARTED"
+	EventApplyVerified            EventKind = "APPLY_VERIFIED"
 	EventApplySucceeded           EventKind = "APPLY_SUCCEEDED"
 	EventApplyFailed              EventKind = "APPLY_FAILED"
 	EventApplyBlocked             EventKind = "APPLY_BLOCKED"
@@ -349,7 +369,7 @@ func (k EventKind) Valid() bool {
 		EventRunStarted, EventRunQuiescing, EventRunStopped, EventRunInterrupted, EventRunBlocked,
 		EventRunSucceeded, EventRunCancelled,
 		EventGraphInstalled,
-		EventApplyAttemptCreated, EventApplySucceeded, EventApplyFailed, EventApplyBlocked,
+		EventApplyAttemptCreated, EventApplyRestarted, EventApplyVerified, EventApplySucceeded, EventApplyFailed, EventApplyBlocked,
 		EventCleanupAttemptCreated, EventCleanupItemRequested, EventCleanupItemCompleted, EventCleanupItemFailed:
 		return true
 	}

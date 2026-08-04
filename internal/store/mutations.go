@@ -151,6 +151,17 @@ func applyMutation(st *model.State, m model.Mutation) error {
 		}
 		a.Status = m.Status
 		a.EndedAt = m.EndedAt
+		if m.StagingHead != "" {
+			a.StagingHead = m.StagingHead
+		}
+	case model.ApplyConfirmationMutation:
+		a := findApplyAttempt(st, m.ID)
+		if a == nil {
+			return fmt.Errorf("apply attempt %s does not exist", m.ID)
+		}
+		a.Preflight = m.Preflight
+		a.PreflightHash = m.PreflightHash
+		a.Fingerprint = m.Fingerprint
 	case model.CleanupAppendMutation:
 		st.CleanupAttempts = append(st.CleanupAttempts, m.CleanupAttempt)
 	case model.CleanupMutation:
@@ -577,10 +588,29 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		return nil
 
 	case model.ApplyMutation:
+		// A facts-only mutation (the staging head) carries no status: the
+		// transition columns stay unchanged then.
+		status := string(m.Status)
+		ended := m.EndedAt.UTC().Format(time.RFC3339Nano)
+		if status == "" {
+			ended = ""
+		}
 		if _, err := q.ExecContext(ctx, `UPDATE apply_attempts
-			SET status = ?, ended_at = ? WHERE id = ? AND workflow_id = ?`,
-			string(m.Status), m.EndedAt.UTC().Format(time.RFC3339Nano), m.ID, st.Workflow.ID); err != nil {
+			SET status = COALESCE(NULLIF(?, ''), status), ended_at = COALESCE(NULLIF(?, ''), ended_at)
+			WHERE id = ? AND workflow_id = ?`,
+			status, ended, m.ID, st.Workflow.ID); err != nil {
 			return fmt.Errorf("update apply attempt: %w", err)
+		}
+		return nil
+
+	case model.ApplyConfirmationMutation:
+		if _, err := q.ExecContext(ctx, `UPDATE apply_attempts
+			SET git_commit_preflight_type = ?, git_commit_preflight_revision = ?,
+			    git_commit_preflight_sha256 = ?, git_commit_policy_fingerprint = ?
+			WHERE id = ? AND workflow_id = ?`,
+			m.Preflight.Type, intOrNil(m.Preflight.Revision), nullIfEmpty(m.PreflightHash),
+			nullIfEmpty(m.Fingerprint), m.ID, st.Workflow.ID); err != nil {
+			return fmt.Errorf("update apply confirmation: %w", err)
 		}
 		return nil
 

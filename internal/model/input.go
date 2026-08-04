@@ -208,6 +208,7 @@ const (
 	AttemptEnded              EffectResultKind = "attempt-ended"
 	ProcessStopped            EffectResultKind = "process-stopped"
 	ApplyStagingSucceeded     EffectResultKind = "apply-staging-succeeded"
+	ApplyStagingFailed        EffectResultKind = "apply-staging-failed"
 	ApplyFastForwardSucceeded EffectResultKind = "apply-fast-forward-succeeded"
 	ApplyFastForwardFailed    EffectResultKind = "apply-fast-forward-failed"
 	CleanupItemRemovedResult  EffectResultKind = "cleanup-item-removed"
@@ -250,7 +251,7 @@ const (
 // Valid reports whether k is a declared Effect Result Kind.
 func (k EffectResultKind) Valid() bool {
 	switch k {
-	case AttemptEnded, ProcessStopped, ApplyStagingSucceeded,
+	case AttemptEnded, ProcessStopped, ApplyStagingSucceeded, ApplyStagingFailed,
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
 		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
@@ -355,6 +356,10 @@ type EffectResultInput struct {
 	// PreMergeHead is the recorded Integration HEAD before a failed merge
 	// (the Rollback target, design 15.5).
 	PreMergeHead string
+	// ObservedHead is the observed actual Target ref after the apply
+	// compare-and-swap (the outcome is reported from the observation,
+	// never assumed; PRD 已确认：显式受保护 Apply step 6).
+	ObservedHead string
 	// Reason is the typed failure reason of an IntegrationMergeFailed
 	// result ("conflict" or "post-merge-check").
 	Reason string
@@ -593,22 +598,25 @@ func (DispatchInput) isInput() {}
 type ApplyCommandKind string
 
 const (
-	ApplyRequest ApplyCommandKind = "request"
-	ApplyConfirm ApplyCommandKind = "confirm"
+	ApplyRequest       ApplyCommandKind = "request"
+	ApplyExecute       ApplyCommandKind = "execute"
+	ApplyPolicyConfirm ApplyCommandKind = "policy-confirm"
 )
 
 // Valid reports whether k is a declared Apply Command Kind.
 func (k ApplyCommandKind) Valid() bool {
-	return k == ApplyRequest || k == ApplyConfirm
+	return k == ApplyRequest || k == ApplyExecute || k == ApplyPolicyConfirm
 }
 
 // String renders the Apply Command Kind.
 func (k ApplyCommandKind) String() string { return string(k) }
 
-// ApplyCommandInput is the user Apply interaction. The request fixes the
-// Target HEAD and Integration HEAD the Apply Attempt must revalidate; the
-// confirmation re-binds them together with the exact Preflight hash and
-// fingerprint, so a drifted fact invalidates the confirmation.
+// ApplyCommandInput is the user Apply interaction (PRD 已确认：显式受保护
+// Apply). The request fixes the Target HEAD and Integration HEAD the
+// Apply Attempt must revalidate and the independent Apply Verification
+// Session allocation; the execute re-binds the heads together with the
+// exact Preflight hash and fingerprint, so a drifted fact invalidates the
+// delivery; the policy-confirm binds the explicit confirmation.
 type ApplyCommandInput struct {
 	Kind ApplyCommandKind
 
@@ -617,9 +625,44 @@ type ApplyCommandInput struct {
 	Preflight       ArtifactRef
 	PreflightHash   string
 	Fingerprint     string
+
+	// PrepareApply allocation facts (design 6.2 rule 6): the independent
+	// Apply Verification Session and the ONE restricted Merge Resolution
+	// Session ("" when no resolution is allocated) the staging may run.
+	ReviewSession     SessionID
+	ReviewRoute       string
+	ReviewProcess     ProcessID
+	ResolutionSession SessionID
+	ResolutionProcess ProcessID
 }
 
 func (ApplyCommandInput) isInput() {}
+
+// ApplyPolicyConfirmationInput is the user's explicit confirmation of a
+// blocked Apply Attempt (PRD 约束 40-41, Apply Command Identity Drift):
+// it binds the exact Apply Attempt, the Target/Integration HEADs, and the
+// new Commit Preflight Revision/hash/fingerprint. CatalogRef fixes the
+// newly discovered, validated, and fixed Apply Verification Catalog
+// Revision the append-only APPLY_CATALOG approval binds (zero when only
+// the Commit Policy changed). If any bound HEAD or fingerprint changed
+// since the attempt was recorded, the confirmation input is void.
+type ApplyPolicyConfirmationInput struct {
+	Attempt         ApplyAttemptID
+	TargetHead      string
+	IntegrationHead string
+	Preflight       ArtifactRef
+	PreflightHash   string
+	Fingerprint     string
+	CatalogRef      CatalogRef
+
+	// ReviewSession/ReviewRoute/ReviewProcess allocate the independent
+	// Apply Verification Session of the confirmation's staging re-run.
+	ReviewSession SessionID
+	ReviewRoute   string
+	ReviewProcess ProcessID
+}
+
+func (ApplyPolicyConfirmationInput) isInput() {}
 
 // CleanupCommandKind is the user Cleanup mutation (design 6.1).
 type CleanupCommandKind string

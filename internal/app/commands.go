@@ -612,6 +612,36 @@ type RetryCommand struct {
 	Node     model.NodeID
 }
 
+// PrepareApplyCommand runs the full protected Apply staging (PRD 已确认：
+// 显式受保护 Apply): the user workspace gate, the isolated Apply
+// Branch/Worktree from the recorded Target HEAD, the Commit Policy
+// revalidation, the --no-ff merge (with the ONE restricted Merge
+// Resolution Attempt on a text conflict), the deterministic apply
+// verification, and the independent Apply Verification Session. The
+// user's working tree is never touched during staging.
+type PrepareApplyCommand struct {
+	Workflow model.WorkflowID
+}
+
+// ExecuteApplyCommand is the explicit delivery (PRD steps 5-6): every
+// fact is rechecked immediately before the delivery and the Target
+// Branch is updated only through the compare-and-swap fast-forward.
+type ExecuteApplyCommand struct {
+	Workflow model.WorkflowID
+}
+
+// ConfirmApplyPolicyCommand is the user's explicit confirmation of a
+// blocked Apply Attempt (PRD 约束 40-41, Apply Command Identity Drift):
+// the fresh Commit Preflight is observed (with the signing probe) and —
+// when the drift changed the Wrapper/Manifest/Executable identity — a
+// new Apply Verification Catalog Revision is re-discovered, validated,
+// and fixed from the new Target HEAD for the append-only APPLY_CATALOG
+// approval. The exact Apply Attempt, Target/Integration heads, and the
+// fresh Preflight facts bind the confirmation.
+type ConfirmApplyPolicyCommand struct {
+	Workflow model.WorkflowID
+}
+
 func (CreateWorkflowCommand) isCommand()      {}
 func (DiscussRequirementCommand) isCommand()  {}
 func (GeneratePlanCommand) isCommand()        {}
@@ -633,6 +663,9 @@ func (ReplacementPreviewCommand) isCommand()  {}
 func (ApproveReplacementCommand) isCommand()  {}
 func (CompleteWorkflowCommand) isCommand()    {}
 func (RetryCommand) isCommand()               {}
+func (PrepareApplyCommand) isCommand()        {}
+func (ExecuteApplyCommand) isCommand()        {}
+func (ConfirmApplyPolicyCommand) isCommand()  {}
 
 // ---------------------------------------------------------------------------
 // Outcome
@@ -649,6 +682,9 @@ type Outcome struct {
 	Events     []model.Event
 	Findings   []model.Finding
 	Cleanup    *model.CleanupAttempt
+	// Apply is the Apply Attempt a protected-apply command operated on
+	// (nil for commands without one).
+	Apply *model.ApplyAttempt
 	// SessionID is the Session identity a planning command created (""
 	// for commands without one).
 	SessionID model.SessionID

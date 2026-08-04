@@ -343,6 +343,12 @@ const (
 	PurposeRepair               AgentPurpose = "repair"
 	PurposeReview               AgentPurpose = "review"
 	PurposeFinalVerification    AgentPurpose = "final-verification"
+	// PurposeApplyVerification is the independent Apply Verification
+	// Session (PRD 已确认：显式受保护 Apply step 4): a fresh Session that
+	// performs the semantic Review of the combined Target + Integration
+	// result inside the Apply Worktree. It can use the same Provider but
+	// never a Session of the Workflow's history.
+	PurposeApplyVerification AgentPurpose = "apply-verification"
 )
 
 // Valid reports whether p is a declared Agent Purpose.
@@ -350,7 +356,7 @@ func (p AgentPurpose) Valid() bool {
 	switch p {
 	case PurposePlanning, PurposePlanCheck, PurposeSpecGeneration,
 		PurposeWorkflowOptimization, PurposeImplementation, PurposeRepair,
-		PurposeReview, PurposeFinalVerification:
+		PurposeReview, PurposeFinalVerification, PurposeApplyVerification:
 		return true
 	}
 	return false

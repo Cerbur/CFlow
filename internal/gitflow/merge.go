@@ -44,8 +44,12 @@ func (g *GitFlow) mergeIntegration(ctx context.Context, op MergeIntegration) (Gi
 	if err := validateBranchName(op.Branch); err != nil {
 		return nil, err
 	}
+	message := op.Message
+	if message == "" {
+		message = "cflow: merge verified task branch " + op.Branch
+	}
 	env := childEnv()
-	out, errOut, exit, err := g.run(ctx, op.Path, env, defaultGitTimeout, "merge", "--no-ff", "-m", "cflow: merge verified task branch "+op.Branch, op.Branch)
+	out, errOut, exit, err := g.run(ctx, op.Path, env, defaultGitTimeout, "merge", "--no-ff", "-m", message, op.Branch)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +175,121 @@ func (g *GitFlow) rollbackMerge(ctx context.Context, op RollbackMerge) (GitResul
 			"gitflow: integration worktree was not restored to the recorded pre-merge head")
 	}
 	return RollbackResult{Path: op.Path, Head: status.Head}, nil
+}
+
+// completeMerge finishes a conflicted Apply staging merge after the ONE
+// restricted Merge Resolution Attempt (design 15.5): only the exact
+// conflict files are staged — any change outside them fails closed — and
+// the Merge Commit is created with the recorded parents (`git commit`
+// completes the merge while MERGE_HEAD is set, exactly what `git merge
+// --continue` runs). The Merge Commit must carry at least two parents and
+// the Apply Worktree must be clean afterwards.
+func (g *GitFlow) completeMerge(ctx context.Context, op CompleteMerge) (GitResult, error) {
+	if err := validateWorktreeDir(op.Path); err != nil {
+		return nil, err
+	}
+	if op.Message == "" {
+		return nil, model.InvalidInputFault("gitflow: merge continuation message is required")
+	}
+	env := childEnv()
+	// A merge must actually be in progress.
+	if _, _, exit, err := g.run(ctx, op.Path, env, defaultGitTimeout, "rev-parse", "-q", "--verify", "MERGE_HEAD"); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: no merge in progress to continue")
+	}
+	// The resolution write scope is exactly the conflict file set.
+	if len(op.ConflictFiles) == 0 {
+		return nil, model.InvalidInputFault("gitflow: merge continuation requires the conflict file set")
+	}
+	for _, rel := range op.ConflictFiles {
+		clean := filepath.Clean(filepath.FromSlash(rel))
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return nil, model.InvalidInputFault("gitflow: conflict file escapes the worktree")
+		}
+	}
+	stage := append([]string{"add", "--"}, op.ConflictFiles...)
+	if _, _, exit, err := g.run(ctx, op.Path, env, defaultGitTimeout, stage...); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: conflict files cannot be staged")
+	}
+	if _, _, exit, err := g.run(ctx, op.Path, env, defaultGitTimeout, "commit", "-m", op.Message); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: the apply merge could not be completed")
+	}
+	head, err := g.revParseHead(ctx, op.Path, env)
+	if err != nil {
+		return nil, err
+	}
+	cf, err := g.commitInspect(ctx, CommitInspect{Ref: head})
+	if err != nil {
+		return nil, err
+	}
+	if len(cf.Parents) < 2 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: the apply merge commit has no integration parent")
+	}
+	status, err := g.gitStatusAt(ctx, op.Path, env, head, true, false)
+	if err != nil {
+		return nil, err
+	}
+	if !status.Clean() {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: the apply worktree is not clean after the merge continuation")
+	}
+	return MergeResult{Path: op.Path, Head: head, Commit: cf}, nil
+}
+
+// updateRef performs the final compare-and-swap fast-forward of the
+// Target Branch (design 15.5, PRD 已确认：显式受保护 Apply steps 5-6): the
+// expected old value is re-observed immediately before the update, the
+// staging head must be a descendant of it (a fast-forward), and the ref
+// is updated only through the three-argument expected-value form of `git
+// update-ref`. There is no force-update argv anywhere in this path. The
+// reported outcome is the observed actual ref after the swap.
+func (g *GitFlow) updateRef(ctx context.Context, op UpdateRef) (GitResult, error) {
+	if err := validateAuditRef(op.Ref); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.New); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.Expected); err != nil {
+		return nil, err
+	}
+	env := childEnv()
+	facts, err := g.refLookup(ctx, RefLookup{Ref: op.Ref, Expected: op.Expected})
+	if err != nil {
+		return nil, err
+	}
+	if !facts.Matches {
+		return nil, model.NewFault(model.CodeTargetHeadChanged,
+			"gitflow: the target ref no longer matches the recorded head")
+	}
+	if !g.isDescendantOf(ctx, g.dir, env, op.New, op.Expected) {
+		return nil, model.NewFault(model.CodeTargetHeadChanged,
+			"gitflow: the staging head is not a fast-forward of the recorded target head")
+	}
+	if _, _, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "update-ref", op.Ref, op.New, op.Expected); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeTargetHeadChanged,
+			"gitflow: the target ref moved during the compare-and-swap")
+	}
+	observed, err := g.refLookup(ctx, RefLookup{Ref: op.Ref})
+	if err != nil {
+		return nil, err
+	}
+	if !observed.Exists || observed.Value != op.New {
+		return nil, model.NewFault(model.CodeTargetHeadChanged,
+			"gitflow: the observed target ref does not match the delivered head")
+	}
+	return UpdateRefResult{Ref: op.Ref, Observed: observed.Value}, nil
 }
 
 // isDescendantOf reports whether from's history contains to (to is an

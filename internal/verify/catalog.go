@@ -330,6 +330,7 @@ var wrapperPaths = []wrapperCandidate{
 	{Path: "scripts/test.sh", Purpose: PurposeTaskVerify},
 	{Path: "scripts/final-verify.sh", Purpose: PurposeFinalVerify},
 	{Path: "scripts/integration-verify.sh", Purpose: PurposeIntegrationVerify},
+	{Path: "scripts/apply-verify.sh", Purpose: PurposeApplyVerify},
 	{Path: "mvnw", Purpose: PurposeTaskVerify},
 	{Path: "gradlew", Purpose: PurposeTaskVerify},
 }

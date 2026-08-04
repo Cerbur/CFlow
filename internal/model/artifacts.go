@@ -90,12 +90,18 @@ const (
 	ApprovalPlan         ApprovalKind = "plan"
 	ApprovalExecution    ApprovalKind = "execution"
 	ApprovalCommitPolicy ApprovalKind = "commit-policy"
+	// ApprovalApplyCatalog is the append-only APPLY_CATALOG approval of a
+	// Target Drift that changed the Wrapper/Manifest/Executable identity
+	// (PRD 已确认：Apply Command Identity Drift): it binds the exact Apply
+	// Attempt, the Target/Integration HEADs, and the newly discovered,
+	// validated, and fixed Apply Verification Catalog Revision.
+	ApprovalApplyCatalog ApprovalKind = "apply-catalog"
 )
 
 // Valid reports whether k is a declared Approval Kind.
 func (k ApprovalKind) Valid() bool {
 	switch k {
-	case ApprovalPlan, ApprovalExecution, ApprovalCommitPolicy:
+	case ApprovalPlan, ApprovalExecution, ApprovalCommitPolicy, ApprovalApplyCatalog:
 		return true
 	}
 	return false

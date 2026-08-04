@@ -943,48 +943,160 @@ func TestApplyRefusesQuarantinedIntegration(t *testing.T) {
 func TestApplyProtocolAndTargetStability(t *testing.T) {
 	state := fixtureCompleted()
 	request := model.ApplyCommandInput{Kind: model.ApplyRequest, TargetHead: "main-head",
-		IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactWorkflow, Revision: 1, Hash: "wf-h"},
-		PreflightHash: "cp-1", Fingerprint: "fp-1"}
+		IntegrationHead: "int-9",
+		Preflight:       model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash:   "cp-1", Fingerprint: "fp-1",
+		ReviewSession: "rev-1", ReviewRoute: "fake", ReviewProcess: "p-1"}
 	got, err := decision.Decide(state, request)
 	requireNoError(t, err)
 	requireEffect(t, got, model.ApplyStagingCreateIntent{Apply: "apply-1", TargetHead: "main-head", IntegrationHead: "int-9"})
 	state = apply(t, state, got)
+	if len(state.ApplyAttempts) != 1 || state.ApplyAttempts[0].Status != model.ApplyStaging {
+		t.Fatalf("apply attempt = %+v, want one STAGING attempt", state.ApplyAttempts)
+	}
+	if len(state.Sessions) != 1 || state.Sessions[0].Purpose != model.PurposeApplyVerification {
+		t.Fatalf("the independent apply verification session is missing: %+v", state.Sessions)
+	}
 
-	// staging succeeded -> awaiting exact confirmation
-	got2, err := decision.Decide(state, model.EffectResultInput{Kind: model.ApplyStagingSucceeded, ApplyAttempt: "apply-1"})
+	// staging succeeded -> the independent Apply Verification Session runs
+	got2, err := decision.Decide(state, model.EffectResultInput{
+		Kind: model.ApplyStagingSucceeded, ApplyAttempt: "apply-1",
+		EndHead: "staging-1", ManifestHash: "mh-1"})
 	requireNoError(t, err)
-	requireNoEffect(t, got2)
+	requireEffect(t, got2, model.ProviderStartIntent{
+		Session: "rev-1", Purpose: model.PurposeApplyVerification, Route: "fake", Process: "p-1"})
 	state = apply(t, state, got2)
+	if got := state.ApplyAttempts[0].StagingHead; got != "staging-1" {
+		t.Fatalf("staging head = %s, want staging-1", got)
+	}
 
-	// drifted Target HEAD -> APPROVAL_INPUT_CHANGED-family refusal, no mutation
-	drifted := model.ApplyCommandInput{Kind: model.ApplyConfirm, TargetHead: "main-head-other",
+	// the review verdict is judged by the Kernel; PASS -> awaiting delivery
+	review := model.EffectResultInput{Kind: model.ProviderRunEnded,
+		Session:      model.Session{ID: "rev-1", ProviderSessionID: "av-1", Purpose: model.PurposeApplyVerification, Status: model.SessionCompleted},
+		Body:         []byte("PASS\n"),
+		ManifestHash: "mh-1"}
+	got3, err := decision.Decide(state, review)
+	requireNoError(t, err)
+	requireNoEffect(t, got3)
+	state = apply(t, state, got3)
+	if got := state.ApplyAttempts[0].Status; got != model.ApplyAwaitingConfirmation {
+		t.Fatalf("apply = %s after the review, want AWAITING_CONFIRMATION", got)
+	}
+
+	// a repeated request against the verified attempt is a no-op that
+	// appends no phantom session (the delivery runs through ExecuteApply)
+	before := len(state.Sessions)
+	dup, err := decision.Decide(state, model.ApplyCommandInput{Kind: model.ApplyRequest,
+		TargetHead: "main-head", IntegrationHead: "int-9",
+		Preflight:     model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash: "cp-1", Fingerprint: "fp-1",
+		ReviewSession: "rev-dup", ReviewRoute: "fake", ReviewProcess: "p-dup"})
+	requireNoError(t, err)
+	requireNoEffect(t, dup)
+	state = apply(t, state, dup)
+	if len(state.Sessions) != before {
+		t.Fatalf("the no-op request appended %d phantom session(s)", len(state.Sessions)-before)
+	}
+
+	// drifted Target HEAD -> refusal, no mutation
+	drifted := model.ApplyCommandInput{Kind: model.ApplyExecute, TargetHead: "main-head-other",
 		IntegrationHead: "int-9", PreflightHash: "cp-1", Fingerprint: "fp-1"}
 	_, err = decision.Decide(state, drifted)
 	assertFaultCode(t, err, model.CodeTargetHeadChanged)
 
 	// drifted commit-policy fingerprint -> COMMIT_POLICY_INPUT_CHANGED
-	policyDrift := model.ApplyCommandInput{Kind: model.ApplyConfirm, TargetHead: "main-head",
+	policyDrift := model.ApplyCommandInput{Kind: model.ApplyExecute, TargetHead: "main-head",
 		IntegrationHead: "int-9", PreflightHash: "cp-1", Fingerprint: "fp-2"}
 	_, err = decision.Decide(state, policyDrift)
 	assertFaultCode(t, err, model.CodeCommitPolicyInputChanged)
 
-	// exact confirmation -> fast-forward effect
-	confirm := model.ApplyCommandInput{Kind: model.ApplyConfirm, TargetHead: "main-head",
+	// exact confirmation -> the final compare-and-swap fast-forward
+	confirm := model.ApplyCommandInput{Kind: model.ApplyExecute, TargetHead: "main-head",
 		IntegrationHead: "int-9", PreflightHash: "cp-1", Fingerprint: "fp-1"}
-	got3, err := decision.Decide(state, confirm)
+	got4, err := decision.Decide(state, confirm)
 	requireNoError(t, err)
-	requireEffect(t, got3, model.ApplyFastForwardIntent{Apply: "apply-1", TargetHead: "main-head"})
-	state = apply(t, state, got3)
+	requireEffect(t, got4, model.ApplyFastForwardIntent{Apply: "apply-1", TargetHead: "main-head"})
+	state = apply(t, state, got4)
 
-	// fast-forward success does not alter the completed Workflow
-	got4, err := decision.Decide(state, model.EffectResultInput{Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: "apply-1"})
+	// fast-forward success settles from the observed ref and never alters
+	// the completed Workflow
+	got5, err := decision.Decide(state, model.EffectResultInput{
+		Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: "apply-1", ObservedHead: "staging-1"})
 	requireNoError(t, err)
-	for _, m := range got4.Mutations {
+	for _, m := range got5.Mutations {
 		if _, ok := m.(model.WorkflowMutation); ok {
 			t.Fatalf("apply success must not alter the Workflow: %+v", m)
 		}
 	}
-	requireEvent(t, got4, model.EventApplySucceeded)
+	requireEvent(t, got5, model.EventApplySucceeded)
+	state = apply(t, state, got5)
+	if got := state.ApplyAttempts[0].Status; got != model.ApplySucceeded {
+		t.Fatalf("apply = %s after the delivery, want SUCCEEDED", got)
+	}
+	if state.Workflow.Stage != model.StageCompleted {
+		t.Fatalf("the completed workflow was altered: %s", state.Workflow.Stage)
+	}
+}
+
+// TestApplyPolicyConfirmationBindsAttemptAndHeads: the explicit
+// confirmation of a blocked Apply Attempt binds the exact Attempt, the
+// Target/Integration heads, and the fresh Preflight facts; a drifted
+// bound fact voids the input and a drift that changed the Catalog
+// identity records the append-only APPLY_CATALOG approval.
+func TestApplyPolicyConfirmationBindsAttemptAndHeads(t *testing.T) {
+	state := fixtureCompleted()
+	request := model.ApplyCommandInput{Kind: model.ApplyRequest, TargetHead: "main-head",
+		IntegrationHead: "int-9",
+		Preflight:       model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash:   "cp-1", Fingerprint: "fp-1",
+		ReviewSession: "rev-1", ReviewRoute: "fake", ReviewProcess: "p-1"}
+	got, err := decision.Decide(state, request)
+	requireNoError(t, err)
+	state = apply(t, state, got)
+
+	// the attempt must be BLOCKED before any confirmation binds it
+	blocked, err := decision.Decide(state, model.EffectResultInput{
+		Kind: model.ApplyStagingFailed, ApplyAttempt: "apply-1", FailureCode: model.CodeMergeConflict})
+	requireNoError(t, err)
+	state = apply(t, state, blocked)
+	if got := state.ApplyAttempts[0].Status; got != model.ApplyBlocked {
+		t.Fatalf("apply = %s, want BLOCKED", got)
+	}
+
+	// a drifted bound head voids the confirmation
+	void := model.ApplyPolicyConfirmationInput{Attempt: "apply-1", TargetHead: "main-head-other",
+		IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 2, Hash: "cp-2"},
+		PreflightHash: "cp-2", Fingerprint: "fp-1"}
+	_, err = decision.Decide(state, void)
+	assertFaultCode(t, err, model.CodeTargetHeadChanged)
+
+	// a changed fingerprint voids the confirmation
+	voidFP := model.ApplyPolicyConfirmationInput{Attempt: "apply-1", TargetHead: "main-head",
+		IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 2, Hash: "cp-2"},
+		PreflightHash: "cp-2", Fingerprint: "fp-2"}
+	_, err = decision.Decide(state, voidFP)
+	assertFaultCode(t, err, model.CodeCommitPolicyInputChanged)
+
+	// the exact confirmation records the append-only approval, rebinds
+	// the attempt's Preflight facts, and re-opens the staging
+	confirm := model.ApplyPolicyConfirmationInput{Attempt: "apply-1", TargetHead: "main-head",
+		IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 2, Hash: "cp-2"},
+		PreflightHash: "cp-2", Fingerprint: "fp-1",
+		CatalogRef:    model.CatalogRef{Revision: 2, Hash: "cat-2"},
+		ReviewSession: "rev-2", ReviewRoute: "fake", ReviewProcess: "p-2"}
+	got2, err := decision.Decide(state, confirm)
+	requireNoError(t, err)
+	requireEffect(t, got2, model.ApplyStagingCreateIntent{Apply: "apply-1", TargetHead: "main-head", IntegrationHead: "int-9"})
+	state = apply(t, state, got2)
+	if len(state.Approvals) != 1 || state.Approvals[0].Kind != model.ApprovalApplyCatalog {
+		t.Fatalf("approval = %+v, want one apply-catalog approval", state.Approvals)
+	}
+	if got := state.ApplyAttempts[0].PreflightHash; got != "cp-2" {
+		t.Fatalf("attempt preflight hash = %s, want the confirmed cp-2", got)
+	}
+	if got := state.ApplyAttempts[0].Status; got != model.ApplyStaging {
+		t.Fatalf("apply = %s after the confirmation, want STAGING", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +1513,13 @@ func apply(t *testing.T, st model.State, d model.Decision) model.State {
 			run.QuiesceSnapshot = m.QuiesceSnapshot
 		case model.SessionAppendMutation:
 			st.Sessions = append(st.Sessions, m.Session)
+		case model.SessionEndMutation:
+			for i := range st.Sessions {
+				if st.Sessions[i].ID == m.ID {
+					st.Sessions[i].Status = m.Status
+					st.Sessions[i].ProviderSessionID = m.ProviderSessionID
+				}
+			}
 		case model.ProcessAppendMutation:
 			st.Processes = append(st.Processes, m.Process)
 		case model.ProcessEndMutation:
@@ -1423,8 +1542,21 @@ func apply(t *testing.T, st model.State, d model.Decision) model.State {
 			if att == nil {
 				t.Fatalf("apply attempt %s missing", m.ID)
 			}
-			att.Status = m.Status
+			if m.Status != "" {
+				att.Status = m.Status
+			}
 			att.EndedAt = m.EndedAt
+			if m.StagingHead != "" {
+				att.StagingHead = m.StagingHead
+			}
+		case model.ApplyConfirmationMutation:
+			att := findApply(st, m.ID)
+			if att == nil {
+				t.Fatalf("apply attempt %s missing", m.ID)
+			}
+			att.Preflight = m.Preflight
+			att.PreflightHash = m.PreflightHash
+			att.Fingerprint = m.Fingerprint
 		case model.CleanupAppendMutation:
 			st.CleanupAttempts = append(st.CleanupAttempts, m.CleanupAttempt)
 		case model.CleanupMutation:
@@ -1511,12 +1643,18 @@ func TestPropertyCompletedNeverChangesTarget(t *testing.T) {
 
 	steps := []model.Input{
 		model.ApplyCommandInput{Kind: model.ApplyRequest, TargetHead: "main-head",
-			IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactWorkflow, Revision: 1, Hash: "wf-h"},
-			PreflightHash: "cp-1", Fingerprint: "fp-1"},
-		model.EffectResultInput{Kind: model.ApplyStagingSucceeded, ApplyAttempt: "apply-1"},
-		model.ApplyCommandInput{Kind: model.ApplyConfirm, TargetHead: "main-head",
+			IntegrationHead: "int-9", Preflight: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+			PreflightHash: "cp-1", Fingerprint: "fp-1",
+			ReviewSession: "rev-1", ReviewRoute: "fake", ReviewProcess: "p-1"},
+		model.EffectResultInput{Kind: model.ApplyStagingSucceeded, ApplyAttempt: "apply-1",
+			EndHead: "staging-1", ManifestHash: "mh-1"},
+		model.EffectResultInput{Kind: model.ProviderRunEnded,
+			Session:      model.Session{ID: "rev-1", ProviderSessionID: "av-1", Purpose: model.PurposeApplyVerification, Status: model.SessionCompleted},
+			Body:         []byte("PASS\n"),
+			ManifestHash: "mh-1"},
+		model.ApplyCommandInput{Kind: model.ApplyExecute, TargetHead: "main-head",
 			IntegrationHead: "int-9", PreflightHash: "cp-1", Fingerprint: "fp-1"},
-		model.EffectResultInput{Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: "apply-1"},
+		model.EffectResultInput{Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: "apply-1", ObservedHead: "staging-1"},
 	}
 	for _, in := range steps {
 		d, err := decision.Decide(state, in)

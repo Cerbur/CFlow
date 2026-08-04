@@ -1238,8 +1238,14 @@ func TestPolicyDriftApplyUnaffected(t *testing.T) {
 	fx.state.Workflow.Runtime = model.RuntimeSucceeded
 	fx.state.Workflow.TargetBranch = "main"
 	fx.state.Workflow.IntegrationHead = "int-h"
+	fx.state.Workflow.ExecutionFacts = &model.ExecutionFacts{
+		Fingerprint: "fp-1", CommitPolicyHash: "cp-1", PreflightRevision: 1,
+	}
 	_, err := decision.Decide(fx.state, model.ApplyCommandInput{
 		Kind: model.ApplyRequest, TargetHead: "main-h", IntegrationHead: "int-h",
+		Preflight:     model.ArtifactRef{Workflow: fx.state.Workflow.ID, Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash: "cp-1", Fingerprint: "fp-1",
+		ReviewSession: "rev-1", ReviewRoute: "fake", ReviewProcess: "p-1",
 	})
 	if err != nil {
 		fx.t.Fatalf("the Apply request must be unaffected by the failure protocols, got %v", err)

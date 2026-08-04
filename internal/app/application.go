@@ -395,6 +395,16 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 	if err != nil {
 		return Outcome{}, orCtx(ctx, err)
 	}
+	// A blocked Apply Attempt surfaces its typed fault to the caller: the
+	// Kernel settled the BLOCKED state (the Target is unchanged and the
+	// completed Workflow untouched) and the CLI must show the exact code
+	// the user has to act on.
+	if out.Apply != nil && out.Apply.Status == model.ApplyBlocked {
+		if code := lastApplyBlockedCode(out.Events); code != "" {
+			return Outcome{}, model.NewFault(code,
+				"apply "+string(out.Apply.ID)+" blocked; the target branch is unchanged")
+		}
+	}
 	// The immutable Final Report Artifact follows the completion Decision
 	// (PRD 最终验收: 生成 final-report.md). The report is a rebuildable read
 	// model; writing it never changes Workflow state.
@@ -617,6 +627,10 @@ func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf m
 	if n := len(final.State.CleanupAttempts); n > 0 {
 		last := final.State.CleanupAttempts[n-1]
 		out.Cleanup = &last
+	}
+	if n := len(final.State.ApplyAttempts); n > 0 {
+		last := final.State.ApplyAttempts[n-1]
+		out.Apply = &last
 	}
 	return out, nil
 }
@@ -879,6 +893,12 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		// The retry runs the ordinary dispatch pass; the kernel Input
 		// placeholder is unused by the dispatch path.
 		return model.DispatchInput{}, wf, nil
+	case PrepareApplyCommand:
+		return a.prepareApply(ctx, c.Workflow)
+	case ExecuteApplyCommand:
+		return a.prepareApplyExecute(ctx, c.Workflow)
+	case ConfirmApplyPolicyCommand:
+		return a.prepareApplyPolicyConfirm(ctx, c.Workflow)
 	case ApproveReplacementCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {
