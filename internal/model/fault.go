@@ -31,6 +31,7 @@ const (
 	CodeAgentProcessCrashed         Code = "AGENT_PROCESS_CRASHED"
 	CodeAgentTimeout                Code = "AGENT_TIMEOUT"
 	CodeCommandFailed               Code = "COMMAND_FAILED"
+	CodeProviderError               Code = "PROVIDER_ERROR"
 	CodeSemanticReviewFailed        Code = "SEMANTIC_REVIEW_FAILED"
 	CodeMergeConflict               Code = "MERGE_CONFLICT"
 	CodeMissingImplementationCommit Code = "MISSING_IMPLEMENTATION_COMMIT"
@@ -152,6 +153,7 @@ func Codes() []Code {
 		CodeAgentProcessCrashed,
 		CodeAgentTimeout,
 		CodeCommandFailed,
+		CodeProviderError,
 		CodeSemanticReviewFailed,
 		CodeMergeConflict,
 		CodeMissingImplementationCommit,
@@ -373,6 +375,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeAgentProcessCrashed, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopNone, true),
 	p(CodeAgentTimeout, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopAffected, true),
 	p(CodeCommandFailed, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopNone, true),
+	p(CodeProviderError, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopNone, true),
 	p(CodeSemanticReviewFailed, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopNone, true),
 	p(CodeMergeConflict, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopNone, true),
 	p(CodeMissingImplementationCommit, CatRetryableAttemptFailure, ScopeAttempt, true, false, StopNone, true),

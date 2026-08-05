@@ -26,6 +26,7 @@ import (
 	"fmt"
 
 	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/model"
 )
 
 // wireFrame is the codex JSONL wire shape (design 14.3: a bounded frame
@@ -157,7 +158,7 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 		p.failed = true
 		return finishEvent(agent.Event{
 			Type:      agent.EventFailed,
-			Code:      "provider_error",
+			Code:      string(model.CodeProviderError),
 			Message:   wf.Message,
 			SessionID: p.established,
 		}, raw), false, nil
@@ -171,7 +172,7 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 		p.failed = true
 		return finishEvent(agent.Event{
 			Type:      agent.EventFailed,
-			Code:      "provider_error",
+			Code:      string(model.CodeProviderError),
 			Message:   errorMessage(wf.Error, wf.Message),
 			SessionID: p.established,
 		}, raw), false, nil

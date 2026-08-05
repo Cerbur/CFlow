@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/model"
 )
 
 // streamInputFrame is one stdin stream-json frame (the realtime input
@@ -298,7 +299,7 @@ func (p *streamParser) parseResultFrame(wf wireFrame, raw []byte) (agent.Event, 
 		}
 		ev := agent.Event{
 			Type:    agent.EventFailed,
-			Code:    wf.Subtype,
+			Code:    claudeErrorCode(wf.Subtype),
 			Message: wf.Error,
 		}
 		if err := withSession(&ev, wf, p.established); err != nil {
@@ -327,6 +328,19 @@ func parseResultPayload(raw json.RawMessage) (string, error) {
 		return "", fmt.Errorf("success result payload is not a JSON object")
 	}
 	return inner, nil
+}
+
+// claudeErrorCode maps a terminal error subtype onto a compiled model
+// Code (the real wire subtypes like `error_max_budget_usd` are not model
+// Codes themselves): the recognized budget subtype maps to BUDGET_EXCEEDED,
+// every other provider-reported error maps to the retryable PROVIDER_ERROR.
+func claudeErrorCode(subtype string) string {
+	switch subtype {
+	case "error_max_budget_usd":
+		return string(model.CodeBudgetExceeded)
+	default:
+		return string(model.CodeProviderError)
+	}
 }
 
 // withSession applies the binding's session id rule (design 14.2):

@@ -815,8 +815,8 @@ func TestDialectErrorAndTurnFailedEmitOneFailed(t *testing.T) {
 		t.Fatalf("expected 2 events (start + one failed), got %d: %+v", len(events), events)
 	}
 	term := events[len(events)-1]
-	if term.Type != agent.EventFailed || term.Code != "provider_error" {
-		t.Fatalf("terminal event = %+v, want one provider_error failed", term)
+	if term.Type != agent.EventFailed || term.Code != "PROVIDER_ERROR" {
+		t.Fatalf("terminal event = %+v, want one PROVIDER_ERROR failed", term)
 	}
 }
 
