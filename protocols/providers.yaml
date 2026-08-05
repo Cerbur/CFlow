@@ -48,12 +48,12 @@ providers:
     binary_identity_policy: "PATH-resolved absolute path pinned with binary sha256 at Execution Approval; drift blocks with COMMAND_IDENTITY_CHANGED"
     dialect:
       id: "cflow.dialect.codex-jsonl.v1"
-      event_schema_revision: "1"
+      event_schema_revision: "2"
     session_contract:
       start_event: "session_started"
-      id_field: "session_id"
-      terminal_events: ["session_finished", "session_failed"]
-      conflict_rule: "every JSONL event after session_started must carry the same session_id; missing ids fail PROVIDER_SESSION_ID_MISSING, conflicts fail PROVIDER_PROTOCOL_VIOLATION"
+      id_field: "thread_id"
+      terminal_events: ["turn.completed", "turn.failed"]
+      conflict_rule: "the thread id is established by the validated thread.started frame; a missing thread id fails PROVIDER_SESSION_ID_MISSING, a conflicting thread id fails PROVIDER_PROTOCOL_VIOLATION"
     start_capabilities:
       - jsonl_events
       - structured_output
@@ -67,7 +67,7 @@ providers:
     known_incompatibilities:
       - "shell command strings, pipes and redirects are never accepted; commands run argv-only"
       - "interactive TTY mode is unsupported; only non-interactive exec is driven"
-      - "codex exec resume accepts no -C/--cd flag (captured 0.141.0 help); resumed sessions run with the supervised process cwd"
+      - "codex exec resume accepts no -C/--cd flag (captured 0.146.0 help); resumed sessions run with the supervised process cwd"
 
   - name: claude
     status: enabled

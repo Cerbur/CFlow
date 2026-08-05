@@ -270,7 +270,7 @@ func TestProviderRegistryReorderedYAMLMaps(t *testing.T) {
 }
 
 // TestProviderRegistryCodexBindingCapturedFacts (task 14 fixture
-// capture): the codex binding pins the captured 0.141.0 protocol facts —
+// capture): the codex binding pins the captured 0.146.0 protocol facts —
 // the executable name, the supported version range (covering the captured
 // baseline and excluding 2.x), the JSONL dialect, the session contract,
 // and the Start/Resume capability gates the Runtime applies.
@@ -287,16 +287,16 @@ func TestProviderRegistryCodexBindingCapturedFacts(t *testing.T) {
 	if b.VersionRange != ">=0.80.0 <2.0.0" {
 		t.Fatalf("codex version range = %q, want the captured binding %q", b.VersionRange, ">=0.80.0 <2.0.0")
 	}
-	if !versionInRange("0.141.0", b.VersionRange) {
-		t.Fatal("the captured baseline 0.141.0 must be inside the codex supported range")
+	if !versionInRange("0.146.0", b.VersionRange) {
+		t.Fatal("the captured baseline 0.146.0 must be inside the codex supported range")
 	}
 	if versionInRange("2.0.0", b.VersionRange) {
 		t.Fatal("2.0.0 must be outside the codex supported range")
 	}
-	if b.Dialect.ID != "cflow.dialect.codex-jsonl.v1" || b.Dialect.EventSchemaRevision != "1" {
+	if b.Dialect.ID != "cflow.dialect.codex-jsonl.v1" || b.Dialect.EventSchemaRevision != "2" {
 		t.Fatalf("codex dialect = %+v", b.Dialect)
 	}
-	if b.SessionContract.StartEvent != "session_started" || b.SessionContract.IDField != "session_id" {
+	if b.SessionContract.StartEvent != "session_started" || b.SessionContract.IDField != "thread_id" {
 		t.Fatalf("codex session contract = %+v", b.SessionContract)
 	}
 	// The Start and Resume capability gates the Runtime applies to every

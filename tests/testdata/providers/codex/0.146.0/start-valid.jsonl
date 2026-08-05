@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"0197f1c1-9c6e-7a00-a000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"summary\":\"Reading the repository to ground the plan.\"}"}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"git status --porcelain","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"git status --porcelain","aggregated_output":"?? internal/search/","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"/worktrees/task-1/src/search.ts","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/worktrees/task-1/src/search.ts","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"{\"summary\":\"The plan has three phases.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":0}}

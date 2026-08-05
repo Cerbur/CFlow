@@ -4,12 +4,13 @@ package codex_test
 // TestStartArgvContainsNoBypassFlags argv contract, the typed Start and
 // Resume argv shapes, the exact ProcessSpec the adapter launches (argv,
 // cwd, stdin prompt, explicit safe env), the JSONL dialect mapping over
-// the captured 0.141.0 fixtures (session extraction, structured
-// completion, malformed/unknown events, conflicting ids, stderr
-// redaction, cancellation, resume not found), Detect (missing, version
-// mismatch, incompatible protocol, executable hash drift, the opt-in
-// smoke detection of the real binary against the captured binding), and
-// the pipeline integration of the dialect through the Runtime.
+// the captured 0.146.0 fixtures (the real thread/turn/item wire: session
+// extraction, structured completion, malformed/unknown events,
+// conflicting thread ids, stderr redaction, cancellation, resume not
+// found), Detect (missing, version mismatch, incompatible protocol,
+// executable hash drift, the opt-in smoke detection of the real binary
+// against the captured binding), and the pipeline integration of the
+// dialect through the Runtime.
 
 import (
 	"bytes"
@@ -35,9 +36,11 @@ import (
 	"cflow.local/cflow/internal/security"
 )
 
-// fixtureDir is the committed Codex 0.141.0 fixture directory, resolved
-// from the package working directory.
-var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers", "codex", "0.141.0")
+// fixtureDir is the committed Codex 0.146.0 fixture directory, resolved
+// from the package working directory (the installed CLI auto-updated
+// 0.141.0 -> 0.146.0 mid-Demo; the 0.141.0 fixtures remain as the
+// historical capture).
+var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers", "codex", "0.146.0")
 
 // capturedSessionID is the provider session id every fixture stream
 // establishes (a UUID v7 shape, matching real codex session ids).
@@ -151,7 +154,7 @@ func stubCodexOnPath(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "codex")
-	if err := os.WriteFile(p, []byte("#!/bin/sh\necho codex-cli 0.141.0\n"), 0o700); err != nil {
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho codex-cli 0.146.0\n"), 0o700); err != nil {
 		t.Fatalf("write stub codex: %v", err)
 	}
 	t.Setenv("PATH", dir)
@@ -329,7 +332,7 @@ func (h *harness) detectIn(t *testing.T) agent.Installation {
 		done <- result{inst, err}
 	}()
 	h.probe++
-	h.scriptVersion(t, h.probe, "codex-cli 0.141.0", 0)
+	h.scriptVersion(t, h.probe, "codex-cli 0.146.0", 0)
 	select {
 	case res := <-done:
 		requireNoError(t, res.err)
@@ -374,7 +377,7 @@ func runtimeStart(t *testing.T, rt *agent.Runtime, h *harness, req agent.StartRe
 		res, err := rt.Start(context.Background(), req)
 		done <- result{res, err}
 	}()
-	h.scriptVersion(t, 1, "codex-cli 0.141.0", 0)
+	h.scriptVersion(t, 1, "codex-cli 0.146.0", 0)
 	h.scriptFrames(t, 2, fixture, 0)
 	select {
 	case res := <-done:
@@ -429,7 +432,7 @@ func TestStartArgvOptionalModel(t *testing.T) {
 }
 
 // TestResumeArgvShape: Resume argv is exactly exec resume --json
-// --output-schema <file> <session-id> -; the captured 0.141.0 resume help
+// --output-schema <file> <session-id> -; the captured 0.146.0 resume help
 // accepts no -C/--cd, so Resume argv must not carry it either.
 func TestResumeArgvShape(t *testing.T) {
 	req := codex.ResumeRequest{
@@ -442,12 +445,12 @@ func TestResumeArgvShape(t *testing.T) {
 	requireAbsentArgs(t, argv, "-C", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--ignore-user-config")
 }
 
-// TestCapturedHelpFixturesConfirmBinding: the captured 0.141.0 help
+// TestCapturedHelpFixturesConfirmBinding: the captured 0.146.0 help
 // fixtures confirm every flag the binding and the argv contract rely on,
 // and pin the captured baseline version.
 func TestCapturedHelpFixturesConfirmBinding(t *testing.T) {
 	help := readFixture(t, "help.txt")
-	if !strings.Contains(help, "codex-cli 0.141.0") {
+	if !strings.Contains(help, "codex-cli 0.146.0") {
 		t.Fatalf("captured version fixture must pin the baseline, got: %q", help)
 	}
 	execHelp := readFixture(t, "exec-help.txt")
@@ -533,9 +536,10 @@ func TestResumeProcessSpecIsExact(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestDialectSessionEventExtraction: start-valid.jsonl maps onto the
-// unified events; known codex frames without a unified mapping
-// (turn_started, turn_completed, the user message) are skipped; every
-// event after the validated start inherits the established session id.
+// unified events in wire order; known codex frames without a unified
+// mapping (turn.started, file_change items, turn.completed usage) are
+// skipped; every event after the validated thread.started inherits the
+// established session id.
 func TestDialectSessionEventExtraction(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
@@ -548,7 +552,6 @@ func TestDialectSessionEventExtraction(t *testing.T) {
 		agent.EventToolStarted,
 		agent.EventToolFinished,
 		agent.EventAssistantMessage,
-		agent.EventUsage,
 		agent.EventCompleted,
 	}
 	if len(events) != len(wantTypes) {
@@ -567,23 +570,23 @@ func TestDialectSessionEventExtraction(t *testing.T) {
 			t.Fatalf("event %d must inherit the established session id, got %q", i+1, ev.SessionID)
 		}
 	}
-	if events[1].Text != "Reading the repository to ground the plan." {
+	// The model's outputs are schema-shaped JSON strings (the codex
+	// --output-schema contract).
+	if events[1].Text != `{"summary":"Reading the repository to ground the plan."}` {
 		t.Fatalf("assistant text = %q", events[1].Text)
 	}
-	if events[2].Tool != "shell" || events[2].Input != `{"command":"git status --porcelain"}` {
+	if events[2].Tool != "shell" || events[2].Input != "git status --porcelain" {
 		t.Fatalf("tool_started facts = %+v", events[2])
 	}
 	if events[3].Tool != "shell" || !strings.Contains(events[3].Output, "internal/search/") {
 		t.Fatalf("tool_finished facts = %+v", events[3])
 	}
-	if events[5].InputTokens != 1200 || events[5].OutputTokens != 300 || events[5].CostUSD != 0.012 {
-		t.Fatalf("usage facts = %+v", events[5])
-	}
 }
 
-// TestDialectStructuredCompletion: the terminal session_finished frame
-// maps onto the unified completed event carrying the raw structured
-// result object and the sha256 of its raw frame.
+// TestDialectStructuredCompletion: the terminal turn.completed frame
+// maps onto the unified completed event carrying the last agent_message's
+// structured result object (the codex --output-schema contract) and the
+// sha256 of its raw frame.
 func TestDialectStructuredCompletion(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
@@ -624,7 +627,7 @@ func TestDialectMalformedFrameFailsClosed(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 	h.scriptFrames(t, 1,
-		`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
+		`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
 			`this is not a jsonl frame`, 0)
 	events, err := collectErr(r)
 	var pe *agent.ProtocolError
@@ -660,13 +663,13 @@ func TestDialectUnknownEventFailsClosed(t *testing.T) {
 	if !bytes.Contains(pe.Frame, []byte("mystery_event")) {
 		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
 	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events before the violation, got %d: %+v", len(events), events)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event before the violation, got %d: %+v", len(events), events)
 	}
 }
 
-// TestDialectConflictingSessionIDsFailsClosed: a frame that explicitly
-// claims a session id different from the established one (fixture
+// TestDialectConflictingSessionIDsFailsClosed: a thread.started frame
+// that claims a thread id different from the established one (fixture
 // session-conflict.jsonl) stops the run with a protocol violation.
 func TestDialectConflictingSessionIDsFailsClosed(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
@@ -683,22 +686,22 @@ func TestDialectConflictingSessionIDsFailsClosed(t *testing.T) {
 	if !bytes.Contains(pe.Frame, []byte("0000000000bb")) {
 		t.Fatalf("protocol error must carry the conflicting frame: %q", pe.Frame)
 	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events before the conflict, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event before the conflict, got %d", len(events))
 	}
 }
 
-// TestDialectEmptyStartIDFailsClosed: a session_started frame that
-// claims no session id fails closed with PROVIDER_SESSION_ID_MISSING
-// (the binding's conflict rule: missing ids fail
-// PROVIDER_SESSION_ID_MISSING), so no session can be established by an
-// empty id and no event is emitted for the offending frame.
+// TestDialectEmptyStartIDFailsClosed: a thread.started frame that claims
+// no thread id fails closed with PROVIDER_SESSION_ID_MISSING (the
+// binding's conflict rule: missing ids fail PROVIDER_SESSION_ID_MISSING),
+// so no session can be established by an empty id and no event is emitted
+// for the offending frame.
 func TestDialectEmptyStartIDFailsClosed(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 	h.scriptFrames(t, 1,
-		`{"type":"session_started","session_id":""}`+"\n"+
-			`{"type":"session_finished","result":{"ok":true}}`, 0)
+		`{"type":"thread.started","thread_id":""}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`, 0)
 	events, err := collectErr(r)
 	var pe *agent.ProtocolError
 	if !errors.As(err, &pe) {
@@ -707,7 +710,7 @@ func TestDialectEmptyStartIDFailsClosed(t *testing.T) {
 	if pe.Code != model.CodeProviderSessionIDMissing {
 		t.Fatalf("code = %s, want PROVIDER_SESSION_ID_MISSING", pe.Code)
 	}
-	if !bytes.Contains(pe.Frame, []byte("session_started")) {
+	if !bytes.Contains(pe.Frame, []byte("thread.started")) {
 		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
 	}
 	if len(events) != 0 {
@@ -716,15 +719,15 @@ func TestDialectEmptyStartIDFailsClosed(t *testing.T) {
 }
 
 // TestDialectTerminalWithoutValidStartFailsClosed: a terminal event that
-// arrives before any validated session_started fails closed (session
+// arrives before any validated thread.started fails closed (session
 // identity appears only through a validated start event); the run can
 // never complete from a stream that never established a session.
 func TestDialectTerminalWithoutValidStartFailsClosed(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 	h.scriptFrames(t, 1,
-		`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"no start"}]}}`+"\n"+
-			`{"type":"session_finished","result":{"ok":true}}`, 0)
+		`{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"no start"}}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`, 0)
 	events, err := collectErr(r)
 	var pe *agent.ProtocolError
 	if !errors.As(err, &pe) {
@@ -733,11 +736,11 @@ func TestDialectTerminalWithoutValidStartFailsClosed(t *testing.T) {
 	if pe.Code != model.CodeProviderProtocolViolation {
 		t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
 	}
-	if !bytes.Contains(pe.Frame, []byte("session_finished")) {
+	if !bytes.Contains(pe.Frame, []byte("item.completed")) {
 		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
 	}
-	if len(events) != 1 {
-		t.Fatalf("expected only the pre-start message event, got %d", len(events))
+	if len(events) != 0 {
+		t.Fatalf("no events may precede a validated start, got %d", len(events))
 	}
 }
 
@@ -749,8 +752,8 @@ func TestDialectMissingCompletionResultFailsClosed(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 	h.scriptFrames(t, 1,
-		`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
-			`{"type":"session_finished"}`, 0)
+		`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`, 0)
 	events, err := collectErr(r)
 	var pe *agent.ProtocolError
 	if !errors.As(err, &pe) {
@@ -759,7 +762,7 @@ func TestDialectMissingCompletionResultFailsClosed(t *testing.T) {
 	if pe.Code != model.CodeProviderProtocolViolation {
 		t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
 	}
-	if !bytes.Contains(pe.Frame, []byte("session_finished")) {
+	if !bytes.Contains(pe.Frame, []byte("turn.completed")) {
 		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
 	}
 	if len(events) != 1 {
@@ -768,16 +771,17 @@ func TestDialectMissingCompletionResultFailsClosed(t *testing.T) {
 }
 
 // TestDialectNonObjectCompletionResultFailsClosed: a terminal completion
-// whose result is not a JSON object (here a plain string) cannot validate
-// structured completion and fails closed.
+// whose result is not a JSON object (here a plain string or null) cannot
+// validate structured completion and fails closed.
 func TestDialectNonObjectCompletionResultFailsClosed(t *testing.T) {
-	for _, result := range []string{`"just a string"`, `null`} {
-		t.Run(result, func(t *testing.T) {
+	for _, text := range []string{`"just a string"`, `null`} {
+		t.Run(text, func(t *testing.T) {
 			h := newHarness(t, codexBinding(t))
 			r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 			h.scriptFrames(t, 1,
-				`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
-					`{"type":"session_finished","result":`+result+`}`, 0)
+				`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
+					`{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":`+text+`}}`+"\n"+
+					`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`, 0)
 			_, err := collectErr(r)
 			var pe *agent.ProtocolError
 			if !errors.As(err, &pe) {
@@ -786,7 +790,7 @@ func TestDialectNonObjectCompletionResultFailsClosed(t *testing.T) {
 			if pe.Code != model.CodeProviderProtocolViolation {
 				t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
 			}
-			if !bytes.Contains(pe.Frame, []byte("session_finished")) {
+			if !bytes.Contains(pe.Frame, []byte("turn.completed")) {
 				t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
 			}
 		})
@@ -803,8 +807,8 @@ func TestDialectExitWithoutTerminalFailsClosed(t *testing.T) {
 			h := newHarness(t, codexBinding(t))
 			r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 			h.scriptFrames(t, 1,
-				`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
-					`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"never finishes"}]}}`, code)
+				`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
+					`{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"never finishes"}}`, code)
 			events, err := collectErr(r)
 			var crash *agent.ProcessCrash
 			if !errors.As(err, &crash) {
@@ -828,9 +832,9 @@ func TestStderrRedaction(t *testing.T) {
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 	hnd := h.waitStarts(t, 1)
 	h.fake.EmitOutput(hnd, process.Stderr, []byte("sk-abcdefghijklmnop: authentication failed\n"))
-	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"))
-	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"still working"}]}}`+"\n"))
-	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"session_finished","result":{"ok":true}}`+"\n"))
+	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"))
+	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"{\"summary\":\"still working\"}"}}`+"\n"))
+	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`+"\n"))
 	h.fake.ExitGroup(hnd, 0)
 	events, err := collectErr(r)
 	requireNoError(t, err)
@@ -923,8 +927,8 @@ func TestCodexAdapterPlugsIntoRuntimePipeline(t *testing.T) {
 	if res.Terminal == nil || res.Terminal.Type != agent.EventCompleted {
 		t.Fatalf("terminal event missing: %+v", res.Terminal)
 	}
-	if len(res.Events) != 7 {
-		t.Fatalf("expected 7 persisted events, got %d", len(res.Events))
+	if len(res.Events) != 6 {
+		t.Fatalf("expected 6 persisted events, got %d", len(res.Events))
 	}
 	for i, ev := range res.Events {
 		if ev.SessionID != agent.ProviderSessionID(capturedSessionID) {
@@ -942,9 +946,10 @@ func TestCodexEventTextRedactedThroughPipeline(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	rt := newCodexRuntime(t, h.ad)
 	leaked := "the token is sk-abc123def4567890 and it must not leak"
-	fixture := `{"type":"session_started","session_id":"` + capturedSessionID + `"}` + "\n" +
-		`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"` + leaked + `"}]}}` + "\n" +
-		`{"type":"session_finished","result":{"ok":true}}`
+	item, _ := json.Marshal(map[string]any{"id": "i0", "type": "agent_message", "text": `{"summary":"` + leaked + `"}`})
+	fixture := `{"type":"thread.started","thread_id":"` + capturedSessionID + `"}` + "\n" +
+		`{"type":"item.completed","item":` + string(item) + "}\n" +
+		`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`
 	res, err := runtimeStart(t, rt, h, fixtureStart(h), fixture)
 	requireNoError(t, err)
 	if res.Status != model.RunSucceeded {
@@ -971,10 +976,10 @@ func TestCancellationPreservesPartialRedactedEvents(t *testing.T) {
 		res, err = rt.Start(context.Background(), fixtureStart(h))
 		done <- err
 	}()
-	h.scriptVersion(t, 1, "codex-cli 0.141.0", 0)
+	h.scriptVersion(t, 1, "codex-cli 0.146.0", 0)
 	hnd := h.scriptFrames(t, 2,
-		`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
-			`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"halfway with sk-abc123def4567890"}]}}`, -1)
+		`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
+			`{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"halfway with sk-abc123def4567890"}}`, -1)
 
 	// The handle appears once the validated start event established the
 	// session; cancel it, then let the process exit so Next unblocks.
@@ -1043,27 +1048,26 @@ func TestCancellationPreservesPartialRedactedEvents(t *testing.T) {
 }
 
 // TestRuntimeRejectsStreamWithoutValidatedStart: a stream that never
-// establishes a session through a validated session_started event fails
-// the run with a non-retryable protocol Finding (brief: missing
-// session_started → non-retryable protocol Finding; exit 0 cannot
-// override it).
+// establishes a session through a validated thread.started event fails
+// the run with a non-retryable protocol Finding (brief: missing start →
+// non-retryable protocol Finding; exit 0 cannot override it).
 func TestRuntimeRejectsStreamWithoutValidatedStart(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	rt := newCodexRuntime(t, h.ad)
 	_, err := runtimeStart(t, rt, h, fixtureStart(h),
-		`{"type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"no start"}]}}`+"\n"+
-			`{"type":"session_finished","result":{"ok":true}}`)
+		`{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"no start"}}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
 	assertFaultCode(t, err, model.CodeProviderProtocolViolation)
 }
 
-// TestRuntimeRejectsEmptyStartID: an empty session id on session_started
+// TestRuntimeRejectsEmptyStartID: an empty thread id on thread.started
 // fails the run with PROVIDER_SESSION_ID_MISSING through the pipeline.
 func TestRuntimeRejectsEmptyStartID(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	rt := newCodexRuntime(t, h.ad)
 	_, err := runtimeStart(t, rt, h, fixtureStart(h),
-		`{"type":"session_started","session_id":""}`+"\n"+
-			`{"type":"session_finished","result":{"ok":true}}`)
+		`{"type":"thread.started","thread_id":""}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
 	assertFaultCode(t, err, model.CodeProviderSessionIDMissing)
 }
 
@@ -1074,8 +1078,8 @@ func TestRuntimeRejectsInvalidCompletion(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	rt := newCodexRuntime(t, h.ad)
 	_, err := runtimeStart(t, rt, h, fixtureStart(h),
-		`{"type":"session_started","session_id":"`+capturedSessionID+`"}`+"\n"+
-			`{"type":"session_finished"}`)
+		`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
 	assertFaultCode(t, err, model.CodeProviderProtocolViolation)
 }
 
@@ -1126,7 +1130,7 @@ func TestResumeReaffirmsBoundSession(t *testing.T) {
 		resumeErr = err
 		done <- res
 	}()
-	h.scriptVersion(t, 1, "codex-cli 0.141.0", 0)
+	h.scriptVersion(t, 1, "codex-cli 0.146.0", 0)
 	h.scriptFrames(t, 2, readFixture(t, "resume-valid.jsonl"), 0)
 	var res *agent.ResumeResult
 	select {
@@ -1157,8 +1161,8 @@ func TestDetectSupportedCapturedBinding(t *testing.T) {
 	if inst.Compatibility != agent.CompatibilitySupported {
 		t.Fatalf("compatibility = %s, want SUPPORTED", inst.Compatibility)
 	}
-	if inst.CLIVersion != "0.141.0" {
-		t.Fatalf("parsed CLI version = %q, want 0.141.0", inst.CLIVersion)
+	if inst.CLIVersion != "0.146.0" {
+		t.Fatalf("parsed CLI version = %q, want 0.146.0", inst.CLIVersion)
 	}
 	if inst.ExecutablePath != filepath.Join(h.codexDir, "codex") {
 		t.Fatalf("executable path = %q", inst.ExecutablePath)
@@ -1211,7 +1215,7 @@ func TestDetectVersionMismatch(t *testing.T) {
 	if inst.Compatibility != agent.CompatibilityUnknownVersion {
 		t.Fatalf("compatibility = %s, want UNKNOWN_VERSION", inst.Compatibility)
 	}
-	if inst.CLIVersion != "0.141.0" {
+	if inst.CLIVersion != "0.146.0" {
 		t.Fatalf("the parsed version must remain a fact: %q", inst.CLIVersion)
 	}
 }
@@ -1244,7 +1248,7 @@ func TestDetectIncompatibleProtocol(t *testing.T) {
 func TestDetectExecutableHashDrift(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "codex")
-	first := []byte("#!/bin/sh\necho codex-cli 0.141.0\n")
+	first := []byte("#!/bin/sh\necho codex-cli 0.146.0\n")
 	if err := os.WriteFile(p, first, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1262,7 +1266,7 @@ func TestDetectExecutableHashDrift(t *testing.T) {
 		t.Fatalf("hash = %q, want %q", inst1.ExecutableSHA256, sha256Hex(first))
 	}
 
-	drifted := []byte("#!/bin/sh\necho codex-cli 0.141.0\n# drifted binary\n")
+	drifted := []byte("#!/bin/sh\necho codex-cli 0.146.0\n# drifted binary\n")
 	if err := os.WriteFile(p, drifted, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1327,7 +1331,7 @@ func TestInspectReportsLiveThenReaped(t *testing.T) {
 	h := newHarness(t, codexBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
 	hnd := h.waitStarts(t, 1)
-	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"session_started","session_id":"s9"}`+"\n"))
+	h.fake.EmitOutput(hnd, process.Stdout, []byte(`{"type":"thread.started","thread_id":"s9"}`+"\n"))
 	ev, err := r.Next(context.Background())
 	requireNoError(t, err)
 	if ev.Type != agent.EventSessionStarted {

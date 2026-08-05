@@ -67,7 +67,7 @@ func newProviderFixture(t *testing.T) *providerFixture {
 	fa, sup := process.NewFakeSupervisor()
 	fx.fa = fa
 	fx.rec = &startRecorder{Supervisor: sup}
-	fx.codex = stubExecutable(t, "codex", "#!/bin/sh\necho codex-cli 0.141.0\n")
+	fx.codex = stubExecutable(t, "codex", "#!/bin/sh\necho codex-cli 0.146.0\n")
 	fx.claude = stubExecutable(t, "claude", "#!/bin/sh\necho "+capturedClaudeVersion+"\n")
 	return fx
 }
@@ -179,7 +179,7 @@ func (fx *providerFixture) driveToExecutionApproval(t *testing.T) (model.Workflo
 		done <- err
 	}()
 	hCodex := fx.rec.waitNextMatch(t, probeOf(fx.codex))
-	fx.fa.EmitOutput(hCodex, process.Stdout, []byte("codex-cli 0.141.0\n"))
+	fx.fa.EmitOutput(hCodex, process.Stdout, []byte("codex-cli 0.146.0\n"))
 	fx.fa.ExitGroup(hCodex, 0)
 	hClaude := fx.rec.waitNextMatch(t, probeOf(fx.claude))
 	fx.fa.EmitOutput(hClaude, process.Stdout, []byte(capturedClaudeVersion+"\n"))
@@ -291,7 +291,7 @@ func TestCodexAndClaudeTasksRunConcurrently(t *testing.T) {
 	fx := newProviderFixture(t)
 	wf, _ := fx.driveToExecutionApproval(t)
 
-	codexFrames := readTestdata(t, "providers/codex/0.141.0/start-valid.jsonl")
+	codexFrames := readTestdata(t, "providers/codex/0.146.0/start-valid.jsonl")
 	claudeFrames := readTestdata(t, "providers/claude/2.1.220/start-valid.jsonl")
 
 	done := make(chan error, 1)
@@ -305,7 +305,7 @@ func TestCodexAndClaudeTasksRunConcurrently(t *testing.T) {
 	// re-detects its binding (concurrent) and launches the run. Every
 	// probe is scripted by executable, never by order.
 	hCodexProbe := fx.rec.waitNextMatch(t, probeOf(fx.codex))
-	fx.fa.EmitOutput(hCodexProbe, process.Stdout, []byte("codex-cli 0.141.0\n"))
+	fx.fa.EmitOutput(hCodexProbe, process.Stdout, []byte("codex-cli 0.146.0\n"))
 	fx.fa.ExitGroup(hCodexProbe, 0)
 	hClaudeProbe := fx.rec.waitNextMatch(t, probeOf(fx.claude))
 	fx.fa.EmitOutput(hClaudeProbe, process.Stdout, []byte(capturedClaudeVersion+"\n"))

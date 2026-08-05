@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"0197f1c1-9c6e-7a00-a000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"summary\":\"Continuing where the session left off.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":900,"output_tokens":150}}

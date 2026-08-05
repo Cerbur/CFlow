@@ -199,7 +199,7 @@ func injectProviderProtocolViolation(t *testing.T, _ matrixRow) rowResult {
 		})
 		done <- err
 	}()
-	scriptVersion(t, rec, fake, 1, "codex-cli 0.141.0", 0)
+	scriptVersion(t, rec, fake, 1, "codex-cli 0.146.0", 0)
 	scriptFrames(t, rec, fake, 2, fixture, 0)
 	select {
 	case err := <-done:
@@ -278,7 +278,7 @@ func injectProviderBindingDrift(t *testing.T, _ matrixRow) rowResult {
 	inst := agent.Installation{Compatibility: agent.CompatibilitySupported,
 		ExecutablePath:   "/approved/codex",
 		ExecutableSHA256: "fresh-sha",
-		CLIVersion:       "0.141.0",
+		CLIVersion:       "0.146.0",
 		DialectID:        "cflow.dialect.codex.v1",
 		RegistryRevision: "reg-1",
 	}
@@ -286,7 +286,7 @@ func injectProviderBindingDrift(t *testing.T, _ matrixRow) rowResult {
 		StartCapabilities: []string{"session_id_on_start", "structured_output"},
 		ExecutablePath:    "/approved/codex",
 		ExecutableSHA256:  "approved-sha",
-		CLIVersion:        "0.141.0",
+		CLIVersion:        "0.146.0",
 		DialectID:         "cflow.dialect.codex.v1",
 		RegistryRevision:  "reg-1",
 	}

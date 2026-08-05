@@ -376,10 +376,26 @@ func (a *Application) writeRoutingPolicies(ctx context.Context, wf model.Workflo
 }
 
 // managedCodingSchema is the managed immutable output schema of a coding
-// Session (design 14.5): the structured terminal result is a JSON
-// object, so the minimal object schema proves the structured contract to
-// the dialect CLIs (the same materialization the adapter tests drive).
+// Session for the Claude Adapter (design 14.5): the structured terminal
+// result is a JSON object, so the minimal object schema proves the
+// structured contract to the dialect CLI (the same materialization the
+// adapter tests drive).
 const managedCodingSchema = `{"type":"object"}`
+
+// codexCodingSchema is the codex output schema of a coding Session. The
+// codex --output-schema contract is stricter than Claude's --json-schema:
+// the real wire (0.141.0+, confirmed by the real Cross-Provider E2E)
+// requires a concrete object schema — non-empty properties, a required
+// array covering every property, and additionalProperties:false — and
+// rejects `{"type":"object"}`. The model's final agent_message then
+// carries the schema-shaped JSON object the dialect turns into the
+// structured terminal result.
+const codexCodingSchema = `{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`
+
+// codexReviewSchema is the codex output schema of a Review Session: the
+// structured PASS/FAIL verdict object the Kernel judges
+// (parseReviewVerdict reads the "decision" member).
+const codexReviewSchema = `{"type":"object","properties":{"decision":{"type":"string"},"report":{"type":"string"}},"required":["decision","report"],"additionalProperties":false}`
 
 // providerTypedInput decorates a Session input with the typed Adapter
 // facts of the routed Provider (design 14.5): the managed immutable
@@ -405,7 +421,7 @@ func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime,
 	switch provider {
 	case "codex":
 		return codex.Input{
-			SchemaPath:       a.managedSchemaPath(ctx),
+			SchemaPath:       a.managedSchemaPath(ctx, purpose),
 			Model:            rb.Model,
 			ContextBundleRef: bundleRef,
 		}
@@ -430,19 +446,29 @@ func contextBundleRefOf(base any) string {
 }
 
 // managedSchemaPath materializes the managed immutable output schema
-// file under CFLOW_HOME (design 14.5: the Application owns the managed
-// schema file; the dialect CLI receives its absolute path) and returns
-// it. The write is idempotent and never modifies an existing file.
-func (a *Application) managedSchemaPath(ctx context.Context) string {
+// file for one Agent Purpose under CFLOW_HOME (design 14.5: the
+// Application owns the managed schema file; the dialect CLI receives its
+// absolute path) and returns it. The write is idempotent and never
+// modifies an existing file. Review purposes materialize the verdict
+// schema; every other coding purpose materializes the implementation
+// schema (the codex --output-schema contract differs per purpose because
+// the codex wire requires a concrete schema and the Review verdict must
+// carry the structured decision).
+func (a *Application) managedSchemaPath(ctx context.Context, purpose model.AgentPurpose) string {
 	dir := filepath.Join(a.home, "schemas")
 	if err := security.CreateSensitiveDir(dir); err != nil {
 		return ""
 	}
-	path := filepath.Join(dir, "coding-output.json")
+	name, schema := "coding-output.json", codexCodingSchema
+	switch purpose {
+	case model.PurposeReview, model.PurposeFinalVerification, model.PurposeApplyVerification:
+		name, schema = "review-output.json", codexReviewSchema
+	}
+	path := filepath.Join(dir, name)
 	if _, err := os.Stat(path); err == nil {
 		return path
 	}
-	if err := os.WriteFile(path, []byte(managedCodingSchema), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(schema), 0o600); err != nil {
 		return ""
 	}
 	return path

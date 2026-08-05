@@ -28,7 +28,7 @@ type run struct {
 	h   process.Handle
 	ch  process.Events
 
-	established  agent.ProviderSessionID
+	parser       streamParser
 	terminalSeen bool
 	stopped      bool
 	reaped       bool
@@ -81,7 +81,7 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 // (PROVIDER_SESSION_ID_MISSING), every other violation is
 // PROVIDER_PROTOCOL_VIOLATION.
 func (r *run) decodeFrame(raw []byte) (agent.Event, bool, error) {
-	ev, skip, err := parseFrame(raw, &r.established)
+	ev, skip, err := r.parser.parse(raw)
 	if err != nil {
 		r.stopProcess()
 		code := model.CodeProviderProtocolViolation
@@ -119,7 +119,7 @@ func (r *run) afterReap(ctx context.Context) (agent.Event, error) {
 	stopped := r.stopped
 	terminal := r.terminalSeen
 	r.reaped = true
-	delete(r.ad.runs, r.established)
+	delete(r.ad.runs, r.parser.established)
 	r.ad.mu.Unlock()
 	if stopped || terminal {
 		return agent.Event{}, io.EOF

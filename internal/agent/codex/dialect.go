@@ -1,13 +1,20 @@
 // The codex JSONL dialect (cflow.dialect.codex-jsonl.v1): the bounded
 // frame decoder of design 14.3 converts one raw `codex exec --json`
-// frame onto the unified Agent Event contract. Real codex frames after
-// session_started carry no session id (they carry turn ids); the dialect
-// inherits the id established by the validated start event, and a frame
-// that explicitly claims a different id fails closed (the binding's
-// conflict rule). Known codex event types with no unified mapping
-// (turn_started, turn_completed, non-assistant messages) are skipped;
-// unknown event types, unparseable frames, unknown message roles, and
-// unknown tool states fail closed with the raw frame for redacted
+// frame onto the unified Agent Event contract. The real codex wire
+// (0.141.0+, confirmed by the real Cross-Provider E2E) is a
+// thread/turn/item protocol: a `thread.started` frame establishes the
+// thread (session) id; `turn.started` begins one turn; `item.started` /
+// `item.completed` carry the agent's work items (agent_message,
+// command_execution, file_change, ...); `turn.completed` ends the turn
+// with usage; `error` / `turn.failed` carry terminal failures. The
+// dialect inherits the id established by the validated thread.started
+// for every subsequent event; a frame that explicitly claims a
+// different id fails closed (the binding's conflict rule). The
+// structured terminal result is the last agent_message's text (the
+// model's final output under --output-schema), validated as a JSON
+// object at the wire boundary. Known codex events with no unified
+// mapping are skipped; unknown event types, unparseable frames, and
+// unknown item types fail closed with the raw frame for redacted
 // evidence.
 package codex
 
@@ -17,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"cflow.local/cflow/internal/agent"
 )
@@ -27,224 +33,228 @@ import (
 // tolerated: the provider owns the wire, the dialect owns the mapping,
 // and fail-closed applies to unknown event types, never to extra fields.
 type wireFrame struct {
-	Type       string          `json:"type"`
-	SessionID  string          `json:"session_id"`
-	Timestamp  string          `json:"timestamp"`
-	TurnID     string          `json:"turn_id"`
-	MessageID  string          `json:"message_id"`
-	Payload    json.RawMessage `json:"payload"`
-	State      string          `json:"state"`
-	ToolCallID string          `json:"tool_call_id"`
-	ToolCall   *toolCall       `json:"tool_call"`
-	Input      json.RawMessage `json:"input"`
-	Output     json.RawMessage `json:"output"`
-	Usage      *usageFrame     `json:"usage"`
-	Result     json.RawMessage `json:"result"`
-	Code       string          `json:"code"`
-	Message    string          `json:"message"`
+	Type     string          `json:"type"`
+	ThreadID string          `json:"thread_id"`
+	Item     json.RawMessage `json:"item"`
+	Error    json.RawMessage `json:"error"`
+	Message  string          `json:"message"`
+	Usage    *usageFrame     `json:"usage"`
 }
 
-// toolCall is the codex tool_call shape inside tool_execution frames;
-// arguments is the raw JSON text of the call arguments.
-type toolCall struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+// itemFrame is one codex work item: the "item" field of item.started /
+// item.completed frames. agent_message carries the model's output text
+// (a schema-shaped JSON string under --output-schema); command_execution
+// carries the shell command and its aggregated output; file_change
+// carries the changed paths; other known types are diagnostic and
+// skipped.
+type itemFrame struct {
+	ID               string       `json:"id"`
+	Type             string       `json:"type"`
+	Text             string       `json:"text"`
+	Command          string       `json:"command"`
+	AggregatedOutput string       `json:"aggregated_output"`
+	ExitCode         *int         `json:"exit_code"`
+	Status           string       `json:"status"`
+	Changes          []fileChange `json:"changes"`
 }
 
-// usageFrame is the codex usage shape.
+// fileChange is one path change inside a file_change item.
+type fileChange struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+}
+
+// usageFrame is the codex usage shape of the turn.completed frame.
 type usageFrame struct {
-	InputTokens  int64   `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
-	CostUSD      float64 `json:"cost_usd"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
 }
 
-// messagePayload is the codex message payload shape.
-type messagePayload struct {
-	Role    string         `json:"role"`
-	Content []contentBlock `json:"content"`
+// knownNoopItemTypes are real codex work item types that carry no unified
+// mapping (file facts, planning/reasoning telemetry, and error items).
+// They are skipped, never failed: fail-closed applies to unknown events,
+// not to known unmapped protocol facts.
+var knownNoopItemTypes = map[string]bool{
+	"file_change":          true,
+	"plan":                 true,
+	"reasoning":            true,
+	"memory":               true,
+	"error":                true,
+	"agent_message_metadata": true,
+	"tool_use_metadata":    true,
+	"worktree":             true,
 }
 
-// contentBlock is one codex message content block.
-type contentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-// knownNoopTypes are real codex JSONL event types that carry no unified
-// mapping (turn lifecycle frames). They are skipped, never failed:
-// fail-closed applies to unknown events, not to known unmapped protocol
-// facts.
-var knownNoopTypes = map[string]bool{
-	"turn_started":   true,
-	"turn_completed": true,
-}
-
-// skippedRoles are known codex message roles with no unified mapping.
-var skippedRoles = map[string]bool{"user": true, "system": true, "developer": true}
-
-// errSessionIDMissing marks a session_started frame that claims no
-// session id: per the binding's conflict rule missing ids fail
+// errSessionIDMissing marks a thread.started frame that claims no thread
+// id: per the binding's conflict rule missing ids fail
 // PROVIDER_SESSION_ID_MISSING. The run maps this onto the fail-closed
 // protocol finding with the raw frame as evidence.
-var errSessionIDMissing = errors.New("session_started frame carries no session id")
+var errSessionIDMissing = errors.New("thread.started frame carries no thread id")
 
-// parseFrame decodes one raw codex JSONL frame into a unified event.
-// established is the session id the stream's validated start event
-// claimed ("" before the start). skip reports known frames that map to
-// no unified event and must be passed over silently. Fail-closed rules
-// at the wire boundary: a start frame with no session id, a terminal
-// event before any validated start, and a completion without a valid
-// JSON-object result are protocol findings (the Runtime enforces the
-// same rules on the unified events; the dialect holds them here so the
-// offending frame is preserved as evidence).
-func parseFrame(raw []byte, established *agent.ProviderSessionID) (agent.Event, bool, error) {
+// streamParser is the stateful decoder of one run: the established
+// thread (session) id ("" before the validated thread.started) and the
+// last agent_message text (the structured terminal result candidate of
+// turn.completed).
+type streamParser struct {
+	established  agent.ProviderSessionID
+	lastAgentText string
+}
+
+// parse decodes one raw codex JSONL frame into a unified event. skip
+// reports known frames that map to no unified event and must be passed
+// over silently. Fail-closed rules at the wire boundary: a thread.started
+// with no id, a terminal event before any validated thread.started, a
+// conflicting thread id, and a turn.completed without a valid JSON-object
+// result are protocol findings (the Runtime enforces the same rules on
+// the unified events; the dialect holds them here so the offending frame
+// is preserved as evidence).
+func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 	var wf wireFrame
 	if err := json.Unmarshal(raw, &wf); err != nil {
 		return agent.Event{}, false, fmt.Errorf("frame is not a codex JSONL object: %w", err)
 	}
 	switch wf.Type {
-	case "session_started":
-		if wf.SessionID == "" {
+	case "thread.started":
+		if wf.ThreadID == "" {
 			return agent.Event{}, false, errSessionIDMissing
 		}
-		*established = agent.ProviderSessionID(wf.SessionID)
+		if p.established != "" && agent.ProviderSessionID(wf.ThreadID) != p.established {
+			return agent.Event{}, false, fmt.Errorf("thread id %q conflicts with the established session %q", wf.ThreadID, p.established)
+		}
+		p.established = agent.ProviderSessionID(wf.ThreadID)
 		return finishEvent(agent.Event{
 			Type:      agent.EventSessionStarted,
-			SessionID: agent.ProviderSessionID(wf.SessionID),
+			SessionID: p.established,
 		}, raw), false, nil
-	case "message":
-		return parseMessageFrame(wf, raw, established)
-	case "tool_execution":
-		return parseToolFrame(wf, raw, established)
-	case "usage":
-		if wf.Usage == nil {
-			return agent.Event{}, false, fmt.Errorf("usage frame carries no usage payload")
+	case "turn.started":
+		return agent.Event{}, true, nil
+	case "item.started":
+		return p.parseItemStarted(wf, raw)
+	case "item.completed":
+		return p.parseItemCompleted(wf, raw)
+	case "turn.completed":
+		if p.established == "" {
+			return agent.Event{}, false, fmt.Errorf("terminal event before a validated thread.started")
 		}
-		ev := agent.Event{
-			Type:         agent.EventUsage,
-			InputTokens:  wf.Usage.InputTokens,
-			OutputTokens: wf.Usage.OutputTokens,
-			CostUSD:      wf.Usage.CostUSD,
+		if !isJSONObjectText(p.lastAgentText) {
+			return agent.Event{}, false, fmt.Errorf("turn.completed carries no valid JSON object result")
 		}
-		if err := withSession(&ev, wf, established); err != nil {
-			return agent.Event{}, false, err
+		return finishEvent(agent.Event{
+			Type:      agent.EventCompleted,
+			Result:    p.lastAgentText,
+			SessionID: p.established,
+		}, raw), false, nil
+	case "error":
+		if p.established == "" {
+			return agent.Event{}, false, fmt.Errorf("terminal event before a validated thread.started")
 		}
-		return finishEvent(ev, raw), false, nil
-	case "session_finished":
-		if *established == "" {
-			return agent.Event{}, false, fmt.Errorf("terminal event before a validated session_started")
+		return finishEvent(agent.Event{
+			Type:      agent.EventFailed,
+			Code:      "provider_error",
+			Message:   wf.Message,
+			SessionID: p.established,
+		}, raw), false, nil
+	case "turn.failed":
+		if p.established == "" {
+			return agent.Event{}, false, fmt.Errorf("terminal event before a validated thread.started")
 		}
-		if !isJSONObject(wf.Result) {
-			return agent.Event{}, false, fmt.Errorf("session_finished frame carries no valid JSON object result")
-		}
-		ev := agent.Event{
-			Type:   agent.EventCompleted,
-			Result: string(wf.Result),
-		}
-		if err := withSession(&ev, wf, established); err != nil {
-			return agent.Event{}, false, err
-		}
-		return finishEvent(ev, raw), false, nil
-	case "session_failed":
-		if *established == "" {
-			return agent.Event{}, false, fmt.Errorf("terminal event before a validated session_started")
-		}
-		ev := agent.Event{
-			Type:    agent.EventFailed,
-			Code:    wf.Code,
-			Message: wf.Message,
-		}
-		if err := withSession(&ev, wf, established); err != nil {
-			return agent.Event{}, false, err
-		}
-		return finishEvent(ev, raw), false, nil
+		return finishEvent(agent.Event{
+			Type:      agent.EventFailed,
+			Code:      "provider_error",
+			Message:   errorMessage(wf.Error, wf.Message),
+			SessionID: p.established,
+		}, raw), false, nil
 	default:
-		if knownNoopTypes[wf.Type] {
-			return agent.Event{}, true, nil
-		}
 		return agent.Event{}, false, fmt.Errorf("unknown codex JSONL event type %q", wf.Type)
 	}
 }
 
-// parseMessageFrame maps a codex message frame: assistant messages become
-// unified assistant_message events (the joined text of their text
-// blocks); user, system, and developer messages are known unmapped roles
-// and are skipped; any other role fails closed.
-func parseMessageFrame(wf wireFrame, raw []byte, established *agent.ProviderSessionID) (agent.Event, bool, error) {
-	if len(wf.Payload) == 0 {
-		return agent.Event{}, false, fmt.Errorf("message frame carries no payload")
+// parseItemStarted maps an item.started frame: a command_execution item
+// is the tool call launch (tool_started with the shell command as the
+// input); every other item type is a known unmapped fact and is skipped.
+func (p *streamParser) parseItemStarted(wf wireFrame, raw []byte) (agent.Event, bool, error) {
+	if p.established == "" {
+		return agent.Event{}, false, fmt.Errorf("item frame before a validated thread.started")
 	}
-	var payload messagePayload
-	if err := json.Unmarshal(wf.Payload, &payload); err != nil {
-		return agent.Event{}, false, fmt.Errorf("message payload is not a codex message: %w", err)
+	var it itemFrame
+	if err := json.Unmarshal(wf.Item, &it); err != nil {
+		return agent.Event{}, false, fmt.Errorf("item frame is not a codex item: %w", err)
 	}
-	if skippedRoles[payload.Role] {
+	switch it.Type {
+	case "command_execution":
+		return finishEvent(agent.Event{
+			Type:      agent.EventToolStarted,
+			Tool:      "shell",
+			Input:     it.Command,
+			SessionID: p.established,
+		}, raw), false, nil
+	default:
 		return agent.Event{}, true, nil
 	}
-	if payload.Role != "assistant" {
-		return agent.Event{}, false, fmt.Errorf("message frame carries unknown role %q", payload.Role)
-	}
-	var text strings.Builder
-	for _, block := range payload.Content {
-		if (block.Type == "text" || block.Type == "output_text") && block.Text != "" {
-			text.WriteString(block.Text)
-		}
-	}
-	ev := agent.Event{Type: agent.EventAssistantMessage, Text: text.String()}
-	if err := withSession(&ev, wf, established); err != nil {
-		return agent.Event{}, false, err
-	}
-	return finishEvent(ev, raw), false, nil
 }
 
-// parseToolFrame maps a codex tool_execution frame: state running maps
-// onto tool_started; states success and error map onto tool_finished
-// with the raw output text; any other state fails closed.
-func parseToolFrame(wf wireFrame, raw []byte, established *agent.ProviderSessionID) (agent.Event, bool, error) {
-	if wf.ToolCall == nil || wf.ToolCall.Name == "" {
-		return agent.Event{}, false, fmt.Errorf("tool_execution frame carries no tool call")
+// parseItemCompleted maps an item.completed frame: an agent_message item
+// is the model's output (assistant_message) and becomes the candidate
+// terminal result text; a command_execution item completes the launched
+// tool (tool_finished with the aggregated output); other known item
+// types are skipped.
+func (p *streamParser) parseItemCompleted(wf wireFrame, raw []byte) (agent.Event, bool, error) {
+	if p.established == "" {
+		return agent.Event{}, false, fmt.Errorf("item frame before a validated thread.started")
 	}
-	var ev agent.Event
-	switch wf.State {
-	case "running":
-		ev = agent.Event{Type: agent.EventToolStarted, Tool: wf.ToolCall.Name, Input: wf.ToolCall.Arguments}
-	case "success", "error":
-		ev = agent.Event{Type: agent.EventToolFinished, Tool: wf.ToolCall.Name, Output: string(wf.Output)}
+	var it itemFrame
+	if err := json.Unmarshal(wf.Item, &it); err != nil {
+		return agent.Event{}, false, fmt.Errorf("item frame is not a codex item: %w", err)
+	}
+	switch it.Type {
+	case "agent_message":
+		if it.Text != "" {
+			p.lastAgentText = it.Text
+		}
+		return finishEvent(agent.Event{
+			Type:      agent.EventAssistantMessage,
+			Text:      it.Text,
+			SessionID: p.established,
+		}, raw), false, nil
+	case "command_execution":
+		return finishEvent(agent.Event{
+			Type:      agent.EventToolFinished,
+			Tool:      "shell",
+			Output:    it.AggregatedOutput,
+			SessionID: p.established,
+		}, raw), false, nil
 	default:
-		return agent.Event{}, false, fmt.Errorf("tool_execution frame carries unknown state %q", wf.State)
-	}
-	if err := withSession(&ev, wf, established); err != nil {
-		return agent.Event{}, false, err
-	}
-	return finishEvent(ev, raw), false, nil
-}
-
-// withSession applies the binding's session id rule (design 14.2):
-// frames after the validated start inherit the established id; a frame
-// that explicitly claims a different id conflicts and fails closed.
-func withSession(ev *agent.Event, wf wireFrame, established *agent.ProviderSessionID) error {
-	if wf.SessionID != "" {
-		if *established != "" && agent.ProviderSessionID(wf.SessionID) != *established {
-			return fmt.Errorf("session id %q conflicts with the established session %q", wf.SessionID, *established)
+		if knownNoopItemTypes[it.Type] {
+			return agent.Event{}, true, nil
 		}
-		ev.SessionID = agent.ProviderSessionID(wf.SessionID)
-		return nil
+		return agent.Event{}, false, fmt.Errorf("item frame carries unknown type %q", it.Type)
 	}
-	ev.SessionID = *established
-	return nil
 }
 
-// isJSONObject reports whether raw is a non-null JSON object, the
+// errorMessage extracts the message of a turn.failed error payload,
+// falling back to the frame's own message field and then the raw error
+// text.
+func errorMessage(raw json.RawMessage, fallback string) string {
+	var e struct {
+		Message string `json:"message"`
+	}
+	if len(raw) > 0 && json.Unmarshal(raw, &e) == nil && e.Message != "" {
+		return e.Message
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return string(raw)
+}
+
+// isJSONObjectText reports whether text is a non-null JSON object, the
 // minimum validity of a structured completion payload. The Runtime's
 // sequence validator enforces the same rule on the unified event; the
 // dialect holds it at the wire boundary so the offending frame is
 // preserved as redacted evidence.
-func isJSONObject(raw json.RawMessage) bool {
-	if len(raw) == 0 {
-		return false
-	}
+func isJSONObjectText(text string) bool {
 	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
 		return false
 	}
 	return m != nil
