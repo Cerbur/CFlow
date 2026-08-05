@@ -75,14 +75,14 @@ type usageFrame struct {
 // They are skipped, never failed: fail-closed applies to unknown events,
 // not to known unmapped protocol facts.
 var knownNoopItemTypes = map[string]bool{
-	"file_change":          true,
-	"plan":                 true,
-	"reasoning":            true,
-	"memory":               true,
-	"error":                true,
+	"file_change":            true,
+	"plan":                   true,
+	"reasoning":              true,
+	"memory":                 true,
+	"error":                  true,
 	"agent_message_metadata": true,
-	"tool_use_metadata":    true,
-	"worktree":             true,
+	"tool_use_metadata":      true,
+	"worktree":               true,
 }
 
 // errSessionIDMissing marks a thread.started frame that claims no thread
@@ -96,7 +96,7 @@ var errSessionIDMissing = errors.New("thread.started frame carries no thread id"
 // last agent_message text (the structured terminal result candidate of
 // turn.completed).
 type streamParser struct {
-	established  agent.ProviderSessionID
+	established   agent.ProviderSessionID
 	lastAgentText string
 }
 
