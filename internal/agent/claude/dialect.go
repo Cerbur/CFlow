@@ -145,13 +145,15 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 // installed CLI also emits diagnostic system frames that carry no
 // session claim, map to no unified event, and are passed over silently
 // (real-wire E2E confirmed): `hook_started`/`hook_response` (Session
-// hooks) and `thinking_tokens` (extended-thinking budget telemetry, an
-// unbounded burst emitted while the model thinks). The stream is still
-// only established by a validated init. Any other unknown subtype fails
-// closed.
+// hooks), `thinking_tokens` (extended-thinking budget telemetry, an
+// unbounded burst emitted while the model thinks), and
+// `vcs_state_changed` (a notification the CLI emits when a tool changed
+// the working tree's Git state — the real-wire Task run emits it when
+// the agent uses Git). The stream is still only established by a
+// validated init. Any other unknown subtype fails closed.
 func (p *streamParser) parseInitFrame(wf wireFrame, raw []byte) (agent.Event, bool, error) {
 	switch wf.Subtype {
-	case "hook_started", "hook_response", "thinking_tokens":
+	case "hook_started", "hook_response", "thinking_tokens", "vcs_state_changed":
 		return agent.Event{}, true, nil
 	case "init":
 		if wf.SessionID == "" {
