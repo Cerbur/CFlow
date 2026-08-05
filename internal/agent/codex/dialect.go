@@ -92,12 +92,15 @@ var knownNoopItemTypes = map[string]bool{
 var errSessionIDMissing = errors.New("thread.started frame carries no thread id")
 
 // streamParser is the stateful decoder of one run: the established
-// thread (session) id ("" before the validated thread.started) and the
-// last agent_message text (the structured terminal result candidate of
-// turn.completed).
+// thread (session) id ("" before the validated thread.started), the last
+// agent_message text (the structured terminal result candidate of
+// turn.completed), and the reported-failure flag (the real wire emits
+// `error` and `turn.failed` together for one failure; only the first is
+// mapped onto a unified failed event).
 type streamParser struct {
 	established   agent.ProviderSessionID
 	lastAgentText string
+	failed        bool
 }
 
 // parse decodes one raw codex JSONL frame into a unified event. skip
@@ -145,9 +148,13 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 			SessionID: p.established,
 		}, raw), false, nil
 	case "error":
+		if p.failed {
+			return agent.Event{}, true, nil
+		}
 		if p.established == "" {
 			return agent.Event{}, false, fmt.Errorf("terminal event before a validated thread.started")
 		}
+		p.failed = true
 		return finishEvent(agent.Event{
 			Type:      agent.EventFailed,
 			Code:      "provider_error",
@@ -155,9 +162,13 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 			SessionID: p.established,
 		}, raw), false, nil
 	case "turn.failed":
+		if p.failed {
+			return agent.Event{}, true, nil
+		}
 		if p.established == "" {
 			return agent.Event{}, false, fmt.Errorf("terminal event before a validated thread.started")
 		}
+		p.failed = true
 		return finishEvent(agent.Event{
 			Type:      agent.EventFailed,
 			Code:      "provider_error",

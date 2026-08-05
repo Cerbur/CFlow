@@ -797,6 +797,29 @@ func TestDialectNonObjectCompletionResultFailsClosed(t *testing.T) {
 	}
 }
 
+// TestDialectErrorAndTurnFailedEmitOneFailed: the real codex wire emits
+// `error` and `turn.failed` together for one failure; only the first is
+// mapped onto the unified failed event, so the stream terminates once and
+// the paired frame is passed over silently.
+func TestDialectErrorAndTurnFailedEmitOneFailed(t *testing.T) {
+	h := newHarness(t, codexBinding(t))
+	r := h.startRun(t, agent.PurposePlanner, codex.Input{SchemaPath: h.schema})
+	h.scriptFrames(t, 1,
+		`{"type":"thread.started","thread_id":"`+capturedSessionID+`"}`+"\n"+
+			`{"type":"turn.started"}`+"\n"+
+			`{"type":"error","message":"model rejected the request"}`+"\n"+
+			`{"type":"turn.failed","error":{"message":"model rejected the request"}}`, 0)
+	events, err := collectErr(r)
+	requireNoError(t, err)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (start + one failed), got %d: %+v", len(events), events)
+	}
+	term := events[len(events)-1]
+	if term.Type != agent.EventFailed || term.Code != "provider_error" {
+		t.Fatalf("terminal event = %+v, want one provider_error failed", term)
+	}
+}
+
 // TestDialectExitWithoutTerminalFailsClosed (PRD 约束 43): a Provider
 // success exit without a validated terminal structured event can never
 // complete the run; the exit code is a fact the crash error carries, and
