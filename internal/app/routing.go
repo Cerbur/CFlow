@@ -227,6 +227,13 @@ func (r *routingResolution) routeBinding(ctx context.Context, provider string, s
 		timeout = s.TimeoutSeconds
 		break
 	}
+	// The spec route's model "default" means the provider's own default
+	// model (the approved Dry Run uses provider-default models); it is
+	// never passed as a literal --model — codex rejects the literal
+	// "default" model name with a ChatGPT account (real E2E).
+	if routeModel == "default" {
+		routeModel = ""
+	}
 	if routeModel == "" {
 		routeModel = r.cfg.Model
 	}
@@ -456,7 +463,16 @@ func contextBundleRefOf(base any) string {
 // carry the structured decision).
 func (a *Application) managedSchemaPath(ctx context.Context, purpose model.AgentPurpose) string {
 	dir := filepath.Join(a.home, "schemas")
-	if err := security.CreateSensitiveDir(dir); err != nil {
+	// The schemas directory is created once and reused by every Session;
+	// CreateSensitiveDir is create-only (never MkdirAll), so reuse an
+	// already-managed owner-only directory instead of failing on EEXIST.
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := security.CreateSensitiveDir(dir); err != nil {
+			return ""
+		}
+	} else if err != nil {
+		return ""
+	} else if ok, err := security.OwnerIsEffectiveUser(dir); err != nil || !ok {
 		return ""
 	}
 	name, schema := "coding-output.json", codexCodingSchema
