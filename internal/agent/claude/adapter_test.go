@@ -37,12 +37,14 @@ import (
 	"cflow.local/cflow/internal/security"
 )
 
-// fixtureDir is the committed Claude 2.1.220 fixture directory, resolved
-// from the package working directory. The plan's baseline was 2.1.185;
-// the installed CLI is 2.1.220, and the captured-fixtures mechanism is
-// the plan's admitted path for the newer version (fixtures named for the
-// actually installed version).
-var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers", "claude", "2.1.220")
+// fixtureDir is the committed Claude fixture directory for the actually
+// installed CLI version, resolved from the package working directory.
+// The plan's baseline was 2.1.185; the installed CLI is 2.1.221 (it
+// auto-updated during the Demo; the 2.1.220 fixtures remain as the
+// historical capture), and the captured-fixtures mechanism is the plan's
+// admitted path for the newer version (fixtures named for the actually
+// installed version, re-captured from the real 2.1.221 wire).
+var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers", "claude", "2.1.221")
 
 // capturedSessionID is the provider session id every fixture stream
 // establishes (a UUID v7 shape, matching real claude stream-json session
@@ -50,7 +52,7 @@ var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers
 const capturedSessionID = "0197f1c1-9c6e-7b00-a000-0000000000c1"
 
 // capturedVersion is the CLI version pinned by the captured fixtures.
-const capturedVersion = "2.1.220"
+const capturedVersion = "2.1.221"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -179,7 +181,7 @@ func stubClaudeOnPath(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "claude")
-	if err := os.WriteFile(p, []byte("#!/bin/sh\necho \"2.1.220 (Claude Code)\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho \"2.1.221 (Claude Code)\"\n"), 0o700); err != nil {
 		t.Fatalf("write stub claude: %v", err)
 	}
 	t.Setenv("PATH", dir)
@@ -453,6 +455,7 @@ func TestStartArgvExactShape(t *testing.T) {
 	req := fixtureClaudeStart()
 	argv := claude.StartArgv(req)
 	requireExactArgs(t, argv, "--print", "--input-format", "stream-json", "--output-format", "stream-json",
+		"--verbose",
 		"--json-schema", req.SchemaJSON, "--max-budget-usd", req.MaxBudgetUSD)
 	requireAbsentArgs(t, argv, "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
 		"--permission-mode", "--allowedTools", "--disallowedTools", "--session-id")
@@ -460,6 +463,7 @@ func TestStartArgvExactShape(t *testing.T) {
 	req.Model = "claude-sonnet-4-5"
 	argv = claude.StartArgv(req)
 	requireExactArgs(t, argv, "--print", "--input-format", "stream-json", "--output-format", "stream-json",
+		"--verbose",
 		"--json-schema", req.SchemaJSON, "--max-budget-usd", req.MaxBudgetUSD, "--model", "claude-sonnet-4-5")
 	requireAbsentArgs(t, argv, "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
 		"--permission-mode", "--allowedTools", "--disallowedTools")
@@ -478,6 +482,7 @@ func TestResumeArgvAddsResumeFlag(t *testing.T) {
 	}
 	argv := claude.ResumeArgv(req)
 	requireExactArgs(t, argv, "--print", "--input-format", "stream-json", "--output-format", "stream-json",
+		"--verbose",
 		"--json-schema", req.SchemaJSON, "--max-budget-usd", req.MaxBudgetUSD, "--resume", capturedSessionID)
 	requireAbsentArgs(t, argv, "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
 		"--permission-mode", "--allowedTools", "--disallowedTools", "--session-id")
@@ -527,6 +532,7 @@ func TestStartProcessSpecIsExact(t *testing.T) {
 
 	spec := h.rec.specAt(0)
 	requireExactArgs(t, spec.Args, "--print", "--input-format", "stream-json", "--output-format", "stream-json",
+		"--verbose",
 		"--json-schema", h.schema, "--max-budget-usd", h.budget)
 	requireAbsentArgs(t, spec.Args, "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
 		"--permission-mode", "--allowedTools", "--disallowedTools")
@@ -569,6 +575,7 @@ func TestResumeProcessSpecIsExact(t *testing.T) {
 
 	spec := h.rec.specAt(0)
 	requireExactArgs(t, spec.Args, "--print", "--input-format", "stream-json", "--output-format", "stream-json",
+		"--verbose",
 		"--json-schema", h.schema, "--max-budget-usd", h.budget, "--resume", capturedSessionID)
 	requireAbsentArgs(t, spec.Args, "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
 		"--permission-mode", "--allowedTools", "--disallowedTools", "--session-id")

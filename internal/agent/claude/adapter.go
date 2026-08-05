@@ -97,14 +97,22 @@ type Input struct {
 
 // StartArgv builds the exact Start argv (brief acceptance): noninteractive
 // `claude --print --input-format stream-json --output-format stream-json
-// --json-schema <json> --max-budget-usd <amount>` with the approved
-// optional --model. Existing Provider permission defaults remain in
-// force: no permission-bypass or allowlist flag is ever added.
+// --verbose --json-schema <json> --max-budget-usd <amount>` with the
+// approved optional --model. Existing Provider permission defaults remain
+// in force: no permission-bypass or allowlist flag is ever added.
+//
+// --verbose is required by the installed Claude CLI (>= 2.1.221) when
+// --print is combined with --output-format stream-json; without it the
+// CLI exits 1 with "requires --verbose" before emitting any event (the
+// real-wire E2E confirmed this). The verbose diagnostics arrive as
+// `system` frames with `hook_started`/`hook_response` subtypes, which
+// the dialect passes over (dialect.go).
 func StartArgv(req StartRequest) []string {
 	argv := []string{
 		"--print",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
+		"--verbose",
 		"--json-schema", req.SchemaJSON,
 		"--max-budget-usd", req.MaxBudgetUSD,
 	}

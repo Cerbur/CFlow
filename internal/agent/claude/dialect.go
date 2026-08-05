@@ -140,20 +140,28 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 
 // parseInitFrame maps the system init frame onto the unified
 // session_started event: the session id is captured from the stream
-// (design 14.3), and a claim of no id fails closed. An init frame with an
+// (design 14.3), and a claim of no id fails closed. With --verbose the
+// installed CLI also emits `hook_started`/`hook_response` system frames
+// (real-wire E2E confirmed); they are diagnostic, carry no session
+// claim, map to no unified event, and are passed over silently — the
+// stream is still only established by a validated init. Any other
 // unknown subtype fails closed.
 func (p *streamParser) parseInitFrame(wf wireFrame, raw []byte) (agent.Event, bool, error) {
-	if wf.Subtype != "init" {
+	switch wf.Subtype {
+	case "hook_started", "hook_response":
+		return agent.Event{}, true, nil
+	case "init":
+		if wf.SessionID == "" {
+			return agent.Event{}, false, errSessionIDMissing
+		}
+		p.established = agent.ProviderSessionID(wf.SessionID)
+		return finishEvent(agent.Event{
+			Type:      agent.EventSessionStarted,
+			SessionID: agent.ProviderSessionID(wf.SessionID),
+		}, raw), false, nil
+	default:
 		return agent.Event{}, false, fmt.Errorf("system frame carries unknown subtype %q", wf.Subtype)
 	}
-	if wf.SessionID == "" {
-		return agent.Event{}, false, errSessionIDMissing
-	}
-	p.established = agent.ProviderSessionID(wf.SessionID)
-	return finishEvent(agent.Event{
-		Type:      agent.EventSessionStarted,
-		SessionID: agent.ProviderSessionID(wf.SessionID),
-	}, raw), false, nil
 }
 
 // parseMessageFrame maps an assistant message frame onto the unified

@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"0197f1c1-9c6e-7b00-a000-0000000000c1","model":"claude-sonnet-4-5","cwd":"/Users/dev/worktrees/task-1","permissionMode":"default","version":"2.1.220"}
+{"type":"assistant","message":{"id":"msg_0bc1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Working in the established session."}],"stop_reason":null,"usage":{}}}
+{"type":"assistant","session_id":"0197f1c1-9c6e-7b00-a000-0000000000c2","message":{"id":"msg_0cc2","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Claiming a different session id."}],"stop_reason":null,"usage":{}}}
