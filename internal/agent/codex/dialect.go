@@ -84,6 +84,8 @@ var knownNoopItemTypes = map[string]bool{
 	"agent_message_metadata": true,
 	"tool_use_metadata":      true,
 	"worktree":               true,
+	"collab_tool_call":       true,
+	"collab_tool_response":   true,
 }
 
 // errSessionIDMissing marks a thread.started frame that claims no thread

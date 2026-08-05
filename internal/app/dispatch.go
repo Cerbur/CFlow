@@ -779,6 +779,12 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 		BaseHead: baseHead,
 		Process:  processID,
 	})
+	// The node's command Input is fixed before the loop: every Effect of
+	// the node chain (worktree creation, the coding Session, ...) executes
+	// against the same DispatchInput (the effect Result feeds the next
+	// Decision through `input`, but never replaces the command context the
+	// executors read).
+	dispatchCmd := input
 	executed := map[string]struct{}{}
 	gateFed := false
 	// The pass may be cancelled mid-chain (user Ctrl+C or a detected
@@ -854,7 +860,7 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 				go a.monitorPolicy(ctx, wf)
 			}
 		}
-		result, err := a.executeEffect(ctx, cd.Decision.Effect, false, wf, DispatchCommand{Workflow: wf}, input, rt)
+		result, err := a.executeEffect(ctx, cd.Decision.Effect, false, wf, DispatchCommand{Workflow: wf}, dispatchCmd, rt)
 		if err != nil {
 			if ctx.Err() != nil {
 				// The pass was interrupted (user Ctrl+C or a detected
