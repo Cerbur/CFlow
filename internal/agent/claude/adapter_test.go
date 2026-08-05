@@ -896,8 +896,8 @@ func TestDialectBudgetExceededFailsAsFailedTerminal(t *testing.T) {
 	if len(events) != 2 || events[1].Type != agent.EventFailed {
 		t.Fatalf("expected the failed terminal, got %+v", events)
 	}
-	if events[1].Code != "error_budget" {
-		t.Fatalf("failed event code = %q, want the wire subtype error_budget", events[1].Code)
+	if events[1].Code != "BUDGET_EXCEEDED" {
+		t.Fatalf("failed event code = %q, want the compiled BUDGET_EXCEEDED", events[1].Code)
 	}
 	if events[1].Message == "" {
 		t.Fatal("failed event must carry the wire error message")
@@ -924,8 +924,8 @@ func TestDialectAuthenticationDistinctFromProtocolUnsupported(t *testing.T) {
 	if len(events) != 2 || events[1].Type != agent.EventFailed {
 		t.Fatalf("an auth failure must settle as a failed terminal, got %+v (err %v)", events, err)
 	}
-	if events[1].Code != "error_auth" {
-		t.Fatalf("auth failure code = %q, want error_auth", events[1].Code)
+	if events[1].Code != "PROVIDER_AUTHENTICATION_REQUIRED" {
+		t.Fatalf("auth failure code = %q, want PROVIDER_AUTHENTICATION_REQUIRED", events[1].Code)
 	}
 	var pe *agent.ProtocolError
 	if errors.As(err, &pe) {
@@ -1273,7 +1273,7 @@ func TestRuntimeBudgetExceededSettlesFailed(t *testing.T) {
 	if res.Session.Status != model.SessionFailed {
 		t.Fatalf("session status = %s, want failed", res.Session.Status)
 	}
-	if res.Terminal == nil || res.Terminal.Type != agent.EventFailed || res.Terminal.Code != "error_budget" {
+	if res.Terminal == nil || res.Terminal.Type != agent.EventFailed || res.Terminal.Code != "BUDGET_EXCEEDED" {
 		t.Fatalf("terminal = %+v", res.Terminal)
 	}
 }

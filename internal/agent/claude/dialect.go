@@ -332,12 +332,16 @@ func parseResultPayload(raw json.RawMessage) (string, error) {
 
 // claudeErrorCode maps a terminal error subtype onto a compiled model
 // Code (the real wire subtypes like `error_max_budget_usd` are not model
-// Codes themselves): the recognized budget subtype maps to BUDGET_EXCEEDED,
-// every other provider-reported error maps to the retryable PROVIDER_ERROR.
+// Codes themselves): a budget subtype maps to BUDGET_EXCEEDED, an
+// authentication subtype maps to PROVIDER_AUTHENTICATION_REQUIRED, and
+// every other provider-reported error maps to the retryable
+// PROVIDER_ERROR.
 func claudeErrorCode(subtype string) string {
-	switch subtype {
-	case "error_max_budget_usd":
+	switch {
+	case strings.Contains(subtype, "budget"):
 		return string(model.CodeBudgetExceeded)
+	case strings.Contains(subtype, "auth"):
+		return string(model.CodeProviderAuthenticationRequired)
 	default:
 		return string(model.CodeProviderError)
 	}
