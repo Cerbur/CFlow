@@ -71,23 +71,6 @@ type usageFrame struct {
 	OutputTokens int64 `json:"output_tokens"`
 }
 
-// knownNoopItemTypes are real codex work item types that carry no unified
-// mapping (file facts, planning/reasoning telemetry, and error items).
-// They are skipped, never failed: fail-closed applies to unknown events,
-// not to known unmapped protocol facts.
-var knownNoopItemTypes = map[string]bool{
-	"file_change":            true,
-	"plan":                   true,
-	"reasoning":              true,
-	"memory":                 true,
-	"error":                  true,
-	"agent_message_metadata": true,
-	"tool_use_metadata":      true,
-	"worktree":               true,
-	"collab_tool_call":       true,
-	"collab_tool_response":   true,
-}
-
 // errSessionIDMissing marks a thread.started frame that claims no thread
 // id: per the binding's conflict rule missing ids fail
 // PROVIDER_SESSION_ID_MISSING. The run maps this onto the fail-closed
@@ -244,10 +227,13 @@ func (p *streamParser) parseItemCompleted(wf wireFrame, raw []byte) (agent.Event
 			SessionID: p.established,
 		}, raw), false, nil
 	default:
-		if knownNoopItemTypes[it.Type] {
-			return agent.Event{}, true, nil
-		}
-		return agent.Event{}, false, fmt.Errorf("item frame carries unknown type %q", it.Type)
+		// Real codex work item types (agent_message and command_execution
+		// map above; file_change, plan, reasoning, memory, error,
+		// collab_*, todo_list_*, ... are the provider's internal
+		// diagnostics) carry no unified mapping. They are passed over
+		// silently: fail-closed applies to unknown event types and
+		// unparseable frames, never to the provider's internal work items.
+		return agent.Event{}, true, nil
 	}
 }
 
