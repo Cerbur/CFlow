@@ -360,6 +360,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		return nil, err
 	}
 	st := view.State
+	worktree := a.integrationWorktreePath(wf)
 	return struct {
 		Plan              string `json:"plan"`
 		Spec              string `json:"spec"`
@@ -369,6 +370,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		IntegrationHead   string `json:"integration_head"`
 		TargetBranch      string `json:"target_branch"`
 		Verification      string `json:"verification"`
+		Diff              string `json:"diff"`
 	}{
 		Plan:              string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
 		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
@@ -378,6 +380,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		IntegrationHead:   st.Workflow.IntegrationHead,
 		TargetBranch:      st.Workflow.TargetBranch,
 		Verification:      string(manifestBody),
+		Diff:              a.gitDiff(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
 	}, nil
 }
 
