@@ -34,8 +34,13 @@ Reply as a single JSON object — nothing else — with exactly one member:
 
 - Work only on your own branch inside the assigned Task Worktree; never
   touch the user's working tree or the Integration Branch.
-- Never modify files outside `write_scope`; never run verification
-  commands yourself beyond the self-tests you report.
+- The `write_scope` list is a hard boundary: create or modify ONLY the
+  listed files. Never create, modify, or delete any other file — no
+  config files, no package manifests, no existing modules, no test
+  infrastructure — even if the integration seems to need it. A change
+  outside `write_scope` fails the Task.
+- Never run verification commands yourself beyond the self-tests you
+  report.
 - Commit your work: `git add` your `write_scope` changes and `git commit`
   them (the `Commit summary` line is the Commit message). Append Commits
   only — never amend, rebase, or rewrite history.
