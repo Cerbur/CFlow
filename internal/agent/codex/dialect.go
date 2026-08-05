@@ -136,6 +136,12 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 		return p.parseItemStarted(wf, raw)
 	case "item.completed":
 		return p.parseItemCompleted(wf, raw)
+	case "item.updated":
+		// An in-flight item progress update (the real E2E wire emits it for
+		// long-running items); the authoritative item facts arrive on the
+		// matching item.started/item.completed frames, so the update is a
+		// known unmapped frame and passes over silently.
+		return agent.Event{}, true, nil
 	case "turn.completed":
 		if p.established == "" {
 			return agent.Event{}, false, fmt.Errorf("terminal event before a validated thread.started")
