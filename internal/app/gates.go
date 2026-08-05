@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"cflow.local/cflow/internal/agent"
@@ -393,19 +394,40 @@ func (a *Application) reviewSessionInput(ctx context.Context, wf model.WorkflowI
 	if err != nil {
 		return nil, err
 	}
+	worktree := a.taskWorktreePath(wf, taskNode)
 	return struct {
 		Spec         string `json:"spec"`
 		Catalog      string `json:"catalog"`
 		CommitRange  string `json:"commit_range"`
 		Worktree     string `json:"worktree"`
 		Verification string `json:"verification"`
+		Diff         string `json:"diff"`
 	}{
 		Spec:         string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
 		Catalog:      string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
 		CommitRange:  manifestRange(manifestBody),
-		Worktree:     a.taskWorktreePath(wf, taskNode),
+		Worktree:     worktree,
 		Verification: string(manifestBody),
+		Diff:         a.gitDiff(ctx, worktree, manifestRange(manifestBody)),
 	}, nil
+}
+
+// gitDiff renders the bounded commit diff of one commit range inside a
+// Task Worktree, so the independent Reviewer can judge the actual changes
+// (the review prompt requires the diff; the Reviewer Session never runs
+// executable commands itself). An empty or failing diff returns "".
+func (a *Application) gitDiff(ctx context.Context, worktree, rangeSpec string) string {
+	if worktree == "" || rangeSpec == "" {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "diff", rangeSpec).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	if len(out) > 32*1024 {
+		out = out[:32*1024]
+	}
+	return string(out)
 }
 
 // taskGateResult runs the Task Commit/Clean/Scope gate after the coding
