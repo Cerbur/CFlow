@@ -19,6 +19,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -524,5 +525,42 @@ func TestRealCrossProvider(t *testing.T) {
 	}
 	if out := git(fx.repo, "branch", "--show-current"); strings.TrimSpace(out) != "main" {
 		t.Fatalf("target branch moved to %q", out)
+	}
+
+	// Record the redacted Gate 3 evidence (observe.ReleaseEvidenceFile, kind
+	// "real-cross-provider") when the controller set CFLOW_REAL_E2E_EVIDENCE:
+	// the report artifact hash of the run's Final Report, bound to the release
+	// candidate facts the controller injects (CFLOW_REAL_E2E_BINARY_SHA256 /
+	// CFLOW_REAL_E2E_SOURCE_COMMIT). Symmetric with the dogfood evidence
+	// writer; without the env vars the run still completes but records no
+	// on-disk evidence.
+	if path := os.Getenv("CFLOW_REAL_E2E_EVIDENCE"); path != "" {
+		binarySHA := os.Getenv("CFLOW_REAL_E2E_BINARY_SHA256")
+		sourceCommit := os.Getenv("CFLOW_REAL_E2E_SOURCE_COMMIT")
+		if binarySHA == "" || sourceCommit == "" {
+			t.Fatalf("CFLOW_REAL_E2E_EVIDENCE requires CFLOW_REAL_E2E_BINARY_SHA256 and CFLOW_REAL_E2E_SOURCE_COMMIT")
+		}
+		store, err := artifact.New(filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, "workflows", string(wf), "artifacts"), security.Registry{})
+		if err != nil {
+			t.Fatalf("report artifact store: %v", err)
+		}
+		ref, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactReport})
+		if err != nil {
+			t.Fatalf("resolve final report: %v", err)
+		}
+		ev := observe.ReleaseEvidenceFile{
+			Kind:         "real-cross-provider",
+			BinarySHA256: binarySHA,
+			SourceCommit: sourceCommit,
+			Reviewed:     true,
+			ReportHash:   ref.Hash,
+		}
+		body, err := json.MarshalIndent(ev, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal real-e2e evidence: %v", err)
+		}
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatalf("write real-e2e evidence: %v", err)
+		}
 	}
 }

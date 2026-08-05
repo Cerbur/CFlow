@@ -141,14 +141,16 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 // parseInitFrame maps the system init frame onto the unified
 // session_started event: the session id is captured from the stream
 // (design 14.3), and a claim of no id fails closed. With --verbose the
-// installed CLI also emits `hook_started`/`hook_response` system frames
-// (real-wire E2E confirmed); they are diagnostic, carry no session
-// claim, map to no unified event, and are passed over silently — the
-// stream is still only established by a validated init. Any other
-// unknown subtype fails closed.
+// installed CLI also emits diagnostic system frames that carry no
+// session claim, map to no unified event, and are passed over silently
+// (real-wire E2E confirmed): `hook_started`/`hook_response` (Session
+// hooks) and `thinking_tokens` (extended-thinking budget telemetry, an
+// unbounded burst emitted while the model thinks). The stream is still
+// only established by a validated init. Any other unknown subtype fails
+// closed.
 func (p *streamParser) parseInitFrame(wf wireFrame, raw []byte) (agent.Event, bool, error) {
 	switch wf.Subtype {
-	case "hook_started", "hook_response":
+	case "hook_started", "hook_response", "thinking_tokens":
 		return agent.Event{}, true, nil
 	case "init":
 		if wf.SessionID == "" {

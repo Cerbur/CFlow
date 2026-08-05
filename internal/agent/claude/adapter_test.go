@@ -4,7 +4,7 @@ package claude_test
 // TestClaudeArgvPreservesProviderPermissionDefaults argv contract, the
 // typed Start and Resume argv shapes, the exact ProcessSpec the adapter
 // launches (argv, cwd, stdin user message frame, explicit safe env), the
-// stream-json dialect mapping over the captured 2.1.220 fixtures (stream
+// stream-json dialect mapping over the captured 2.1.222 fixtures (stream
 // ordering, Session capture, structured schema result, partial frames,
 // malformed/unknown events, conflicting ids, budget exceeded,
 // Authentication Unknown distinct from Protocol unsupported, stderr
@@ -39,12 +39,12 @@ import (
 
 // fixtureDir is the committed Claude fixture directory for the actually
 // installed CLI version, resolved from the package working directory.
-// The plan's baseline was 2.1.185; the installed CLI is 2.1.221 (it
-// auto-updated during the Demo; the 2.1.220 fixtures remain as the
+// The plan's baseline was 2.1.185; the installed CLI is 2.1.222 (it
+// auto-updated during the Demo; the 2.1.221 fixtures remain as the
 // historical capture), and the captured-fixtures mechanism is the plan's
 // admitted path for the newer version (fixtures named for the actually
-// installed version, re-captured from the real 2.1.221 wire).
-var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers", "claude", "2.1.221")
+// installed version, re-captured from the real 2.1.222 wire).
+var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers", "claude", "2.1.222")
 
 // capturedSessionID is the provider session id every fixture stream
 // establishes (a UUID v7 shape, matching real claude stream-json session
@@ -52,7 +52,7 @@ var fixtureDir = filepath.Join("..", "..", "..", "tests", "testdata", "providers
 const capturedSessionID = "0197f1c1-9c6e-7b00-a000-0000000000c1"
 
 // capturedVersion is the CLI version pinned by the captured fixtures.
-const capturedVersion = "2.1.221"
+const capturedVersion = "2.1.222"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -181,7 +181,7 @@ func stubClaudeOnPath(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "claude")
-	if err := os.WriteFile(p, []byte("#!/bin/sh\necho \"2.1.221 (Claude Code)\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho \"2.1.222 (Claude Code)\"\n"), 0o700); err != nil {
 		t.Fatalf("write stub claude: %v", err)
 	}
 	t.Setenv("PATH", dir)
@@ -590,7 +590,8 @@ func TestResumeProcessSpecIsExact(t *testing.T) {
 
 // TestDialectStreamOrderingAndSessionCapture: start-valid.jsonl maps onto
 // the unified events in wire order; known claude frames without a unified
-// mapping (tool_use_start, the user tool-result echo) are skipped; every
+// mapping (hook_started/hook_response/thinking_tokens diagnostics, the
+// tool_use_start echo, the user tool-result echo) are skipped; every
 // event after the validated start inherits the established session id.
 func TestDialectStreamOrderingAndSessionCapture(t *testing.T) {
 	h := newHarness(t, claudeBinding(t))
