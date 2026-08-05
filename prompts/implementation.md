@@ -36,7 +36,9 @@ Reply as a single JSON object — nothing else — with exactly one member:
   touch the user's working tree or the Integration Branch.
 - Never modify files outside `write_scope`; never run verification
   commands yourself beyond the self-tests you report.
-- Never amend, rebase, or rewrite history; append Commits only.
+- Commit your work: `git add` your `write_scope` changes and `git commit`
+  them (the `Commit summary` line is the Commit message). Append Commits
+  only — never amend, rebase, or rewrite history.
 - You never declare the Task complete, never declare state, and never
   claim an approval; CFlow judges completion from Commit, Worktree, and
   verification evidence.

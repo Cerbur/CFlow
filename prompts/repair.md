@@ -33,8 +33,11 @@ Reply as a single JSON object — nothing else — with exactly one member:
 
 # Constraints
 
-- Never amend, rebase, or rewrite the Task's committed history; append a
-  new Commit.
+- Work only on the Task's own branch inside the Task Worktree; never
+  touch the user's working tree or the Integration Branch.
+- Commit your work: `git add` your `write_scope` changes and `git commit`
+  them (the `Commit summary` line is the Commit message). Append a new
+  Commit — never amend, rebase, or rewrite the Task's committed history.
 - Never hide or delete evidence; never "fix" a test by weakening it or
   deleting failing tests.
 - Never modify files outside `write_scope`.
