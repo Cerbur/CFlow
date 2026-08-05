@@ -23,15 +23,19 @@ inside it.
 
 # Output contract
 
-Reply as a Markdown final acceptance report containing:
+Reply as a single JSON object — nothing else — with exactly these
+members:
 
-1. A verdict line: `PASS` or `FAIL`.
-2. Per-node acceptance results (implementation, verification, merge,
-   review) traced to evidence.
-3. A short "Integration acceptance" paragraph: the exact Integration
-   Commit range and the final verification result.
-4. Explicit checks that no acceptance node was skipped and no history was
-   rewritten.
+1. `"decision"`: `"PASS"` or `"FAIL"`.
+2. `"report"`: a Markdown final acceptance report containing per-node
+   acceptance results (implementation, verification, merge, review)
+   traced to evidence, a short "Integration acceptance" paragraph (the
+   exact Integration Commit range and the final verification result),
+   and explicit checks that no acceptance node was skipped and no
+   history was rewritten.
+
+The structured `decision` member is what CFlow judges; a `PASS` verdict
+is a recommendation only.
 
 # Constraints
 
