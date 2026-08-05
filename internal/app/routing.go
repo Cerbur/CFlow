@@ -433,8 +433,17 @@ func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime,
 			ContextBundleRef: bundleRef,
 		}
 	case "claude":
+		schema := managedCodingSchema
+		switch purpose {
+		case model.PurposeReview, model.PurposeFinalVerification, model.PurposeApplyVerification:
+			// The verdict sessions must emit {decision, report} at the top
+			// level — the real claude wire wrapped the model output in an
+			// "output" member under the minimal object schema, so
+			// parseReviewVerdict could not find the decision.
+			schema = codexReviewSchema
+		}
 		return claude.Input{
-			SchemaJSON:       managedCodingSchema,
+			SchemaJSON:       schema,
 			MaxBudgetUSD:     strconv.FormatFloat(rb.BudgetUSD, 'f', -1, 64),
 			Model:            rb.Model,
 			ContextBundleRef: bundleRef,
