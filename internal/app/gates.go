@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/compile"
@@ -361,6 +363,24 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	}
 	st := view.State
 	worktree := a.integrationWorktreePath(wf)
+	// Collect every verify node's deterministic evidence so the Final
+	// Reviewer can judge each acceptance node independently (a real codex
+	// Final Reviewer once failed SEMANTIC_REVIEW_FAILED because only the
+	// final-verify manifest was supplied and the per-task verification
+	// executions were "not established").
+	var verifications []string
+	for id, n := range st.Nodes {
+		if n.Kind == model.NodeVerify {
+			if b, err := a.readVerificationManifestFile(wf, id); err == nil && len(b) > 0 {
+				verifications = append(verifications, string(b))
+			}
+		}
+	}
+	sort.Strings(verifications)
+	verificationBody := string(manifestBody)
+	if len(verifications) > 0 {
+		verificationBody = strings.Join(verifications, "\n\n")
+	}
 	return struct {
 		Plan              string `json:"plan"`
 		Spec              string `json:"spec"`
@@ -371,6 +391,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		TargetBranch      string `json:"target_branch"`
 		Verification      string `json:"verification"`
 		Diff              string `json:"diff"`
+		Commits           string `json:"commits"`
 	}{
 		Plan:              string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
 		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
@@ -379,9 +400,27 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		IntegrationBranch: st.Workflow.IntegrationBranch,
 		IntegrationHead:   st.Workflow.IntegrationHead,
 		TargetBranch:      st.Workflow.TargetBranch,
-		Verification:      string(manifestBody),
+		Verification:      verificationBody,
 		Diff:              a.gitDiff(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
+		Commits:           a.gitLog(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
 	}, nil
+}
+
+// gitLog renders the bounded commit list of one range (the integration
+// commits including the serial --no-ff merges) so the Final Reviewer can
+// verify the merge execution evidence.
+func (a *Application) gitLog(ctx context.Context, worktree, rangeSpec string) string {
+	if worktree == "" || rangeSpec == "" {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "log", "--oneline", rangeSpec).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	if len(out) > 16*1024 {
+		out = out[:16*1024]
+	}
+	return string(out)
 }
 
 // reviewSessionInput builds the Reviewer's typed input block: the Spec,
