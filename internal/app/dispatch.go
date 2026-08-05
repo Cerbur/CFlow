@@ -1065,8 +1065,33 @@ func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowI
 	if err != nil {
 		return nil
 	}
+	body := readArtifact(ctx, store, wf, model.ArtifactSpec)
+	bodies, err := splitSpecSetBody(body)
+	if err != nil {
+		return nil
+	}
+	// The Compiler names each Task node "task-<spec-id>"; hand the coding
+	// Session ONLY its own Spec so a multi-Spec workflow (Task 12) can
+	// never be implemented under the wrong Spec — a provider agent that
+	// receives the whole Spec set may attribute a sibling Spec to its
+	// Task.
+	specID := strings.TrimPrefix(string(node), "task-")
+	nodeSpec := ""
+	for _, b := range bodies {
+		s, err := compile.ParseSpec(b)
+		if err != nil {
+			continue
+		}
+		if s.ID == specID {
+			nodeSpec = string(b)
+			break
+		}
+	}
+	if nodeSpec == "" {
+		return nil
+	}
 	return &codingSessionInput{
-		Spec:     string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+		Spec:     nodeSpec,
 		Catalog:  string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
 		Worktree: a.taskWorktreePath(wf, node),
 	}
