@@ -235,7 +235,7 @@ func (a *Application) applyReviewProviderStart(ctx context.Context, wf model.Wor
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:   intent.Purpose,
 		Provider:  intent.Route,
-		Prompt:    prompt.Body,
+		Prompt:    renderPrompt(prompt.Body, input),
 		Input:     a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, input),
 		CWD:       cwd,
 		SessionID: intent.Session,

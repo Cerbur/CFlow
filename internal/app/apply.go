@@ -319,7 +319,7 @@ func (a *Application) runApplyResolution(ctx context.Context, wf model.WorkflowI
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:   model.PurposeRepair,
 		Provider:  provider,
-		Prompt:    prompt.Body,
+		Prompt:    renderPrompt(prompt.Body, input),
 		Input:     a.providerTypedInput(ctx, rt, model.PurposeRepair, provider, input),
 		CWD:       path,
 		SessionID: resolutionSession,

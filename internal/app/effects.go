@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"cflow.local/cflow/internal/agent"
@@ -347,7 +348,7 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	req := agent.StartRequest{
 		Purpose:    intent.Purpose,
 		Provider:   intent.Route,
-		Prompt:     prompt.Body,
+		Prompt:     renderPrompt(prompt.Body, a.sessionInput(ctx, wf, cmd)),
 		Input:      a.sessionInput(ctx, wf, cmd),
 		CWD:        cwd,
 		SessionID:  intent.Session,
@@ -421,7 +422,7 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		ProviderSessionID: agent.ProviderSessionID(providerSessionID),
 		Purpose:           intent.Purpose,
 		Provider:          provider,
-		Prompt:            prompt.Body,
+		Prompt:            renderPrompt(prompt.Body, a.sessionInput(ctx, wf, cmd)),
 		Input:             a.sessionInput(ctx, wf, cmd),
 		CWD:               cwd,
 		Context:           a.resumeContext(ctx, wf, intent.Session, provider),
@@ -622,12 +623,13 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	// and re-establishes the lineage through Supersedes (design 14.4,
 	// PRD 已确认：Session Resume 失败与跨 Provider 上下文交接).
 	supersedes, bundle := a.successorHandoff(rt, intent.Session)
+	sessionIn := a.sessionInput(ctx, wf, cmd)
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:  intent.Purpose,
 		Provider: intent.Route,
-		Prompt:   prompt.Body,
+		Prompt:   renderPrompt(prompt.Body, sessionIn),
 		Input: a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route,
-			attachBundleInput(a.sessionInput(ctx, wf, cmd), bundle)),
+			attachBundleInput(sessionIn, bundle)),
 		CWD:        cwd,
 		SessionID:  intent.Session,
 		Supersedes: supersedes,
@@ -768,6 +770,28 @@ func planningBody(cmd model.Input, res *agent.RunResult) []byte {
 		return nil
 	}
 	return nil
+}
+
+// renderPrompt fills a prompt's <CFLOW_INPUT> block with the structured
+// Session input (the approved Spec/Catalog/Worktree or the review context)
+// as JSON. Without this the real provider agents receive only the prompt
+// body and the literal empty input placeholder — they cannot know which
+// Spec to implement, which the real Cross-Provider E2E exposed (the claude
+// Task misattributed a sibling Spec). Prompts without the block are
+// returned unchanged.
+func renderPrompt(body string, input any) string {
+	const open = "<CFLOW_INPUT>"
+	const close = "</CFLOW_INPUT>"
+	start := strings.Index(body, open)
+	end := strings.Index(body, close)
+	if start < 0 || end < 0 || end <= start {
+		return body
+	}
+	data, err := json.Marshal(input)
+	if err != nil {
+		return body
+	}
+	return body[:start+len(open)] + "\n" + string(data) + "\n" + body[end:]
 }
 
 // sessionInput is the structured input recorded with the Prompt: the
