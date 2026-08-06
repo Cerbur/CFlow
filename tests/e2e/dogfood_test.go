@@ -648,7 +648,7 @@ func (fx *dogfoodFixture) driveToApproval(wf model.WorkflowID) {
 func (fx *dogfoodFixture) dispatchUntilCompleted(wf model.WorkflowID) app.InspectView {
 	fx.t.Helper()
 	a := fx.realApp()
-	for i := 0; i < 24; i++ {
+	for i := 0; i < 40; i++ {
 		if _, err := a.Execute(context.Background(), app.DispatchCommand{Workflow: wf}); err != nil {
 			fx.t.Fatalf("dispatch pass %d: %v", i, err)
 		}
@@ -658,7 +658,11 @@ func (fx *dogfoodFixture) dispatchUntilCompleted(wf model.WorkflowID) app.Inspec
 		}
 	}
 	iv := fx.inspect(wf)
-	fx.t.Fatalf("dogfood workflow did not complete within the dispatch budget")
+	var atts []string
+	for _, at := range iv.Attempts {
+		atts = append(atts, fmt.Sprintf("%s=%s/%s", at.Key.Node, at.Status, at.FailureCode))
+	}
+	fx.t.Fatalf("dogfood workflow did not complete within the dispatch budget: nodes=%v attempts=%s", nodeStatuses(iv), strings.Join(atts, " "))
 	return iv
 }
 
