@@ -65,6 +65,7 @@ type wireFrame struct {
 	Result    json.RawMessage `json:"result"`
 	IsError   bool            `json:"is_error"`
 	Error     string          `json:"error"`
+	Errors    []string        `json:"errors"`
 }
 
 // streamEvent is the payload of a stream_event frame.
@@ -296,13 +297,20 @@ func (p *streamParser) parseResultFrame(wf wireFrame, raw []byte) (agent.Event, 
 		}
 		return finishEvent(ev, raw), false, nil
 	case wf.Subtype != "" && wf.IsError:
-		if wf.Error == "" {
+		// The real wire reports the terminal error through a string `errors`
+		// array (the `error` member is null), e.g.
+		// `"errors":["Reached maximum budget ($0.000001)"]`.
+		if wf.Error == "" && len(wf.Errors) == 0 {
 			return agent.Event{}, false, fmt.Errorf("error result frame carries no error message")
+		}
+		msg := wf.Error
+		if msg == "" && len(wf.Errors) > 0 {
+			msg = wf.Errors[0]
 		}
 		ev := agent.Event{
 			Type:    agent.EventFailed,
 			Code:    claudeErrorCode(wf.Subtype),
-			Message: wf.Error,
+			Message: msg,
 		}
 		if err := withSession(&ev, wf, p.established); err != nil {
 			return agent.Event{}, false, err
