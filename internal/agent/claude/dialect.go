@@ -154,8 +154,6 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 // validated init. Any other unknown subtype fails closed.
 func (p *streamParser) parseInitFrame(wf wireFrame, raw []byte) (agent.Event, bool, error) {
 	switch wf.Subtype {
-	case "hook_started", "hook_response", "thinking_tokens", "vcs_state_changed":
-		return agent.Event{}, true, nil
 	case "init":
 		if wf.SessionID == "" {
 			return agent.Event{}, false, errSessionIDMissing
@@ -166,7 +164,13 @@ func (p *streamParser) parseInitFrame(wf wireFrame, raw []byte) (agent.Event, bo
 			SessionID: agent.ProviderSessionID(wf.SessionID),
 		}, raw), false, nil
 	default:
-		return agent.Event{}, false, fmt.Errorf("system frame carries unknown subtype %q", wf.Subtype)
+		// Diagnostic system frames (hook_*, thinking_tokens,
+		// vcs_state_changed, task_*, ...) carry no session claim and map to
+		// no unified event; they are passed over silently (the real wire
+		// emits several, confirmed by the real E2E and dogfood runs). The
+		// stream is still only established by a validated init, and a
+		// missing init id still fails closed.
+		return agent.Event{}, true, nil
 	}
 }
 
