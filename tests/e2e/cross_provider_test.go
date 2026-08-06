@@ -150,6 +150,50 @@ func (fx *e2eFixture) crossProviderApp(scripts ...string) *app.Application {
 // change no Spec covers.
 const dualProviderRequirement = "增加 multiply 和 divide。divide 遇到除数为零时抛出明确异常。增加单元测试。"
 
+// dualProviderPlan is the deterministic plan Markdown matching the
+// dual-provider requirement and Spec set (no README task): every section
+// the plan envelope requires, with the write scopes exactly the two
+// Specs implement.
+const dualProviderPlan = `# 计算器增强计划
+
+## 背景
+计算器目前只有 add 和 subtract。
+## 目标
+增加 multiply 和 divide，除数为零时抛出明确异常，增加单元测试。
+## 范围
+src 与 test 目录。
+## 非目标
+不引入新的依赖。
+## 约束
+使用 Node 内置测试运行器。
+## 当前实现分析
+src/add.ts 与 src/subtract.ts 已存在并有测试。
+## 推荐技术方案
+新增 src/multiply.ts、src/divide.ts 与相应测试。
+## 关键设计决策
+divide 除数为零时抛出明确异常。
+## 涉及模块与文件边界
+src/multiply.ts、src/divide.ts、test/*.test.ts。
+## 数据与兼容性影响
+新增独立模块与测试，不影响既有 add/subtract 行为。
+## 测试与验收方案
+新增 multiply 与 divide 单元测试，运行 npm test 验收。
+## 风险与回滚
+实现缺陷由 Task Review 拦截；失败可回滚对应提交。
+## 未决问题
+无。`
+
+// dualProviderPlanScript wraps the dual-provider plan in a Session
+// output (the planScript helper uses the README-scoped validPlan; the
+// dual E2E must not present a plan that asks for a change no Spec
+// covers).
+func dualProviderPlanScript(id string) string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":%q,"exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":%q,"at_ms":0}
+{"type":"assistant_message","session_id":%q,"text":"Planning.","at_ms":10}
+{"type":"session_finished","session_id":%q,"result":{"plan_markdown":%q},"at_ms":20}`, id, id, id, id, dualProviderPlan)
+}
+
 // driveDualToExecutionApproval runs the planning lifecycle with the
 // dual-provider Spec set through the Execution Approval and returns the
 // workflow identity. The planning phases (discussion through
@@ -175,7 +219,7 @@ func (fx *e2eFixture) driveDualToExecutionApprovalWith(t *testing.T, runtimeApp 
 		t.Fatalf("discuss: %v", err)
 	}
 	fx.planSeq++
-	if _, err := fx.crossProviderApp(planScript("p1")).Execute(context.Background(),
+	if _, err := fx.crossProviderApp(dualProviderPlanScript("p1")).Execute(context.Background(),
 		app.GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
 		t.Fatalf("generate plan: %v", err)
 	}
