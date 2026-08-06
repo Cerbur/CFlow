@@ -47,7 +47,7 @@ const providerTrustBoundary = "agents run with the provider's default permission
 // acceptance runs on the approved route set).
 var routedPurposes = []model.AgentPurpose{
 	model.PurposeImplementation, model.PurposeReview, model.PurposeRepair,
-	model.PurposeFinalVerification,
+	model.PurposeFinalVerification, model.PurposeApplyVerification,
 }
 
 // resolvedConfig loads and resolves the strict local configuration
