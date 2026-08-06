@@ -136,7 +136,12 @@ func (p *streamParser) parse(raw []byte) (agent.Event, bool, error) {
 	case "result":
 		return p.parseResultFrame(wf, raw)
 	default:
-		return agent.Event{}, false, fmt.Errorf("unknown claude stream-json event type %q", wf.Type)
+		// Diagnostic event types (tool_progress, ...) carry no unified
+		// mapping and are passed over silently — the real wire emits them
+		// (confirmed by the real E2E), and the protocol remains
+		// fail-closed on the validated init, the session id rule, and the
+		// terminal result shapes.
+		return agent.Event{}, true, nil
 	}
 }
 

@@ -730,26 +730,21 @@ func TestDialectMalformedFrameFailsClosed(t *testing.T) {
 	}
 }
 
-// TestDialectUnknownEventFailsClosed: an event type outside the closed
-// claude stream-json dialect (fixture protocol-invalid.jsonl) stops the
-// run with a protocol violation carrying the offending frame.
-func TestDialectUnknownEventFailsClosed(t *testing.T) {
+// TestDialectUnknownEventPassedOver: an event type outside the claude
+// stream-json dialect (fixture protocol-invalid.jsonl) is a diagnostic
+// frame with no unified mapping and is passed over silently — the stream
+// still completes through its validated terminal result.
+func TestDialectUnknownEventPassedOver(t *testing.T) {
 	h := newHarness(t, claudeBinding(t))
 	r := h.startRun(t, agent.PurposePlanner, claude.Input{SchemaJSON: h.schema, MaxBudgetUSD: h.budget})
 	h.scriptFrames(t, 1, readFixture(t, "protocol-invalid.jsonl"), 0)
 	events, err := collectErr(r)
-	var pe *agent.ProtocolError
-	if !errors.As(err, &pe) {
-		t.Fatalf("expected a ProtocolError, got %v", err)
+	requireNoError(t, err)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events (start, assistant, completed), got %d: %+v", len(events), events)
 	}
-	if pe.Code != model.CodeProviderProtocolViolation {
-		t.Fatalf("code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
-	}
-	if !bytes.Contains(pe.Frame, []byte("mystery_event")) {
-		t.Fatalf("protocol error must carry the offending frame: %q", pe.Frame)
-	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events before the violation, got %d: %+v", len(events), events)
+	if events[2].Type != agent.EventCompleted {
+		t.Fatalf("last event = %+v, want completed", events[2])
 	}
 }
 
@@ -932,19 +927,17 @@ func TestDialectAuthenticationDistinctFromProtocolUnsupported(t *testing.T) {
 		t.Fatalf("an auth failure must never surface as a protocol finding: %v", err)
 	}
 
-	// The same stream with an unknown event fails closed as a protocol
-	// violation: Authentication Unknown is not Protocol Unsupported.
+	// The same stream with an unknown diagnostic event passes it over
+	// silently: Authentication Unknown is never disguised as a protocol
+	// finding, and a diagnostic frame is not a protocol violation.
 	h2 := newHarness(t, claudeBinding(t))
 	r2 := h2.startRun(t, agent.PurposePlanner, claude.Input{SchemaJSON: h2.schema, MaxBudgetUSD: h2.budget})
 	h2.scriptFrames(t, 1,
 		`{"type":"system","subtype":"init","session_id":"`+capturedSessionID+`"}`+"\n"+
 			`{"type":"mystery_event","payload":{"x":1}}`, 0)
 	_, err2 := collectErr(r2)
-	if !errors.As(err2, &pe) {
-		t.Fatalf("an unknown event must fail closed as a protocol finding, got %v", err2)
-	}
-	if pe.Code != model.CodeProviderProtocolViolation {
-		t.Fatalf("unknown event code = %s, want PROVIDER_PROTOCOL_VIOLATION", pe.Code)
+	if errors.As(err2, &pe) {
+		t.Fatalf("a diagnostic frame must not surface as a protocol finding, got %v", err2)
 	}
 }
 
