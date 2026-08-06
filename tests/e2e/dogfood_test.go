@@ -446,6 +446,46 @@ func dogfoodPlanningApp(t *testing.T, repo, home string, scripts ...string) *app
 // 要求).
 const dogfoodRequirement = "Add a short documentation-only note under docs/ that describes the local-first boundary, and add one bounded Go test under internal/observe that asserts the build identity renders. Do not change production source files."
 
+// dogfoodPlan is the deterministic plan Markdown matching the dogfood
+// requirement and Spec set (a docs note and one observe test), with every
+// plan-envelope required section.
+const dogfoodPlan = `# CFlow 本地优先文档与构建身份测试计划
+
+## 背景
+CFlow 需要补充本地优先边界文档与构建身份渲染测试。
+## 目标
+在 docs/ 增加本地优先边界说明；在 internal/observe 增加构建身份渲染测试。
+## 范围
+docs/ 与 internal/observe 的测试文件。
+## 非目标
+不修改生产源码。
+## 约束
+仅文档与测试；不新增依赖。
+## 当前实现分析
+现有文档与测试已覆盖核心流程。
+## 推荐技术方案
+新增 docs/cflow-local-first.md 与 internal/observe 的构建身份测试。
+## 关键设计决策
+文档仅描述边界；测试断言构建身份渲染。
+## 涉及模块与文件边界
+docs/cflow-local-first.md、internal/observe/build_render_test.go。
+## 数据与兼容性影响
+无生产数据影响。
+## 测试与验收方案
+新增测试通过 go test 验收。
+## 风险与回滚
+文档/测试变更风险低；失败可回滚对应提交。
+## 未决问题
+无。`
+
+// dogfoodPlanScript wraps the dogfood plan in a Session output.
+func dogfoodPlanScript(id string) string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":%q,"exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":%q,"at_ms":0}
+{"type":"assistant_message","session_id":%q,"text":"Planning.","at_ms":10}
+{"type":"session_finished","session_id":%q,"result":{"plan_markdown":%q},"at_ms":20}`, id, id, id, id, dogfoodPlan)
+}
+
 // dogfoodSpecs routes two independent Tasks across codex and claude with
 // write scopes strictly inside docs/ and internal/observe test files, each
 // requiring the deterministic verify command and an independent review.
@@ -548,15 +588,15 @@ func (fx *dogfoodFixture) targetHead() string {
 // the real codex and claude executables.
 func (fx *dogfoodFixture) driveToApproval(wf model.WorkflowID) {
 	fx.t.Helper()
-	if _, err := fx.planningApp().Execute(context.Background(),
+	if _, err := fx.planningApp(discussionScript("d1")).Execute(context.Background(),
 		app.DiscussRequirementCommand{Workflow: wf, Text: dogfoodRequirement, Provider: "fake"}); err != nil {
 		fx.t.Fatalf("discuss: %v", err)
 	}
-	if _, err := fx.planningApp().Execute(context.Background(),
+	if _, err := fx.planningApp(dogfoodPlanScript("p1")).Execute(context.Background(),
 		app.GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
 		fx.t.Fatalf("generate plan: %v", err)
 	}
-	if _, err := fx.planningApp().Execute(context.Background(),
+	if _, err := fx.planningApp(checkScript("c1")).Execute(context.Background(),
 		app.CheckPlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
 		fx.t.Fatalf("check plan: %v", err)
 	}
