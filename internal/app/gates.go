@@ -384,8 +384,17 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	// The per-node acceptance status: a SUCCEEDED verify node proves its
 	// required independent review passed (the review is part of the verify
 	// node), and a SUCCEEDED merge/task proves that acceptance node ran.
+	// The Final Verify node itself is excluded: its own status is RUNNING
+	// by construction while this review runs, and its deterministic
+	// verification evidence is supplied separately in the Verification
+	// member — a self-referential RUNNING row only misleads the reviewer
+	// (a real codex Final Reviewer once failed SEMANTIC_REVIEW_FAILED
+	// because it refused to accept a node recorded RUNNING).
 	var nodeAcceptance []string
 	for id, n := range st.Nodes {
+		if id == verifyNode {
+			continue
+		}
 		nodeAcceptance = append(nodeAcceptance, fmt.Sprintf("%s/%s=%s", id, n.Kind, n.Status))
 	}
 	sort.Strings(nodeAcceptance)
