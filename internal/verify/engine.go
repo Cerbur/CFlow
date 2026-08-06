@@ -632,6 +632,13 @@ func envFor(names []string) map[string]string {
 			env["GOCACHE"] = filepath.Join(cacheDir, "go-build")
 		}
 	}
+	// The managed runtime resolves HOME itself (os.UserHomeDir fails
+	// without $HOME): the go suite under final verification exercises the
+	// provider adapters, and without HOME in the child env their exact
+	// {HOME, PATH} process spec cannot be constructed.
+	if v, ok := os.LookupEnv("HOME"); ok {
+		env["HOME"] = v
+	}
 	return env
 }
 
