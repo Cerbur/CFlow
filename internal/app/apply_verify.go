@@ -232,6 +232,15 @@ func (a *Application) applyReviewProviderStart(ctx context.Context, wf model.Wor
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
+	// The approved Routing Policy Set is attached at dispatch; the Apply
+	// Verification Session starts outside a dispatch pass, so attach the
+	// approved policy here (the Runtime refuses to resolve a route
+	// without it, and the typed provider input is built from the binding).
+	routing, err := a.approvedRoutingPolicy(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	rt.SetRoutingPolicy(routing)
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:   intent.Purpose,
 		Provider:  intent.Route,

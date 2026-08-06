@@ -316,6 +316,13 @@ func (a *Application) runApplyResolution(ctx context.Context, wf model.WorkflowI
 	if err != nil {
 		return err
 	}
+	// The resolution Session also starts outside a dispatch pass; attach
+	// the approved policy so the typed provider input can be built.
+	routing, err := a.approvedRoutingPolicy(ctx, wf)
+	if err != nil {
+		return err
+	}
+	rt.SetRoutingPolicy(routing)
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:   model.PurposeRepair,
 		Provider:  provider,
