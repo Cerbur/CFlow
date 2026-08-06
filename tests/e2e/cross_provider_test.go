@@ -49,8 +49,8 @@ import (
 // fixture: two independent Tasks, S01 routed to codex and S02 routed to
 // claude, disjoint write scopes, each verified through the approved
 // "verify" wrapper.
-const dualProviderSpecs = `{"id":"s01","goal":"implement multiply","depends_on":[],"write_scope":["src/multiply.ts","test/multiply.test.ts"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"codex","model":"default","budget":10},"timeout_seconds":300,"max_retry":2}
-{"id":"s02","goal":"implement divide with a clear exception on zero divisor","depends_on":[],"write_scope":["src/divide.ts","test/divide.test.ts"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"claude","model":"default","budget":10},"timeout_seconds":300,"max_retry":2}`
+const dualProviderSpecs = `{"id":"s01","goal":"implement multiply","depends_on":[],"write_scope":["src/multiply.ts","test/multiply.test.ts"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"codex","model":"default","budget":10},"timeout_seconds":600,"max_retry":2}
+{"id":"s02","goal":"implement divide with a clear exception on zero divisor","depends_on":[],"write_scope":["src/divide.ts","test/divide.test.ts"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"claude","model":"default","budget":10},"timeout_seconds":600,"max_retry":2}`
 
 // dualProviderSpecScript wraps the two Specs in the Session output.
 func dualProviderSpecScript(sessionID string) string {
@@ -285,8 +285,19 @@ func (fx *e2eFixture) dispatchUntilCompleted(t *testing.T, wf model.WorkflowID, 
 		}
 	}
 	iv := fx.inspect(wf)
-	t.Fatalf("workflow did not complete within the pass budget: %+v", nodeStatuses(iv))
+	t.Fatalf("workflow did not complete within the pass budget: nodes=%+v attempts=%s", nodeStatuses(iv), attemptsSummary(iv))
 	return iv
+}
+
+// attemptsSummary renders each Attempt's node, status and failure code for
+// diagnosing a stalled real-provider workflow.
+func attemptsSummary(iv app.InspectView) string {
+	parts := make([]string, 0, len(iv.Attempts))
+	for i := range iv.Attempts {
+		a := iv.Attempts[i]
+		parts = append(parts, fmt.Sprintf("%s=%s/%s", a.Key.Node, a.Status, a.FailureCode))
+	}
+	return "[" + strings.Join(parts, " ") + "]"
 }
 
 // TestDialectEquivalentCrossProvider (brief Step 5: the offline
