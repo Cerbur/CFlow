@@ -696,6 +696,11 @@ func TestDogfood(t *testing.T) {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatalf("mkdir home: %v", err)
 	}
+	// The concurrency cap must admit the two parallel dogfood Tasks.
+	cfg := filepath.Join(home, "config.yaml")
+	if err := os.WriteFile(cfg, []byte("concurrency: 4\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	// 1. Build the candidate, copy it to an immutable path outside the
 	//    repository, pin its SHA-256, and prove it runs against the clean
