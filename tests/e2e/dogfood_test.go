@@ -497,7 +497,7 @@ func dogfoodPlanScript(id string) string {
 // the apply verification) — these are CFlow's own scripts the dogfood run
 // then executes, bounded to pass on the docs/tests-only output.
 const dogfoodSpecs = `{"id":"s01","goal":"add a documentation-only note under docs/ describing the local-first boundary","depends_on":[],"write_scope":["docs/cflow-local-first.md"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"codex","model":"default","budget":10},"timeout_seconds":300,"max_retry":2}
-{"id":"s02","goal":"add one bounded build-identity render test under internal/observe","depends_on":[],"write_scope":["internal/observe/build_render_test.go"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"claude","model":"default","budget":10},"timeout_seconds":300,"max_retry":2}`
+{"id":"s02","goal":"add one bounded build-identity render test under internal/observe","depends_on":[],"write_scope":["internal/observe/build_render_test.go"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"],"review_required":true},"route":{"provider":"claude","model":"default","budget":30},"timeout_seconds":300,"max_retry":2}`
 
 // writeDogfoodEvidence writes the self-Dogfood evidence file (observe.
 // ReleaseEvidenceFile, kind "dogfood") that the Gate 3 validation consumes.
