@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/artifact"
@@ -267,29 +269,67 @@ func (a *Application) applyReviewProviderStart(ctx context.Context, wf model.Wor
 }
 
 // applyReviewSessionInput builds the Apply Verification Session's typed
-// input block: the Target Branch and recorded Target HEAD, the
-// Integration HEAD, the verified staging head, the approved Catalog
-// Revision, and the deterministic apply verification manifest.
+// input block: the FINAL_VERIFICATION prompt contract the session reuses
+// (the Plan, Spec set, Catalog, compiled Workflow, the Integration facts,
+// the per-node acceptance status table, the deterministic verification
+// evidence, and the Git diff/commits of the staged range) plus the
+// apply-specific staging facts (the staging head, apply branch, approved
+// Catalog Revision, and the apply verification manifest hash). At Apply
+// time the Workflow is COMPLETED, so every acceptance node — including
+// the Final Verify node — is recorded SUCCEEDED; a real codex Apply
+// Reviewer once failed SEMANTIC_REVIEW_FAILED because the input carried
+// no nodes member and no ancestry/verification evidence at all.
 func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt) (any, error) {
 	view, err := a.writeStoreView(ctx, wf)
 	if err != nil {
 		return nil, err
 	}
-	catalog, err := a.applyCatalogRef(ctx, wf, att, view.State)
+	st := view.State
+	store, err := a.artifactStore(wf)
 	if err != nil {
 		return nil, err
 	}
+	catalog, err := a.applyCatalogRef(ctx, wf, att, st)
+	if err != nil {
+		return nil, err
+	}
+	// Collect every verify node's deterministic evidence so the reviewer
+	// can trace each acceptance node independently.
+	var verifications []string
+	for id, n := range st.Nodes {
+		if n.Kind == model.NodeVerify || n.Kind == model.NodeFinalVerify {
+			if b, err := a.readVerificationManifestFile(wf, id); err == nil && len(b) > 0 {
+				verifications = append(verifications, string(b))
+			}
+		}
+	}
+	sort.Strings(verifications)
+	var nodeAcceptance []string
+	for id, n := range st.Nodes {
+		nodeAcceptance = append(nodeAcceptance, fmt.Sprintf("%s/%s=%s", id, n.Kind, n.Status))
+	}
+	sort.Strings(nodeAcceptance)
+	rangeSpec := st.Workflow.TargetBranch + ".." + att.StagingHead
+	worktree := a.applyWorktreePath(wf, att.Number)
 	return map[string]any{
-		"workflow":          string(wf),
-		"target_branch":     view.State.Workflow.TargetBranch,
-		"target_head":       att.TargetHead,
-		"integration_head":  att.IntegrationHead,
-		"staging_head":      att.StagingHead,
-		"apply_branch":      a.applyBranchName(wf, att.Number),
-		"catalog_revision":  catalog.Revision,
-		"catalog_hash":      catalog.Hash,
-		"verification_hash": a.applyVerificationManifestHash(wf, att),
-		"message":           "review the combined target + integration result inside the apply worktree",
+		"plan":               string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
+		"spec":               string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+		"catalog":            string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		"workflow":           string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		"integration_branch": st.Workflow.IntegrationBranch,
+		"integration_head":   st.Workflow.IntegrationHead,
+		"target_branch":      st.Workflow.TargetBranch,
+		"verification":       strings.Join(verifications, "\n\n"),
+		"diff":               a.gitDiff(ctx, worktree, rangeSpec),
+		"commits":            a.gitLog(ctx, worktree, rangeSpec),
+		"nodes":              strings.Join(nodeAcceptance, "\n"),
+		"target_head":        att.TargetHead,
+		"staging_head":       att.StagingHead,
+		"apply_branch":       a.applyBranchName(wf, att.Number),
+		"catalog_revision":   catalog.Revision,
+		"catalog_hash":       catalog.Hash,
+		"verification_hash":  a.applyVerificationManifestHash(wf, att),
+		"message":            "review the combined target + integration result inside the apply worktree",
 	}, nil
 }
 
