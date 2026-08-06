@@ -381,6 +381,14 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	if len(verifications) > 0 {
 		verificationBody = strings.Join(verifications, "\n\n")
 	}
+	// The per-node acceptance status: a SUCCEEDED verify node proves its
+	// required independent review passed (the review is part of the verify
+	// node), and a SUCCEEDED merge/task proves that acceptance node ran.
+	var nodeAcceptance []string
+	for id, n := range st.Nodes {
+		nodeAcceptance = append(nodeAcceptance, fmt.Sprintf("%s/%s=%s", id, n.Kind, n.Status))
+	}
+	sort.Strings(nodeAcceptance)
 	return struct {
 		Plan              string `json:"plan"`
 		Spec              string `json:"spec"`
@@ -392,6 +400,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		Verification      string `json:"verification"`
 		Diff              string `json:"diff"`
 		Commits           string `json:"commits"`
+		Nodes             string `json:"nodes"`
 	}{
 		Plan:              string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
 		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
@@ -403,6 +412,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		Verification:      verificationBody,
 		Diff:              a.gitDiff(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
 		Commits:           a.gitLog(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
+		Nodes:             strings.Join(nodeAcceptance, "\n"),
 	}, nil
 }
 
