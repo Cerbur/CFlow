@@ -143,6 +143,13 @@ func (fx *e2eFixture) crossProviderApp(scripts ...string) *app.Application {
 	return a
 }
 
+// dualProviderRequirement is the real Cross-Provider requirement. The
+// dualProviderSpecs implement multiply and divide only (two Tasks routed
+// to codex and claude) — the requirement deliberately does not ask for a
+// README update, so the plan and the Final Reviewer cannot demand a
+// change no Spec covers.
+const dualProviderRequirement = "增加 multiply 和 divide。divide 遇到除数为零时抛出明确异常。增加单元测试。"
+
 // driveDualToExecutionApproval runs the planning lifecycle with the
 // dual-provider Spec set through the Execution Approval and returns the
 // workflow identity. The planning phases (discussion through
@@ -164,7 +171,7 @@ func (fx *e2eFixture) driveDualToExecutionApprovalWith(t *testing.T, runtimeApp 
 	wf := fx.createWorkflow("dual-provider")
 	fx.discussSeq++
 	if _, err := fx.crossProviderApp(discussionScript("d1")).Execute(context.Background(),
-		app.DiscussRequirementCommand{Workflow: wf, Text: requirement, Provider: "fake"}); err != nil {
+		app.DiscussRequirementCommand{Workflow: wf, Text: dualProviderRequirement, Provider: "fake"}); err != nil {
 		t.Fatalf("discuss: %v", err)
 	}
 	fx.planSeq++

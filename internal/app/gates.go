@@ -370,7 +370,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	// executions were "not established").
 	var verifications []string
 	for id, n := range st.Nodes {
-		if n.Kind == model.NodeVerify {
+		if n.Kind == model.NodeVerify || n.Kind == model.NodeFinalVerify {
 			if b, err := a.readVerificationManifestFile(wf, id); err == nil && len(b) > 0 {
 				verifications = append(verifications, string(b))
 			}
