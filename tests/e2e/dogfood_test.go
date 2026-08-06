@@ -351,7 +351,7 @@ func dogfoodImmutableCopy(t *testing.T, repo, bin, dir string) (string, string) 
 // phases run through the deterministic Fake adapter (dogfoodPlanningApp);
 // the Execution Dry Run, the Execution Approval, the dispatch, and the
 // protected Apply run through this real App.
-func dogfoodApp(t *testing.T, repo, home string) *app.Application {
+func dogfoodApp(t *testing.T, repo, home string, ids model.IDSource) *app.Application {
 	t.Helper()
 	sup := process.NewSupervisor(process.NewOSAdapter())
 	reg, err := agent.LoadProviderRegistry()
@@ -379,7 +379,7 @@ func dogfoodApp(t *testing.T, repo, home string) *app.Application {
 		Project:      app.ProjectFor(repo),
 		CflowVersion: "0.1.0-demo3",
 		Now:          func() time.Time { return time.Unix(1700000000, 0).UTC() },
-		IDs:          model.SequentialIDSource(),
+		IDs:          ids,
 		Supervisor:   sup,
 		GitFlow:      flow,
 		Prompts:      prompts,
@@ -399,7 +399,7 @@ func dogfoodApp(t *testing.T, repo, home string) *app.Application {
 // the deterministic Fake Adapter for the planning phases (discussion through
 // compilation). The fixture scripts run with the fake dialect; the real App
 // (dogfoodApp) runs the Execution Dry Run, Approval, dispatch, and Apply.
-func dogfoodPlanningApp(t *testing.T, repo, home string, scripts ...string) *app.Application {
+func dogfoodPlanningApp(t *testing.T, repo, home string, ids model.IDSource, scripts ...string) *app.Application {
 	t.Helper()
 	sup := process.NewSupervisor(process.NewOSAdapter())
 	reg, err := agent.LoadProviderRegistry()
@@ -425,7 +425,7 @@ func dogfoodPlanningApp(t *testing.T, repo, home string, scripts ...string) *app
 		Project:      app.ProjectFor(repo),
 		CflowVersion: "0.1.0-demo3",
 		Now:          func() time.Time { return time.Unix(1700000000, 0).UTC() },
-		IDs:          model.SequentialIDSource(),
+		IDs:          ids,
 		Supervisor:   sup,
 		GitFlow:      flow,
 		Prompts:      prompts,
@@ -537,16 +537,21 @@ type dogfoodFixture struct {
 	t    *testing.T
 	repo string
 	home string
+	// ids is shared by every Application the fixture drives so planning
+	// Sessions across discuss -> plan -> check allocate distinct ids (each
+	// fresh Application would otherwise restart SequentialIDSource and
+	// collide).
+	ids model.IDSource
 }
 
 func (fx *dogfoodFixture) planningApp(scripts ...string) *app.Application {
 	fx.t.Helper()
-	return dogfoodPlanningApp(fx.t, fx.repo, fx.home, scripts...)
+	return dogfoodPlanningApp(fx.t, fx.repo, fx.home, fx.ids, scripts...)
 }
 
 func (fx *dogfoodFixture) realApp() *app.Application {
 	fx.t.Helper()
-	return dogfoodApp(fx.t, fx.repo, fx.home)
+	return dogfoodApp(fx.t, fx.repo, fx.home, fx.ids)
 }
 
 func (fx *dogfoodFixture) createWorkflow() model.WorkflowID {
@@ -730,7 +735,7 @@ func TestDogfood(t *testing.T) {
 	//    bounded docs-or-tests-only requirement, independent Reviews,
 	//    deterministic Verification, serial --no-ff merges, the Final
 	//    Verify/Review, and the immutable Final Report.
-	fx := &dogfoodFixture{t: t, repo: repo, home: home}
+	fx := &dogfoodFixture{t: t, repo: repo, home: home, ids: model.SequentialIDSource()}
 	wf := fx.createWorkflow()
 	fx.driveToApproval(wf)
 	iv := fx.dispatchUntilCompleted(wf)
