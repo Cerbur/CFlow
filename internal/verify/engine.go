@@ -619,6 +619,19 @@ func envFor(names []string) map[string]string {
 	if env["GOMODCACHE"] == "" && env["GOPATH"] != "" {
 		env["GOMODCACHE"] = filepath.Join(env["GOPATH"], "pkg", "mod")
 	}
+	// `go` also needs the build cache; the child env carries no HOME, so
+	// without an explicit GOCACHE it fails with "build cache is required,
+	// but could not be located: GOCACHE is not defined and $HOME is not
+	// defined". Default it the same way `go` itself does (the parent
+	// process resolves the user cache dir, the child never needs HOME).
+	if v, ok := os.LookupEnv("GOCACHE"); ok {
+		env["GOCACHE"] = v
+	}
+	if env["GOCACHE"] == "" {
+		if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+			env["GOCACHE"] = filepath.Join(cacheDir, "go-build")
+		}
+	}
 	return env
 }
 
