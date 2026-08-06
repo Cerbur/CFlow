@@ -602,6 +602,14 @@ func envFor(names []string) map[string]string {
 			env[name] = v
 		}
 	}
+	// A verification wrapper that invokes `go` (the dogfood wrappers) needs
+	// the module cache location; the catalog env list does not carry it,
+	// and `go` fails with "neither GOMODCACHE nor GOPATH is set".
+	for _, name := range []string{"GOMODCACHE", "GOPATH"} {
+		if v, ok := os.LookupEnv(name); ok {
+			env[name] = v
+		}
+	}
 	return env
 }
 
