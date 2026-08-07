@@ -345,11 +345,12 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
+	input := a.sessionInput(ctx, wf, cmd)
 	req := agent.StartRequest{
 		Purpose:    intent.Purpose,
 		Provider:   intent.Route,
-		Prompt:     renderPrompt(prompt.Body, a.sessionInput(ctx, wf, cmd)),
-		Input:      a.sessionInput(ctx, wf, cmd),
+		Prompt:     renderPrompt(prompt.Body, input),
+		Input:      a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, input),
 		CWD:        cwd,
 		SessionID:  intent.Session,
 		Supersedes: agent.ProviderSessionID(intent.Supersedes),

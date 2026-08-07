@@ -18,6 +18,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/agent/claude"
+	"cflow.local/cflow/internal/agent/codex"
 	"cflow.local/cflow/internal/agent/fake"
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/gitflow"
@@ -921,6 +923,11 @@ func openApplication(ctx context.Context, deps Dependencies) (*app.Application, 
 			return nil, err
 		}
 	}
+	adapters, err := openAdapters(sup, reg, os.Getenv("CFLOW_PROVIDERS"))
+	if err != nil {
+		return nil, err
+	}
+	adapters["fake"] = ad
 	return app.New(app.Options{
 		Home:         home,
 		Project:      app.ProjectFor(root),
@@ -932,10 +939,40 @@ func openApplication(ctx context.Context, deps Dependencies) (*app.Application, 
 		Agent: agent.RuntimeOptions{
 			Registry:    reg,
 			Redaction:   deps.Redaction,
-			Adapters:    map[string]agent.Adapter{"fake": ad},
+			Adapters:    adapters,
 			EvidenceDir: filepath.Join(home, "evidence"),
 		},
 	})
+}
+
+// openAdapters registers the optional real Provider Adapters the
+// interactive CLI serves: CFLOW_PROVIDERS names the comma-separated
+// Providers (codex, claude) to bind from the embedded registry — the
+// same Adapters the approval-gated E2E and self-Dogfood drive. Without
+// the switch the CLI is unchanged: the deterministic Fake Adapter is
+// the default, and no real Provider executable is ever probed here
+// (detection happens later at the Execution Dry Run).
+func openAdapters(sup process.Supervisor, reg *agent.ProviderRegistry, providers string) (map[string]agent.Adapter, error) {
+	adapters := map[string]agent.Adapter{}
+	for _, name := range strings.Split(providers, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		binding, err := reg.Select(name)
+		if err != nil {
+			return nil, fmt.Errorf("CFLOW_PROVIDERS: %w", err)
+		}
+		switch name {
+		case "codex":
+			adapters["codex"] = codex.New(sup, binding)
+		case "claude":
+			adapters["claude"] = claude.New(sup, binding)
+		default:
+			return nil, fmt.Errorf("CFLOW_PROVIDERS: unsupported provider %q (codex and claude are registered)", name)
+		}
+	}
+	return adapters, nil
 }
 
 // resolveHome resolves CFLOW_HOME: the environment variable wins, then

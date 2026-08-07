@@ -313,3 +313,62 @@ func TestProviderTypedInputCarriesBundleRef(t *testing.T) {
 		t.Fatalf("fresh codex typed input carries a bundle ref %q", freshIn.ContextBundleRef)
 	}
 }
+
+// TestProviderTypedInputPlanningFallback: the planning Sessions run
+// before the Execution Approval binds the routing policy, so their typed
+// input falls back to the resolved config default model and the hard
+// budget cap (absent config = the embedded defaults); a routed purpose
+// without its approved binding still fails closed on the base input
+// (PRD 约束 306: an unapproved route never substitutes silently).
+func TestProviderTypedInputPlanningFallback(t *testing.T) {
+	fx := newExecutionFixture(t)
+	if err := os.MkdirAll(filepath.Join(fx.home, "evidence"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := agent.NewRuntime(agent.RuntimeOptions{
+		Now:         fx.now,
+		IDs:         fx.ids,
+		Registry:    reg,
+		Redaction:   security.Registry{},
+		EvidenceDir: filepath.Join(fx.home, "evidence"),
+		Adapters: map[string]agent.Adapter{
+			"fake":   fake.New(reg),
+			"codex":  fake.New(reg),
+			"claude": fake.New(reg),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { requireNoError(t, rt.Close()) }()
+	// No routing policy attached: the planning purposes are not routed.
+	a := fx.app()
+	ctx := context.Background()
+	base := map[string]any{"message": "plan the requirement"}
+
+	codexIn, ok := a.providerTypedInput(ctx, rt, model.PurposePlanning, "codex", base).(codex.Input)
+	if !ok {
+		t.Fatalf("planning codex typed input has unexpected type %T", a.providerTypedInput(ctx, rt, model.PurposePlanning, "codex", base))
+	}
+	if codexIn.SchemaPath == "" {
+		t.Fatalf("planning codex typed input lost the managed schema path: %+v", codexIn)
+	}
+
+	claudeIn, ok := a.providerTypedInput(ctx, rt, model.PurposePlanCheck, "claude", base).(claude.Input)
+	if !ok {
+		t.Fatalf("planning claude typed input has unexpected type %T", a.providerTypedInput(ctx, rt, model.PurposePlanCheck, "claude", base))
+	}
+	if claudeIn.SchemaJSON == "" || claudeIn.MaxBudgetUSD != "0" {
+		t.Fatalf("planning claude typed input lost the schema or budget facts: %+v", claudeIn)
+	}
+
+	// A routed purpose without its approved binding fails closed on the
+	// base input instead of substituting an unapproved route.
+	if _, ok := a.providerTypedInput(ctx, rt, model.PurposeImplementation, "codex", base).(codex.Input); ok {
+		t.Fatal("routed purpose without a binding must return the base input, got the typed input")
+	}
+}

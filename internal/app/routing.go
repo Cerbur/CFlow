@@ -421,15 +421,34 @@ func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime,
 		return base
 	}
 	rb, ok := rt.RouteBinding(purpose, provider)
-	if !ok {
+	routeModel := rb.Model
+	routeBudget := rb.BudgetUSD
+	switch {
+	case ok:
+		// The approved binding of a routed purpose (execution sessions).
+	case routedPurposeOf(purpose):
+		// A routed purpose without its approved binding: never substitute
+		// an unapproved route (PRD 约束 306); the session fails closed on
+		// the base input instead.
 		return base
+	default:
+		// A non-routed purpose: the planning Sessions run before the
+		// Execution Approval binds the routing policy, so their typed
+		// input falls back to the resolved config default model and the
+		// hard budget cap (an absent config means the embedded defaults).
+		cfg, err := a.resolvedConfig()
+		if err != nil {
+			return base
+		}
+		routeModel = cfg.Model
+		routeBudget = cfg.MaxUSDPerRun
 	}
 	bundleRef := contextBundleRefOf(base)
 	switch provider {
 	case "codex":
 		return codex.Input{
 			SchemaPath:       a.managedSchemaPath(ctx, purpose),
-			Model:            rb.Model,
+			Model:            routeModel,
 			ContextBundleRef: bundleRef,
 		}
 	case "claude":
@@ -444,12 +463,24 @@ func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime,
 		}
 		return claude.Input{
 			SchemaJSON:       schema,
-			MaxBudgetUSD:     strconv.FormatFloat(rb.BudgetUSD, 'f', -1, 64),
-			Model:            rb.Model,
+			MaxBudgetUSD:     strconv.FormatFloat(routeBudget, 'f', -1, 64),
+			Model:            routeModel,
 			ContextBundleRef: bundleRef,
 		}
 	}
 	return base
+}
+
+// routedPurposeOf reports whether one Purpose is an execution-purpose
+// route of the approved routing policy (routedPurposes); the planning
+// purposes are not routed and fall back to the resolved config.
+func routedPurposeOf(purpose model.AgentPurpose) bool {
+	for _, p := range routedPurposes {
+		if p == purpose {
+			return true
+		}
+	}
+	return false
 }
 
 // contextBundleRefOf extracts the immutable Context Bundle handoff
