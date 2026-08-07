@@ -1,209 +1,204 @@
 # CFlow
 
-CFlow is a local-first Go CLI for the Plan-to-Done lifecycle of coding-agent
-workflows: requirement discussion, Plan generation and approval, Spec
-compilation, restricted workflow execution across coding agents,
-deterministic verification, and protected delivery. All CFlow-owned state
-stays on the local machine; there is no daemon and no cloud control plane.
+[中文说明](README-zh.md)
 
-This repository is at the **Demo implementation stage**. The current
-candidate is the **Demo Complete Candidate** (Gate 3): every deterministic
-acceptance gate passes, the cross-platform CGO-disabled binary builds on
-macOS and Linux (amd64/arm64), the release metadata is pinned, the real
-Cross-Provider E2E and the self-Dogfood runs are **approval-gated** (they
-cost real model requests and apply to the target branch, so they run only
-with explicit user authorization), and the protected Apply and Safe Cleanup
-are implemented. It is a Gate 3 candidate, **not a release**: the final
-user release sign-off is a separate human step, and no artifact claims
-`Released`.
+CFlow is a local-first workflow runtime for coding agents. It turns a coding
+requirement into an approved Plan, restricted execution graph, isolated coding
+tasks, deterministic verification, independent review, and protected delivery
+without introducing a cloud control plane.
 
-## Build
+CFlow is not another thin wrapper around `codex` or `claude`. It owns the
+recoverable Plan-to-Done lifecycle and advances state only from persisted
+evidence—not from an agent saying that the work is complete.
 
-Requires Go 1.26.5 (see `go` and `toolchain` in `go.mod`).
+> **Project status:** the Demo implementation is present. The evidence-backed
+> Gate 3 candidate is tied to source commit `68fd200`; see the
+> [acceptance report](docs/cflow-demo-acceptance-report.md). The current branch
+> contains later CLI/provider wiring and documentation changes that have not
+> been re-attested by a new Gate 3 run. Treat it as post-candidate development,
+> not as a released build.
+
+## Why CFlow
+
+- **Local-first:** workflow state, artifacts, sessions, logs, evidence, and
+  worktrees stay on the local machine.
+- **Approval-driven:** a checked Plan and the exact execution inputs require
+  separate user approvals.
+- **Agent-independent evidence:** commits, clean worktrees, scopes, tests, and
+  independent reviews determine progress.
+- **Recoverable execution:** SQLite state, immutable artifacts, Git facts,
+  process facts, and evidence are reconciled after interruption or failure.
+- **Isolated parallel work:** independent tasks run in separate Git worktrees
+  and merge serially into a CFlow-owned Integration Branch.
+- **Protected delivery:** completion never changes the user's Target Branch;
+  `cflow apply` stages, re-verifies, and compare-and-swap fast-forwards it.
+- **Bounded autonomy:** retries, budgets, provider routes, commands, and
+  workflow patches are constrained and auditable.
+
+## Lifecycle
+
+```text
+Requirement discussion
+  -> Draft Plan
+  -> independent Plan Check
+  -> user Plan Approval
+  -> Specs + Verification Catalog
+  -> restricted Dynamic Workflow
+  -> user Execution Approval
+  -> isolated Task Worktrees
+  -> deterministic verification + independent review
+  -> serial Integration merges
+  -> Final Verification + report
+  -> completed Workflow
+  -> explicit protected Apply
+```
+
+The Runtime—not a Planner, Implementer, or Reviewer—owns every authoritative
+state transition.
+
+## Architecture
+
+| Module | Responsibility |
+|---|---|
+| Application | Command/query seam, locking, transactions, and typed effect loop |
+| Decision Kernel | Pure lifecycle, retry, approval, and safety decisions |
+| State Store | SQLite runtime state and authoritative event sequence |
+| Artifact Store | Immutable, versioned, hash-addressed workflow artifacts |
+| Agent Runtime | Fake, Codex, and Claude protocol adapters and session lineage |
+| Compiler + Scheduler | Restricted DAG compilation and deterministic readiness |
+| GitFlow | Repository facts, worktrees, commit gates, merge, quarantine, and Apply |
+| Verification Engine | Approved command catalog, deterministic checks, and evidence |
+| Recovery Engine | Reconciliation across database, artifacts, Git, processes, and evidence |
+
+All external processes are intended to use executable-plus-argv invocation.
+Dynamic workflows cannot contain arbitrary shell, Python, or TypeScript code.
+
+## Requirements
+
+- Go 1.26.5
+- Git
+- macOS or Linux; Windows is supported through WSL for the Demo
+- Codex CLI and Claude Code installed and authenticated for real-provider runs
+- A Git repository with a valid commit and an attached local branch
+
+The target repository's Git author/committer identity must be configured.
+When commit signing is enabled, it must work non-interactively within the
+configured timeout.
+
+## Build from source
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -o cflow ./cmd/cflow
+./cflow version
+./cflow doctor
 ```
 
-The release remains one statically linked executable with no CGO dependency.
-Release builds stamp the full identity explicitly, because the Go toolchain
-does not stamp VCS metadata in git worktrees, and they carry no timestamp in
-the binary identity (a rebuild from the same source and toolchain produces
-the same SHA-256). The registry/schema/migration/Artifact/Provider/prompt
-hashes come from `scripts/release-metadata`:
+Release-style builds additionally stamp the source commit and embedded
+registry hashes. See [`scripts/check-cross-build.sh`](scripts/check-cross-build.sh)
+and the [acceptance report](docs/cflow-demo-acceptance-report.md).
+
+## Current Demo usage
+
+The current interface is line-oriented and command-driven. Bare `cflow`
+prints the command tree; the fully guided interactive lifecycle described in
+the PRD is not yet exposed as one continuous loop.
+
+Real providers are currently registered in the post-candidate CLI through
+`CFLOW_PROVIDERS`. Without it, the deterministic Fake Adapter remains the
+default.
 
 ```sh
-eval "$(go run ./scripts/release-metadata)"
-CGO_ENABLED=0 go build -trimpath \
-  -ldflags "-X cflow.local/cflow/internal/observe.Version=0.1.0-demo3 \
-            -X cflow.local/cflow/internal/observe.SourceCommit=$(git rev-parse HEAD) \
-            -X cflow.local/cflow/internal/observe.sourceDirty=0 \
-            -X cflow.local/cflow/internal/observe.schemaVersion=$schema_version \
-            -X cflow.local/cflow/internal/observe.MigrationHash=$migration \
-            -X cflow.local/cflow/internal/observe.ArtifactHash=$artifact \
-            -X cflow.local/cflow/internal/observe.ProviderHash=$provider \
-            -X cflow.local/cflow/internal/observe.PromptHash=$prompt" \
-  -o cflow ./cmd/cflow
+export CFLOW_PROVIDERS=codex,claude
+
+./cflow workflow-create my-change --provider codex
+printf '%s\n' 'Describe the change and its constraints.' | \
+  ./cflow discuss --provider codex
+./cflow plan-generate --provider codex
+./cflow plan-check --provider claude
+./cflow plan-show
+./cflow plan-approve
+./cflow spec-generate --provider codex
+./cflow compile-workflow --provider claude
+./cflow execution-dry-run
+./cflow execution-show
+./cflow execution-approve
 ```
 
-`cflow version` reports the stamped identity. Note that Go 1.24+ withholds
-the raw `-ldflags` string from `go version -m` for security, so the
-linker-set values are proven by the runnable binary's own `version` output
-(and the cross-platform matrix proves the CGO-disabled `-trimpath` build
-configuration for every target).
+Approval commands are interactive and default to “no.” Provider execution may
+use the network and incur model cost. Review the exact routes, budgets,
+commands, Git identity/signing facts, and permission boundary before approval.
 
-## Cross-platform build proof
+The Demo CLI is still an engineering candidate: several `doctor` stateful
+checks currently report `NOT_YET_AVAILABLE`, and the current post-candidate
+provider wiring has not received refreshed Gate 3 evidence.
 
-`scripts/check-cross-build.sh <artifact-dir>` compiles the CGO-disabled
-single binary for `darwin/amd64`, `darwin/arm64`, `linux/amd64`, and
-`linux/arm64` with the release metadata linker flags, records each SHA-256,
-proves the release build configuration through `go version -m`, proves the
-pinned metadata through the native binary's `version` output, and runs the
-full test suite on the native platform. Windows is supported through WSL for
-the Demo.
+## Command map
 
-## Usage
-
-| Command | Purpose |
+| Area | Commands |
 |---|---|
-| `cflow` | command tree help |
-| `cflow list` | list the project's workflows |
-| `cflow status [workflow-id]` | show one workflow's stage, runtime, plan, and integration facts |
-| `cflow inspect [workflow-id]` | show the full workflow aggregate |
-| `cflow inspect task <task-id> [workflow-id]` | show one task's delivery evidence (attempts, heads, evidence) |
-| `cflow logs [workflow-id]` | show the redacted authoritative event log |
-| `cflow workflow-create <name>` | create a workflow over the current git repository |
-| `cflow discuss [workflow-id]` | submit one requirement discussion turn |
-| `cflow plan-generate [workflow-id]` | produce a new plan revision |
-| `cflow plan-check [workflow-id]` | run an independent plan check |
-| `cflow plan-approve [workflow-id]` | approve the exact active plan revision and hash |
-| `cflow spec-generate [workflow-id]` | discover the verification catalog and generate the specs |
-| `cflow compile-workflow [workflow-id]` | compile the approved specs into the restricted workflow |
-| `cflow execution-dry-run [workflow-id]` | run the commit preflight and pause at the execution approval gate |
-| `cflow execution-approve [workflow-id]` | approve the exact displayed execution inputs |
-| `cflow retry <task-id> [workflow-id]` | drive one dispatch pass for a task with a ready retry |
-| `cflow pause [workflow-id]` | pause a running workflow (two-phase controlled stop) |
-| `cflow resume [workflow-id]` | resume a paused workflow |
-| `cflow cancel [workflow-id]` | cancel a workflow; every artifact, session, worktree, branch, commit, and audit ref is preserved |
-| `cflow apply-prepare [workflow-id]` | stage the completed integration output in an isolated Apply Worktree and revalidate it |
-| `cflow apply-execute [workflow-id]` | deliver through the compare-and-swap fast-forward (refuses on target drift) |
-| `cflow cleanup [workflow-id]` | produce the cleanup dry-run manifest |
-| `cflow cleanup --execute [workflow-id]` | execute the confirmed cleanup (exact-target, partial-safe) |
-| `cflow report [workflow-id]` | render the final execution report read model (redacted) |
-| `cflow doctor` | read-only report of build identity, tool availability, provider protocol bindings, and check status |
-| `cflow version` | build identity: version, source commit, dirty flag, Go version, OS/arch, embedded-registry hashes |
+| Read and diagnose | `list`, `status`, `inspect`, `inspect task`, `logs`, `report`, `doctor`, `version` |
+| Plan lifecycle | `workflow-create`, `discuss`, `plan-generate`, `plan-check`, `plan-show`, `plan-approve` |
+| Execution definition | `spec-generate`, `compile-workflow`, `execution-dry-run`, `execution-show`, `execution-approve` |
+| Runtime control | `retry`, `pause`, `resume`, `cancel`, `policy-confirm` |
+| Recovery | `replacement-preview`, `replacement-approve` |
+| Delivery | `apply`, `apply --confirm`, `apply --execute` |
+| Cleanup | `cleanup`, `cleanup --execute <manifest-id>` |
 
-`version`, `help`, `doctor`, and `list` never create CFLOW_HOME; reads never
-migrate. Every command answers `--help` and returns one of the stable exit
-classes below.
+Use `cflow <command> --help` for exact arguments. When no Workflow ID is
+provided, commands use the current project's applicable workflow projection.
 
-## Execution lifecycle
+## Trust boundary
 
-An approved workflow executes through the deterministic delivery chain:
-agent Tasks code only inside their own Task Worktrees created from the
-verified Integration HEAD, the approved Verification Catalog commands run
-deterministically, independent Reviewer Sessions judge each Task, and
-serial `--no-ff` merges advance the CFlow-owned Integration Branch. After
-every merge, the Final Verify Node runs the approved final-verify Catalog
-command over the full Integration range inside the Integration Worktree,
-an independent Final Reviewer Session (bound to the exact
-Plan/Spec/Catalog/Workflow refs and the Integration HEAD) judges the
-result, and the Workflow records COMPLETED only with exact evidence —
-every Node SUCCEEDED, no Blocking Finding, and the bound Integration HEAD
-unchanged (`EVIDENCE_SUBJECT_CHANGED` otherwise). Completion never changes
-the Target Branch. The protected Apply (`apply-prepare` then
-`apply-execute`) stages the Integration output in an isolated Apply
-Worktree, revalidates the Catalog and an independent Apply Verification
-Session, then fast-forwards the Target Branch through a compare-and-swap —
-refusing with `TARGET_HEAD_DRIFTED` (or the dirty/identity codes) when the
-Target changed after the staging verification, and leaving the Target
-exactly at the late advance. The immutable Execution Report (`cflow
-report`, also written as a report artifact at completion) covers approvals,
-commits, commit policy, verification, sessions, findings, migration
-compatibility, security posture, the Provider default-permission trust
-boundary, the Apply outcome, and the cleanup posture.
+CFlow provides strong workflow and repository evidence gates, but it is not an
+OS sandbox.
 
-## Real Cross-Provider E2E
+- Provider CLIs run with the user's existing provider configuration and
+  default permissions.
+- Providers and approved project tools may access the network.
+- CFlow does not add danger/bypass flags, copy credentials, or promise that an
+  agent cannot read outside its worktree.
+- CFlow-owned sensitive paths are designed for owner-only permissions, and
+  persisted provider/tool content passes through the redaction pipeline.
+- Local evidence is not encrypted by CFlow and may be included in operating
+  system backups.
+- Cancel preserves artifacts, sessions, commits, worktrees, and evidence.
+  Cleanup is a separate, exact-target operation and never deletes audit
+  history.
 
-`tests/e2e/cross_provider_test.go` carries the opt-in real Codex/Claude
-E2E: two parallel Tasks routed to the real providers with real Commits,
-independent Reviews, deterministic Verification, serial merges, the Final
-Verify/Review, the final report, and an unchanged Target Branch. It NEVER
-runs without `CFLOW_E2E_REAL=1`, because it costs real model requests and
-runs with the providers' default permissions — the user must approve the
-exact Dry Run, the provider routes/models/budgets, the default-permission
-trust boundary, and the potential network/cost before the gate is set.
-The offline deterministic equivalent (`TestDialectEquivalentCrossProvider`)
-runs in the Gate 2 suite, and the Gate 3 validation consumes the authorized
-real-run evidence (`observe.ReleaseEvidenceFile`, kind
-`real-cross-provider`).
+## Verification and release evidence
 
-## Self-Dogfood
+The repository contains deterministic Gate scripts and opt-in real-provider
+tests:
 
-`tests/e2e/dogfood_test.go` carries the opt-in self-Dogfood harness: it
-builds the candidate binary from the current source, copies it to an
-immutable path outside the CFlow repository, hashes it, and runs a
-CFlow-managed workflow against the CFlow repository itself with a bounded
-documentation-or-test-only requirement, at least two Tasks routed across
-Codex and Claude, independent Reviews, full deterministic Verification,
-serial Integration, the final report, and the protected Apply. It NEVER
-runs without `CFLOW_DOGFOOD_REAL=1`: the same approvals apply as the real
-E2E, plus the bounded requirement and the Apply target (the dogfood Apply
-advances the target branch). The offline deterministic dogfood-equivalent
-(`TestDogfoodPreflight`) runs in the Gate 3 suite and proves the immutable
-binary copy, the pinned hash, the target/workspace contamination guards,
-and the bounded-requirement preflight. CFlow never runs Dogfood over an
-uncommitted workspace.
+```sh
+./scripts/gate1.sh <artifact-dir>
+./scripts/gate2.sh <artifact-dir>
+./scripts/gate3.sh <artifact-dir>
+```
 
-## Configuration
+Gate 1 and Gate 2 are internal candidates. Gate 3 can produce a Demo Complete
+Candidate, never a release. Real Cross-Provider E2E and self-Dogfood require
+explicit authorization because they invoke provider CLIs, may incur cost, and
+the Dogfood flow performs protected Apply.
 
-`CFLOW_HOME/config.yaml` is the one strict local configuration file. Its
-schema is closed: unknown keys and invalid values are rejected (exit class 4),
-and credentials, scripts, and raw command strings are impossible because no
-such key exists in the schema. Precedence is explicit per-command input,
-then the file, then an embedded safe default.
+Historical evidence is evidence for its exact binary and source commit only;
+it does not automatically attest later commits.
 
-## Process exit classes
+## Documentation
 
-| Exit class | Meaning |
-|---|---|
-| 0 | requested read or mutation reached its defined successful outcome |
-| 2 | invalid command or user input |
-| 3 | safe user action is required; Workflow is Paused or Blocked |
-| 4 | local environment or compatibility precondition failed |
-| 5 | runtime invariant failed or facts cannot be safely reconciled |
-| 130 | user interruption completed through the controlled-stop protocol |
+- [Product requirements](docs/cflow-prd.md)
+- [Technical design](docs/cflow-demo-design.md)
+- [Implementation plan](docs/cflow-demo-implementation-plan.md)
+- [Gate 3 acceptance report](docs/cflow-demo-acceptance-report.md)
+- [Local-first boundary](docs/cflow-local-first.md)
+- [Domain language](CONTEXT.md)
 
-## Trust boundary and limitations
+## Non-goals for the Demo
 
-- Agents run with the provider's default permissions and the user's existing
-  provider configuration; CFlow provides no sandbox guarantee.
-- The CLI registers the deterministic Fake Adapter under the provider names;
-  the real Codex and Claude adapters are exercised in the approval-gated
-  in-process E2E and self-Dogfood runs, not through the interactive CLI.
-- Git signing probes can depend on external agents or hardware and need
-  strict non-interactive timeouts.
-- Windows is supported through WSL only.
-- The real E2E and self-Dogfood evidence are recorded only when the user
-  authorizes and runs them; the Gate 3 manifest reports the pending state
-  until then.
+No Web UI, cloud service, arbitrary workflow scripts, automatic push/PR,
+cross-repository workflow, OpenCode adapter, Provider TUI attach, or unlimited
+autonomous retry loop.
 
-## Gate evidence
+## License
 
-`scripts/gate1.sh <artifact-dir>` writes the Gate 1 evidence of the
-Internal Core Candidate. `scripts/gate2.sh <artifact-dir>` reruns Gate 1,
-adds the offline protocol/routing/recovery matrices and the deterministic
-dialect-equivalent Cross-Provider flow, optionally validates the approved
-real Cross-Provider evidence (`CFLOW_E2E_REAL=1`), builds the CGO-disabled
-binary, pins the binary SHA-256, the Git source Commit, the clean status,
-and the embedded registry hashes, and writes a redacted Manifest declaring
-the candidate **Internal Runtime Candidate** — never "Demo Complete".
-`scripts/gate3.sh <artifact-dir>` reruns Gate 1 and Gate 2, adds the
-cross-platform build matrix, the native race tests, the release-evidence
-validation (a Gate manifest is rejected with `EVIDENCE_SUBJECT_CHANGED`
-when it was recorded by a different subject), the optional real-E2E and
-self-Dogfood evidence validation, the CGO-disabled release candidate build
-with the pinned metadata, and a recursive secret scan over the redacted
-evidence, and writes a redacted Manifest declaring the candidate **Demo
-Complete Candidate** — never `Released`. The final user release sign-off is
-a separate human step.
+[MIT](LICENSE)
