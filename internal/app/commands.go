@@ -226,6 +226,18 @@ type PlanView struct {
 	Approved   bool
 }
 
+// ChangeSetView is the frozen candidate Change Set projection. Ref points
+// at the immutable ArtifactChangeSet Revision written by the freeze; the
+// remaining fields mirror the Git facts the Runtime captured.
+type ChangeSetView struct {
+	Ref       model.ArtifactRef
+	Base      string
+	Candidate string
+	Verified  string
+	Fingerprint string
+	Dirty     bool
+}
+
 // ExecutionPreviewView is the Execution Approval preview projection.
 type ExecutionPreviewView struct {
 	Workflow model.WorkflowID
@@ -398,6 +410,7 @@ func (InspectView) isView()            {}
 func (LogsView) isView()               {}
 func (DiscoveryView) isView()          {}
 func (PlanView) isView()               {}
+func (ChangeSetView) isView()          {}
 func (ExecutionPreviewView) isView()   {}
 func (PolicyConfirmationView) isView() {}
 func (CancelSummaryView) isView()      {}
@@ -432,6 +445,18 @@ type DiscussRequirementCommand struct {
 	Workflow model.WorkflowID
 	Text     string
 	Provider string
+}
+
+// FreezeDiscussionCommand freezes the candidate Change Set of the
+// Workspace at one discussion Session turn (TUI task 5): the Runtime
+// observes the exact Git facts (Base/Heads, committed Commit Range,
+// tracked Diff, Untracked inventory, Dirty Fingerprint) and writes them
+// as one immutable ArtifactChangeSet Revision. The Change Set is never
+// Agent-authored; freezing again after further turns produces the next
+// Revision while every earlier Revision stays byte-identical.
+type FreezeDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
 }
 
 // GeneratePlanCommand is the /finish transition: the planner produces a
@@ -658,6 +683,7 @@ type ConfirmApplyPolicyCommand struct {
 
 func (CreateWorkflowCommand) isCommand()      {}
 func (DiscussRequirementCommand) isCommand()  {}
+func (FreezeDiscussionCommand) isCommand()    {}
 func (GeneratePlanCommand) isCommand()        {}
 func (CheckPlanCommand) isCommand()           {}
 func (ApprovePlanCommand) isCommand()         {}
@@ -703,6 +729,9 @@ type Outcome struct {
 	// SessionID is the Session identity a planning command created (""
 	// for commands without one).
 	SessionID model.SessionID
+	// ChangeSet is the Change Set the freeze command wrote (nil for
+	// commands without one).
+	ChangeSet *ChangeSetView
 	// ExportErr reports a failed events.jsonl export. The export is a
 	// rebuildable audit file, never the recovery stream (design 21); the
 	// mutation itself is unaffected.

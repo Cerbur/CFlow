@@ -392,6 +392,8 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 	switch cmd.(type) {
 	case DispatchCommand, RetryCommand:
 		out, err = a.executeDispatch(ctx, st, wf, restricted)
+	case FreezeDiscussionCommand:
+		out, err = a.executeFreeze(ctx, st, wf, cmd.(FreezeDiscussionCommand))
 	default:
 		out, err = a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
 	}
@@ -718,6 +720,18 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			Text: c.Text, Provider: c.Provider,
 			Session: model.SessionID(a.ids(model.IDSession)),
 		}, wf, nil
+	case FreezeDiscussionCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if !c.Session.Valid() {
+			return nil, "", model.InvalidInputFault("freezing the change set requires a discussion session identity")
+		}
+		// The freeze observes the Workspace and writes the immutable
+		// Change Set Revision itself (TUI task 5); the Kernel Input
+		// placeholder is unused by the dedicated freeze path.
+		return model.DispatchInput{}, wf, nil
 	case GeneratePlanCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

@@ -32,13 +32,21 @@ const (
 	// Execution Approval: the configured hard cap and the per-routed-node
 	// approved budgets (design 20.1).
 	ArtifactBudgetPolicy ArtifactType = "budget-policy"
+	// ArtifactChangeSet is one immutable, Runtime-generated Freeze of the
+	// candidate Change Set of a Workflow's Workspace at a discussion
+	// Session turn: the exact Base/Heads, the committed Commit Range, the
+	// tracked Diff, the Untracked inventory, the Dirty Fingerprint, the
+	// Session identity, and the canonical content Hash. It is never
+	// Agent-authored; its structure is fixed by these Go types and the
+	// artifact Hash (TUI task 5).
+	ArtifactChangeSet ArtifactType = "change-set"
 )
 
 // Valid reports whether t is a declared Artifact Type.
 func (t ArtifactType) Valid() bool {
 	switch t {
 	case ArtifactPlan, ArtifactSpec, ArtifactWorkflow, ArtifactCatalog, ArtifactReport, ArtifactCleanupManifest,
-		ArtifactDiscussionTurn, ArtifactPlanCheck, ArtifactRoutingPolicy, ArtifactBudgetPolicy:
+		ArtifactDiscussionTurn, ArtifactPlanCheck, ArtifactRoutingPolicy, ArtifactBudgetPolicy, ArtifactChangeSet:
 		return true
 	}
 	return false
@@ -79,6 +87,58 @@ type ArtifactEnvelope struct {
 type CatalogRef struct {
 	Revision int
 	Hash     string
+}
+
+// ChangeSetEntry is one path-level Git observation of a frozen candidate
+// Change Set: a tracked staged/unstaged/committed path or an Untracked
+// path, with its porcelain status and identity facts.
+type ChangeSetEntry struct {
+	// Path is the real repository-relative path.
+	Path string `json:"path"`
+	// Original is the rename/change-source path ("" when not a rename).
+	Original string `json:"original,omitempty"`
+	// Mode is the path's Git file mode (for tracked paths).
+	Mode string `json:"mode,omitempty"`
+	// Size is the working-tree file size in bytes.
+	Size int64 `json:"size,omitempty"`
+	// Hash is the Git blob hash ("" when Git did not provide one, e.g.
+	// an Untracked file).
+	Hash string `json:"hash,omitempty"`
+	// Status is the porcelain XY code pair ("" for plain tracked
+	// changes without a dedicated identity code).
+	Status string `json:"status,omitempty"`
+}
+
+// ChangeSet is the canonical, Runtime-generated body of one immutable
+// ArtifactChangeSet Revision. Every field is produced by the Runtime from
+// observed Git facts in the Workflow's Workspace; the structure is fixed
+// by this Go type, canonical JSON, and the artifact Hash (TUI task 5).
+type ChangeSet struct {
+	// BaseCommit is the Workflow Base the candidate Change Set is filed
+	// against (the planning session's Branch point).
+	BaseCommit string `json:"base_commit"`
+	// CandidateHead is the candidate branch head the Freeze observed.
+	CandidateHead string `json:"candidate_head"`
+	// VerifiedHead is the Branch Head the runtime verified (identity
+	// check): usually equal to CandidateHead; distinct when the observed
+	// candidate needed re-verification after the observation.
+	VerifiedHead string `json:"verified_head"`
+	// Commits is the ordered Commit Range of candidate commits relative
+	// to BaseCommit (empty when the candidate filed no commits).
+	Commits []string `json:"commits"`
+	// TrackedDiff inventories every tracked path changed by the
+	// candidate relative to BaseCommit (committed, staged, and unstaged).
+	TrackedDiff []ChangeSetEntry `json:"tracked_diff"`
+	// Untracked inventories every Untracked file the Freeze observed in
+	// the Workspace.
+	Untracked []ChangeSetEntry `json:"untracked"`
+	// DirtyFingerprint is the observed workspace Dirty Fingerprint.
+	DirtyFingerprint string `json:"dirty_fingerprint"`
+	// SessionID is the discussion Session the Freeze is bound to.
+	SessionID string `json:"session_id"`
+	// ContentHash is the canonical SHA-256 of this body (fields below
+	// excluded); the artifact store additionally hashes the payload.
+	ContentHash string `json:"content_hash"`
 }
 
 // ApprovalKind distinguishes the append-only user decisions. Plan and

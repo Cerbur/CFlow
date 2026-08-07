@@ -58,6 +58,10 @@ var compatibilityRegistry = map[model.ArtifactType][]string{
 	// and parses them; no agent body schema applies).
 	model.ArtifactRoutingPolicy: {"1.0.0"},
 	model.ArtifactBudgetPolicy:  {"1.0.0"},
+	// Task 5 change set artifacts: the frozen candidate Change Set is a
+	// Runtime-authored canonical body fixed by the model.ChangeSet Go
+	// types (no agent body schema applies).
+	model.ArtifactChangeSet: {"1.0.0"},
 }
 
 // supportedVersion reports whether a declared Artifact Type's schema
