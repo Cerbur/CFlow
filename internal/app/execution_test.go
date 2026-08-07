@@ -198,7 +198,7 @@ func approveExecution(t *testing.T, fx *planningFixture, wf model.WorkflowID, pv
 		Workflow: wf,
 		PlanHash: pv.PlanHash, SpecHashes: pv.SpecHashes, CatalogHash: pv.CatalogHash,
 		WorkflowHash: pv.WorkflowHash, RoutingHash: pv.RoutingHash, BudgetHash: pv.BudgetHash,
-		CommitPolicyHash: pv.CommitPolicyHash,
+		CommitPolicyHash: pv.CommitPolicyHash, ChangeSetHash: pv.ChangeSetHash,
 	}); err != nil {
 		t.Fatalf("execution approval: %v", err)
 	}

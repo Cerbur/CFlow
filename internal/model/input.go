@@ -120,9 +120,44 @@ type ExecutionApprovalInput struct {
 	RoutingHash      string
 	BudgetHash       string
 	CommitPolicyHash string
+	// ChangeSetHash is the frozen Change Set Hash the Execution Approval
+	// binds (TUI task 6, design 8.4). Empty when the approval binds no
+	// Change Set (legacy flows); non-empty approvals gate the Workspace
+	// behind the Adoption Gate.
+	ChangeSetHash string
 }
 
 func (ExecutionApprovalInput) isInput() {}
+
+// AdoptWorkspaceInput is the Runtime-verified input of the Workspace
+// Adoption Gate (TUI task 6, design 8.4): the Execution Approval bound a
+// frozen Change Set, and the Application re-verified the Workspace's
+// Change Set, Commit Policy, Identity/Signing, Clean/Scope, Catalog
+// Verification, and review route before the Kernel records the independent
+// Adoption Review Session. On a PASS verdict the Kernel advances
+// verified_workspace_head to the exact verified Candidate Head; a FAIL or
+// a drifted Workspace Blocks the Workflow and preserves the Workspace and
+// the Target Branch.
+type AdoptWorkspaceInput struct {
+	// Session is the fresh independent Adoption Review Session identity.
+	Session SessionID
+	// Route is the approved independent-review Provider binding of the
+	// Execution Approval's routing policy.
+	Route string
+	// ChangeSetHash is the frozen Change Set Hash the Execution Approval
+	// bound; the adoption re-verifies the Workspace against this exact
+	// Revision.
+	ChangeSetHash string
+	// CandidateHead is the Workspace Head the Runtime verified (the
+	// Change Set's candidate head, re-observed unchanged).
+	CandidateHead string
+	// DirtyFingerprint is the observed Dirty Fingerprint of the Workspace
+	// at the verified Candidate Head (the frozen Change Set's
+	// fingerprint, re-observed unchanged).
+	DirtyFingerprint string
+}
+
+func (AdoptWorkspaceInput) isInput() {}
 
 // SpecGenerationInput starts one Spec Generation Session (PRD Agent 角色:
 // SPEC_GENERATION 将 Plan 拆成 Specs). CatalogRef is the immutable
@@ -162,6 +197,11 @@ type ExecutionDryRunInput struct {
 	// binds their hashes.
 	RoutingRef ArtifactRef
 	BudgetRef  ArtifactRef
+	// ChangeSetRef is the frozen ArtifactChangeSet Revision the Dry Run
+	// resolved (zero when no Change Set was frozen yet); the gate records
+	// its active reference so the Execution Approval binds the Change Set
+	// (TUI task 6, design 8.4).
+	ChangeSetRef ArtifactRef
 }
 
 func (ExecutionDryRunInput) isInput() {}

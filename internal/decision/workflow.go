@@ -544,20 +544,28 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 	if state.Plan == nil {
 		return model.Decision{}, model.InvalidInputFault("execution approval requires the approved plan reference")
 	}
-	if !facts.Matches(in.PlanHash, in.SpecHashes, in.CatalogHash, in.WorkflowHash, in.RoutingHash, in.BudgetHash, in.CommitPolicyHash) {
+	if !facts.Matches(in.PlanHash, in.SpecHashes, in.CatalogHash, in.WorkflowHash, in.RoutingHash, in.BudgetHash, in.CommitPolicyHash, in.ChangeSetHash) {
 		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged, "execution facts changed since the approval preview")
+	}
+	refs := []model.ArtifactRef{
+		{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: state.Plan.Revision, Hash: facts.PlanHash},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
+	}
+	if facts.ChangeSetHash != "" && facts.ChangeSetRevision > 0 {
+		// The frozen Change Set Revision the approval binds: the Workspace
+		// candidate is adopted (verified) before any normal Task starts
+		// (TUI task 6, design 8.4).
+		refs = append(refs, model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactChangeSet,
+			Revision: facts.ChangeSetRevision, Hash: facts.ChangeSetHash})
 	}
 	b := &builder{state: state}
 	b.mutate(model.ApprovalAppendMutation{Approval: model.Approval{
 		ID:   model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
 		Kind: model.ApprovalExecution,
 		Seq:  state.NextEventSeq,
-		Refs: []model.ArtifactRef{
-			{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: state.Plan.Revision, Hash: facts.PlanHash},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
-		},
+		Refs: refs,
 		Fingerprint:       facts.Fingerprint,
 		PreflightRevision: facts.PreflightRevision,
 	}})
@@ -736,6 +744,18 @@ func decideExecutionDryRun(state model.State, in model.ExecutionDryRunInput) (mo
 			Revision: in.BudgetRef.Revision,
 			Path:     in.BudgetRef.String(),
 			Hash:     in.BudgetRef.Hash,
+		})
+	}
+	if in.ChangeSetRef.Hash != "" {
+		// The frozen Change Set the discussion froze becomes an active
+		// reference of the Execution Facts, so the Execution Approval
+		// preview binds its hash and the approval gates the Workspace
+		// behind the Adoption Gate (TUI task 6, design 8.4).
+		b.mutate(model.ArtifactRefMutation{
+			Type:     model.ArtifactChangeSet,
+			Revision: in.ChangeSetRef.Revision,
+			Path:     in.ChangeSetRef.String(),
+			Hash:     in.ChangeSetRef.Hash,
 		})
 	}
 	b.mutate(wfMutStatus(state, model.RuntimePaused))

@@ -188,9 +188,18 @@ type StatusView struct {
 	BaseCommit        string
 	IntegrationBranch string
 	IntegrationHead   string
-	Findings          []model.Finding
-	Run               *model.Run
-	Processes         []model.ProcessRecord
+	// WorkspacePath/Branch are the aggregated workspace facts (design 8.1),
+	// and CandidateWorkspaceHead/VerifiedWorkspaceHead/WorkspaceDirty-
+	// Fingerprint are the workspace adoption facts (design 8.2, 8.4): the
+	// verified head is the only legal Task base.
+	WorkspacePath             string
+	WorkspaceBranch           string
+	CandidateWorkspaceHead    string
+	VerifiedWorkspaceHead     string
+	WorkspaceDirtyFingerprint string
+	Findings                  []model.Finding
+	Run                       *model.Run
+	Processes                 []model.ProcessRecord
 	// PlanStatus is the active Plan Revision's review status ("" when no
 	// Plan exists). PlanApproved is true only for the user's append-only
 	// Approval; a checker pass never sets it.
@@ -259,6 +268,9 @@ type ExecutionPreviewView struct {
 	RoutingHash      string
 	BudgetHash       string
 	CommitPolicyHash string
+	// ChangeSetHash is the frozen Change Set Hash the Approval binds
+	// ("" when no Change Set was frozen).
+	ChangeSetHash string
 
 	Routes            []RoutePreview
 	Budgets           []BudgetPreview
@@ -564,6 +576,10 @@ type ApproveExecutionCommand struct {
 	RoutingHash      string
 	BudgetHash       string
 	CommitPolicyHash string
+	// ChangeSetHash is the frozen Change Set Hash the Approval binds (TUI
+	// task 6): non-empty when the Execution Approval gates the Workspace
+	// behind the Adoption Gate.
+	ChangeSetHash string
 }
 
 // DispatchCommand runs one allocation pass of the approved execution
@@ -573,6 +589,17 @@ type ApproveExecutionCommand struct {
 // the Kernel revalidates the gate in the same transaction so no start can
 // cross a committed closure (Pause, Quiesce, Cancel, Safety Stop).
 type DispatchCommand struct {
+	Workflow model.WorkflowID
+}
+
+// AdoptWorkspaceCommand runs the Workspace Adoption Gate of one
+// Execution-Approved Workflow whose Approval bound a frozen Change Set
+// (TUI task 6, design 8.4): the Runtime re-verifies the Workspace's
+// Change Set, Commit Policy, Identity/Signing, Clean/Scope, Catalog
+// Verification, and an independent Review; on a PASS verdict the
+// verified_workspace_head advances to the exact candidate Head and
+// normal Tasks may be scheduled from it.
+type AdoptWorkspaceCommand struct {
 	Workflow model.WorkflowID
 }
 
@@ -698,6 +725,7 @@ func (CompileWorkflowCommand) isCommand()     {}
 func (ExecutionDryRunCommand) isCommand()     {}
 func (ApproveExecutionCommand) isCommand()    {}
 func (DispatchCommand) isCommand()            {}
+func (AdoptWorkspaceCommand) isCommand()      {}
 func (ReconcileCommand) isCommand()           {}
 func (CommitPolicyConfirmCommand) isCommand() {}
 func (ReplacementPreviewCommand) isCommand()  {}

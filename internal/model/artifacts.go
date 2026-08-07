@@ -208,12 +208,20 @@ type ExecutionFacts struct {
 	BudgetHash       string
 	CommitPolicyHash string
 	Fingerprint      string
+	// ChangeSetHash is the frozen ArtifactChangeSet Revision the Execution
+	// Approval binds (TUI task 6): the Workspace candidate the approval
+	// gates behind the Adoption Gate. Empty when the approval bound no
+	// Change Set (legacy planning-only flows).
+	ChangeSetHash string
 	// SpecRevision/CatalogRevision/WorkflowRevision are the active
 	// revisions of the execution Artifacts (the Approval row binds
 	// revisions and hashes together).
 	SpecRevision     int
 	CatalogRevision  int
 	WorkflowRevision int
+	// ChangeSetRevision is the active revision of the frozen Change Set
+	// Artifact.
+	ChangeSetRevision int
 	// PreflightRevision is the revision of the latest recorded Commit
 	// Preflight row (0 when none exists yet).
 	PreflightRevision int
@@ -221,12 +229,13 @@ type ExecutionFacts struct {
 
 // Matches reports whether the candidate Execution Approval input binds the
 // exact same facts as the active ExecutionFacts.
-func (f *ExecutionFacts) Matches(planHash string, specHashes []string, catalogHash, workflowHash, routingHash, budgetHash, commitPolicyHash string) bool {
+func (f *ExecutionFacts) Matches(planHash string, specHashes []string, catalogHash, workflowHash, routingHash, budgetHash, commitPolicyHash, changeSetHash string) bool {
 	if f == nil {
 		return false
 	}
 	if f.PlanHash != planHash || f.CatalogHash != catalogHash || f.WorkflowHash != workflowHash ||
-		f.RoutingHash != routingHash || f.BudgetHash != budgetHash || f.CommitPolicyHash != commitPolicyHash {
+		f.RoutingHash != routingHash || f.BudgetHash != budgetHash || f.CommitPolicyHash != commitPolicyHash ||
+		f.ChangeSetHash != changeSetHash {
 		return false
 	}
 	if len(f.SpecHashes) != len(specHashes) {

@@ -35,6 +35,141 @@ func verifyFailureCode(node *model.Node) model.Code {
 	return model.CodeCommandFailed
 }
 
+// ---------------------------------------------------------------------------
+// Workspace Adoption Gate (TUI task 6, design 8.4)
+// ---------------------------------------------------------------------------
+
+// decideAdoptWorkspace starts the Workspace Adoption Gate of one
+// Execution-Approved Workflow whose Approval bound a frozen Change Set.
+// The Application already re-verified the Workspace facts (Change Set
+// re-observation, Commit Policy, Identity/Signing, Clean/Scope, Catalog
+// Verification) and resolved the approved independent-review route; the
+// Kernel revalidates the committed gates (aggregated workspace layout,
+// EXECUTION stage, running Runtime, the bound Change Set hash, an
+// unadopted Workspace, and a fresh independent Session) and records the
+// Adoption Review Session. The Session's PASS verdict advances
+// verified_workspace_head to the exact verified Candidate Head; a FAIL
+// verdict or a drifted Workspace Blocks the Workflow and preserves the
+// Workspace and the Target Branch.
+func decideAdoptWorkspace(state model.State, in model.AdoptWorkspaceInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to adopt")
+	}
+	if state.Workflow.LayoutVersion < 2 || state.Workflow.WorkspacePath == "" || state.Workflow.WorkspaceBranch == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the aggregated workspace layout")
+	}
+	if state.Workflow.Stage != model.StageExecution {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the EXECUTION stage")
+	}
+	if state.Workflow.Runtime != model.RuntimeRunning {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires a running workflow")
+	}
+	if state.Workflow.VerifiedWorkspaceHead != "" {
+		return model.Decision{}, model.InvalidInputFault("the workspace is already adopted")
+	}
+	facts := state.Workflow.ExecutionFacts
+	if facts == nil || facts.ChangeSetHash == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires an execution approval bound to a change set")
+	}
+	if in.ChangeSetHash == "" || in.ChangeSetHash != facts.ChangeSetHash {
+		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
+			"the change set hash does not match the execution approval facts")
+	}
+	if in.CandidateHead == "" || in.DirtyFingerprint == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the verified workspace facts")
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	if in.Route == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the approved review route")
+	}
+	b := &builder{state: state}
+	// The verified candidate facts are recorded when the gate starts: the
+	// runtime re-verified the exact Candidate Head and Dirty Fingerprint,
+	// and the PASS verdict later advances verified_workspace_head to them
+	// (design 8.4 step 6).
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.CandidateWorkspaceHead = in.CandidateHead
+	m.WorkspaceDirtyFingerprint = in.DirtyFingerprint
+	b.mutate(m)
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID: in.Session, Purpose: model.PurposeReview, Status: model.SessionStarting,
+	}, Provider: in.Route})
+	b.effect(model.ProviderStartIntent{
+		Session: in.Session,
+		Purpose: model.PurposeReview,
+		Route:   in.Route,
+	})
+	return b.decision(), nil
+}
+
+// decideAdoptionReviewRunEnded settles one Workspace Adoption Review
+// Session: the review pass is evidence (a structured PASS/FAIL verdict),
+// never the Runtime deciding success. A PASS writes the exact verified
+// Workspace facts (CandidateHead, VerifiedHead, and the clean Dirty
+// Fingerprint at the adopted Head) and opens dispatch to the adopted
+// Workspace; a FAIL or an unparsable verdict Blocks the Workflow with a
+// blocking Finding while the Workspace, the Change Set, and the Target
+// Branch stay untouched (design 8.4 step 7).
+func decideAdoptionReviewRunEnded(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
+	attempt := attemptBySession(state, created.ID)
+	if attempt != nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("adoption review session %s has an execution attempt", created.ID))
+	}
+	b := &builder{state: state}
+	b.mutate(sessionEnd(state, created, in))
+	if in.Session.Status != model.SessionCompleted {
+		code := in.FailureCode
+		if code == "" {
+			code = model.CodeAgentProcessCrashed
+		}
+		return adoptionFailure(b, state, created, code), nil
+	}
+	verdict, err := parseReviewVerdict(in.Body)
+	if err != nil {
+		return adoptionFailure(b, state, created, model.CodeSemanticReviewFailed), nil
+	}
+	if !verdict {
+		return adoptionFailure(b, state, created, model.CodeSemanticReviewFailed), nil
+	}
+	// The Adoption PASS advances the verified Workspace Head to the exact
+	// Candidate Head the Runtime re-verified and records the clean Dirty
+	// Fingerprint at that Head (design 8.4 step 6).
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.CandidateWorkspaceHead = state.Workflow.CandidateWorkspaceHead
+	m.VerifiedWorkspaceHead = state.Workflow.CandidateWorkspaceHead
+	m.WorkspaceDirtyFingerprint = in.EndDirtyFingerprint
+	b.mutate(m)
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workspace adopted")
+	return b.decision(), nil
+}
+
+// adoptionFailure Blocks the Workflow on a failed Workspace Adoption
+// Review: a blocking Finding is recorded and the Runtime moves to BLOCKED
+// while the Workspace, the Change Set, and the Target Branch stay
+// untouched (design 8.4 step 7).
+func adoptionFailure(b *builder, state model.State, created *model.Session, code model.Code) model.Decision {
+	pol, _ := model.Policy(code)
+	b.mutate(model.FindingAppendMutation{Finding: model.Finding{
+		ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+1)),
+		Code:     code,
+		Scope:    pol.Scope,
+		Subject:  string(created.ID),
+		Blocking: true,
+		Text:     code.String(),
+		Seq:      state.NextEventSeq,
+	}})
+	b.event(model.EventFindingOpened, "", model.AttemptKey{}, code, "workspace adoption review failed")
+	b.mutate(wfMutStatus(state, model.RuntimeBlocked))
+	b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked by the workspace adoption review")
+	return b.decision()
+}
+
+// ---------------------------------------------------------------------------
+// Final Verify dispatch and settlement
+// ---------------------------------------------------------------------------
+
 // decideFinalVerifyDispatch allocates the Final Verify Node (Task 18,
 // PRD 最终验收): the RUNNING Attempt commits at the recorded Integration
 // HEAD, the independent Final Reviewer Session of the FINAL_VERIFICATION

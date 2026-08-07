@@ -511,6 +511,7 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 		RoutingHash:      facts.RoutingHash,
 		BudgetHash:       facts.BudgetHash,
 		CommitPolicyHash: facts.CommitPolicyHash,
+		ChangeSetHash:    facts.ChangeSetHash,
 		Findings:         view.State.Findings,
 	}
 	if facts.CommitPolicyHash != "" {

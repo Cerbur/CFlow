@@ -834,7 +834,18 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		if err != nil {
 			return nil, "", err
 		}
-		return model.ExecutionDryRunInput{Preflight: preflight, RoutingRef: routingRef, BudgetRef: budgetRef}, wf, nil
+		// The frozen Change Set (the Workspace candidate the discussion
+		// finished) becomes an active reference of the Dry Run, so the
+		// Execution Approval preview binds its hash and the approval gates
+		// the Workspace behind the Adoption Gate (TUI task 6, design 8.4).
+		changeSetRef, err := a.latestChangeSetRef(ctx, wf)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.ExecutionDryRunInput{
+			Preflight: preflight, RoutingRef: routingRef, BudgetRef: budgetRef,
+			ChangeSetRef: changeSetRef,
+		}, wf, nil
 	case ApproveExecutionCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {
@@ -852,6 +863,7 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			RoutingHash:      c.RoutingHash,
 			BudgetHash:       c.BudgetHash,
 			CommitPolicyHash: c.CommitPolicyHash,
+			ChangeSetHash:    c.ChangeSetHash,
 		}, wf, nil
 	case DispatchCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
@@ -862,6 +874,8 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		// approved execution artifacts; the kernel Input placeholder is
 		// unused by the dispatch path.
 		return model.DispatchInput{}, wf, nil
+	case AdoptWorkspaceCommand:
+		return a.prepareAdoption(ctx, c)
 	case ReconcileCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

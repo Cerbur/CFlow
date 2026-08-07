@@ -358,6 +358,12 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 		return a.codingProviderStart(ctx, wf, intent, cmd, rt)
 	}
 	if intent.Purpose == model.PurposeReview {
+		if intent.Node == "" {
+			// The Workspace Adoption Review (TUI task 6, design 8.4): the
+			// independent Review of the frozen candidate Change Set inside
+			// the Workspace, with no execution Attempt.
+			return a.adoptionReviewProviderStart(ctx, wf, intent, cmd, rt)
+		}
 		// The independent Reviewer Session (design 16.2): a non-coding
 		// Session inside the Task Worktree, bound to the exact
 		// Commit/Catalog/evidence refs.

@@ -283,6 +283,13 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		}
 		facts.BudgetHash = h.Hash
 	}
+	if h, ok := refs["change-set"]; ok {
+		if facts == nil {
+			facts = &model.ExecutionFacts{}
+		}
+		facts.ChangeSetHash = h.Hash
+		facts.ChangeSetRevision = h.Revision
+	}
 	if facts != nil {
 		var preflightRevision int
 		var preflightHash, fingerprint sql.NullString

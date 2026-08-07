@@ -44,6 +44,8 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideExecutionDryRun(state, in)
 	case model.ExecutionApprovalInput:
 		return decideExecutionApproval(state, in)
+	case model.AdoptWorkspaceInput:
+		return decideAdoptWorkspace(state, in)
 	case model.GraphInstallInput:
 		return decideGraphInstall(state, in)
 	case model.DispatchInput:

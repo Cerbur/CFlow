@@ -123,6 +123,11 @@ func statusView(st model.State) StatusView {
 		TargetBranch: st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
 		IntegrationBranch: st.Workflow.IntegrationBranch,
 		IntegrationHead:   st.Workflow.IntegrationHead,
+		WorkspacePath:     st.Workflow.WorkspacePath,
+		WorkspaceBranch:   st.Workflow.WorkspaceBranch,
+		CandidateWorkspaceHead:    st.Workflow.CandidateWorkspaceHead,
+		VerifiedWorkspaceHead:     st.Workflow.VerifiedWorkspaceHead,
+		WorkspaceDirtyFingerprint: st.Workflow.WorkspaceDirtyFingerprint,
 		Findings:          st.Findings,
 		Processes:         st.Processes,
 	}

@@ -126,6 +126,15 @@ func (a *Application) executeDispatch(ctx context.Context, st *store.Store, wf m
 		return Outcome{}, model.NewFault(model.CodeApprovalInputChanged,
 			"the execution artifacts no longer match the approval facts; re-approve before dispatch")
 	}
+	// The Workspace Adoption Gate (TUI task 6, design 8.4): an Execution
+	// Approval bound to a frozen Change Set may not schedule normal Tasks
+	// until the Workspace was adopted — no Task may be created from an
+	// unadopted candidate Head (verified_workspace_head is the only legal
+	// Task base).
+	if facts.ChangeSetHash != "" && view.State.Workflow.VerifiedWorkspaceHead == "" {
+		return Outcome{}, model.NewFault(model.CodeWorkspaceAdoptionRequired,
+			"the workspace has not been adopted; run AdoptWorkspaceCommand before dispatch")
+	}
 	approved, err := a.verifyApprovedRouting(ctx, wf, facts)
 	if err != nil {
 		return Outcome{}, err
