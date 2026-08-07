@@ -808,3 +808,171 @@ func TestValidateBodyWorkflowPatch(t *testing.T) {
 	err = ValidateBody("no-such-schema.json", ok)
 	requireFaultCode(t, err, model.CodeInvalidInput)
 }
+
+// aggregatedTestRoot builds a workflows aggregated root exactly as the
+// Application will: <home>/projects/<project-key>/<workflow-id>, then
+// initializes it as a managed directory so the Security Guard accepts it.
+func aggregatedTestRoot(t *testing.T, wf string) string {
+	t.Helper()
+	root := filepath.Join(tempRoot(t), "home", "projects", "project-a", wf)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("create aggregated root: %v", err)
+	}
+	return root
+}
+
+func newTestWorkflowStore(t *testing.T, wf string) *Store {
+	t.Helper()
+	root := aggregatedTestRoot(t, wf)
+	s, err := NewWorkflow(root, model.WorkflowID(wf), testRedactionRegistry())
+	if err != nil {
+		t.Fatalf("new workflow store: %v", err)
+	}
+	return s
+}
+
+// TestWorkflowStorePutGetRoundTrip: an aggregated store reads and writes the
+// same immutable revision identity as the legacy layout, under the workflow
+// aggregated root (design 7).
+func TestWorkflowStorePutGetRoundTrip(t *testing.T) {
+	s := newTestWorkflowStore(t, "wf-1")
+	req := fixturePlanRequest("wf-1", "Fix login bug", 1)
+	ref := mustPut(t, s, req)
+
+	if ref.Workflow != "wf-1" || ref.Type != model.ArtifactPlan || ref.Revision != 1 {
+		t.Fatalf("unexpected ref: %+v", ref)
+	}
+	body := mustGet(t, s, ref)
+	if !strings.Contains(string(body), "# Fix login bug") {
+		t.Fatalf("round trip body mismatch: %q", body)
+	}
+}
+
+// TestWorkflowStoreAggregatedTypeDirs: every managed type maps to one of
+// the fixed aggregated directories and the legacy artifacts/<wf>/<type>
+// path is never used.
+func TestWorkflowStoreAggregatedTypeDirs(t *testing.T) {
+	allowed := map[string]bool{
+		"plans": true, "specs": true, "workflows": true, "discussion": true,
+		"reviews": true, "reports": true, "evidence": true,
+	}
+	seen := map[string]bool{}
+	for _, typ := range []model.ArtifactType{
+		model.ArtifactPlan, model.ArtifactSpec, model.ArtifactCatalog, model.ArtifactWorkflow,
+		model.ArtifactDiscussionTurn, model.ArtifactPlanCheck, model.ArtifactReport,
+		model.ArtifactCleanupManifest, model.ArtifactRoutingPolicy, model.ArtifactBudgetPolicy,
+	} {
+		dir, ok := aggregatedTypeDirs[typ]
+		if !ok { // guard against dropping the map entry
+			t.Fatalf("aggregated type dir mapping missing for %s", typ)
+		}
+		if !allowed[dir] {
+			t.Fatalf("aggregated type dir %q is not a managed directory", dir)
+		}
+		seen[dir] = true
+	}
+	for name := range allowed {
+		if !seen[name] {
+			t.Fatalf("aggregated directory %s has no artifact type", name)
+		}
+	}
+}
+
+// TestWorkflowStoreRejectsForeignWorkflow: the aggregated store is bound to
+// exactly one workflow; a reference to any other workflow is refused even
+// when the body itself is schema-valid.
+func TestWorkflowStoreRejectsForeignWorkflow(t *testing.T) {
+	s := newTestWorkflowStore(t, "wf-1")
+	req := fixturePlanRequest("wf-2", "another plan", 1)
+	_, err := s.Put(context.Background(), req)
+	requireFaultCode(t, err, model.CodeInvalidInput)
+}
+
+// TestWorkflowStoreRootMustMatchWorkflowID: NewWorkflow requires the root's
+// final component to be exactly the workflow id.
+func TestWorkflowStoreRootMustMatchWorkflow(t *testing.T) {
+	root := aggregatedTestRoot(t, "wf-1")
+	if _, err := NewWorkflow(root, "wf-2", testRedactionRegistry()); err == nil {
+		t.Fatal("root mismatch must be rejected")
+	}
+	if _, err := NewWorkflow(root, "", testRedactionRegistry()); err == nil {
+		t.Fatal("empty workflow id must be rejected")
+	}
+}
+
+// TestWorkflowStoreRootMustBeAggregatedRoot: the root must sit at exactly
+// <home>/projects/<project-key>/<workflow-id> with every component a safe
+// single path component (design 7); a matching basename outside that tree
+// is not the aggregated root.
+func TestWorkflowStoreRootMustBeAggregatedRoot(t *testing.T) {
+	for name, root := range map[string]string{
+		"outside projects":     filepath.Join(tempRoot(t), "x", "wf-1"),
+		"module under project": filepath.Join(aggregatedTestRoot(t, "wf-1"), "..", "true-root", "wf-1"),
+		"projects root itself": filepath.Join(tempRoot(t), "projects", "wf-1"),
+	} {
+		if _, err := NewWorkflow(root, model.WorkflowID("wf-1"), testRedactionRegistry()); err == nil {
+			t.Fatalf("root %q (%s) must be rejected", root, name)
+		}
+	}
+}
+
+// TestWorkflowStorePhysicalLayout: an aggregated write lands exactly at
+// <root>/<type-dir>/<revision>/<hash> with owner-only mode, and the
+// legacy artifacts/<wf>/<type> and <root>/<workflow-id> shapes never
+// appear on disk (design 7).
+func TestWorkflowStorePhysicalLayout(t *testing.T) {
+	s := newTestWorkflowStore(t, "wf-1")
+	ref := mustPut(t, s, fixturePlanRequest("wf-1", "Fix login bug", 1))
+
+	revisionDir := filepath.Join(s.root, "plans", "1")
+	entries, err := os.ReadDir(revisionDir)
+	requireNoError(t, err)
+	if len(entries) != 1 || entries[0].Name() != ref.Hash {
+		t.Fatalf("revision dir must hold exactly the content hash, got %v", entries)
+	}
+	fi, err := os.Stat(filepath.Join(revisionDir, ref.Hash))
+	requireNoError(t, err)
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("artifact file mode must be 0600, got %o", fi.Mode().Perm())
+	}
+	// The workflow id must never appear as a path component, and the
+	// legacy artifacts/ tree must not exist.
+	if _, err := os.Lstat(filepath.Join(s.root, "wf-1")); !os.IsNotExist(err) {
+		t.Fatalf("workflow id leaked into the aggregated layout: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.root, "artifacts")); !os.IsNotExist(err) {
+		t.Fatalf("legacy artifacts/ tree must not exist under the aggregated root: %v", err)
+	}
+}
+
+// TestWorkflowStoreRejectsForeignWorkflowRead: a Get or Resolve of a
+// reference to a foreign workflow is refused by the bound store, exactly
+// like the write path.
+func TestWorkflowStoreRejectsForeignWorkflowRead(t *testing.T) {
+	s := newTestWorkflowStore(t, "wf-1")
+	ref := model.ArtifactRef{Workflow: "wf-2", Type: model.ArtifactPlan, Revision: 1,
+		Hash: strings.Repeat("a", 64)}
+	if _, err := s.Get(context.Background(), ref); err == nil {
+		t.Fatal("foreign read must be rejected")
+	}
+	if _, err := s.Resolve(context.Background(), ResolveRequest{
+		WorkflowID: "wf-2", Type: model.ArtifactPlan,
+	}); err == nil {
+		t.Fatal("foreign resolve must be rejected")
+	}
+}
+
+// TestWorkflowStoreResolveLatest: the latest-revision resolution walks the
+// aggregated revision directories exactly as in the legacy layout.
+func TestWorkflowStoreResolveLatest(t *testing.T) {
+	s := newTestWorkflowStore(t, "wf-1")
+	mustPut(t, s, fixturePlanRequest("wf-1", "first", 1))
+	ref2 := mustPut(t, s, fixturePlanRequest("wf-1", "second", 2))
+	resolved, err := s.Resolve(context.Background(), ResolveRequest{
+		WorkflowID: "wf-1", Type: model.ArtifactPlan,
+	})
+	requireNoError(t, err)
+	if resolved != ref2 {
+		t.Fatalf("latest revision mismatch: got %+v want %+v", resolved, ref2)
+	}
+}

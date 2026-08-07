@@ -583,6 +583,37 @@ func TestCheckCleanupScratchRejectsEvidenceAndStateTrees(t *testing.T) {
 	}
 }
 
+// TestCheckCleanupScratchRejectsAggregatedWorkflowRoot: the aggregated
+// workflow root and its managed artifact directories (design 7:
+// plans/, specs/, workflows/, discussion/, reviews/, reports/, evidence/)
+// live under scoped projects/, a preserved tree; an exact path inside
+// them is never an exact scratch target.
+func TestCheckCleanupScratchRejectsAggregatedWorkflowRoot(t *testing.T) {
+	root := tempRoot(t)
+	home := filepath.Join(root, "cflow")
+	mkdir(t, home, 0o700)
+	repo := filepath.Join(root, "repo")
+	mkdir(t, repo, 0o700)
+
+	for _, dir := range []string{
+		"plans", "specs", "workflows", "evidence",
+		"reports", "reviews", "discussion",
+	} {
+		p := filepath.Join(home, "projects", "project-a", "wf-1", dir)
+		mkdirAll(t, p, 0o700)
+		if _, err := security.CheckCleanupScratch(security.CleanupScratchRequest{
+			Path: p, HomeRoot: home, WorkspaceRoot: repo,
+		}); err == nil {
+			t.Fatalf("scratch target inside the aggregated %s/ tree must be rejected", dir)
+		}
+		// The managed directory itself must pass CheckPath once created
+		// through the guard (owner-only mode, no symlink escape).
+		if _, err := security.CheckPath(security.PathRequest{Path: p, Kind: security.KindDir}); err != nil {
+			t.Fatalf("aggregated %s/ tree must be a managed path: %v", dir, err)
+		}
+	}
+}
+
 // TestCheckCleanupScratchRejectsSymlinkEscape: a scratch target that
 // resolves through a symlink (inside or outside) is never removed.
 func TestCheckCleanupScratchRejectsSymlinkEscape(t *testing.T) {
