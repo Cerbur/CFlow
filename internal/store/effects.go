@@ -103,6 +103,8 @@ func effectKindOf(i model.EffectIntent) (string, error) {
 		return "provider-cancel", nil
 	case model.PlanningWorktreeCreateIntent:
 		return "planning-worktree-create", nil
+	case model.WorkspaceWorktreeCreateIntent:
+		return "workspace-worktree-create", nil
 	case model.IntegrationWorktreeCreateIntent:
 		return "integration-worktree-create", nil
 	case model.TaskWorktreeCreateIntent:
@@ -155,6 +157,10 @@ func effectFromKind(kind string, payload []byte) (model.EffectIntent, error) {
 		return v, err
 	case "planning-worktree-create":
 		var v model.PlanningWorktreeCreateIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "workspace-worktree-create":
+		var v model.WorkspaceWorktreeCreateIntent
 		err = json.Unmarshal(payload, &v)
 		return v, err
 	case "integration-worktree-create":

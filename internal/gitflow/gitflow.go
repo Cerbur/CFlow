@@ -202,6 +202,17 @@ type CreatePlanningSnapshot struct {
 
 func (CreatePlanningSnapshot) isGitOperation() {}
 
+// CreateWorkspace creates the single long-lived Workspace Branch/Worktree
+// from BaseHead at the recorded Branch and Path (design 8.1; TUI task 4).
+// The branch must not already exist; the user's target branch never moves.
+type CreateWorkspace struct {
+	Branch   string // refname (without refs/heads/ prefix)
+	BaseHead string // full commit hash, the recorded Workflow Base
+	Path     string // canonical destination worktree path
+}
+
+func (CreateWorkspace) isGitOperation() {}
+
 // CreateIntegration creates the Integration Branch/Worktree from
 // BaseCommit (design 15.2, only after Execution Approval). The branch
 // must not already exist.
@@ -519,6 +530,15 @@ type PlanningSnapshotResult struct {
 
 func (PlanningSnapshotResult) isGitResult() {}
 
+// WorkspaceWorktreeResult reports the created Workspace worktree.
+type WorkspaceWorktreeResult struct {
+	Worktree string
+	Branch   string
+	Head     string
+}
+
+func (WorkspaceWorktreeResult) isGitResult() {}
+
 // IntegrationWorktreeResult reports the created Integration worktree.
 type IntegrationWorktreeResult struct {
 	Worktree string
@@ -691,6 +711,8 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.createPlanningSnapshot(ctx, op)
 	case CreateIntegration:
 		return g.createIntegration(ctx, op)
+	case CreateWorkspace:
+		return g.createWorkspace(ctx, op)
 	case CreateTask:
 		return g.createTask(ctx, op)
 	case CreateAuditRef:

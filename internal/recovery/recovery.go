@@ -242,6 +242,11 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 	case model.PlanningWorktreeCreateIntent:
 		return e.classifyWorktreeAt(ctx, base, e.planningPath(wf), "planning",
 			intent.BaseCommit, "")
+	case model.WorkspaceWorktreeCreateIntent:
+		// The Workspace branch is created by, and only by, this Intent's
+		// create (design 8.1); classify against the intent's own Path.
+		return e.classifyWorktreeAt(ctx, base, intent.Path, "workspace",
+			intent.BaseHead, intent.Branch)
 	case model.VerificationRunIntent:
 		return e.classifyVerification(ctx, wf, base, intent)
 	case model.ProviderStartIntent, model.ProviderResumeIntent:

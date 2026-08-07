@@ -152,6 +152,12 @@ func (cf *cleanupFixture) planningWorktreePath() string {
 	return filepath.Join(cf.af.fx.home, "worktrees", ProjectFor(cf.af.fx.root).Key, string(cf.wf), "planning")
 }
 
+// workspacePath is the aggregated Workspace root of the fixture's
+// workflow (Layout Version 2, design §8).
+func (cf *cleanupFixture) workspacePath() string {
+	return filepath.Join(cf.af.fx.home, "projects", ProjectFor(cf.af.fx.root).Key, string(cf.wf), "workspace")
+}
+
 func (cf *cleanupFixture) taskBranch() string {
 	return "cflow/" + string(cf.wf) + "/task-" + string(cf.taskNode())
 }
@@ -629,8 +635,9 @@ func TestCleanupRemovesCleanWorktreesAndPreservesEvidence(t *testing.T) {
 	}
 	fx.RequireWorktreeRemoved(fx.integrationWorktreePath())
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
-	// The Planning Snapshot is never a Cleanup target.
-	fx.RequireWorktreePresent(fx.planningWorktreePath())
+	// The Workspace (Layout Version 2 planning mainline) is never a
+	// Cleanup target.
+	fx.RequireWorktreePresent(fx.workspacePath())
 	// Branches, Commits, audit data, and the Workflow aggregate stay.
 	fx.RequireBranchPresent(fx.integrationBranch())
 	fx.RequireTaskBranchPresent()

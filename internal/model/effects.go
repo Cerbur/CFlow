@@ -60,9 +60,25 @@ type ProviderCancelIntent struct {
 
 func (ProviderCancelIntent) isEffectIntent() {}
 
+// WorkspaceWorktreeCreateIntent creates the single long-lived Workspace
+// Branch/Worktree of a new Workflow (design 8.1). BaseHead is the
+// expected-HEAD value the branch is created from; Branch and Path are the
+// identity facts the Application derived through the layout Resolver and
+// the PostgreSQL persisted (design 6.2 rule 6, TUI task 4).
+type WorkspaceWorktreeCreateIntent struct {
+	Workflow WorkflowID
+	BaseHead string
+	Branch   string
+	Path     string
+}
+
+func (WorkspaceWorktreeCreateIntent) isEffectIntent() {}
+
 // PlanningWorktreeCreateIntent creates the Planning Snapshot Worktree
 // fixed at the recorded Base Commit (design 15.2). The Base Commit is an
-// expected-HEAD value, fixed before the Effect (design 6.2 rule 6).
+// expected-HEAD value, fixes before the Effect (design 6.2 rule 6).
+// Task 4 keeps this only as the Legacy Layout path; new Workflows use
+// WorkspaceWorktreeCreateIntent.
 type PlanningWorktreeCreateIntent struct {
 	Workflow   WorkflowID
 	BaseCommit string

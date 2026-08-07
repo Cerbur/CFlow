@@ -50,6 +50,15 @@ type WorkflowCommandInput struct {
 	TargetBranch string
 	BaseCommit   string
 	Reason       string
+
+	// WorkspacePath and WorkspaceBranch are the layout identity facts the
+	// Application derived for the new Workflow (design 7): the
+	// deterministic aggregated workspace root and its CFlow-owned branch.
+	// The Kernel records them at create and requests the
+	// WorkspaceWorktreeCreateIntent with the exact Branch/Path (design
+	// 6.2 rule 6).
+	WorkspacePath   string
+	WorkspaceBranch string
 }
 
 func (WorkflowCommandInput) isInput() {}
@@ -222,6 +231,9 @@ const (
 	// PlanningWorktreeCreated reports that the Planning Snapshot Worktree
 	// exists at the recorded Base Commit.
 	PlanningWorktreeCreated EffectResultKind = "planning-worktree-created"
+	// WorkspaceWorktreeCreated reports that the Workspace Branch/Worktree
+	// exists at the recorded Base Head (design 8.1; TUI task 4).
+	WorkspaceWorktreeCreated EffectResultKind = "workspace-worktree-created"
 	// WorkflowCompiled reports the canonical Dynamic Workflow body the
 	// Compiler produced from the approved Specs, Catalog, and Patch IR.
 	WorkflowCompiled EffectResultKind = "workflow-compiled"
@@ -255,6 +267,7 @@ func (k EffectResultKind) Valid() bool {
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
 		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
+		WorkspaceWorktreeCreated,
 		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated,
 		VerificationRunEnded, IntegrationMerged, IntegrationMergeFailed,
 		IntegrationRollbacked, GitAuditRefCreated:

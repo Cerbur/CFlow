@@ -93,6 +93,49 @@ func (g *GitFlow) createIntegration(ctx context.Context, op CreateIntegration) (
 	return IntegrationWorktreeResult{Worktree: path, Branch: op.Branch, Head: entry.Head}, nil
 }
 
+// createWorkspace creates the single long-lived Workspace Branch/Worktree
+// from the recorded Base Head (design 8.1: created at workflow creation,
+// the cwd of every planning session and of adopted execution). The branch
+// must not already exist.
+func (g *GitFlow) createWorkspace(ctx context.Context, op CreateWorkspace) (GitResult, error) {
+	if err := validateBranchName(op.Branch); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.BaseHead); err != nil {
+		return nil, err
+	}
+	path, err := g.validateWorktreePath(ctx, op.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.requireCommit(ctx, op.BaseHead); err != nil {
+		return nil, err
+	}
+	ref := "refs/heads/" + op.Branch
+	if exists, err := g.refExists(ctx, ref); err != nil {
+		return nil, err
+	} else if exists {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: workspace branch already exists")
+	}
+	env := childEnv()
+	if _, _, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "worktree", "add", "-b", op.Branch, path, op.BaseHead); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: workspace worktree could not be created")
+	}
+	entry, err := g.verifiedEntry(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Detached || entry.Branch != op.Branch || entry.Head != op.BaseHead {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: workspace worktree does not match the expected state")
+	}
+	return WorkspaceWorktreeResult{Worktree: path, Branch: op.Branch, Head: entry.Head}, nil
+}
+
 // createTask creates one isolated Task Branch/Worktree from the verified
 // Integration HEAD recorded when the Task became Ready (design 15.2). An
 // unknown BaseHead is a fail-closed expected-HEAD mismatch: the Task

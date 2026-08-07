@@ -354,7 +354,8 @@ type matrixCase struct {
 
 func TestWorkflowCommandMatrix(t *testing.T) {
 	create := model.WorkflowCommandInput{Kind: model.CreateWorkflow, Workflow: "wf-1", Project: "p-1",
-		TargetBranch: "main", BaseCommit: "base-1"}
+		TargetBranch: "main", BaseCommit: "base-1",
+		WorkspacePath: "/home/projects/p-1/wf-1/workspace", WorkspaceBranch: "cflow/wf-1/workspace"}
 	start := model.WorkflowCommandInput{Kind: model.StartWorkflow}
 	pause := model.WorkflowCommandInput{Kind: model.PauseWorkflow}
 	resume := model.WorkflowCommandInput{Kind: model.ResumeWorkflow}

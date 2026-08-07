@@ -140,13 +140,29 @@ func decideCreateWorkflow(state model.State, in model.WorkflowCommandInput) (mod
 	if in.TargetBranch == "" || in.BaseCommit == "" {
 		return model.Decision{}, model.InvalidInputFault("workflow creation requires a target branch and base commit")
 	}
+	if in.WorkspacePath == "" || in.WorkspaceBranch == "" {
+		return model.Decision{}, model.InvalidInputFault("workflow creation requires the workspace layout facts")
+	}
 	b := &builder{state: state}
-	b.mutate(wfMut(state, model.StageRequirementDiscussion, model.RuntimePending, nil))
+	m := wfMut(state, model.StageRequirementDiscussion, model.RuntimePending, nil)
+	// A create that carries the workspace layout records Layout Version 2
+	// and its canonical workspace facts (Task 4): new workflows run on a
+	// single long-lived Workspace; legacy workflows keep Layout 1 until an
+	// explicit migration (Task 8).
+	m.LayoutVersion = 2
+	m.WorkspacePath = in.WorkspacePath
+	m.WorkspaceBranch = in.WorkspaceBranch
+	b.mutate(m)
 	b.event(model.EventWorkflowCreated, "", model.AttemptKey{}, "", "workflow created")
-	// The Planning Snapshot Worktree is created at the recorded Base
-	// Commit; the expected HEAD is fixed before the Effect (design 15.2,
-	// 6.2 rule 6). The user's working tree is never touched.
-	b.effect(model.PlanningWorktreeCreateIntent{Workflow: in.Workflow, BaseCommit: in.BaseCommit})
+	// The Workspace Branch/Worktree is created at the recorded Base Head;
+	// the expected HEAD, Branch, and Path are fixed before the Effect
+	// (design 8.1, 6.2 rule 6). The user's working tree is never touched.
+	b.effect(model.WorkspaceWorktreeCreateIntent{
+		Workflow: in.Workflow,
+		BaseHead: in.BaseCommit,
+		Branch:   in.WorkspaceBranch,
+		Path:     in.WorkspacePath,
+	})
 	return b.decision(), nil
 }
 

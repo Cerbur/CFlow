@@ -22,6 +22,7 @@ import (
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/decision"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
 	"cflow.local/cflow/internal/process"
@@ -46,6 +47,7 @@ type Application struct {
 	git        *gitflow.GitFlow
 	prompts    *agent.PromptRegistry
 	agent      agent.RuntimeOptions
+	layout     layout.Resolver
 	probe      probe // test seam: protocol-order observation, nil in production
 
 	mu        sync.Mutex
@@ -146,8 +148,9 @@ func New(opts Options) (*Application, error) {
 		redaction:          opts.Redaction,
 		supervisor:         sup,
 		git:                opts.GitFlow,
-		prompts:            opts.Prompts,
-		agent:              opts.Agent,
+prompts:          opts.Prompts,
+		agent:            opts.Agent,
+		layout:           layout.Resolver{Home: opts.Home, ProjectKey: opts.Project.Key},
 		stores:             map[model.WorkflowID]*store.Store{},
 		known:              map[model.WorkflowID]struct{}{},
 		procs:              map[model.ProcessID]process.Handle{},
@@ -693,10 +696,15 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			return nil, "", model.InvalidInputFault("a discussion provider is required and bounded")
 		}
 		wf := model.WorkflowID(a.ids(model.IDWorkflow))
+		ws := a.layout.Workspace(wf)
+		wb := workspaceBranchOf(wf)
 		return model.WorkflowCommandInput{
 			Kind: model.CreateWorkflow, Workflow: wf,
-			Project:      model.ProjectID(a.project.Key),
-			TargetBranch: facts.Branch, BaseCommit: facts.Head,
+			Project:         model.ProjectID(a.project.Key),
+			TargetBranch:    facts.Branch,
+			BaseCommit:      facts.Head,
+			WorkspacePath:   ws,
+			WorkspaceBranch: wb,
 		}, wf, nil
 	case DiscussRequirementCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)

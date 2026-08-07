@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	yaml "go.yaml.in/yaml/v3"
 
@@ -123,15 +124,47 @@ func (a *Application) planningWorktreePath(wf model.WorkflowID) string {
 	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "planning")
 }
 
-// ensureWorktreeParent creates the managed worktree chain 0700 through
-// the security guard.
+// workflowLayout reads the persisted Layout Version of one workflow from
+// the open write Store when the caller holds it, else from a read view
+// (design §7: 1 = legacy planning snapshot, 2 = aggregated workspace).
+func (a *Application) workflowLayout(ctx context.Context, wf model.WorkflowID) int {
+	a.mu.Lock()
+	st := a.stores[wf]
+	a.mu.Unlock()
+	if st != nil {
+		if view, err := st.View(ctx, store.StoreQuery{}); err == nil {
+			return view.State.Workflow.LayoutVersion
+		}
+	}
+	if view, err := a.readAggregate(ctx, wf, store.StoreQuery{}); err == nil {
+		return view.State.Workflow.LayoutVersion
+	}
+	return 0
+}
+
+// planningCWD returns the deterministic session cwd of the planning
+// (non-coding) sessions: the long-lived Workspace on Layout Version 2,
+// the Planning Snapshot Worktree on the legacy Layout 1 (design 8.1,
+// Task 4: Artifact and Plan discovery run inside the Workspace).
+func (a *Application) planningCWD(ctx context.Context, wf model.WorkflowID) string {
+	if a.workflowLayout(ctx, wf) >= 2 {
+		return a.layout.Workspace(wf)
+	}
+	return a.planningWorktreePath(wf)
+}
+
+// ensureWorktreeParent creates every missing ancestor from the managed
+// home down to the parent of the target worktree path, all 0700 through
+// the security guard (design §7: aggregated layout and legacy chain).
 func (a *Application) ensureWorktreeParent(path string) error {
 	parent := filepath.Dir(path)
-	for _, dir := range []string{
-		filepath.Join(a.home, "worktrees"),
-		filepath.Join(a.home, "worktrees", a.project.Key),
-		parent,
-	} {
+	rel, err := filepath.Rel(a.home, parent)
+	if err != nil || rel == "" || strings.HasPrefix(rel, "..") {
+		return model.InvariantFault(fmt.Errorf("worktree path %s is outside the managed home", path))
+	}
+	dir := a.home
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		dir = filepath.Join(dir, part)
 		if _, err := os.Stat(dir); err == nil {
 			continue
 		}
@@ -233,7 +266,8 @@ type workflowManifest struct {
 	Name          string             `yaml:"name"`
 	Repository    repositoryManifest `yaml:"repository"`
 	Bindings      bindingsManifest   `yaml:"bindings"`
-	Planning      planningManifest   `yaml:"planning_snapshot"`
+	Planning      planningManifest   `yaml:"planning_snapshot,omitempty"`
+	Workspace     workspaceManifest  `yaml:"workspace,omitempty"`
 	Artifacts     artifactsManifest  `yaml:"artifacts"`
 	CreatedAt     string             `yaml:"created_at"`
 }
@@ -244,7 +278,8 @@ type repositoryManifest struct {
 	BaseCommit              string `yaml:"base_commit"`
 	InitialWorktreeDirty    bool   `yaml:"initial_worktree_dirty"`
 	InitialDirtyFingerprint string `yaml:"initial_dirty_fingerprint,omitempty"`
-	IntegrationBranch       string `yaml:"integration_branch"`
+	WorkspaceBranch         string `yaml:"workspace_branch,omitempty"`
+	IntegrationBranch       string `yaml:"integration_branch,omitempty"`
 }
 
 type bindingsManifest struct {
@@ -255,6 +290,12 @@ type bindingsManifest struct {
 
 type planningManifest struct {
 	Worktree string `yaml:"worktree"`
+	Head     string `yaml:"head"`
+}
+
+type workspaceManifest struct {
+	Worktree string `yaml:"worktree"`
+	Branch   string `yaml:"branch"`
 	Head     string `yaml:"head"`
 }
 
@@ -270,9 +311,52 @@ type activePlanManifest struct {
 
 // writeWorkflowManifest records the static identity of a created
 // Workflow: the repository baseline, the initial dirty facts, the
-// config/prompt/protocol hashes, and the Planning Snapshot intent and
-// result (brief Step 3).
-func (a *Application) writeWorkflowManifest(ctx context.Context, wf model.WorkflowID, create CreateWorkflowCommand, snap gitflow.PlanningSnapshotResult) error {
+// config/prompt/protocol hashes, and the Workspace Worktree intent and
+// result (TUI task 4).
+func (a *Application) writeWorkflowManifest(ctx context.Context, wf model.WorkflowID, create CreateWorkflowCommand, ws gitflow.WorkspaceWorktreeResult) error {
+	facts, err := a.discoverProject(ctx)
+	if err != nil {
+		return err
+	}
+	d := facts.Status.Dirty
+	m := workflowManifest{
+		SchemaVersion: 2,
+		WorkflowID:    string(wf),
+		ProjectID:     a.project.Key,
+		Name:          create.Name,
+		Repository: repositoryManifest{
+			CanonicalPath:           facts.Root,
+			TargetBranch:            facts.Branch,
+			BaseCommit:              facts.Head,
+			InitialWorktreeDirty:    d.StagedCount+d.UnstagedCount+d.UntrackedCount > 0,
+			InitialDirtyFingerprint: "sha256:" + d.Combined,
+			WorkspaceBranch:         workspaceBranchOf(wf),
+		},
+		Bindings: bindingsManifest{
+			ConfigSHA256:   sha256File(filepath.Join(a.home, "config.yaml")),
+			PromptSHA256:   promptHashOf(a.promptRegistry(), "REQUIREMENT_DISCUSSION"),
+			ProtocolSHA256: providerBindingHash(create.Provider),
+		},
+		Workspace: workspaceManifest{Worktree: ws.Worktree, Branch: ws.Branch, Head: ws.Head},
+		CreatedAt: a.now().UTC().Format("2006-01-02T15:04:05Z07:00"),
+	}
+	body, err := yaml.Marshal(m)
+	if err != nil {
+		return model.InvariantFault(fmt.Errorf("workflow manifest cannot be serialized"))
+	}
+	return a.writeManifest(wf, filepath.Join(a.workflowDir(wf), "workflow.yaml"), body)
+}
+
+// workspaceBranchOf is the deterministic CFlow-owned workspace branch of
+// one workflow (design 8.2).
+func workspaceBranchOf(wf model.WorkflowID) string {
+	return "cflow/" + string(wf) + "/workspace"
+}
+
+// writeLegacyWorkflowManifest records the schema-1 manifest of a Legacy
+// Layout workflow (Planning Snapshot Worktree, no Workspace facts). New
+// Workflows use writeWorkflowManifest with the Workspace facts instead.
+func (a *Application) writeLegacyWorkflowManifest(ctx context.Context, wf model.WorkflowID, create CreateWorkflowCommand, snap gitflow.PlanningSnapshotResult) error {
 	facts, err := a.discoverProject(ctx)
 	if err != nil {
 		return err

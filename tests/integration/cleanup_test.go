@@ -65,6 +65,13 @@ func (cf *cleanupIntegrationFixture) planningWorktreePath() string {
 		app.ProjectFor(cf.af.fx.repo.Root).Key, string(cf.wf), "planning")
 }
 
+// workspacePath returns the aggregated Workspace root of the fixture's
+// workflow (Layout Version 2 planning mainline, design §8).
+func (cf *cleanupIntegrationFixture) workspacePath() string {
+	return filepath.Join(cf.af.fx.home, "projects",
+		app.ProjectFor(cf.af.fx.repo.Root).Key, string(cf.wf), "workspace")
+}
+
 func (cf *cleanupIntegrationFixture) manifestOf(a *app.Application) *model.CleanupAttempt {
 	out, err := a.Execute(context.Background(), app.DryRunCommand{Workflow: cf.wf})
 	if err != nil {
@@ -128,9 +135,10 @@ func TestCleanupDryRunThenExactExecuteRemovesManagedWorktrees(t *testing.T) {
 	if _, err := os.Stat(cf.integrationWorktreePath()); err == nil {
 		t.Fatalf("integration worktree still present")
 	}
-	// The Planning Snapshot is never a Cleanup target.
-	if _, err := os.Stat(cf.planningWorktreePath()); err != nil {
-		t.Fatalf("planning worktree was removed: %v", err)
+	// The Workspace (Layout Version 2 planning mainline) is never a
+	// Cleanup target.
+	if _, err := os.Stat(cf.workspacePath()); err != nil {
+		t.Fatalf("workspace was removed: %v", err)
 	}
 	// Branches and commits survive.
 	taskBranch := "cflow/" + string(cf.wf) + "/task-" + string(cf.taskNode())

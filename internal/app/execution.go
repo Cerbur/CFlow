@@ -44,7 +44,7 @@ import (
 // only produces Candidates: the written Revision is what an Execution
 // Approval may bind (design 16.1).
 func (a *Application) assembleCatalog(ctx context.Context, wf model.WorkflowID, session model.SessionID) (model.ArtifactRef, error) {
-	wrappers, err := verify.DiscoverWrappers(a.planningWorktreePath(wf))
+	wrappers, err := verify.DiscoverWrappers(a.planningCWD(ctx, wf))
 	if err != nil {
 		return model.ArtifactRef{}, err
 	}
@@ -142,7 +142,7 @@ func (a *Application) promoteCatalogProposals(ctx context.Context, wf model.Work
 	for _, e := range catalog.Entries {
 		candidates = append(candidates, catalogEntryCandidate(e))
 	}
-	base := a.planningWorktreePath(wf)
+	base := a.planningCWD(ctx, wf)
 	accepted := 0
 	for _, p := range doc.ProposedCommands {
 		c := proposalCandidate(p, base)
@@ -607,7 +607,7 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 	pv.WorktreePlan = []string{
 		"integration branch: cflow/" + string(wf) + "/integration",
 		"integration worktree: " + integrationPath,
-		"planning snapshot: " + a.planningWorktreePath(wf),
+		"planning snapshot: " + a.planningCWD(ctx, wf),
 		"task worktrees: created at readiness from the verified integration head",
 	}
 

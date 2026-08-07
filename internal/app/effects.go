@@ -62,8 +62,8 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 	case model.ProviderCancelIntent:
 		// STUB (Task 17): the two-phase Provider stop protocol.
 		return model.EffectResultInput{}, stubEffect(e)
-	case model.PlanningWorktreeCreateIntent:
-		return a.planningWorktreeCreate(ctx, e, cmd)
+	case model.WorkspaceWorktreeCreateIntent:
+		return a.workspaceWorktreeCreate(ctx, e, cmd)
 	case model.IntegrationWorktreeCreateIntent:
 		return a.integrationWorktreeCreate(ctx, e)
 	case model.TaskWorktreeCreateIntent:
@@ -165,6 +165,10 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 	case model.ManagedProcessStopIntent:
 		if r.Kind != model.ProcessStopped || r.Process != e.Process {
 			return model.InvariantFault(fmt.Errorf("process stop result does not match intent for process %s", e.Process))
+		}
+	case model.WorkspaceWorktreeCreateIntent:
+		if r.Kind != model.WorkspaceWorktreeCreated {
+			return model.InvariantFault(fmt.Errorf("workspace result does not match its intent"))
 		}
 	case model.PlanningWorktreeCreateIntent:
 		if r.Kind != model.PlanningWorktreeCreated {
@@ -274,10 +278,44 @@ func stubEffect(intent model.EffectIntent) error {
 // planning executors (design 6.3): GitFlow, Agent Runtime, Artifact Store
 // ---------------------------------------------------------------------------
 
+// workspaceWorktreeCreate creates the single long-lived Workspace
+// Branch/Worktree at the recorded Base Head, Branch, and Path (design
+// 8.1; TUI task 4) and writes the workflow.yaml static identity manifest
+// (PRD Workflow 元信息). The user's target branch and working tree are
+// never touched.
+func (a *Application) workspaceWorktreeCreate(ctx context.Context, intent model.WorkspaceWorktreeCreateIntent, cmd Command) (model.EffectResultInput, error) {
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	create, ok := cmd.(CreateWorkflowCommand)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("workspace effect outside workflow creation"))
+	}
+	if intent.Path == "" || intent.Branch == "" {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("workspace create intent carries no path or branch"))
+	}
+	if err := a.ensureWorktreeParent(intent.Path); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := a.git.Execute(ctx, gitflow.CreateWorkspace{
+		Branch:   intent.Branch,
+		BaseHead: intent.BaseHead,
+		Path:     intent.Path,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	ws, ok := res.(gitflow.WorkspaceWorktreeResult)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("workspace result has an unexpected type"))
+	}
+	if err := a.writeWorkflowManifest(ctx, intent.Workflow, create, ws); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return model.EffectResultInput{Kind: model.WorkspaceWorktreeCreated}, nil
+}
+
 // planningWorktreeCreate creates the Planning Snapshot Worktree fixed at
-// the recorded Base Commit (design 15.2) and writes the workflow.yaml
-// static identity manifest (PRD Workflow 元信息). The user's target
-// branch and working tree are never touched.
 func (a *Application) planningWorktreeCreate(ctx context.Context, intent model.PlanningWorktreeCreateIntent, cmd Command) (model.EffectResultInput, error) {
 	if a.git == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
@@ -298,7 +336,10 @@ func (a *Application) planningWorktreeCreate(ctx context.Context, intent model.P
 	if !ok {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("planning snapshot result has an unexpected type"))
 	}
-	if err := a.writeWorkflowManifest(ctx, intent.Workflow, create, snap); err != nil {
+	// Legacy Layout (schema 1): no Workspace facts are recorded. New
+	// Workflows always carry Workspace facts through
+	// WorkspaceWorktreeCreateIntent (Task 4).
+	if err := a.writeLegacyWorkflowManifest(ctx, intent.Workflow, create, snap); err != nil {
 		return model.EffectResultInput{}, err
 	}
 	return model.EffectResultInput{Kind: model.PlanningWorktreeCreated}, nil
@@ -340,7 +381,7 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")
 	}
-	cwd := a.planningWorktreePath(wf)
+	cwd := a.planningCWD(ctx, wf)
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -414,7 +455,7 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
 			"session is not known to the agent runtime")
 	}
-	cwd := a.planningWorktreePath(wf)
+	cwd := a.planningCWD(ctx, wf)
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
