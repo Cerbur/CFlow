@@ -309,10 +309,10 @@ func (fx *e2eFixture) inspect(wf model.WorkflowID) app.InspectView {
 	return view.(app.InspectView)
 }
 
-// worktreeBase is the deterministic managed worktree root of one
-// workflow.
+// worktreeBase is the deterministic aggregated workflow root of one
+// workflow (design 8.5, TUI task 7): <home>/projects/<key>/<workflow-id>.
 func (fx *e2eFixture) worktreeBase(wf model.WorkflowID) string {
-	return filepath.Join(fx.home, "worktrees", app.ProjectFor(fx.repo).Key, string(wf))
+	return filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, string(wf))
 }
 
 // ---------------------------------------------------------------------------
@@ -663,18 +663,20 @@ func TestFakePlanToIntegration(t *testing.T) {
 		}
 	}
 
-	// The Integration Branch exists with a serial --no-ff Merge Commit per
-	// Task, and the merged source is present in the Integration Worktree.
+	// The Workspace Branch exists with a serial --no-ff Merge Commit per
+	// Task, and the merged source is present in the Workspace Worktree
+	// (the aggregated Workspace is the single delivery mainline, design
+	// 8.5, TUI task 7).
 	base := fx.worktreeBase(wf)
-	integration := filepath.Join(base, "integration")
+	workspace := filepath.Join(base, "workspace")
 	for _, file := range []string{"src/multiply.ts", "src/divide.ts", "test/integration.test.ts"} {
-		if !pathExists(filepath.Join(integration, file)) {
-			t.Fatalf("merged file %s missing from the integration worktree", file)
+		if !pathExists(filepath.Join(workspace, file)) {
+			t.Fatalf("merged file %s missing from the workspace worktree", file)
 		}
 	}
-	merged := git(fx.repo, "rev-list", "--count", "--merges", "cflow/"+string(wf)+"/integration")
+	merged := git(fx.repo, "rev-list", "--count", "--merges", "cflow/"+string(wf)+"/workspace")
 	if n, err := strconv.Atoi(merged); err != nil || n < 4 {
-		t.Fatalf("integration merge commits = %q, want at least 4 serial --no-ff merges", merged)
+		t.Fatalf("workspace merge commits = %q, want at least 4 serial --no-ff merges", merged)
 	}
 	// The audit Refs pin every Attempt end.
 	for _, id := range []string{"task-s01", "task-s02", "task-s03", "task-s04"} {
@@ -683,13 +685,10 @@ func TestFakePlanToIntegration(t *testing.T) {
 			t.Fatalf("audit ref %s missing", ref)
 		}
 	}
-	// The user's working tree and the planning snapshot were never
-	// touched by any Task.
-	for _, root := range []string{fx.repo, filepath.Join(base, "planning")} {
-		for _, file := range []string{"src/multiply.ts", "src/divide.ts"} {
-			if pathExists(filepath.Join(root, file)) {
-				t.Fatalf("task output leaked into %s", root)
-			}
+	// The user's working tree was never touched by any Task.
+	for _, file := range []string{"src/multiply.ts", "src/divide.ts"} {
+		if pathExists(filepath.Join(fx.repo, file)) {
+			t.Fatalf("task output leaked into the user's working tree")
 		}
 	}
 }
@@ -738,7 +737,7 @@ func TestFakeMissingCommitAndDirtyWorktree(t *testing.T) {
 		t.Fatalf("user dirt changed: %q", data)
 	}
 	// The dirty Task Worktree is preserved for repair (never discarded).
-	if !pathExists(filepath.Join(fx.worktreeBase(wf), "tasks", "task-s01", "src", "multiply.ts")) {
+	if !pathExists(filepath.Join(fx.worktreeBase(wf), "tmp", "tasks", "task-s01", "src", "multiply.ts")) {
 		t.Fatalf("the dirty task worktree content was discarded")
 	}
 }

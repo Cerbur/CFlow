@@ -153,6 +153,18 @@ func (a *Application) planningCWD(ctx context.Context, wf model.WorkflowID) stri
 	return a.planningWorktreePath(wf)
 }
 
+// deliveryFacts returns the layout-aware delivery mainline facts of one
+// workflow: on the aggregated workspace layout (Version 2) the Workspace
+// Branch and the verified Workspace Head (design 8.5, TUI task 7); on the
+// legacy Layout 1 the Integration Branch and Head. The verified head is
+// the only legal Task base and the delivery the protected Apply merges.
+func (a *Application) deliveryFacts(ctx context.Context, wf model.WorkflowID, st model.State) (branch, head, path string) {
+	if st.Workflow.LayoutVersion >= 2 {
+		return st.Workflow.WorkspaceBranch, st.Workflow.VerifiedWorkspaceHead, a.layout.Workspace(wf)
+	}
+	return st.Workflow.IntegrationBranch, st.Workflow.IntegrationHead, a.integrationWorktreePath(wf)
+}
+
 // ensureWorktreeParent creates every missing ancestor from the managed
 // home down to the parent of the target worktree path, all 0700 through
 // the security guard (design §7: aggregated layout and legacy chain).

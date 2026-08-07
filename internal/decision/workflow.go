@@ -48,15 +48,24 @@ func decideComplete(state model.State, in model.CompleteWorkflowInput) (model.De
 		return model.Decision{}, model.InvalidInputFault(
 			"completion requires the succeeded final verify attempt with evidence")
 	}
-	// The exact Integration Commit evidence: the head the Final Reviewer
-	// bound must still be the current Integration HEAD (design 16.2:
-	// completion is bound to the evidence subject it verified).
-	if fv.StartHead == "" || fv.StartHead != state.Workflow.IntegrationHead {
+	// The exact delivery Commit evidence: the head the Final Reviewer
+	// bound must still be the current delivery HEAD (design 16.2:
+	// completion is bound to the evidence subject it verified). On the
+	// aggregated workspace layout the verified Workspace Head is the
+	// delivery (design 8.5, TUI task 7); the legacy layout uses the
+	// Integration HEAD.
+	deliveryHead := state.Workflow.IntegrationHead
+	deliveryBranch := state.Workflow.IntegrationBranch
+	if state.Workflow.LayoutVersion >= 2 {
+		deliveryHead = state.Workflow.VerifiedWorkspaceHead
+		deliveryBranch = state.Workflow.WorkspaceBranch
+	}
+	if fv.StartHead == "" || fv.StartHead != deliveryHead {
 		return model.Decision{}, model.NewFault(model.CodeEvidenceSubjectChanged,
-			"the integration head moved after the final review; completion requires the exact verified head")
+			"the delivery head moved after the final review; completion requires the exact verified head")
 	}
 	// Every Merge Node's succeeded Attempt carries commit evidence on the
-	// recorded Integration Branch: the delivery chain's evidence subjects
+	// recorded delivery Branch: the delivery chain's evidence subjects
 	// are exact.
 	for _, n := range state.Nodes {
 		if n.Kind != model.NodeMerge {
@@ -67,7 +76,7 @@ func decideComplete(state model.State, in model.CompleteWorkflowInput) (model.De
 			return model.Decision{}, model.InvalidInputFault(
 				"completion requires a succeeded merge attempt for " + string(n.ID))
 		}
-		if !evidenceOn(ma.Evidence, model.EvidenceCommit, state.Workflow.IntegrationBranch) {
+		if !evidenceOn(ma.Evidence, model.EvidenceCommit, deliveryBranch) {
 			return model.Decision{}, model.NewFault(model.CodeEvidenceSubjectChanged,
 				"a merge attempt's commit evidence subject changed; completion requires the exact verified subjects")
 		}
@@ -570,19 +579,31 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 		PreflightRevision: facts.PreflightRevision,
 	}})
 	// The approval is the workflow's entry into EXECUTION: dispatch opens
-	// with a fresh Run (closing every prior gate run) and the deterministic
-	// Integration Branch is recorded.
+	// with a fresh Run (closing every prior gate run). On the aggregated
+	// workspace layout the Workspace (created at workflow creation, Task
+	// 4) IS the single delivery mainline — no Integration Branch/Worktree
+	// is created (design 8.5, TUI task 7). On the legacy Layout 1 the
+	// deterministic Integration Branch is recorded and its Worktree
+	// creation requested.
 	closePriorRuns(b, state)
 	b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
-	b.mutate(wfWithIntegration(state, model.StageExecution, model.RuntimeRunning, integrationBranch(state.Workflow.ID)))
+	if state.Workflow.LayoutVersion >= 2 {
+		m := wfMut(state, model.StageExecution, model.RuntimeRunning, state.Workflow.CancelIntent)
+		m.WorkspaceBranch = state.Workflow.WorkspaceBranch
+		b.mutate(m)
+	} else {
+		b.mutate(wfWithIntegration(state, model.StageExecution, model.RuntimeRunning, integrationBranch(state.Workflow.ID)))
+	}
 	b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workflow resumed into execution")
 	b.event(model.EventExecutionApproved, "", model.AttemptKey{}, "", "execution approved")
 	b.event(model.EventStageChanged, "", model.AttemptKey{}, "", "stage changed to EXECUTION")
-	b.effect(model.IntegrationWorktreeCreateIntent{
-		Workflow:   state.Workflow.ID,
-		BaseCommit: state.Workflow.BaseCommit,
-	})
+	if state.Workflow.LayoutVersion < 2 {
+		b.effect(model.IntegrationWorktreeCreateIntent{
+			Workflow:   state.Workflow.ID,
+			BaseCommit: state.Workflow.BaseCommit,
+		})
+	}
 	return b.decision(), nil
 }
 

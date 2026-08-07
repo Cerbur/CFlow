@@ -79,6 +79,10 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return a.integrationMerge(ctx, wf, e)
 	case model.IntegrationRollbackIntent:
 		return a.integrationRollback(ctx, wf, e)
+	case model.WorkspaceMergeIntent:
+		return a.workspaceMerge(ctx, wf, e)
+	case model.WorkspaceRollbackIntent:
+		return a.workspaceRollback(ctx, wf, e)
 	case model.VerificationRunIntent:
 		return a.verificationRun(ctx, wf, e)
 	case model.ApplyStagingCreateIntent:
@@ -233,6 +237,17 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 	case model.IntegrationRollbackIntent:
 		if r.Kind != model.IntegrationRollbacked || r.Attempt != e.Attempt {
 			return model.InvariantFault(fmt.Errorf("integration rollback result does not match its intent"))
+		}
+	case model.WorkspaceMergeIntent:
+		if r.Kind != model.WorkspaceMerged && r.Kind != model.WorkspaceMergeFailed {
+			return model.InvariantFault(fmt.Errorf("workspace merge result does not match its intent"))
+		}
+		if r.Kind == model.WorkspaceMergeFailed && r.PreMergeHead == "" {
+			return model.InvariantFault(fmt.Errorf("workspace merge failure carries no pre-merge head"))
+		}
+	case model.WorkspaceRollbackIntent:
+		if r.Kind != model.WorkspaceRollbacked || r.Attempt != e.Attempt {
+			return model.InvariantFault(fmt.Errorf("workspace rollback result does not match its intent"))
 		}
 	case model.GitAuditRefCreateIntent:
 		if r.Kind != model.GitAuditRefCreated {

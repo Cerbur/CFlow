@@ -385,7 +385,14 @@ func (af *applyFixture) targetHead() string {
 }
 
 func (af *applyFixture) integrationHead() string {
-	return af.inspect().Status.IntegrationHead
+	st := af.inspect().Status
+	// On the aggregated workspace layout the delivery mainline is the
+	// verified Workspace head (design 8.5, TUI task 7); the legacy layout
+	// reads the Integration head.
+	if st.VerifiedWorkspaceHead != "" {
+		return st.VerifiedWorkspaceHead
+	}
+	return st.IntegrationHead
 }
 
 // applyBranchHead resolves the current head of the CFlow-owned Apply

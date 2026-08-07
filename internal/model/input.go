@@ -296,6 +296,15 @@ const (
 	// IntegrationRollbacked reports that the managed Integration Worktree
 	// was restored to the recorded pre-merge HEAD.
 	IntegrationRollbacked EffectResultKind = "integration-rollbacked"
+	// WorkspaceMerged reports one serial --no-ff Workspace merge with the
+	// Merge Commit evidence (design 8.5; TUI task 7).
+	WorkspaceMerged EffectResultKind = "workspace-merged"
+	// WorkspaceMergeFailed reports a failed Workspace merge with the typed
+	// reason; the Kernel requests the recorded Workspace Rollback.
+	WorkspaceMergeFailed EffectResultKind = "workspace-merge-failed"
+	// WorkspaceRollbacked reports that the managed Workspace Worktree was
+	// restored to the recorded pre-merge HEAD.
+	WorkspaceRollbacked EffectResultKind = "workspace-rollbacked"
 	// GitAuditRefCreated reports one created append-only audit Ref.
 	GitAuditRefCreated EffectResultKind = "git-audit-ref-created"
 )
@@ -310,7 +319,8 @@ func (k EffectResultKind) Valid() bool {
 		WorkspaceWorktreeCreated,
 		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated,
 		VerificationRunEnded, IntegrationMerged, IntegrationMergeFailed,
-		IntegrationRollbacked, GitAuditRefCreated:
+		IntegrationRollbacked, GitAuditRefCreated,
+		WorkspaceMerged, WorkspaceMergeFailed, WorkspaceRollbacked:
 		return true
 	}
 	return false

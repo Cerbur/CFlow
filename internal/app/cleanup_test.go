@@ -141,11 +141,17 @@ func (cf *cleanupFixture) taskNode() model.NodeID {
 }
 
 func (cf *cleanupFixture) taskWorktreePath() string {
-	return filepath.Join(cf.af.fx.home, "worktrees", ProjectFor(cf.af.fx.root).Key, string(cf.wf), "tasks", string(cf.taskNode()))
+	// Layout Version 2: the aggregated temporary root <root>/tmp/tasks/
+	// <node> (design 8.5, TUI task 7); the legacy layout reads the
+	// worktrees/<key>/<wf>/tasks/<node> path.
+	return filepath.Join(cf.af.fx.home, "projects", ProjectFor(cf.af.fx.root).Key, string(cf.wf), "tmp", "tasks", string(cf.taskNode()))
 }
 
 func (cf *cleanupFixture) integrationWorktreePath() string {
-	return filepath.Join(cf.af.fx.home, "worktrees", ProjectFor(cf.af.fx.root).Key, string(cf.wf), "integration")
+	// Layout Version 2: the aggregated Workspace IS the delivery mainline
+	// (design 8.5, TUI task 7); the legacy layout reads the
+	// worktrees/<key>/<wf>/integration path.
+	return filepath.Join(cf.af.fx.home, "projects", ProjectFor(cf.af.fx.root).Key, string(cf.wf), "workspace")
 }
 
 func (cf *cleanupFixture) planningWorktreePath() string {
@@ -163,7 +169,10 @@ func (cf *cleanupFixture) taskBranch() string {
 }
 
 func (cf *cleanupFixture) integrationBranch() string {
-	return "cflow/" + string(cf.wf) + "/integration"
+	// Layout Version 2: the Workspace Branch is the delivery mainline
+	// (design 8.5, TUI task 7); the legacy layout reads the Integration
+	// Branch.
+	return "cflow/" + string(cf.wf) + "/workspace"
 }
 
 // ---------------------------------------------------------------------------
@@ -528,11 +537,12 @@ func TestCleanupRejectsWrongOwnerScratch(t *testing.T) {
 	fx.RequireTaskBranchPresent()
 }
 
-// TestCleanupPartialResultStopsAtFailedItem: the Integration Worktree
-// (item 0) is removed, the Task Worktree removal command is injected to
-// fail, so the Task item FAILS and the Attempt Blocks with partial results
-// explicit; the scratch item is never requested and every unremoved
-// target stays preserved.
+// TestCleanupPartialResultStopsAtFailedItem: the Task Worktree removal
+// command is injected to fail, so the Task item FAILS and the Attempt
+// Blocks with partial results explicit; the scratch item is never
+// requested and every unremoved target stays preserved. The aggregated
+// Workspace (the delivery mainline, design 8.5) is never a Cleanup
+// target.
 func TestCleanupPartialResultStopsAtFailedItem(t *testing.T) {
 	fx := newCleanupFixture(t)
 	scratch := filepath.Join(fx.af.fx.home, "scratch", "run-1", "tmp")
@@ -543,9 +553,8 @@ func TestCleanupPartialResultStopsAtFailedItem(t *testing.T) {
 		t.Fatalf("write scratch payload: %v", err)
 	}
 	manifest := fx.PlanCleanup(scratch)
-	// Fail the Task Worktree removal command itself: the Integration item
-	// (0) is removed first, the Task item (1) fails, the scratch item (2)
-	// is never requested.
+	// Fail the Task Worktree removal command itself: the Task item (0)
+	// fails, the scratch item (1) is never requested.
 	fx.af.trace.armFailCall(func(args []string) bool {
 		return len(args) >= 3 && args[0] == "worktree" && args[1] == "remove" && args[2] == fx.taskWorktreePath()
 	})
@@ -559,8 +568,6 @@ func TestCleanupPartialResultStopsAtFailedItem(t *testing.T) {
 	att := out.Cleanup
 	for i := range att.Items {
 		switch att.Items[i].CanonicalPath {
-		case fx.integrationWorktreePath():
-			fx.requireItem(&att.Items[i], model.CleanupItemCompleted, "")
 		case fx.taskWorktreePath():
 			fx.requireItem(&att.Items[i], model.CleanupItemFailed, model.CodeCleanupItemFailed)
 		case scratch:
@@ -569,30 +576,31 @@ func TestCleanupPartialResultStopsAtFailedItem(t *testing.T) {
 			}
 		}
 	}
-	fx.RequireWorktreeRemoved(fx.integrationWorktreePath())
 	fx.RequireTaskWorktreePresent()
 	fx.RequireTaskBranchPresent()
+	fx.RequireWorktreePresent(fx.workspacePath())
 	if _, err := os.Stat(scratch); err != nil {
 		t.Fatalf("scratch %s was touched by a blocked cleanup", scratch)
 	}
 	fx.RequireWorkflowCompleted()
 }
 
-// TestCleanupCrashAfterRemovalRecovers: the Integration removal succeeds
-// but the post-removal verification is injected to fail, leaving the item
-// REQUESTED with the Worktree already gone; the retry reconciles (the
-// exact target is absent) and completes the remaining items without ever
-// re-removing or pretending the removed target present.
+// TestCleanupCrashAfterRemovalRecovers: the Task Worktree removal
+// succeeds but the post-removal verification is injected to fail, leaving
+// the item REQUESTED with the Worktree already gone; the retry reconciles
+// (the exact target is absent) and completes the remaining items without
+// ever re-removing or pretending the removed target present. The
+// aggregated Workspace (the delivery mainline) is never a Cleanup target.
 func TestCleanupCrashAfterRemovalRecovers(t *testing.T) {
 	fx := newCleanupFixture(t)
 	manifest := fx.PlanCleanup()
 	fx.af.trace.armFailAfter(func(args []string) bool {
-		return len(args) >= 3 && args[0] == "worktree" && args[1] == "remove" && args[2] == fx.integrationWorktreePath()
+		return len(args) >= 3 && args[0] == "worktree" && args[1] == "remove" && args[2] == fx.taskWorktreePath()
 	})
 	if err := fx.ExecuteCleanup(manifest.ID, manifest.Hash); err == nil {
 		t.Fatalf("the injected post-removal crash must fail the execution")
 	}
-	fx.RequireWorktreeRemoved(fx.integrationWorktreePath())
+	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
 	iv := fx.inspect()
 	att := iv.CleanupAttempts[len(iv.CleanupAttempts)-1]
 	if att.Status != model.CleanupStatusRunning {
@@ -610,9 +618,9 @@ func TestCleanupCrashAfterRemovalRecovers(t *testing.T) {
 	if out.Cleanup == nil || out.Cleanup.Status != model.CleanupStatusSucceeded {
 		t.Fatalf("cleanup after recovery = %+v, want SUCCEEDED", out.Cleanup)
 	}
-	fx.RequireWorktreeRemoved(fx.integrationWorktreePath())
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
 	fx.RequireTaskBranchPresent()
+	fx.RequireWorktreePresent(fx.workspacePath())
 	fx.RequireBranchPresent(fx.integrationBranch())
 	fx.RequireWorkflowCompleted()
 }
@@ -633,10 +641,9 @@ func TestCleanupRemovesCleanWorktreesAndPreservesEvidence(t *testing.T) {
 	if out.Cleanup == nil || out.Cleanup.Status != model.CleanupStatusSucceeded {
 		t.Fatalf("cleanup = %+v, want SUCCEEDED", out.Cleanup)
 	}
-	fx.RequireWorktreeRemoved(fx.integrationWorktreePath())
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
-	// The Workspace (Layout Version 2 planning mainline) is never a
-	// Cleanup target.
+	// The Workspace (the aggregated delivery mainline, design 8.5) is
+	// never a Cleanup target.
 	fx.RequireWorktreePresent(fx.workspacePath())
 	// Branches, Commits, audit data, and the Workflow aggregate stay.
 	fx.RequireBranchPresent(fx.integrationBranch())
@@ -691,9 +698,9 @@ func TestCleanupRemovesExactScratchPath(t *testing.T) {
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Fatalf("sentinel %s was removed by a broader-than-exact deletion", sentinel)
 	}
-	fx.RequireWorktreeRemoved(fx.integrationWorktreePath())
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
 	fx.RequireTaskBranchPresent()
+	fx.RequireWorktreePresent(fx.workspacePath())
 	fx.RequireWorkflowCompleted()
 }
 

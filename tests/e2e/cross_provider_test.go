@@ -370,18 +370,19 @@ func TestDialectEquivalentCrossProvider(t *testing.T) {
 		}
 	}
 
-	// Serial --no-ff Integration merges.
-	merged := git(fx.repo, "rev-list", "--count", "--merges", "cflow/"+string(wf)+"/integration")
+	// Serial --no-ff Workspace merges: the aggregated Workspace Branch is
+	// the single delivery mainline (design 8.5, TUI task 7).
+	merged := git(fx.repo, "rev-list", "--count", "--merges", "cflow/"+string(wf)+"/workspace")
 	if n, err := strconv.Atoi(merged); err != nil || n < 2 {
-		t.Fatalf("integration merge commits = %q, want at least 2 serial --no-ff merges", merged)
+		t.Fatalf("workspace merge commits = %q, want at least 2 serial --no-ff merges", merged)
 	}
 
-	// The Final Verify bound the exact Integration HEAD: its Attempt's
-	// StartHead is the head the Final Reviewer verified and the Workflow
-	// completed against.
+	// The Final Verify bound the exact verified Workspace HEAD: its
+	// Attempt's StartHead is the head the Final Reviewer verified and the
+	// Workflow completed against.
 	fv := attemptOf(iv, "final-verify")
-	if fv == nil || fv.StartHead == "" || fv.StartHead != iv.Status.IntegrationHead {
-		t.Fatalf("final-verify attempt %+v does not bind the integration head %s", fv, iv.Status.IntegrationHead)
+	if fv == nil || fv.StartHead == "" || fv.StartHead != iv.Status.VerifiedWorkspaceHead {
+		t.Fatalf("final-verify attempt %+v does not bind the verified workspace head %s", fv, iv.Status.VerifiedWorkspaceHead)
 	}
 
 	// The immutable Final Report renders PASSED with Apply not run.

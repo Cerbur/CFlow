@@ -299,14 +299,17 @@ func TestExecutionLifecyclePlanToIntegrationWorktree(t *testing.T) {
 	if len(pv.WorktreePlan) == 0 {
 		t.Fatal("no worktree plan in the preview")
 	}
-	// The compiled workflow carries the integration resource lock on its
-	// merge node.
-	if len(pv.Locks) != 1 || pv.Locks[0].Lock != "integration:"+string(wf) {
+	// The compiled workflow carries the workspace resource lock on its
+	// merge node (design 8.5, TUI task 7: the serial --no-ff merges
+	// advance the single Workspace).
+	if len(pv.Locks) != 1 || pv.Locks[0].Lock != "workspace:"+string(wf) {
 		t.Fatalf("locks = %+v", pv.Locks)
 	}
 
-	// The exact Approval advances to EXECUTION and alone requests the
-	// Integration Worktree creation.
+	// The exact Approval advances to EXECUTION; on the aggregated layout
+	// the Workspace (created at workflow creation) is the single delivery
+	// mainline — no Integration Worktree is created (design 8.5, TUI task
+	// 7).
 	approveExecution(t, fx, wf, pv)
 	view := fx.status(wf)
 	if view.Stage != model.StageExecution || view.Runtime != model.RuntimeRunning {
@@ -324,16 +327,22 @@ func TestExecutionLifecyclePlanToIntegrationWorktree(t *testing.T) {
 		t.Fatalf("execution approval refs = %+v, want all four artifacts", execution.Refs)
 	}
 
-	// The Integration Worktree exists at the recorded Base Commit, and
-	// the Integration Branch exists in the repository.
+	// The Workspace exists at the recorded Base Commit and the Workspace
+	// Branch exists in the repository; no Integration Worktree/Branch is
+	// created on the aggregated layout.
 	integrationPath := filepath.Join(fx.home, "worktrees", ProjectFor(fx.root).Key, string(wf), "integration")
-	if !pathExists(integrationPath) {
-		t.Fatalf("integration worktree %s was not created", integrationPath)
+	if pathExists(integrationPath) {
+		t.Fatalf("integration worktree %s was created on the aggregated layout", integrationPath)
 	}
 	if out, err := execGit(fx.root, "branch", "--list", "cflow/"+string(wf)+"/integration").CombinedOutput(); err != nil {
 		t.Fatalf("list integration branch: %v", err)
-	} else if !strings.Contains(string(out), "cflow/"+string(wf)+"/integration") {
-		t.Fatalf("integration branch missing: %s", out)
+	} else if strings.Contains(string(out), "cflow/"+string(wf)+"/integration") {
+		t.Fatalf("integration branch exists on the aggregated layout: %s", out)
+	}
+	if out, err := execGit(fx.root, "branch", "--list", "cflow/"+string(wf)+"/workspace").CombinedOutput(); err != nil {
+		t.Fatalf("list workspace branch: %v", err)
+	} else if !strings.Contains(string(out), "cflow/"+string(wf)+"/workspace") {
+		t.Fatalf("workspace branch missing: %s", out)
 	}
 }
 
@@ -1139,20 +1148,19 @@ func TestDifferentProjectsDispatchConcurrently(t *testing.T) {
 }
 
 // TestCodingOccursOnlyInTaskWorktree: the Fake coding Session's writes
-// land only in the Task Worktree; the user workspace, the Planning
-// Snapshot, and the Integration Worktree are untouched (PRD Worktree 策略).
+// land only in the Task Worktree; the user workspace and the Workspace are
+// untouched (PRD Worktree 策略, design 8.5).
 func TestCodingOccursOnlyInTaskWorktree(t *testing.T) {
 	fx := newExecutionFixture(t)
 	fx.RunReadyTasks()
-	base := filepath.Join(fx.home, "worktrees", ProjectFor(fx.root).Key, string(fx.wf))
+	base := filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key, string(fx.wf))
 	coded := filepath.Join("src", "divide", "divide.go")
-	if !pathExists(filepath.Join(base, "tasks", "S01", coded)) {
-		t.Fatalf("the coded file must land in the Task Worktree %s", filepath.Join(base, "tasks", "S01", coded))
+	if !pathExists(filepath.Join(base, "tmp", "tasks", "S01", coded)) {
+		t.Fatalf("the coded file must land in the Task Worktree %s", filepath.Join(base, "tmp", "tasks", "S01", coded))
 	}
 	for _, root := range []string{
 		fx.root,
-		filepath.Join(base, "planning"),
-		filepath.Join(base, "integration"),
+		filepath.Join(base, "workspace"),
 	} {
 		if pathExists(filepath.Join(root, coded)) {
 			t.Fatalf("the coded file leaked into %s", root)
@@ -1160,22 +1168,23 @@ func TestCodingOccursOnlyInTaskWorktree(t *testing.T) {
 	}
 }
 
-// TestTaskBaseIsVerifiedIntegrationHeadAtReadiness: the Task Base Commit
-// recorded at readiness is the Integration HEAD, and the Task Branch and
-// Worktree are created from it (PRD Worktree 策略).
-func TestTaskBaseIsVerifiedIntegrationHeadAtReadiness(t *testing.T) {
+// TestTaskBaseIsVerifiedWorkspaceHeadAtReadiness: the Task Base Commit
+// recorded at readiness is the verified Workspace HEAD, and the Task
+// Branch and Worktree are created from it (design 8.5, TUI task 7: Task
+// Base = current verified Workspace Head).
+func TestTaskBaseIsVerifiedWorkspaceHeadAtReadiness(t *testing.T) {
 	fx := newExecutionFixture(t)
 	fx.RunReadyTasks()
-	// The Task Base must equal the Integration Worktree's actual HEAD (the
-	// verified Integration HEAD at readiness, PRD Worktree 策略).
-	integrationPath := filepath.Join(fx.home, "worktrees", ProjectFor(fx.root).Key, string(fx.wf), "integration")
-	out, err := execGit(integrationPath, "rev-parse", "HEAD").CombinedOutput()
+	// The Task Base must equal the Workspace Worktree's actual HEAD (the
+	// verified Workspace Head at readiness).
+	workspacePath := filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key, string(fx.wf), "workspace")
+	out, err := execGit(workspacePath, "rev-parse", "HEAD").CombinedOutput()
 	if err != nil {
-		t.Fatalf("resolve integration head: %v", err)
+		t.Fatalf("resolve workspace head: %v", err)
 	}
 	head := strings.TrimSpace(string(out))
 	if head == "" {
-		t.Fatal("no integration head recorded")
+		t.Fatal("no workspace head recorded")
 	}
 	db, err := sql.Open("sqlite", filepath.Join(fx.home, "cflow.db"))
 	if err != nil {
@@ -1189,7 +1198,7 @@ func TestTaskBaseIsVerifiedIntegrationHeadAtReadiness(t *testing.T) {
 		t.Fatalf("read task row: %v", err)
 	}
 	if base != head {
-		t.Fatalf("task base = %s, want the integration head %s", base, head)
+		t.Fatalf("task base = %s, want the workspace head %s", base, head)
 	}
 	if branch != "cflow/"+string(fx.wf)+"/task-S01" {
 		t.Fatalf("task branch = %q", branch)

@@ -230,6 +230,141 @@ func (a *Application) gitAuditRefCreate(ctx context.Context, intent model.GitAud
 	return model.EffectResultInput{Kind: model.GitAuditRefCreated}, nil
 }
 
+// workspaceMerge performs one serial --no-ff Workspace merge (design 8.5,
+// TUI task 7): the verified Task Branch is merged into the single
+// long-lived Workspace Worktree at its Workspace Branch. The pre-merge
+// facts are re-observed (the recorded Expected Workspace Head, a clean
+// Workspace, and the accepted Commit still the Task Branch HEAD), the
+// Commit Preflight runs before the merge, and the Merge Commit's identity
+// is verified after it. A text conflict or a failed post-merge check
+// returns a typed failed result carrying the recorded pre-merge HEAD; the
+// Kernel requests the Workspace Rollback. Task history is never rewritten:
+// a sibling that merged first simply moves the expected head the next
+// merge Intent pinned at scheduling time.
+func (a *Application) workspaceMerge(ctx context.Context, wf model.WorkflowID, intent model.WorkspaceMergeIntent) (model.EffectResultInput, error) {
+	attempt := a.runningAttemptKey(ctx, wf, intent.Node)
+	fail := func(code model.Code, reason string) model.EffectResultInput {
+		return model.EffectResultInput{
+			Kind: model.WorkspaceMergeFailed, Attempt: attempt,
+			FailureCode: code, PreMergeHead: intent.ExpectedWorkspaceHead, Reason: reason,
+		}
+	}
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	path := a.planningCWD(ctx, wf)
+
+	// Pre-merge facts (PRD: Merge 前再次比较已验收 Commit、Task Branch HEAD
+	// 和 Git-clean 状态).
+	status, err := a.observeWorktree(ctx, path, intent.ExpectedWorkspaceHead)
+	if err != nil {
+		return fail(model.CodeStateInvariantViolation, "pre-merge workspace status is unreadable"), nil
+	}
+	if !status.Clean() {
+		return fail(model.CodeDirtyTaskWorktree, "the workspace is not git-clean before the merge"), nil
+	}
+	refFacts, err := a.git.Observe(ctx, gitflow.RefLookup{Ref: "refs/heads/" + intent.TaskBranch})
+	if err != nil {
+		return fail(model.CodeStateInvariantViolation, "task branch facts are unreadable"), nil
+	}
+	rf, ok := refFacts.(gitflow.RefFacts)
+	if !ok || !rf.Exists || rf.Value != intent.VerifiedCommit {
+		return fail(model.CodeEvidenceSubjectChanged, "the task branch moved after verification"), nil
+	}
+
+	// The Commit Preflight runs before the Merge Commit is created (PRD
+	// 已确认：Merge Conflict 处理).
+	preflightRes, err := a.git.Execute(ctx, gitflow.CommitPreflight{
+		Revision: fmt.Sprintf("workspace-merge-%s-%s", wf, attempt.Node),
+	})
+	if err != nil {
+		return fail(model.CodeGitIdentityNotConfigured, "merge commit preflight failed"), nil
+	}
+	preflight, ok := preflightRes.(gitflow.PreflightEvidence)
+	if !ok {
+		return fail(model.CodeStateInvariantViolation, "merge preflight result has an unexpected type"), nil
+	}
+
+	res, err := a.git.Execute(ctx, gitflow.MergeIntegration{Path: path, Branch: intent.TaskBranch})
+	if err != nil {
+		code, _ := model.CodeOf(err)
+		return fail(code, "the workspace merge did not complete"), nil
+	}
+	switch r := res.(type) {
+	case gitflow.MergeConflictResult:
+		return fail(model.CodeMergeConflict, "text conflict; the workspace stays at the pre-merge head for the rollback"), nil
+	case gitflow.MergeResult:
+		// The Merge Commit's identity must match the just-run Preflight.
+		if _, err := a.git.Execute(ctx, gitflow.VerifyCommit{
+			Ref: r.Head, ExpectedAuthor: preflight.Author,
+			ExpectedCommitter: preflight.Committer, ExpectedSigning: preflight.Signing,
+		}); err != nil {
+			return fail(model.CodeCommitPolicyMismatch, "merge commit identity does not match the preflight"), nil
+		}
+		// Post-merge check: the Worktree is clean at the Merge Commit.
+		post, err := a.observeWorktree(ctx, path, r.Head)
+		if err != nil {
+			return fail(model.CodeStateInvariantViolation, "post-merge status is unreadable"), nil
+		}
+		if !post.Clean() {
+			return fail(model.CodeMergeConflict, "post-merge verification failed: the workspace is not git-clean"), nil
+		}
+		return model.EffectResultInput{
+			Kind: model.WorkspaceMerged, Attempt: attempt,
+			EndHead: r.Head,
+			Evidence: model.EvidenceRef{
+				Kind: model.EvidenceCommit, Hash: r.Head, Subject: intent.TaskBranch,
+			},
+			EvidenceRefs: []model.EvidenceRef{
+				{Kind: model.EvidenceCommit, Hash: r.Head, Subject: intent.TaskBranch},
+				{Kind: model.EvidenceGitSnapshot, Hash: r.Head, Subject: "workspace"},
+			},
+		}, nil
+	default:
+		return fail(model.CodeStateInvariantViolation, "merge result has an unexpected type"), nil
+	}
+}
+
+// workspaceRollback restores the managed Workspace Worktree to the
+// recorded pre-merge HEAD (RollbackMerge: `git merge --abort` for a
+// conflicted merge, the guarded reset for a committed merge that failed
+// its post-merge checks; design 8.5, PRD 已确认：Merge Conflict 处理). Only
+// the managed Workspace Worktree is touched. When a committed merge is
+// rolled back, the failed Merge Commit's hash is captured as evidence
+// before the restore, so the failure stays auditable; the typed FailureCode
+// rides the result so the Attempt settles with the code the executor
+// observed.
+func (a *Application) workspaceRollback(ctx context.Context, wf model.WorkflowID, intent model.WorkspaceRollbackIntent) (model.EffectResultInput, error) {
+	if a.git == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	path := a.planningCWD(ctx, wf)
+	evidence := []model.EvidenceRef{
+		{Kind: model.EvidenceGitSnapshot, Hash: intent.Head, Subject: "workspace"},
+	}
+	// A committed merge that failed its post-merge checks advanced the
+	// head; its Commit is captured as evidence before the restore.
+	if pre, err := a.observeWorktree(ctx, path, ""); err == nil && pre.Head != "" && pre.Head != intent.Head {
+		evidence = append([]model.EvidenceRef{
+			{Kind: model.EvidenceCommit, Hash: pre.Head, Subject: "workspace"},
+		}, evidence...)
+	}
+	res, err := a.git.Execute(ctx, gitflow.RollbackMerge{Path: path, ExpectedHead: intent.Head})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	rr, ok := res.(gitflow.RollbackResult)
+	if !ok {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("rollback result has an unexpected type"))
+	}
+	return model.EffectResultInput{
+		Kind: model.WorkspaceRollbacked, Attempt: intent.Attempt,
+		EndHead: rr.Head, FailureCode: intent.FailureCode,
+		Evidence:     evidence[0],
+		EvidenceRefs: evidence,
+	}, nil
+}
+
 // reviewProviderStart runs the independent Reviewer Session (design
 // 16.2, TASK_REVIEW purpose) inside the Task Worktree, bound to the
 // exact Commit/Catalog/evidence refs through its typed input block. The
@@ -309,6 +444,9 @@ func (a *Application) finalReviewProviderStart(ctx context.Context, wf model.Wor
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the final review purpose")
 	}
 	cwd := a.integrationWorktreePath(wf)
+	if a.workflowLayout(ctx, wf) >= 2 {
+		cwd = a.planningCWD(ctx, wf)
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -363,6 +501,15 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	}
 	st := view.State
 	worktree := a.integrationWorktreePath(wf)
+	deliveryBranch := st.Workflow.IntegrationBranch
+	deliveryHead := st.Workflow.IntegrationHead
+	if st.Workflow.LayoutVersion >= 2 {
+		// Aggregated workspace layout (design 8.5, TUI task 7): the final
+		// acceptance covers the verified Workspace result.
+		worktree = a.planningCWD(ctx, wf)
+		deliveryBranch = st.Workflow.WorkspaceBranch
+		deliveryHead = st.Workflow.VerifiedWorkspaceHead
+	}
 	// Collect every verify node's deterministic evidence so the Final
 	// Reviewer can judge each acceptance node independently (a real codex
 	// Final Reviewer once failed SEMANTIC_REVIEW_FAILED because only the
@@ -415,12 +562,12 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
 		Catalog:           string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
 		Workflow:          string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
-		IntegrationBranch: st.Workflow.IntegrationBranch,
-		IntegrationHead:   st.Workflow.IntegrationHead,
+		IntegrationBranch: deliveryBranch,
+		IntegrationHead:   deliveryHead,
 		TargetBranch:      st.Workflow.TargetBranch,
 		Verification:      verificationBody,
-		Diff:              a.gitDiff(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
-		Commits:           a.gitLog(ctx, worktree, st.Workflow.TargetBranch+".."+st.Workflow.IntegrationHead),
+		Diff:              a.gitDiff(ctx, worktree, st.Workflow.TargetBranch+".."+deliveryHead),
+		Commits:           a.gitLog(ctx, worktree, st.Workflow.TargetBranch+".."+deliveryHead),
 		Nodes:             strings.Join(nodeAcceptance, "\n"),
 	}, nil
 }
@@ -690,7 +837,16 @@ func (a *Application) verificationNodeFacts(ctx context.Context, wf model.Workfl
 		return "", "", "", "", fmt.Errorf("verify node references no catalog command")
 	}
 	if nodeKindOf(found) == model.NodeFinalVerify {
-		return commandID, "", verify.PurposeFinalVerify, a.integrationWorktreePath(wf), nil
+		// The Final Verify runs inside the full accepted delivery: the
+		// Workspace Worktree on the aggregated layout (design 8.5, TUI
+		// task 7), the Integration Worktree on the legacy layout (Task
+		// 18, PRD 最终验收: 全量构建与测试 over the full Integration
+		// range).
+		cwd := a.integrationWorktreePath(wf)
+		if a.workflowLayout(ctx, wf) >= 2 {
+			cwd = a.planningCWD(ctx, wf)
+		}
+		return commandID, "", verify.PurposeFinalVerify, cwd, nil
 	}
 	taskNode, err = taskDependencyNode(wfIR, found)
 	if err != nil {

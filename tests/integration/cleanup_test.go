@@ -51,13 +51,16 @@ func (cf *cleanupIntegrationFixture) taskNode() model.NodeID {
 }
 
 func (cf *cleanupIntegrationFixture) taskWorktreePath() string {
-	return filepath.Join(cf.af.fx.home, "worktrees",
-		app.ProjectFor(cf.af.fx.repo.Root).Key, string(cf.wf), "tasks", string(cf.taskNode()))
+	return filepath.Join(cf.af.fx.home, "projects",
+		app.ProjectFor(cf.af.fx.repo.Root).Key, string(cf.wf), "tmp", "tasks", string(cf.taskNode()))
 }
 
 func (cf *cleanupIntegrationFixture) integrationWorktreePath() string {
-	return filepath.Join(cf.af.fx.home, "worktrees",
-		app.ProjectFor(cf.af.fx.repo.Root).Key, string(cf.wf), "integration")
+	// Layout Version 2: the aggregated Workspace IS the delivery mainline
+	// (design 8.5, TUI task 7); the legacy layout reads the
+	// worktrees/<key>/<wf>/integration path.
+	return filepath.Join(cf.af.fx.home, "projects",
+		app.ProjectFor(cf.af.fx.repo.Root).Key, string(cf.wf), "workspace")
 }
 
 func (cf *cleanupIntegrationFixture) planningWorktreePath() string {
@@ -132,11 +135,11 @@ func TestCleanupDryRunThenExactExecuteRemovesManagedWorktrees(t *testing.T) {
 	if _, err := os.Stat(cf.taskWorktreePath()); err == nil {
 		t.Fatalf("task worktree still present")
 	}
-	if _, err := os.Stat(cf.integrationWorktreePath()); err == nil {
-		t.Fatalf("integration worktree still present")
+	// The Workspace (the aggregated delivery mainline, design 8.5) is
+	// never a Cleanup target.
+	if _, err := os.Stat(cf.integrationWorktreePath()); err != nil {
+		t.Fatalf("workspace was removed by cleanup: %v", err)
 	}
-	// The Workspace (Layout Version 2 planning mainline) is never a
-	// Cleanup target.
 	if _, err := os.Stat(cf.workspacePath()); err != nil {
 		t.Fatalf("workspace was removed: %v", err)
 	}
@@ -145,8 +148,8 @@ func TestCleanupDryRunThenExactExecuteRemovesManagedWorktrees(t *testing.T) {
 	if out := strings.TrimSpace(string(cf.af.fx.repo.git("rev-parse", "--verify", "--quiet", "refs/heads/"+taskBranch))); out == "" {
 		t.Fatalf("task branch %s was deleted", taskBranch)
 	}
-	if out := strings.TrimSpace(string(cf.af.fx.repo.git("rev-parse", "--verify", "--quiet", "refs/heads/"+cf.af.fx.Inspect(cf.wf).Status.IntegrationBranch))); out == "" {
-		t.Fatalf("integration branch was deleted")
+	if out := strings.TrimSpace(string(cf.af.fx.repo.git("rev-parse", "--verify", "--quiet", "refs/heads/cflow/"+string(cf.wf)+"/workspace"))); out == "" {
+		t.Fatalf("workspace branch was deleted")
 	}
 	iv := cf.af.fx.Inspect(cf.wf)
 	if iv.Status.Stage != model.StageCompleted || iv.Status.Runtime != model.RuntimeSucceeded {

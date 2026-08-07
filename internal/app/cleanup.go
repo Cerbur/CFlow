@@ -342,11 +342,16 @@ func (a *Application) validateCleanupScratch(path string) error {
 
 // validateCleanupWorktreeTarget re-validates one managed Worktree target
 // immediately before its removal: the exact canonical path must be under
-// the recorded CFLOW_HOME/worktrees/<project-key>/<workflow-id>/ and owned
-// by the effective user. A mismatch is CLEANUP_FACT_MISMATCH and deletes
+// the workflow's managed root — the aggregated <home>/projects/<key>/
+// <workflow-id>/ on Layout Version 2 (design 8.5, TUI task 7), the legacy
+// <home>/worktrees/<key>/<workflow-id>/ on Layout 1 — and owned by the
+// effective user. A mismatch is CLEANUP_FACT_MISMATCH and deletes
 // nothing.
 func (a *Application) validateCleanupWorktreeTarget(wf model.WorkflowID, path string) error {
 	root := filepath.Join(a.home, "worktrees", a.project.Key, string(wf))
+	if a.workflowLayout(context.Background(), wf) >= 2 {
+		root = a.layout.WorkflowRoot(wf)
+	}
 	if !strings.HasPrefix(path, root+string(filepath.Separator)) {
 		return model.NewFault(model.CodeCleanupFactsChanged,
 			"worktree target escapes the recorded managed root")

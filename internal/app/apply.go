@@ -58,7 +58,8 @@ func (a *Application) applyStagingCreate(ctx context.Context, wf model.WorkflowI
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("apply attempt %s is missing", intent.Apply))
 	}
 	targetBranch := view.State.Workflow.TargetBranch
-	integrationBranch := view.State.Workflow.IntegrationBranch
+	deliveryBranch, _, _ := a.deliveryFacts(ctx, wf, view.State)
+	integrationBranch := deliveryBranch
 
 	// 1. The workspace gate (PRD step 1: clean and attached to the
 	// expected Target Branch at the recorded head).
@@ -144,9 +145,15 @@ func (a *Application) applyWorkspaceGate(ctx context.Context, targetBranch, targ
 }
 
 // applyWorktreePath is the deterministic Apply Worktree location of one
-// attempt (PRD 全局目录结构; each attempt stages in its own isolated
-// Worktree, preserved for inspection and retry).
+// attempt: the aggregated temporary root <root>/tmp/apply-<n> on Layout
+// Version 2 (design 13.1, TUI task 7), the legacy
+// worktrees/<project-key>/<workflow-id>/apply-<n> on Layout 1 (PRD 全局
+// 目录结构; each attempt stages in its own isolated Worktree, preserved
+// for inspection and retry).
 func (a *Application) applyWorktreePath(wf model.WorkflowID, number int) string {
+	if a.workflowLayout(context.Background(), wf) >= 2 {
+		return a.layout.Apply(wf, number)
+	}
 	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf),
 		fmt.Sprintf("apply-%d", number))
 }
@@ -179,6 +186,9 @@ func (a *Application) applyWorktreeEnsure(ctx context.Context, wf model.Workflow
 			}
 			return path, nil
 		}
+	}
+	if err := a.ensureWorktreeParent(path); err != nil {
+		return "", err
 	}
 	res, err := a.git.Execute(ctx, gitflow.CreateApply{Branch: branch, BaseHead: att.TargetHead, Path: path})
 	if err != nil {
@@ -473,7 +483,8 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("apply attempt %s is missing", intent.Apply))
 	}
 	targetBranch := view.State.Workflow.TargetBranch
-	integrationBranch := view.State.Workflow.IntegrationBranch
+	deliveryBranch, _, _ := a.deliveryFacts(ctx, wf, view.State)
+	integrationBranch := deliveryBranch
 	targetRef := "refs/heads/" + targetBranch
 
 	// The staging head is the Apply Branch ref (the authoritative git

@@ -54,13 +54,17 @@ func (a *Application) prepareApply(ctx context.Context, wf model.WorkflowID) (mo
 	if err != nil {
 		return nil, "", err
 	}
-	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+st.Workflow.IntegrationBranch)
+	deliveryBranch, deliveryHead, _ := a.deliveryFacts(ctx, resolved, st)
+	if deliveryBranch == "" || deliveryHead == "" {
+		return nil, "", model.InvalidInputFault("apply requires the recorded delivery branch and head")
+	}
+	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+deliveryBranch)
 	if err != nil {
 		return nil, "", err
 	}
-	if integrationHead != st.Workflow.IntegrationHead {
+	if integrationHead != deliveryHead {
 		return nil, "", model.NewFault(model.CodeTargetHeadChanged,
-			"the integration branch no longer matches the recorded head")
+			"the delivery branch no longer matches the recorded head")
 	}
 	fingerprint, err := a.observePolicyFingerprint(ctx, "apply-"+string(resolved))
 	if err != nil {
@@ -121,9 +125,14 @@ func (a *Application) prepareApplyExecute(ctx context.Context, wf model.Workflow
 	if err != nil {
 		return nil, "", err
 	}
-	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+st.Workflow.IntegrationBranch)
+	deliveryBranch, deliveryHead, _ := a.deliveryFacts(ctx, resolved, st)
+	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+deliveryBranch)
 	if err != nil {
 		return nil, "", err
+	}
+	if integrationHead != deliveryHead {
+		return nil, "", model.NewFault(model.CodeTargetHeadChanged,
+			"the delivery branch no longer matches the recorded head")
 	}
 	return model.ApplyCommandInput{
 		Kind:              model.ApplyExecute,
@@ -165,9 +174,14 @@ func (a *Application) prepareApplyPolicyConfirm(ctx context.Context, wf model.Wo
 	if err != nil {
 		return nil, "", err
 	}
-	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+st.Workflow.IntegrationBranch)
+	deliveryBranch, deliveryHead, _ := a.deliveryFacts(ctx, resolved, st)
+	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+deliveryBranch)
 	if err != nil {
 		return nil, "", err
+	}
+	if integrationHead != deliveryHead {
+		return nil, "", model.NewFault(model.CodeTargetHeadChanged,
+			"the delivery branch no longer matches the recorded head")
 	}
 	if st.Workflow.ExecutionFacts == nil {
 		return nil, "", model.InvalidInputFault("the confirmation requires the approved execution facts")

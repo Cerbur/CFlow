@@ -587,7 +587,13 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 	}
 	for _, n := range wfIR.Nodes {
 		if n.Type == "merge" {
-			pv.Locks = append(pv.Locks, LockPreview{NodeID: n.ID, Lock: "integration:" + string(wf)})
+			lock := "integration:" + string(wf)
+			if a.workflowLayout(ctx, wf) >= 2 {
+				// Aggregated workspace layout (design 8.5, TUI task 7): the
+				// serial --no-ff merges advance the same Workspace.
+				lock = "workspace:" + string(wf)
+			}
+			pv.Locks = append(pv.Locks, LockPreview{NodeID: n.ID, Lock: lock})
 		}
 	}
 	pv.ParallelGroups = compile.ParallelGroups(wfIR)
@@ -601,16 +607,29 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 		})
 	}
 
-	// The Worktree plan: the Integration Branch is withheld until the
-	// Execution Approval; task worktrees are created at readiness from
-	// the verified Integration HEAD (PRD Worktree 策略).
-	integrationPath := filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "integration")
-	pv.WorktreePlan = []string{
-		"integration branch: cflow/" + string(wf) + "/integration",
-		"integration worktree: " + integrationPath,
+	// The Worktree plan: on the aggregated workspace layout the Workspace
+	// (created at workflow creation) is the single mainline and task
+	// worktrees branch from the verified Workspace Head at readiness; the
+	// legacy layout withholds the Integration Branch until the Execution
+	// Approval (PRD Worktree 策略).
+	worktreePlan := []string{
 		"planning snapshot: " + a.planningCWD(ctx, wf),
-		"task worktrees: created at readiness from the verified integration head",
 	}
+	if a.workflowLayout(ctx, wf) >= 2 {
+		worktreePlan = append(worktreePlan,
+			"workspace: "+a.layout.Workspace(wf),
+			"workspace branch: cflow/"+string(wf)+"/workspace",
+			"task worktrees: created at readiness from the verified workspace head",
+		)
+	} else {
+		integrationPath := filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "integration")
+		worktreePlan = append(worktreePlan,
+			"integration branch: cflow/"+string(wf)+"/integration",
+			"integration worktree: "+integrationPath,
+			"task worktrees: created at readiness from the verified integration head",
+		)
+	}
+	pv.WorktreePlan = worktreePlan
 
 	// The Provider default-permission trust boundary (PRD 约束 323):
 	// agents run with the provider's default permissions and the user's

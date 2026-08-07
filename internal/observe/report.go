@@ -123,7 +123,13 @@ type ReportWorkflow struct {
 	BaseCommit        string
 	IntegrationBranch string
 	IntegrationHead   string
-	PlanRevision      int
+	// Workspace facts (design 8.5, TUI task 7): the aggregated workspace
+	// is the single delivery mainline on Layout Version 2.
+	WorkspaceBranch           string
+	VerifiedWorkspaceHead     string
+	CandidateWorkspaceHead    string
+	WorkspaceDirtyFingerprint string
+	PlanRevision              int
 }
 
 // ReportSummary is the aggregate count summary (PRD 最终报告示例).
@@ -240,6 +246,10 @@ func GenerateReport(in ReportInput) (Report, error) {
 			TargetBranch: st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
 			IntegrationBranch: st.Workflow.IntegrationBranch,
 			IntegrationHead:   st.Workflow.IntegrationHead,
+			WorkspaceBranch:   st.Workflow.WorkspaceBranch,
+			VerifiedWorkspaceHead:     st.Workflow.VerifiedWorkspaceHead,
+			CandidateWorkspaceHead:    st.Workflow.CandidateWorkspaceHead,
+			WorkspaceDirtyFingerprint: st.Workflow.WorkspaceDirtyFingerprint,
 		},
 		Migration:   in.Migration,
 		Security:    in.Security,

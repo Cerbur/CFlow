@@ -51,6 +51,12 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return decideIntegrationMergeFailed(state, in)
 	case model.IntegrationRollbacked:
 		return decideIntegrationRollbacked(state, in)
+	case model.WorkspaceMerged:
+		return decideWorkspaceMerged(state, in)
+	case model.WorkspaceMergeFailed:
+		return decideWorkspaceMergeFailed(state, in)
+	case model.WorkspaceRollbacked:
+		return decideWorkspaceRollbacked(state, in)
 	case model.GitAuditRefCreated:
 		// The append-only audit Ref exists; the aggregate records the
 		// Attempt evidence through the gate result, not a separate row.

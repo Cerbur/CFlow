@@ -146,6 +146,36 @@ type IntegrationRollbackIntent struct {
 
 func (IntegrationRollbackIntent) isEffectIntent() {}
 
+// WorkspaceMergeIntent merges one verified Task Branch into the single
+// long-lived Workspace (design 8.5, TUI task 7): ExpectedWorkspaceHead is
+// the current verified Workspace Head the merge must observe
+// (compare-and-sawp); TaskBranch and VerifiedCommit fix the exact Task
+// Branch and the accepted Commit the merge must bring in. Parallel sibling
+// Tasks may share an old Base, but every merge Intent fixes the LATEST
+// verified Workspace Head at scheduling time; merges are serial --no-ff
+// and never auto-rebase or rewrite Task history.
+type WorkspaceMergeIntent struct {
+	Node                NodeID
+	ExpectedWorkspaceHead string
+	TaskBranch          string
+	VerifiedCommit      string
+}
+
+func (WorkspaceMergeIntent) isEffectIntent() {}
+
+// WorkspaceRollbackIntent restores the managed Workspace Worktree to a
+// recorded pre-merge HEAD after a failed Workspace merge. Attempt fixes
+// the Attempt whose failure the rollback settles; FailureCode carries the
+// typed failure the Attempt settles with once the Worktree is restored
+// ("" means the default MERGE_CONFLICT).
+type WorkspaceRollbackIntent struct {
+	Head        string
+	Attempt     AttemptKey
+	FailureCode Code
+}
+
+func (WorkspaceRollbackIntent) isEffectIntent() {}
+
 // VerificationRunIntent runs one approved Catalog Entry by identity.
 type VerificationRunIntent struct {
 	Node        NodeID
