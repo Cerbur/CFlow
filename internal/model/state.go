@@ -332,11 +332,38 @@ type Workflow struct {
 	BaseCommit string
 	// IntegrationBranch is the CFlow-owned branch that serially
 	// accumulates verified Task Commit histories for one Workflow
-	// (CONTEXT.md: Integration Branch).
+	// (CONTEXT.md: Integration Branch). Legacy compatibility read field:
+	// no new Workflow writes it (design 7).
 	IntegrationBranch string
 	// IntegrationHead is the current HEAD of the CFlow-owned Integration
-	// Branch, advanced only by verified serial merges.
+	// Branch, advanced only by verified serial merges. Legacy read field:
+	// Task 6 stops writing it for new Workflows; existing rows keep it.
 	IntegrationHead string
+
+	// LayoutVersion is the layout the Workflow's managed directories bind
+	// to: 1 is the legacy integration layout, 2 is the aggregated
+	// workspace layout (design 7). The default for migrated legacy rows
+	// is 1; a create that predates workspace wiring persists 1, and the
+	// aggregated create path (Task 4) persists 2.
+	LayoutVersion int
+	// WorkspacePath is the canonical aggregated workspace root of a
+	// Layout Version 2 Workflow: <home>/projects/<key>/<workflow-id>/workspace
+	// (design 8.1).
+	WorkspacePath string
+	// WorkspaceBranch is the CFlow-owned branch of the workspace
+	// Worktree (design 8.2).
+	WorkspaceBranch string
+	// CandidateWorkspaceHead is the workspace HEAD recorded when the
+	// Execution Approval was granted (design 8.4); the adopted head must
+	// equal it before further scheduling.
+	CandidateWorkspaceHead string
+	// VerifiedWorkspaceHead is the workspace HEAD verified after the
+	// workspace was adopted (design 8.4).
+	VerifiedWorkspaceHead string
+	// WorkspaceDirtyFingerprint is the observed dirty state of the
+	// workspace when the facts were written; a later dispatch must
+	// reconcile against it (design 8.4).
+	WorkspaceDirtyFingerprint string
 
 	// ExecutionFacts are the immutable policy references an Execution
 	// Approval binds by exact hash (design 20.1).

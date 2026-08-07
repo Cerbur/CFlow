@@ -105,15 +105,21 @@ func (b *builder) decision() model.Decision { return b.d }
 // caller passes through the current values except the ones it changes.
 func wfMut(state model.State, stage model.WorkflowStage, rt model.RuntimeStatus, intent *model.CancelIntent) model.WorkflowMutation {
 	return model.WorkflowMutation{
-		ID:                state.Workflow.ID,
-		Project:           state.Workflow.Project,
-		Stage:             stage,
-		Runtime:           rt,
-		TargetBranch:      state.Workflow.TargetBranch,
-		BaseCommit:        state.Workflow.BaseCommit,
-		IntegrationBranch: state.Workflow.IntegrationBranch,
-		IntegrationHead:   state.Workflow.IntegrationHead,
-		CancelIntent:      intent,
+		ID:                        state.Workflow.ID,
+		Project:                   state.Workflow.Project,
+		Stage:                     stage,
+		Runtime:                   rt,
+		TargetBranch:              state.Workflow.TargetBranch,
+		BaseCommit:                state.Workflow.BaseCommit,
+		IntegrationBranch:         state.Workflow.IntegrationBranch,
+		IntegrationHead:           state.Workflow.IntegrationHead,
+		LayoutVersion:             state.Workflow.LayoutVersion,
+		WorkspacePath:             state.Workflow.WorkspacePath,
+		WorkspaceBranch:           state.Workflow.WorkspaceBranch,
+		CandidateWorkspaceHead:    state.Workflow.CandidateWorkspaceHead,
+		VerifiedWorkspaceHead:     state.Workflow.VerifiedWorkspaceHead,
+		WorkspaceDirtyFingerprint: state.Workflow.WorkspaceDirtyFingerprint,
+		CancelIntent:              intent,
 	}
 }
 

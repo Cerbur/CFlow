@@ -43,6 +43,7 @@ func migrations() []Migration {
 		{Version: 2, ID: "cflow-002-cleanup-apply", File: "002_cleanup_apply.sql"},
 		{Version: 3, ID: "cflow-003-integration-head", File: "003_integration_head.sql"},
 		{Version: 4, ID: "cflow-004-apply-staging-head", File: "004_apply_staging_head.sql"},
+		{Version: 5, ID: "cflow-005-workspace-layout", File: "005_workspace_layout.sql"},
 	}
 	for i, m := range reg {
 		body, err := migrationfs.FS.ReadFile(m.File)

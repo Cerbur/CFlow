@@ -212,6 +212,7 @@ var migrationMeta = []struct {
 	{2, "cflow-002-cleanup-apply", "002_cleanup_apply.sql"},
 	{3, "cflow-003-integration-head", "003_integration_head.sql"},
 	{4, "cflow-004-apply-staging-head", "004_apply_staging_head.sql"},
+	{5, "cflow-005-workspace-layout", "005_workspace_layout.sql"},
 }
 
 func migrationSHA(t *testing.T, file string) string {
@@ -265,7 +266,7 @@ func v1DB(t *testing.T) string {
 func v1WithBackup(t *testing.T, phase string) (string, string) {
 	t.Helper()
 	path := v1DB(t)
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-005-workspace-layout")
 	if err := os.MkdirAll(backupDir, 0o700); err != nil {
 		t.Fatalf("backup dir: %v", err)
 	}
@@ -288,7 +289,7 @@ func v1WithBackup(t *testing.T, phase string) (string, string) {
 		}
 		manifest := map[string]any{
 			"source_version": 1,
-			"target_version": 4,
+			"target_version": 5,
 			"cflow_version":  "0.0.0-dev",
 			"database_hash":  sha256Hex(buf),
 			"database_size":  len(buf),
@@ -296,6 +297,7 @@ func v1WithBackup(t *testing.T, phase string) (string, string) {
 				{"migration_id": "cflow-002-cleanup-apply", "migration_sha256": migrationSHA(t, "002_cleanup_apply.sql")},
 				{"migration_id": "cflow-003-integration-head", "migration_sha256": migrationSHA(t, "003_integration_head.sql")},
 				{"migration_id": "cflow-004-apply-staging-head", "migration_sha256": migrationSHA(t, "004_apply_staging_head.sql")},
+				{"migration_id": "cflow-005-workspace-layout", "migration_sha256": migrationSHA(t, "005_workspace_layout.sql")},
 			},
 			"backup_path":   backupPath,
 			"manifest_path": filepath.Join(backupDir, "backup-manifest.json"),
@@ -381,8 +383,8 @@ func injectMigrationCrashAfterManifest(t *testing.T, _ matrixRow) rowResult {
 		t.Fatalf("read backup after reopen: %v", err)
 	}
 	ev := evidenceOf("chain_applied", "backup_reused")
-	if rawUserVersion(t, path) == 3 && migrationRowsCount(t, path) == 3 {
-		ev["chain_applied"] = true
+	if rawUserVersion(t, path) != 5 || migrationRowsCount(t, path) != 5 {
+		ev["chain_applied"] = false
 	}
 	if string(before) == string(after) {
 		ev["backup_reused"] = true
