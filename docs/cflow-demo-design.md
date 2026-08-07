@@ -15,13 +15,17 @@ prd_sha256: 28765291866c197dbef2124c5e0bf066e3a3bebba1c72a85f9f99b18e00f66de
 
 ## 1. Document status and authority
 
+> **2026-08-07 已确认变更**：另行批准了 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`。全屏 Bubble Tea TUI 成为默认主入口；Native Codex/Claude 需求讨论、聚合 Workflow 目录、唯一 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup 取代旧 line-oriented CLI 交互；Cobra Headless CLI 保留为与 TUI 同级的正式入口。本设计文档中涉及 line-oriented CLI 的段落标记为 `Superseded`，仅作历史架构背景；其安全不变量、状态所有权、审批门与证据门禁全部保留并继续适用。
+
 This document translates the approved [CFlow PRD](./cflow-prd.md) into a Go architecture and executable technical contract. It does not change product scope, add a third normal approval gate, or authorize implementation.
 
-The PRD remains authoritative for product behaviour. The user approved this design on 2026-08-02. If the two documents conflict, the PRD wins and this design must be corrected through an explicit successor revision.
+The PRD remains authoritative for product behaviour. The user approved this design on 2026-08-02, and approved the TUI workflow design on 2026-08-07. If the two documents conflict, the PRD wins and this design must be corrected through an explicit successor revision.
 
 The repository-wide domain language is defined in [`CONTEXT.md`](../CONTEXT.md). Code, schemas, CLI text, tests, and future documentation must use those canonical terms.
 
 ## 2. Design outcome
+
+> **2026-08-07 更新**：以下"line-oriented CLI"表述已被 TUI Workflow 设计取代。交互层现在由 Bubble Tea TUI 与 Cobra Headless CLI 两个同级前端组成，二者共用同一个 Application 接口；需求讨论默认进入 Provider 原生 Terminal，详见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`。
 
 CFlow will be a foreground, local-first Go CLI built around one application seam and a small set of deep modules:
 
@@ -46,8 +50,10 @@ The design deliberately avoids:
 
 ```mermaid
 flowchart LR
-    U["User"] --> CLI["CFlow line-oriented CLI"]
-    CLI --> APP["Application module"]
+    U["User"] --> TUI["CFlow TUI (Bubble Tea)"]
+    U --> CLI["CFlow Headless CLI (Cobra)"]
+    TUI --> APP["Application module"]
+    CLI --> APP
     APP --> STORE["SQLite State Store"]
     APP --> ART["Immutable Artifact Store"]
     APP --> AGENT["Agent Runtime"]
@@ -63,6 +69,8 @@ flowchart LR
     GIT --> REPO["Local Git repository and worktrees"]
     VERIFY --> TOOLS["Approved local project tools"]
 ```
+
+> 2026-08-07 更新：TUI 与 Headless CLI 是两个同级前端，共用同一个 Application 接口；TUI 通过 Foreground Runner 驱动执行，并通过 Native Session Bridge 挂起自身 Alternate Screen 运行 Codex/Claude 原生讨论。详细分层见 TUI Workflow 设计 §6。
 
 All CFlow-owned state remains local. Provider CLIs and approved project commands may use the network according to their own configuration; CFlow does not claim an offline or OS-sandbox boundary.
 
@@ -811,6 +819,8 @@ CFlow Demo does not provide application-layer encryption, a general OS sandbox, 
 
 ## 20. CLI and interaction design
 
+> **Superseded (2026-08-07)**：本节原为 line-oriented CLI 设计。2026-08-07 已确认变更后，全屏 Bubble Tea TUI 成为默认主入口，需求讨论默认进入 Codex / Claude 原生 Terminal；Cobra Headless CLI 保留为与 TUI 同级的正式入口。本节的历史内容仅保留作为架构背景。
+
 The CLI is line-oriented and owns stdin while CFlow is in the foreground. Provider output is rendered as streaming redacted events; Provider TUI attach remains P1.
 
 CLI package responsibilities are limited to:
@@ -828,6 +838,8 @@ The CLI never:
 - decides state transitions;
 - interprets an Agent message as success;
 - mutates global Git, Provider, shell, or Codex configuration.
+
+> 2026-08-07 补充：上述"CLI never"约束同时适用于 TUI。TUI 同样不得直接读写 SQLite/Artifact、调用 Git 或 Provider、判定状态转换、把 Agent 文本认定为成功，也不得自行推进 Workflow 状态；任何变更动作都必须发起类型化 Command，与 Headless CLI 共用同一套 Application 接口。
 
 Command exit classes:
 

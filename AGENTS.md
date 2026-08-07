@@ -6,14 +6,20 @@ CFlow 是一个 local-first 的 Coding Agent Workflow CLI，负责从 Plan 到 D
 
 ## 当前阶段
 
-项目当前处于**Demo 实现阶段**。PRD v0.2、Demo 技术设计 v0.1 和实现 Plan v0.1 已获得用户明确确认；用户选择在独立 Claude Code Session 中采用 Subagent-Driven 模式执行。实现必须严格遵循 `docs/cflow-demo-implementation-plan.md` 的任务顺序和 Gate：
+> **2026-08-07 已确认变更**：全屏 TUI 成为默认主入口；Native Discussion、聚合 Workflow 目录、唯一 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup 取代旧的 line-oriented Demo 交互决策。权威规格见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`，任务顺序见 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md`。旧决策（"Demo 不使用全屏 TUI"等）标记为 `Superseded`，仅作历史背景；其安全不变量全部保留。
 
-- 每个任务使用新的 Implementer 上下文，完成后必须经过独立的规格符合性和代码质量审查。
-- Critical/Important 审查问题修复并复审通过前，不得进入下一任务。
-- 每个任务必须有目标测试、全量测试、Git Commit 和 Git-visible Clean 证据。
-- Gate 1 和 Gate 2 只能标记为 Internal Candidate；不得提前宣称 Demo 完成。
-- 真实 Provider E2E 和 Self-Dogfood 仍需执行时的单独明确批准。
-- 不实现完整 TUI、OpenCode P1、复杂插件系统或其他已列非目标。
+项目当前处于**TUI 工作流实现阶段**。此前已确认的 PRD v0.2、Demo 技术设计 v0.1 和实现 Plan v0.1（line-oriented Demo）构成历史基线；实现必须严格遵循 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md` 的 Task 1–16 顺序与如下 Gate：
+
+- 每个 Task 使用新的 Implementer 上下文，完成后必须经过独立的规格符合性和代码质量审查。
+- Critical/Important 审查问题修复并复审通过前，不得进入下一 Task。
+- 每个 Task 必须有目标测试、全量测试、Git Commit 和 Git-visible Clean 证据。
+- 外部命令一律 program + argv，禁止 `shell: true`、Force、Ignore、Best-effort、Danger/Bypass Flag。
+- Bubble Tea TUI/Headless CLI 共用权威 Application/Runtime；TUI 不直接写 SQLite、Artifact、Git 或最终状态。
+- 全局 `$CFLOW_HOME/cflow.db` 继续是权威状态库；Workflow-local `state/` 只是投影与恢复辅助证据。
+- 真实 Codex/Claude E2E 和 Self-Dogfood 仍需执行时的单独明确批准。
+- 新 Workflow 立即使用聚合目录；Legacy Layout 只读可识别，迁移必须显式执行。
+- 原始 Target Branch 只在显式 Apply Execute 时改变；Apply 必须同步更新原始 Target Working Tree 的 HEAD、Index 与文件。
+- Cleanup 必须显式 Dry Run 和确认。
 - 不创建云端服务。
 - 不自动 push、创建 PR 或修改远程仓库。
 
@@ -52,4 +58,4 @@ CFlow 是一个 local-first 的 Coding Agent Workflow CLI，负责从 Plan 到 D
 
 ## 当前阶段的交付门槛
 
-严格按已批准实现 Plan 的 Task 1–22 与 Gate 1–3 执行。若实现发现产品不变量、深模块边界、审批模型或事实权威无法满足，必须停止并返回文档审查；不得为了让代码通过而静默削弱 PRD、设计或 Plan。
+严格按已批准 TUI 实现 Plan 的 Task 1–16 执行。若实现发现产品不变量、深模块边界、审批模型或事实权威无法满足，必须停止并返回文档审查；不得为了让代码通过而静默削弱设计或 Plan。旧的 line-oriented Demo 的 Task 1–22 / Gate 1–3 已作为历史证据保留，未被本阶段重新验收。
