@@ -11,8 +11,8 @@ CFlow is not another thin wrapper around `codex` or `claude`. It owns the
 recoverable Plan-to-Done lifecycle and advances state only from persisted
 evidence—not from an agent saying that the work is complete.
 
-> **Project status:** the line-oriented Demo implementation is present, and its
-> Gate 3 candidate is tied to source commit `68fd200`; see the
+> **Project status:** the TUI workflow (Tasks 4–16) is implemented and its
+> deterministic Fake TUI Gate is the current **Internal Candidate**; see the
 > [acceptance report](docs/cflow-demo-acceptance-report.md). On 2026-08-07 the
 > **TUI workflow direction was confirmed** (full-screen Bubble Tea TUI as the
 > default entry, native Codex/Claude requirement discussions, an aggregated
@@ -20,9 +20,11 @@ evidence—not from an agent saying that the work is complete.
 > workspace-aware Apply and explicit Cleanup) — see
 > [the TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md)
 > and [its implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
-> The TUI is **not yet implemented**; the current interface below is still the
-> old line-oriented Demo CLI and must not be presented as the confirmed TUI
-> workflow.
+> A bare `cflow` on an interactive terminal launches the full-screen TUI; the
+> line-oriented subcommands (`cflow status`, `cflow plan`, …) remain as the
+> headless CLI. The real Codex/Claude Native + Headless E2E and the
+> self-Dogfood are **not yet run** — they require separate explicit user
+> approval on a new exact candidate Commit.
 
 ## Why CFlow
 

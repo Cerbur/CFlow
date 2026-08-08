@@ -244,3 +244,31 @@ No push, tag, PR, or remote publication has occurred.
 - [x] The user has reviewed this report and the Gate 3 evidence.
 - [x] The user authorized the real Cross-Provider E2E and self-Dogfood runs.
 - [ ] The user performs the final release sign-off and records it here.
+
+## 11. Fake TUI Gate candidate (TUI task 16)
+
+The TUI workflow (Tasks 4–16) introduces a NEW Internal Candidate evidence
+chain, clearly separated from the historical Gate 3 candidate above: the
+deterministic Fake TUI Gate (`scripts/gate-tui.sh`) runs the
+fully-Fake-provider suites — `internal/tui`, `internal/foreground`,
+`internal/native`, and the complete `go test ./...` — and binds the Source
+Commit, Binary SHA-256, Go Version, the test logs, and the redacted
+Manifest into a new empty artifact directory. It NEVER invokes a real
+Provider.
+
+- **Candidate:** Internal Candidate (Fake TUI Gate) — NOT a release and
+  NOT the Demo Complete Candidate of Gate 3.
+- **Gate script:** `scripts/gate-tui.sh <new-empty-artifact-dir>`.
+- **Fake E2E:** `TestTUIPlanToApplyAndCleanup` drives the complete
+  lifecycle — create → native discussion prepare/finish (strict
+  `discussion-handoff.json` handoff) → plan approval → execution approval
+  (default-no) → foreground Runner → report → apply → cleanup — through
+  the Fake Adapter with the TUI models exercised at every stage.
+- **Worktree policy:** the aggregated Workspace is the single delivery
+  mainline; tasks branch from the verified workspace head and merge back
+  serially; the explicit Cleanup lists the aggregated code directories
+  (`workspace`, `tmp/tasks/*`, `tmp/apply-*`) and never the
+  Artifacts/Evidence/Report/DB/Refs.
+- **Real Provider boundary:** the real Codex/Claude Native + Headless E2E
+  and the self-Dogfood remain separate, approval-gated runs; they are NOT
+  part of this Gate and have not been executed here.

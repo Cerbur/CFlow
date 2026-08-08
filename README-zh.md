@@ -6,7 +6,7 @@ CFlow 是一个面向 Coding Agent 的 local-first 工作流 Runtime。它把一
 
 CFlow 不是 `codex` 或 `claude` 的薄封装。它负责可恢复的 Plan-to-Done 生命周期，并且只依据持久化证据推进状态，而不会因为 Agent 声称“已经完成”就判定成功。
 
-> **项目状态：**行式 Demo 基础实现存在。具有完整证据的 Gate 3 Candidate 绑定到源码 Commit `68fd200`，详见[验收报告](docs/cflow-demo-acceptance-report.md)。2026-08-07 已确认 **TUI 工作流方向**：全屏 Bubble Tea TUI 成为默认主入口，需求讨论进入 Codex / Claude 原生 Terminal，采用聚合 Workflow 目录、唯一长期 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup——见 [TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与 [其实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。**该 TUI 尚未实现**；下方当前用法仍为旧的行式 Demo CLI，不应被表述为已确认的 TUI 工作流。
+> **项目状态：**TUI 工作流（Task 4–16）已实现，其确定性 Fake TUI Gate 是当前 **Internal Candidate**，详见[验收报告](docs/cflow-demo-acceptance-report.md)。2026-08-07 已确认 **TUI 工作流方向**：全屏 Bubble Tea TUI 成为默认主入口，需求讨论进入 Codex / Claude 原生 Terminal，采用聚合 Workflow 目录、唯一长期 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup——见 [TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与 [其实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。交互式终端上执行裸 `cflow` 会启动全屏 TUI；行式子命令（`cflow status`、`cflow plan` …）仍作为 headless CLI 保留。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood **尚未运行**，需要在新精确 Candidate Commit 上单独明确授权。
 
 ## 为什么需要 CFlow
 
@@ -76,9 +76,9 @@ Release 风格构建还会写入源码 Commit 与内嵌 Registry Hash。详见 [
 
 ## 当前 Demo 用法
 
-> 2026-08-07 已确认方向将用全屏 TUI 与原生需求讨论取代本行式入口；**该 TUI 尚未实现**。在 TUI 任务完成前，界面仍为下面的行式、命令驱动 Demo，直接执行 `cflow` 仍显示命令树。
+> 2026-08-07 已确认方向将用全屏 TUI 与原生需求讨论取代本行式入口。TUI 已实现：交互式终端上执行裸 `cflow` 启动全屏 TUI；下面的行式子命令仍作为 headless CLI 保留。
 
-当前界面是行式、命令驱动的。直接执行 `cflow` 会显示命令树；PRD 中描述的完整引导式交互生命周期尚未作为一条连续循环提供。
+当前界面是行式、命令驱动的。直接执行 `cflow` 会显示命令树；PRD 中描述的完整引导式交互生命周期已通过全屏 TUI 提供（交互式终端）或以行式子命令提供（headless）。
 
 Post-candidate CLI 当前通过 `CFLOW_PROVIDERS` 注册真实 Provider；未设置时默认仍是确定性 Fake Adapter。
 
