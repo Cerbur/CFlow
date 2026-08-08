@@ -201,8 +201,8 @@ func TestMigrationFromFreshDatabase(t *testing.T) {
 	}
 	defer s.Close()
 	rows := schemaRows(t, s)
-	if len(rows) != 4 {
-		t.Fatalf("schema_migrations = %d rows, want 4", len(rows))
+	if len(rows) != 5 {
+		t.Fatalf("schema_migrations = %d rows, want 5", len(rows))
 	}
 	// Baseline rows need no backup: manifest fields stay empty (PRD 决策 5).
 	for i, r := range rows {
@@ -211,11 +211,12 @@ func TestMigrationFromFreshDatabase(t *testing.T) {
 		}
 	}
 	if rows[0].ID != "cflow-001-initial" || rows[1].ID != "cflow-002-cleanup-apply" ||
-		rows[2].ID != "cflow-003-integration-head" || rows[3].ID != "cflow-004-apply-staging-head" {
+		rows[2].ID != "cflow-003-integration-head" || rows[3].ID != "cflow-004-apply-staging-head" ||
+		rows[4].ID != "cflow-005-workspace-layout" {
 		t.Fatalf("rows = %+v", rows)
 	}
-	if got := userVersion(t, s); got != 4 {
-		t.Fatalf("user_version = %d, want 4", got)
+	if got := userVersion(t, s); got != 5 {
+		t.Fatalf("user_version = %d, want 5", got)
 	}
 	integrityOK(t, s)
 	// No backup debris on a fresh baseline.
@@ -232,11 +233,11 @@ func TestMigrationAppliesForwardChainFromV1(t *testing.T) {
 	}
 	defer s.Close()
 	rows := schemaRows(t, s)
-	if len(rows) != 4 {
-		t.Fatalf("rows = %d, want 4: %+v", len(rows), rows)
+	if len(rows) != 5 {
+		t.Fatalf("rows = %d, want 5: %+v", len(rows), rows)
 	}
-	if got := userVersion(t, s); got != 4 {
-		t.Fatalf("user_version = %d, want 4", got)
+	if got := userVersion(t, s); got != 5 {
+		t.Fatalf("user_version = %d, want 5", got)
 	}
 	// The upgrade row records the verified backup manifest.
 	if rows[1].ManifestPath == "" || rows[1].ManifestSHA256 == "" {
@@ -249,7 +250,7 @@ func TestMigrationAppliesForwardChainFromV1(t *testing.T) {
 	}
 
 	// The 0600 backup + immutable manifest sit under backups/db/.
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-005-workspace-layout")
 	info, err := os.Stat(backupDir)
 	if err != nil {
 		t.Fatalf("backup dir: %v", err)
@@ -282,16 +283,17 @@ func TestMigrationAppliesForwardChainFromV1(t *testing.T) {
 	if err := json.Unmarshal(manifestBody, &mf); err != nil {
 		t.Fatalf("parse manifest: %v", err)
 	}
-	if mf.SourceVersion != 1 || mf.TargetVersion != 4 || mf.CflowVersion != "2.0.0" {
+	if mf.SourceVersion != 1 || mf.TargetVersion != 5 || mf.CflowVersion != "2.0.0" {
 		t.Fatalf("manifest versions = %+v", mf)
 	}
 	if mf.BackupPath != backupPath || mf.ManifestPath != manifestPath {
 		t.Fatalf("manifest paths = %+v", mf)
 	}
 	reg := migrations()
-	if len(mf.Migrations) != 3 || mf.Migrations[0].ID != reg[1].ID || mf.Migrations[0].SHA256 != reg[1].SHA256 ||
+	if len(mf.Migrations) != 4 || mf.Migrations[0].ID != reg[1].ID || mf.Migrations[0].SHA256 != reg[1].SHA256 ||
 		mf.Migrations[1].ID != reg[2].ID || mf.Migrations[1].SHA256 != reg[2].SHA256 ||
-		mf.Migrations[2].ID != reg[3].ID || mf.Migrations[2].SHA256 != reg[3].SHA256 {
+		mf.Migrations[2].ID != reg[3].ID || mf.Migrations[2].SHA256 != reg[3].SHA256 ||
+		mf.Migrations[3].ID != reg[4].ID || mf.Migrations[3].SHA256 != reg[4].SHA256 {
 		t.Fatalf("manifest chain = %+v", mf.Migrations)
 	}
 	buf, err := os.ReadFile(backupPath)
@@ -303,6 +305,57 @@ func TestMigrationAppliesForwardChainFromV1(t *testing.T) {
 			mf.DatabaseHash, mf.DatabaseSize, sha256Of(string(buf)), len(buf))
 	}
 	integrityOK(t, s)
+}
+
+// TestMigrationLegacyWorkflowDefaultsToLayoutVersion1: a Workflow row
+// created under migration 003/004 (before layout facts existed) reads back
+// as Layout Version 1 with empty workspace facts after forward migration,
+// so legacy aggregates are never mistaken for aggregated-layout ones
+// (design 7, plan Task 3 step 5).
+func TestMigrationLegacyWorkflowDefaultsToLayoutVersion1(t *testing.T) {
+	path := v1FixturePath(t)
+	db, err := sql.Open("sqlite", fileDSN(path, false, time.Second))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	defer db.Close()
+	now := nowText()
+	// The 003/004-era row predates the workspace columns.
+	if _, err := db.Exec(`INSERT INTO projects
+		(id, project_key, canonical_path, display_name, git_root, created_at, updated_at, last_opened_at)
+		VALUES ('p-1', 'p-1', '/p-1', 'p-1', '/p-1', ?, ?, ?)`, now, now, now); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO workflows
+		(id, project_id, stage, runtime_status, aggregate_version,
+		 target_branch, base_commit, integration_branch, created_at, updated_at)
+		VALUES ('wf-legacy', 'p-1', 'REQUIREMENT_DISCUSSION', 'RUNNING', 1,
+			'main', 'base-1', 'cflow/wf-legacy/integration', ?, ?)`, now, now); err != nil {
+		t.Fatalf("seed legacy workflow: %v", err)
+	}
+
+	s, err := Open(context.Background(), OpenOptions{Path: path, Workflow: "wf-legacy", CflowVersion: "2.0.0"})
+	if err != nil {
+		t.Fatalf("open with forward migration: %v", err)
+	}
+	defer s.Close()
+	if got := userVersion(t, s); got != 5 {
+		t.Fatalf("user_version = %d, want 5", got)
+	}
+	view := mustView(t, s)
+	wf := view.State.Workflow
+	if wf.LayoutVersion != 1 {
+		t.Fatalf("legacy layout version = %d, want 1", wf.LayoutVersion)
+	}
+	if wf.WorkspacePath != "" || wf.WorkspaceBranch != "" ||
+		wf.CandidateWorkspaceHead != "" || wf.VerifiedWorkspaceHead != "" ||
+		wf.WorkspaceDirtyFingerprint != "" {
+		t.Fatalf("legacy workflow must have empty workspace facts: %+v", wf)
+	}
+	// The legacy integration identity is preserved read-side.
+	if wf.IntegrationBranch != "cflow/wf-legacy/integration" {
+		t.Fatalf("integration branch = %q", wf.IntegrationBranch)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +476,7 @@ func TestCrashBeforeBackupManifestLeavesUnverifiableBackup(t *testing.T) {
 		t.Fatalf("open = %v, want injected failure", err)
 	}
 	// Crash state: consistent backup exists, manifest was never written.
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-005-workspace-layout")
 	if _, err := os.Stat(filepath.Join(backupDir, "cflow.db")); err != nil {
 		t.Fatalf("backup file missing after crash: %v", err)
 	}
@@ -461,7 +514,7 @@ func TestCrashAfterBackupManifestRetriesIdempotently(t *testing.T) {
 	if !errors.Is(err, errInjected) {
 		t.Fatalf("open = %v, want injected failure", err)
 	}
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-005-workspace-layout")
 	manifestPath := filepath.Join(backupDir, "backup-manifest.json")
 	manifestBody, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -480,11 +533,11 @@ func TestCrashAfterBackupManifestRetriesIdempotently(t *testing.T) {
 		t.Fatalf("reopen after crash: %v", err2)
 	}
 	defer s2.Close()
-	if got := userVersion(t, s2); got != 4 {
-		t.Fatalf("user_version = %d, want 4", got)
+	if got := userVersion(t, s2); got != 5 {
+		t.Fatalf("user_version = %d, want 5", got)
 	}
 	rows := schemaRows(t, s2)
-	if len(rows) != 4 || rows[3].ManifestSHA256 != sha256Of(string(manifestBody)) {
+	if len(rows) != 5 || rows[4].ManifestSHA256 != sha256Of(string(manifestBody)) {
 		t.Fatalf("rows after retry = %+v", rows)
 	}
 	backupAfter, err := os.ReadFile(backupPath)
@@ -533,11 +586,11 @@ func TestCrashAfterMigrationCommitRecognizesCompletion(t *testing.T) {
 		t.Fatalf("reopen after committed migration: %v", err2)
 	}
 	defer s2.Close()
-	if got := userVersion(t, s2); got != 4 {
-		t.Fatalf("user_version = %d, want 4", got)
+	if got := userVersion(t, s2); got != 5 {
+		t.Fatalf("user_version = %d, want 5", got)
 	}
-	if rows := schemaRows(t, s2); len(rows) != 4 {
-		t.Fatalf("rows = %d, want 4 (no re-run)", len(rows))
+	if rows := schemaRows(t, s2); len(rows) != 5 {
+		t.Fatalf("rows = %d, want 5 (no re-run)", len(rows))
 	}
 }
 
@@ -551,7 +604,7 @@ func TestMigrationManifestDeletedFailsClosed(t *testing.T) {
 	if !errors.Is(err, errInjected) {
 		t.Fatalf("open = %v, want injected failure", err)
 	}
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-005-workspace-layout")
 	if err := os.Remove(filepath.Join(backupDir, "backup-manifest.json")); err != nil {
 		t.Fatalf("remove manifest: %v", err)
 	}
@@ -602,7 +655,7 @@ func TestMigrationPerformsNoExternalEffects(t *testing.T) {
 	// The backup directory contains exactly the consistent backup and its
 	// immutable manifest: no Artifact, Git, Verification, or Provider
 	// outputs are produced by migration (PRD 决策 7).
-	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-004-apply-staging-head")
+	backupDir := filepath.Join(filepath.Dir(path), "backups", "db", "cflow-005-workspace-layout")
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		t.Fatalf("read backup dir: %v", err)
@@ -649,11 +702,11 @@ func TestMigrationConcurrentOpensMigrateExactlyOnce(t *testing.T) {
 	}
 	defer s.Close()
 	rows := schemaRows(t, s)
-	if len(rows) != 4 {
-		t.Fatalf("rows = %d, want 4 (migrated exactly once)", len(rows))
+	if len(rows) != 5 {
+		t.Fatalf("rows = %d, want 5 (migrated exactly once)", len(rows))
 	}
-	if got := userVersion(t, s); got != 4 {
-		t.Fatalf("user_version = %d, want 4", got)
+	if got := userVersion(t, s); got != 5 {
+		t.Fatalf("user_version = %d, want 5", got)
 	}
 }
 

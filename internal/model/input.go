@@ -50,6 +50,15 @@ type WorkflowCommandInput struct {
 	TargetBranch string
 	BaseCommit   string
 	Reason       string
+
+	// WorkspacePath and WorkspaceBranch are the layout identity facts the
+	// Application derived for the new Workflow (design 7): the
+	// deterministic aggregated workspace root and its CFlow-owned branch.
+	// The Kernel records them at create and requests the
+	// WorkspaceWorktreeCreateIntent with the exact Branch/Path (design
+	// 6.2 rule 6).
+	WorkspacePath   string
+	WorkspaceBranch string
 }
 
 func (WorkflowCommandInput) isInput() {}
@@ -66,6 +75,28 @@ type DiscussRequirementInput struct {
 }
 
 func (DiscussRequirementInput) isInput() {}
+
+// PrepareNativeDiscussionInput establishes the exact CFlow Session of one
+// native interactive requirement discussion (design §9.1, TUI task 12):
+// the Kernel records the fresh Session as STARTING so the TUI's blocking
+// exec callback runs the Bridge against a persisted, recoverable Session.
+type PrepareNativeDiscussionInput struct {
+	Provider string
+	Session  SessionID
+}
+
+func (PrepareNativeDiscussionInput) isInput() {}
+
+// FinishDiscussionInput settles one finished native discussion Session
+// and writes its immutable ArtifactDiscussionHandoff (design §9.2, TUI
+// task 12): the Kernel validates the Session is bound to the workflow,
+// settles it COMPLETED, and requests the handoff write.
+type FinishDiscussionInput struct {
+	Session SessionID
+	Handoff []byte
+}
+
+func (FinishDiscussionInput) isInput() {}
 
 // GeneratePlanInput is the /finish transition (PRD Plan 生成): the
 // planner produces a new immutable Plan Revision from the requirement
@@ -111,9 +142,44 @@ type ExecutionApprovalInput struct {
 	RoutingHash      string
 	BudgetHash       string
 	CommitPolicyHash string
+	// ChangeSetHash is the frozen Change Set Hash the Execution Approval
+	// binds (TUI task 6, design 8.4). Empty when the approval binds no
+	// Change Set (legacy flows); non-empty approvals gate the Workspace
+	// behind the Adoption Gate.
+	ChangeSetHash string
 }
 
 func (ExecutionApprovalInput) isInput() {}
+
+// AdoptWorkspaceInput is the Runtime-verified input of the Workspace
+// Adoption Gate (TUI task 6, design 8.4): the Execution Approval bound a
+// frozen Change Set, and the Application re-verified the Workspace's
+// Change Set, Commit Policy, Identity/Signing, Clean/Scope, Catalog
+// Verification, and review route before the Kernel records the independent
+// Adoption Review Session. On a PASS verdict the Kernel advances
+// verified_workspace_head to the exact verified Candidate Head; a FAIL or
+// a drifted Workspace Blocks the Workflow and preserves the Workspace and
+// the Target Branch.
+type AdoptWorkspaceInput struct {
+	// Session is the fresh independent Adoption Review Session identity.
+	Session SessionID
+	// Route is the approved independent-review Provider binding of the
+	// Execution Approval's routing policy.
+	Route string
+	// ChangeSetHash is the frozen Change Set Hash the Execution Approval
+	// bound; the adoption re-verifies the Workspace against this exact
+	// Revision.
+	ChangeSetHash string
+	// CandidateHead is the Workspace Head the Runtime verified (the
+	// Change Set's candidate head, re-observed unchanged).
+	CandidateHead string
+	// DirtyFingerprint is the observed Dirty Fingerprint of the Workspace
+	// at the verified Candidate Head (the frozen Change Set's
+	// fingerprint, re-observed unchanged).
+	DirtyFingerprint string
+}
+
+func (AdoptWorkspaceInput) isInput() {}
 
 // SpecGenerationInput starts one Spec Generation Session (PRD Agent 角色:
 // SPEC_GENERATION 将 Plan 拆成 Specs). CatalogRef is the immutable
@@ -153,6 +219,11 @@ type ExecutionDryRunInput struct {
 	// binds their hashes.
 	RoutingRef ArtifactRef
 	BudgetRef  ArtifactRef
+	// ChangeSetRef is the frozen ArtifactChangeSet Revision the Dry Run
+	// resolved (zero when no Change Set was frozen yet); the gate records
+	// its active reference so the Execution Approval binds the Change Set
+	// (TUI task 6, design 8.4).
+	ChangeSetRef ArtifactRef
 }
 
 func (ExecutionDryRunInput) isInput() {}
@@ -222,6 +293,9 @@ const (
 	// PlanningWorktreeCreated reports that the Planning Snapshot Worktree
 	// exists at the recorded Base Commit.
 	PlanningWorktreeCreated EffectResultKind = "planning-worktree-created"
+	// WorkspaceWorktreeCreated reports that the Workspace Branch/Worktree
+	// exists at the recorded Base Head (design 8.1; TUI task 4).
+	WorkspaceWorktreeCreated EffectResultKind = "workspace-worktree-created"
 	// WorkflowCompiled reports the canonical Dynamic Workflow body the
 	// Compiler produced from the approved Specs, Catalog, and Patch IR.
 	WorkflowCompiled EffectResultKind = "workflow-compiled"
@@ -244,6 +318,19 @@ const (
 	// IntegrationRollbacked reports that the managed Integration Worktree
 	// was restored to the recorded pre-merge HEAD.
 	IntegrationRollbacked EffectResultKind = "integration-rollbacked"
+	// WorkspaceMerged reports one serial --no-ff Workspace merge with the
+	// Merge Commit evidence (design 8.5; TUI task 7).
+	WorkspaceMerged EffectResultKind = "workspace-merged"
+	// WorkspaceMergeFailed reports a failed Workspace merge with the typed
+	// reason; the Kernel requests the recorded Workspace Rollback.
+	WorkspaceMergeFailed EffectResultKind = "workspace-merge-failed"
+	// WorkspaceRollbacked reports that the managed Workspace Worktree was
+	// restored to the recorded pre-merge HEAD.
+	WorkspaceRollbacked EffectResultKind = "workspace-rollbacked"
+	// LayoutMigrationCompleted reports that the explicit Legacy Layout
+	// Migration finished: every move landed and the persisted Layout facts
+	// advanced to Version 2 (TUI task 8).
+	LayoutMigrationCompleted EffectResultKind = "layout-migration-completed"
 	// GitAuditRefCreated reports one created append-only audit Ref.
 	GitAuditRefCreated EffectResultKind = "git-audit-ref-created"
 )
@@ -255,9 +342,12 @@ func (k EffectResultKind) Valid() bool {
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
 		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
+		WorkspaceWorktreeCreated,
 		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated,
 		VerificationRunEnded, IntegrationMerged, IntegrationMergeFailed,
-		IntegrationRollbacked, GitAuditRefCreated:
+		IntegrationRollbacked, GitAuditRefCreated,
+		WorkspaceMerged, WorkspaceMergeFailed, WorkspaceRollbacked,
+		LayoutMigrationCompleted:
 		return true
 	}
 	return false

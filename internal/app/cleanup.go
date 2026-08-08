@@ -97,6 +97,14 @@ func (a *Application) collectCleanupWorktreeItems(ctx context.Context, wf model.
 	if st.Workflow.IntegrationBranch != "" {
 		managed[a.integrationWorktreePath(wf)] = st.Workflow.IntegrationBranch
 	}
+	if st.Workflow.WorkspaceBranch != "" && st.Workflow.LayoutVersion >= 2 {
+		// The aggregated Workspace is the delivery mainline code directory
+		// of a Layout Version 2 workflow; the explicit Cleanup manifest
+		// lists it (design §8.5, TUI task 15 step 4). Artifacts,
+		// Discussion/Plan/Spec/Review/Evidence/Report, the DB, and the
+		// refs never enter the deletion set — only Worktrees do.
+		managed[a.layout.Workspace(wf)] = st.Workflow.WorkspaceBranch
+	}
 	for _, n := range st.Nodes {
 		if n == nil || n.Kind != model.NodeAgentTask {
 			continue
@@ -342,11 +350,16 @@ func (a *Application) validateCleanupScratch(path string) error {
 
 // validateCleanupWorktreeTarget re-validates one managed Worktree target
 // immediately before its removal: the exact canonical path must be under
-// the recorded CFLOW_HOME/worktrees/<project-key>/<workflow-id>/ and owned
-// by the effective user. A mismatch is CLEANUP_FACT_MISMATCH and deletes
+// the workflow's managed root — the aggregated <home>/projects/<key>/
+// <workflow-id>/ on Layout Version 2 (design 8.5, TUI task 7), the legacy
+// <home>/worktrees/<key>/<workflow-id>/ on Layout 1 — and owned by the
+// effective user. A mismatch is CLEANUP_FACT_MISMATCH and deletes
 // nothing.
 func (a *Application) validateCleanupWorktreeTarget(wf model.WorkflowID, path string) error {
 	root := filepath.Join(a.home, "worktrees", a.project.Key, string(wf))
+	if a.workflowLayout(context.Background(), wf) >= 2 {
+		root = a.layout.WorkflowRoot(wf)
+	}
 	if !strings.HasPrefix(path, root+string(filepath.Separator)) {
 		return model.NewFault(model.CodeCleanupFactsChanged,
 			"worktree target escapes the recorded managed root")

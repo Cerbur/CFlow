@@ -126,6 +126,15 @@ func (a *Application) executeDispatch(ctx context.Context, st *store.Store, wf m
 		return Outcome{}, model.NewFault(model.CodeApprovalInputChanged,
 			"the execution artifacts no longer match the approval facts; re-approve before dispatch")
 	}
+	// The Workspace Adoption Gate (TUI task 6, design 8.4): an Execution
+	// Approval bound to a frozen Change Set may not schedule normal Tasks
+	// until the Workspace was adopted — no Task may be created from an
+	// unadopted candidate Head (verified_workspace_head is the only legal
+	// Task base).
+	if facts.ChangeSetHash != "" && view.State.Workflow.VerifiedWorkspaceHead == "" {
+		return Outcome{}, model.NewFault(model.CodeWorkspaceAdoptionRequired,
+			"the workspace has not been adopted; run AdoptWorkspaceCommand before dispatch")
+	}
 	approved, err := a.verifyApprovedRouting(ctx, wf, facts)
 	if err != nil {
 		return Outcome{}, err
@@ -424,10 +433,11 @@ func (a *Application) dispatchPass(ctx context.Context, st *store.Store, wf mode
 		}
 	}
 
-	// The verified Integration HEAD is observed at readiness and fixed as
-	// the immutable Task Base of every Task this pass allocates (PRD
-	// Worktree 策略: Task Base = current verified Integration HEAD).
-	baseHead, err := a.observedIntegrationHead(ctx, wf)
+	// The verified Workspace HEAD is observed at readiness and fixed as
+	// the immutable Task Base of every Task this pass allocates (design
+	// 8.5, TUI task 7: Task Base = current verified Workspace Head on the
+	// aggregated layout; the legacy Integration HEAD on Layout 1).
+	baseHead, err := a.observedTaskBaseHead(ctx, wf, state)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -1018,20 +1028,31 @@ func (a *Application) writeStoreView(ctx context.Context, wf model.WorkflowID) (
 }
 
 // taskWorktreePath is the deterministic Task Worktree location of one
-// Node (PRD 全局目录结构: worktrees/<project-key>/<workflow-id>/tasks/<node>).
+// Node: the aggregated temporary root <root>/tmp/tasks/<node> on Layout
+// Version 2 (design 8.5, TUI task 7: 临时并行 Task Worktree), and the
+// legacy worktrees/<project-key>/<workflow-id>/tasks/<node> on Layout 1
+// (PRD 全局目录结构).
 func (a *Application) taskWorktreePath(wf model.WorkflowID, node model.NodeID) string {
+	if a.workflowLayout(context.Background(), wf) >= 2 {
+		return a.layout.Task(wf, node)
+	}
 	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "tasks", string(node))
 }
 
-// observedIntegrationHead is the current verified Integration HEAD: the
-// Runtime observes the Integration Worktree's HEAD through the GitFlow
-// seam at readiness (the workflows row persists the Integration Branch;
-// the HEAD is a git fact the Runtime re-observes, PRD Worktree 策略).
-func (a *Application) observedIntegrationHead(ctx context.Context, wf model.WorkflowID) (string, error) {
+// observedTaskBaseHead is the current verified Task Base HEAD observed at
+// dispatch readiness: on the aggregated workspace layout (Version 2) the
+// Runtime re-observes the Workspace Worktree's HEAD — the only legal Task
+// base is verified_workspace_head (design 8.5, TUI task 7) — and on the
+// legacy Layout 1 it re-observes the Integration Worktree's HEAD (PRD
+// Worktree 策略: the HEAD is a git fact the Runtime re-observes).
+func (a *Application) observedTaskBaseHead(ctx context.Context, wf model.WorkflowID, state model.State) (string, error) {
 	if a.git == nil {
 		return "", model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
 	}
-	path := filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "integration")
+	path := a.integrationWorktreePath(wf)
+	if state.Workflow.LayoutVersion >= 2 {
+		path = a.planningCWD(ctx, wf)
+	}
 	facts, err := a.git.Observe(ctx, gitflow.GitStatus{Dir: path})
 	if err != nil {
 		return "", err
@@ -1041,7 +1062,7 @@ func (a *Application) observedIntegrationHead(ctx context.Context, wf model.Work
 		return "", model.InvariantFault(fmt.Errorf("git status observation has an unexpected type"))
 	}
 	if st.Head == "" {
-		return "", model.InvariantFault(fmt.Errorf("the integration worktree has no verified head"))
+		return "", model.InvariantFault(fmt.Errorf("the task base worktree has no verified head"))
 	}
 	return st.Head, nil
 }

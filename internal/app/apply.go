@@ -58,7 +58,8 @@ func (a *Application) applyStagingCreate(ctx context.Context, wf model.WorkflowI
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("apply attempt %s is missing", intent.Apply))
 	}
 	targetBranch := view.State.Workflow.TargetBranch
-	integrationBranch := view.State.Workflow.IntegrationBranch
+	deliveryBranch, _, _ := a.deliveryFacts(ctx, wf, view.State)
+	integrationBranch := deliveryBranch
 
 	// 1. The workspace gate (PRD step 1: clean and attached to the
 	// expected Target Branch at the recorded head).
@@ -144,9 +145,15 @@ func (a *Application) applyWorkspaceGate(ctx context.Context, targetBranch, targ
 }
 
 // applyWorktreePath is the deterministic Apply Worktree location of one
-// attempt (PRD 全局目录结构; each attempt stages in its own isolated
-// Worktree, preserved for inspection and retry).
+// attempt: the aggregated temporary root <root>/tmp/apply-<n> on Layout
+// Version 2 (design 13.1, TUI task 7), the legacy
+// worktrees/<project-key>/<workflow-id>/apply-<n> on Layout 1 (PRD 全局
+// 目录结构; each attempt stages in its own isolated Worktree, preserved
+// for inspection and retry).
 func (a *Application) applyWorktreePath(wf model.WorkflowID, number int) string {
+	if a.workflowLayout(context.Background(), wf) >= 2 {
+		return a.layout.Apply(wf, number)
+	}
 	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf),
 		fmt.Sprintf("apply-%d", number))
 }
@@ -179,6 +186,9 @@ func (a *Application) applyWorktreeEnsure(ctx context.Context, wf model.Workflow
 			}
 			return path, nil
 		}
+	}
+	if err := a.ensureWorktreeParent(path); err != nil {
+		return "", err
 	}
 	res, err := a.git.Execute(ctx, gitflow.CreateApply{Branch: branch, BaseHead: att.TargetHead, Path: path})
 	if err != nil {
@@ -473,7 +483,8 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("apply attempt %s is missing", intent.Apply))
 	}
 	targetBranch := view.State.Workflow.TargetBranch
-	integrationBranch := view.State.Workflow.IntegrationBranch
+	deliveryBranch, _, _ := a.deliveryFacts(ctx, wf, view.State)
+	integrationBranch := deliveryBranch
 	targetRef := "refs/heads/" + targetBranch
 
 	// The staging head is the Apply Branch ref (the authoritative git
@@ -565,30 +576,38 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 			"the apply verification evidence is missing before the delivery"), nil
 	}
 
-	// The final compare-and-swap fast-forward. The gitflow operation
-	// re-observes the expected head, verifies the fast-forward, and
-	// updates only through the expected-value argv; the outcome is the
-	// observed actual ref. A typed TARGET_HEAD_DRIFTED is a blocked
+	// The final delivery: a working-tree fast-forward. The gitflow
+	// operation re-observes the clean root, the attached Branch, and the
+	// expected head, then runs `git merge --ff-only <staging>` — the
+	// HEAD, Index, and Worktree files all move together (no update-ref
+	// that leaves the files stale). No reset/force/stash/checkout ever
+	// appears. A typed TARGET_HEAD_DRIFTED or a dirty root is a blocked
 	// delivery; any other failure is the unsettled crash path (the
 	// attempt stays RUNNING and the retry observes).
-	res, err := a.git.Execute(ctx, gitflow.UpdateRef{Ref: targetRef, New: stagingHead, Expected: att.TargetHead})
+	res, err := a.git.Execute(ctx, gitflow.FastForwardWorkingTree{
+		Root:     a.project.Root,
+		Branch:   targetBranch,
+		Expected: att.TargetHead,
+		New:      stagingHead,
+	})
 	if err != nil {
 		code, ok := model.CodeOf(err)
-		if ok && code == model.CodeTargetHeadChanged {
+		if ok && (code == model.CodeTargetHeadChanged || code == model.CodeApplyTargetDirty ||
+			code == model.CodeApplyTargetBranchChanged) {
 			return fail(code, err.Error()), nil
 		}
 		return model.EffectResultInput{}, err
 	}
-	ur, ok := res.(gitflow.UpdateRefResult)
+	ff, ok := res.(gitflow.FastForwardWorkingTreeResult)
 	if !ok {
-		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("target update has an unexpected result"))
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("target fast-forward has an unexpected result"))
 	}
-	if ur.Observed != stagingHead {
+	if ff.Head != stagingHead || !ff.Clean {
 		return fail(model.CodeTargetHeadChanged,
-			"the observed target ref does not match the delivered head"), nil
+			"the delivered working tree does not match the verified staging head"), nil
 	}
 	return model.EffectResultInput{
-		Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: intent.Apply, ObservedHead: ur.Observed,
+		Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: intent.Apply, ObservedHead: ff.Head,
 	}, nil
 }
 

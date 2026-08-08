@@ -30,7 +30,13 @@ func applyMutation(st *model.State, m model.Mutation) error {
 			ID: m.ID, Project: m.Project, Stage: m.Stage, Runtime: m.Runtime,
 			TargetBranch: m.TargetBranch, BaseCommit: m.BaseCommit,
 			IntegrationBranch: m.IntegrationBranch, IntegrationHead: m.IntegrationHead,
-			CancelIntent: m.CancelIntent, ExecutionFacts: st.Workflow.ExecutionFacts,
+			LayoutVersion:             m.LayoutVersion,
+			WorkspacePath:             m.WorkspacePath,
+			WorkspaceBranch:           m.WorkspaceBranch,
+			CandidateWorkspaceHead:    m.CandidateWorkspaceHead,
+			VerifiedWorkspaceHead:     m.VerifiedWorkspaceHead,
+			WorkspaceDirtyFingerprint: m.WorkspaceDirtyFingerprint,
+			CancelIntent:              m.CancelIntent, ExecutionFacts: st.Workflow.ExecutionFacts,
 		}
 	case model.PlanMutation:
 		if st.Plan == nil {
@@ -254,14 +260,27 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 			cancelAt = nowText
 			cancelReason = m.CancelIntent.Reason
 		}
+		// The aggregate admits only {1=legacy, 2=aggregated}; a create
+		// that predates layout wiring carries 0, which is persisted as
+		// the design default 1 (design 7: new Workflows are created with
+		// the aggregated layout once the workspace is wired, Task 4).
+		layoutVersion := m.LayoutVersion
+		if layoutVersion < 1 {
+			layoutVersion = 1
+		}
 		if !existed {
 			// The identity-establishing INSERT (creation).
 			if _, err := q.ExecContext(ctx, `INSERT INTO workflows
 				(id, project_id, stage, runtime_status, target_branch, base_commit,
-				 integration_branch, integration_head, cancel_requested_at, cancel_reason, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 integration_branch, integration_head,
+				 layout_version, workspace_path, workspace_branch,
+				 candidate_workspace_head, verified_workspace_head, workspace_dirty_fingerprint,
+				 cancel_requested_at, cancel_reason, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				m.ID, m.Project, string(m.Stage), string(m.Runtime),
 				m.TargetBranch, m.BaseCommit, m.IntegrationBranch, m.IntegrationHead,
+				layoutVersion, m.WorkspacePath, m.WorkspaceBranch,
+				m.CandidateWorkspaceHead, m.VerifiedWorkspaceHead, m.WorkspaceDirtyFingerprint,
 				cancelAt, cancelReason, nowText, nowText); err != nil {
 				return fmt.Errorf("insert workflow: %w", err)
 			}
@@ -269,10 +288,16 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE workflows
 			SET stage = ?, runtime_status = ?, target_branch = ?, base_commit = ?,
-			    integration_branch = ?, integration_head = ?, cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
+			    integration_branch = ?, integration_head = ?,
+			    layout_version = ?, workspace_path = ?, workspace_branch = ?,
+			    candidate_workspace_head = ?, verified_workspace_head = ?, workspace_dirty_fingerprint = ?,
+			    cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
 			WHERE id = ?`,
 			string(m.Stage), string(m.Runtime), m.TargetBranch, m.BaseCommit,
-			m.IntegrationBranch, m.IntegrationHead, cancelAt, cancelReason, nowText, m.ID); err != nil {
+			m.IntegrationBranch, m.IntegrationHead,
+			layoutVersion, m.WorkspacePath, m.WorkspaceBranch,
+			m.CandidateWorkspaceHead, m.VerifiedWorkspaceHead, m.WorkspaceDirtyFingerprint,
+			cancelAt, cancelReason, nowText, m.ID); err != nil {
 			return fmt.Errorf("update workflow: %w", err)
 		}
 		return nil

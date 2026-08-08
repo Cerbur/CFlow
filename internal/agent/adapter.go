@@ -148,13 +148,37 @@ type SessionFact struct {
 // Adapter is the stable Agent Adapter seam (design 14.1, ledger):
 // detection, scripted or real start/resume event streams, two-phase
 // cancel, and session inspection. The interface is fixed; new Providers
-// implement it, they never alter it.
+// implement it, they never alter it. The interactive-resume capability is
+// OPTIONAL: an Adapter that supports it also implements
+// InteractiveAdapter (TUI task 11).
 type Adapter interface {
 	Detect(context.Context) (Installation, error)
 	Start(context.Context, StartRequest) (Run, error)
 	Resume(context.Context, ResumeRequest) (Run, error)
 	Cancel(context.Context, RunHandle) error
 	Inspect(context.Context, ProviderSessionID) (SessionFact, error)
+}
+
+// InteractiveResumeSpec is the exact argv of one native interactive
+// resume (design §9, TUI task 11): the provider terminal is launched
+// with an explicit argv array — never a shell string — in the workflow
+// Worktree, inheriting the caller's terminal. Capability is true only
+// when the binding's NativeInteractiveResume capability is set.
+type InteractiveResumeSpec struct {
+	Executable string
+	Args       []string
+	Dir        string
+	Env        map[string]string
+	Capability bool
+}
+
+// InteractiveAdapter is the optional Adapter seam for native interactive
+// sessions (design §9, TUI task 11). InteractiveResume returns the exact
+// argv of the provider's native resume command for one Session; it is
+// only available when the Registry's NativeInteractiveResume capability
+// is true.
+type InteractiveAdapter interface {
+	InteractiveResume(context.Context, ProviderSessionID, string) (InteractiveResumeSpec, error)
 }
 
 // Run is one Provider event stream (design 14.1). Next returns the next

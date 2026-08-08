@@ -75,8 +75,10 @@ func (a *Application) queryCancelSummary(ctx context.Context, q CancelSummaryQue
 	// The managed Worktrees: the Planning Snapshot, the Integration
 	// Worktree, and every Task Worktree of the persisted Nodes. The dirty
 	// state and the unmerged Commit facts are observed per Worktree.
+	// Layout Version 2 workflows run their planning sessions inside the
+	// single Workspace (design 8.1), so the Workspace is listed there.
 	entries := []CancelWorktree{
-		{Path: a.planningWorktreePath(wf), Branch: "detached@base"},
+		{Path: a.planningCWD(ctx, wf), Branch: "detached@base"},
 		{Path: a.integrationWorktreePath(wf), Branch: st.Workflow.IntegrationBranch},
 	}
 	for id, n := range st.Nodes {

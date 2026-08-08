@@ -324,3 +324,89 @@ func lastLine(s string) string {
 	}
 	return trimmed
 }
+
+// fastForwardWorkingTree delivers one verified Apply staging head to the
+// user's original working tree (TUI task 15, design §13.2). The Root
+// must be clean and attached to the expected Branch at the expected
+// HEAD, the new head must be a descendant (merge --ff-only never creates
+// a merge commit and never rewrites history), and the resulting
+// HEAD/Index/Worktree are re-verified fail-closed. No reset, force,
+// stash, or checkout argv appears anywhere in this path.
+func (g *GitFlow) fastForwardWorkingTree(ctx context.Context, op FastForwardWorkingTree) (GitResult, error) {
+	if err := validateWorktreeDir(op.Root); err != nil {
+		return nil, err
+	}
+	if err := validateBranchName(op.Branch); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.Expected); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.New); err != nil {
+		return nil, err
+	}
+	env := childEnv()
+	// Pre-delivery facts: the root is clean, attached to the expected
+	// branch, at the expected head.
+	status, err := g.gitStatusAt(ctx, op.Root, env, op.Expected, true, true)
+	if err != nil {
+		return nil, err
+	}
+	if !status.Clean() {
+		return nil, model.NewFault(model.CodeApplyTargetDirty,
+			"gitflow: the working tree is dirty; the delivery never overwrites user content")
+	}
+	branch, err := g.attachedBranch(ctx, op.Root)
+	if err != nil {
+		return nil, err
+	}
+	if branch != op.Branch {
+		return nil, model.NewFault(model.CodeApplyTargetBranchChanged,
+			"gitflow: the working tree is not attached to the expected branch")
+	}
+	if status.Head != op.Expected {
+		return nil, model.NewFault(model.CodeTargetHeadChanged,
+			"gitflow: the working tree head does not match the recorded target head")
+	}
+	// The fast-forward must be a descendant of the recorded head.
+	if !g.isDescendantOf(ctx, op.Root, env, op.New, op.Expected) {
+		return nil, model.NewFault(model.CodeTargetHeadChanged,
+			"gitflow: the staging head is not a fast-forward of the recorded target head")
+	}
+	// The delivery: merge --ff-only <new> — the only argv form allowed;
+	// no reset/force/stash/checkout ever appears.
+	_, errOut, exit, err := g.run(ctx, op.Root, env, defaultGitTimeout, "merge", "--ff-only", op.New)
+	if err != nil {
+		return nil, err
+	}
+	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: the working tree fast-forward refused: "+lastLine(string(errOut)))
+	}
+	// Post-delivery facts: HEAD/Index/Worktree re-verified fail-closed.
+	after, err := g.gitStatusAt(ctx, op.Root, env, op.New, true, true)
+	if err != nil {
+		return nil, err
+	}
+	if after.Head != op.New || !after.Clean() {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: the delivered working tree was not fast-forwarded to the staging head")
+	}
+	return FastForwardWorkingTreeResult{Head: after.Head, Clean: after.Clean()}, nil
+}
+
+// attachedBranch resolves the attached Branch of one worktree root (the
+// registry is authoritative; "" when detached).
+func (g *GitFlow) attachedBranch(ctx context.Context, root string) (string, error) {
+	wf, err := g.worktreeList(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range wf.Entries {
+		if e.Path == root {
+			return e.Branch, nil
+		}
+	}
+	return "", model.NewFault(model.CodeApplyTargetBranchChanged,
+		"gitflow: the working tree is missing from the worktree registry")
+}

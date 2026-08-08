@@ -23,6 +23,8 @@ approved: 2026-08-02
 
 ## 产品定义与关键决策
 
+> **2026-08-07 已确认变更**：全屏 TUI 成为默认主入口；Native Discussion、聚合 Workflow 目录、唯一 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup 取代旧的 line-oriented Demo 交互决策。权威规格见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`，实施 Plan 见 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md`。本 PRD 中标注 `Superseded` 的旧决策仅作历史背景，其安全不变量全部保留；两条主链路常规批准门（Plan Approval、Execution Approval）不变。
+
 ### 产品背景
 
 CFlow 希望把目前依赖人工 Prompt、手动启动多个 Coding Agent、手动维护 Plan 和手动分配任务的开发流程，固化成一个可恢复、可验收、可切换 Agent 的本地 CLI 工作流。
@@ -273,7 +275,7 @@ status = 当前阶段处于什么运行状态
 
 > 决策日期：2026-08-02
 >
-> 决策状态：已确认
+> 决策状态：已确认 → **Superseded (2026-08-07)**。需求讨论阶段默认改为进入 Codex / Claude 原生 Terminal（Native Discussion）；其余托管非交互协议、Session 独立性、Reconcile 与证据门禁继续保留，见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md` §9。
 
 CFlow 采用“托管主链路 + 原生 Session Attach”的非对称交互模型：
 
@@ -2492,8 +2494,8 @@ Release Build 默认使用 `CGO_ENABLED=0`，为 macOS 和 Linux 的 amd64/arm64
 
 ```text
 Go 1.26.x
-Cobra：子命令、Flag、Help 和 Completion
-bufio + golang.org/x/term：行式交互和终端能力检测
+Bubble Tea v2（charm.land/bubbletea/v2，固定版本）：全屏 TUI 主工作台
+Cobra：Headless CLI 子命令、Flag、Help 和 Completion（与 TUI 同级前端）
 os/exec：所有外部命令使用 program + argv，禁止隐式 Shell
 encoding/json + go.yaml.in/yaml/v3：结构化事件与 Artifact
 database/sql + 无 CGO SQLite Driver：本地运行状态
@@ -2503,6 +2505,8 @@ log/slog：结构化日志
 ```
 
 SQLite Driver 的首选候选是 `modernc.org/sqlite`，因为它实现 `database/sql` 且不依赖 CGO，符合跨平台单二进制目标；最终版本号必须在实现设计中固定并由 `go.sum` 锁定，不得在构建时使用浮动 `latest`。[Driver 文档](https://pkg.go.dev/modernc.org/sqlite)
+
+> **Superseded (2026-08-07)**：以下是旧决策。2026-08-07 已确认变更后，TUI 主工作台 + 原生 Codex/Claude 讨论成为默认主入口；旧行式交互及相关讨论仅作历史背景，其安全不变量（stderr、argv、无隐式 Shell 等）继续保留。
 
 不推荐 Demo 一开始引入 Bubble Tea 全屏 TUI，原因是：
 

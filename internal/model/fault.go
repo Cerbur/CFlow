@@ -133,6 +133,11 @@ const (
 	// committed closure is refused without mutation (design 12, PRD 已确
 	// 认：并行失败后的 Quiescing).
 	CodeDispatchGateClosed Code = "DISPATCH_GATE_CLOSED"
+	// CodeWorkspaceAdoptionRequired: the Execution Approval bound a frozen
+	// Change Set, but the Workspace has not been adopted yet; no normal
+	// Task may be created from an unadopted candidate Head (design 8.4,
+	// TUI task 6). The user must run AdoptWorkspaceCommand first.
+	CodeWorkspaceAdoptionRequired Code = "WORKSPACE_ADOPTION_REQUIRED"
 	// CodeNotYetAvailable: a requested protocol whose full semantics land
 	// with a later task (the protected Apply, the Cleanup execute) is
 	// reported with this stable finding, never with a fabricated result
@@ -211,6 +216,7 @@ func Codes() []Code {
 		CodeSessionIndependenceViolation,
 		CodeUnexpectedAgentMutation,
 		CodeDispatchGateClosed,
+		CodeWorkspaceAdoptionRequired,
 		CodeNotYetAvailable,
 	}
 }
@@ -458,6 +464,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeSessionIndependenceViolation, CatInvariantFailure, ScopeSession, false, true, StopAll, false),
 	p(CodeUnexpectedAgentMutation, CatSafetyStop, ScopeSession, false, true, StopAll, false),
 	p(CodeDispatchGateClosed, CatInvalidInput, ScopeRun, false, false, StopNone, false),
+	p(CodeWorkspaceAdoptionRequired, CatUserActionRequired, ScopeWorkflow, false, false, StopNone, false),
 	p(CodeNotYetAvailable, CatUserActionRequired, ScopeWorkflow, false, false, StopNone, false),
 }
 

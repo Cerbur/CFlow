@@ -52,6 +52,10 @@ const queryWorkflowRow = `
 	SELECT id, project_id, stage, runtime_status, plan_status, aggregate_version,
 	       COALESCE(target_branch, ''), COALESCE(base_commit, ''),
 	       COALESCE(integration_branch, ''), COALESCE(integration_head, ''),
+	       COALESCE(layout_version, 1),
+	       COALESCE(workspace_path, ''), COALESCE(workspace_branch, ''),
+	       COALESCE(candidate_workspace_head, ''), COALESCE(verified_workspace_head, ''),
+	       COALESCE(workspace_dirty_fingerprint, ''),
 	       cancel_requested_at, cancel_reason
 	FROM workflows WHERE id = ?`
 
@@ -175,10 +179,19 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		integrationBranch           string
 		integrationHead             string
 		cancelAt, cancelReason      sql.NullString
+		layoutVersion               int
+		workspacePath               string
+		workspaceBranch             string
+		candidateHead               string
+		verifiedHead                string
+		dirtyFingerprint            string
 	)
 	err := q.QueryRowContext(ctx, queryWorkflowRow, workflow).Scan(
 		&id, &project, &stage, &runtime, &planStatus, &version,
-		&targetBranch, &baseCommit, &integrationBranch, &integrationHead, &cancelAt, &cancelReason)
+		&targetBranch, &baseCommit, &integrationBranch, &integrationHead,
+		&layoutVersion, &workspacePath, &workspaceBranch,
+		&candidateHead, &verifiedHead, &dirtyFingerprint,
+		&cancelAt, &cancelReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -191,6 +204,12 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 		Stage: model.WorkflowStage(stage), Runtime: model.RuntimeStatus(runtime),
 		TargetBranch: targetBranch, BaseCommit: baseCommit,
 		IntegrationBranch: integrationBranch, IntegrationHead: integrationHead,
+		LayoutVersion:             layoutVersion,
+		WorkspacePath:             workspacePath,
+		WorkspaceBranch:           workspaceBranch,
+		CandidateWorkspaceHead:    candidateHead,
+		VerifiedWorkspaceHead:     verifiedHead,
+		WorkspaceDirtyFingerprint: dirtyFingerprint,
 	}
 	if cancelAt.Valid {
 		st.Workflow.CancelIntent = &model.CancelIntent{Reason: cancelReason.String}
@@ -263,6 +282,13 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 			facts = &model.ExecutionFacts{}
 		}
 		facts.BudgetHash = h.Hash
+	}
+	if h, ok := refs["change-set"]; ok {
+		if facts == nil {
+			facts = &model.ExecutionFacts{}
+		}
+		facts.ChangeSetHash = h.Hash
+		facts.ChangeSetRevision = h.Revision
 	}
 	if facts != nil {
 		var preflightRevision int

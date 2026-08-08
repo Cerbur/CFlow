@@ -176,6 +176,71 @@ type WorkflowSummary struct {
 	BaseCommit   string
 }
 
+// ProjectWorkspaceQuery is the TUI workspace projection (design §1, TUI
+// task 10): one bounded, read-only View that carries everything the
+// workspace screen renders — the Project identity, every Workflow
+// summary, the selected Workflow's lifecycle facts, the provider/git
+// health, and the legal actions — so the TUI never issues several
+// mutually-inconsistent Queries per frame.
+type ProjectWorkspaceQuery struct {
+	// Selected is the workflow the workspace screen focuses ("" = the
+	// first workflow, or the empty workspace).
+	Selected model.WorkflowID
+}
+
+func (ProjectWorkspaceQuery) isQuery() {}
+
+// WorkspaceView is the aggregate workspace projection.
+type WorkspaceView struct {
+	Project     ProjectView
+	Workflows   []WorkflowSummary
+	Selected    model.WorkflowID
+	Lifecycle   *WorkflowLifecycleView
+	Health      HealthView
+	LegalActions []LegalAction
+}
+
+// ProjectView is the project identity the workspace renders.
+type ProjectView struct {
+	Key  string
+	Root string
+	Name string
+}
+
+// WorkflowLifecycleView is the selected workflow's lifecycle facts the
+// workspace main column renders: the status projection plus the active
+// Plan revision and the blocking findings.
+type WorkflowLifecycleView struct {
+	Status     StatusView
+	Plan       *PlanView
+	Blocked    bool
+	Adopted    bool
+}
+
+// HealthView is the provider/git health of the workspace (read-only
+// probes; never a model request).
+type HealthView struct {
+	GitAvailable bool
+	Providers    []ProviderHealth
+}
+
+// ProviderHealth is one enabled Provider's detection summary.
+type ProviderHealth struct {
+	Name          string
+	Compatible    bool
+	Executable    string
+	CLIVersion    string
+}
+
+// LegalAction is one action the selected workflow may legally take right
+// now (the workspace renders them; the explicit commands execute them).
+type LegalAction struct {
+	Label string
+	Kind  model.WorkflowCommandKind
+	// Paused/Blocked/etc. action hints the TUI maps to commands.
+	Hint string
+}
+
 // ListView is the list projection.
 type ListView struct{ Workflows []WorkflowSummary }
 
@@ -188,9 +253,18 @@ type StatusView struct {
 	BaseCommit        string
 	IntegrationBranch string
 	IntegrationHead   string
-	Findings          []model.Finding
-	Run               *model.Run
-	Processes         []model.ProcessRecord
+	// WorkspacePath/Branch are the aggregated workspace facts (design 8.1),
+	// and CandidateWorkspaceHead/VerifiedWorkspaceHead/WorkspaceDirty-
+	// Fingerprint are the workspace adoption facts (design 8.2, 8.4): the
+	// verified head is the only legal Task base.
+	WorkspacePath             string
+	WorkspaceBranch           string
+	CandidateWorkspaceHead    string
+	VerifiedWorkspaceHead     string
+	WorkspaceDirtyFingerprint string
+	Findings                  []model.Finding
+	Run                       *model.Run
+	Processes                 []model.ProcessRecord
 	// PlanStatus is the active Plan Revision's review status ("" when no
 	// Plan exists). PlanApproved is true only for the user's append-only
 	// Approval; a checker pass never sets it.
@@ -226,6 +300,45 @@ type PlanView struct {
 	Approved   bool
 }
 
+// ChangeSetView is the frozen candidate Change Set projection. Ref points
+// at the immutable ArtifactChangeSet Revision written by the freeze; the
+// remaining fields mirror the Git facts the Runtime captured.
+type ChangeSetView struct {
+	Ref       model.ArtifactRef
+	Base      string
+	Candidate string
+	Verified  string
+	Fingerprint string
+	Dirty     bool
+}
+
+// MigrationPreviewView is the read-only Legacy Layout Migration preview:
+// the exact ordered moves and the canonical manifest hash the Prepare
+// binds (TUI task 8, design §7.4).
+type MigrationPreviewView struct {
+	Workflow     model.WorkflowID
+	From         int
+	To           int
+	Moves        []model.PathMove
+	ManifestHash string
+}
+
+// DiscussionReturnView is the native discussion Return Page projection
+// (design §9.2, TUI task 12).
+type DiscussionReturnView struct {
+	Workflow model.WorkflowID
+	// Session is the bound interactive Session lineage ("" when no
+	// discussion session exists yet).
+	Session model.SessionID
+	// Provider is the approved Provider of the bound Session.
+	Provider string
+	// ChangeSet is the frozen Change Set Ref ("" until the first
+	// freeze).
+	ChangeSet *model.ArtifactRef
+	// Actions are the legal return actions of the page.
+	Actions []string
+}
+
 // ExecutionPreviewView is the Execution Approval preview projection.
 type ExecutionPreviewView struct {
 	Workflow model.WorkflowID
@@ -247,6 +360,9 @@ type ExecutionPreviewView struct {
 	RoutingHash      string
 	BudgetHash       string
 	CommitPolicyHash string
+	// ChangeSetHash is the frozen Change Set Hash the Approval binds
+	// ("" when no Change Set was frozen).
+	ChangeSetHash string
 
 	Routes            []RoutePreview
 	Budgets           []BudgetPreview
@@ -394,10 +510,14 @@ type LogsView struct {
 
 func (ListView) isView()               {}
 func (StatusView) isView()             {}
+func (WorkspaceView) isView()          {}
 func (InspectView) isView()            {}
 func (LogsView) isView()               {}
 func (DiscoveryView) isView()          {}
 func (PlanView) isView()               {}
+func (ChangeSetView) isView()          {}
+func (MigrationPreviewView) isView()   {}
+func (DiscussionReturnView) isView()   {}
 func (ExecutionPreviewView) isView()   {}
 func (PolicyConfirmationView) isView() {}
 func (CancelSummaryView) isView()      {}
@@ -432,6 +552,18 @@ type DiscussRequirementCommand struct {
 	Workflow model.WorkflowID
 	Text     string
 	Provider string
+}
+
+// FreezeDiscussionCommand freezes the candidate Change Set of the
+// Workspace at one discussion Session turn (TUI task 5): the Runtime
+// observes the exact Git facts (Base/Heads, committed Commit Range,
+// tracked Diff, Untracked inventory, Dirty Fingerprint) and writes them
+// as one immutable ArtifactChangeSet Revision. The Change Set is never
+// Agent-authored; freezing again after further turns produces the next
+// Revision while every earlier Revision stays byte-identical.
+type FreezeDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
 }
 
 // GeneratePlanCommand is the /finish transition: the planner produces a
@@ -539,6 +671,10 @@ type ApproveExecutionCommand struct {
 	RoutingHash      string
 	BudgetHash       string
 	CommitPolicyHash string
+	// ChangeSetHash is the frozen Change Set Hash the Approval binds (TUI
+	// task 6): non-empty when the Execution Approval gates the Workspace
+	// behind the Adoption Gate.
+	ChangeSetHash string
 }
 
 // DispatchCommand runs one allocation pass of the approved execution
@@ -549,6 +685,80 @@ type ApproveExecutionCommand struct {
 // cross a committed closure (Pause, Quiesce, Cancel, Safety Stop).
 type DispatchCommand struct {
 	Workflow model.WorkflowID
+}
+
+// AdoptWorkspaceCommand runs the Workspace Adoption Gate of one
+// Execution-Approved Workflow whose Approval bound a frozen Change Set
+// (TUI task 6, design 8.4): the Runtime re-verifies the Workspace's
+// Change Set, Commit Policy, Identity/Signing, Clean/Scope, Catalog
+// Verification, and an independent Review; on a PASS verdict the
+// verified_workspace_head advances to the exact candidate Head and
+// normal Tasks may be scheduled from it.
+type AdoptWorkspaceCommand struct {
+	Workflow model.WorkflowID
+}
+
+// PrepareNativeDiscussionCommand establishes the exact CFlow Session of
+// one native interactive requirement discussion (design §9.1, TUI task
+// 12): it validates the workflow and the approved Provider route,
+// allocates the fresh Session identity, and returns the Provider
+// binding facts the TUI's blocking exec callback passes to the Bridge.
+type PrepareNativeDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Provider string
+}
+
+// DiscussionReturnQuery projects the native discussion Return Page: the
+// bound Session lineage, the Workspace facts, the frozen Change Set Ref
+// ("" until the first freeze), and the legal return actions.
+type DiscussionReturnQuery struct {
+	Workflow model.WorkflowID
+}
+
+func (DiscussionReturnQuery) isQuery() {}
+
+// FinishDiscussionCommand finishes one native requirement discussion
+// (design §9.2, TUI task 12): it freezes the current Change Set if none
+// exists yet, then writes the immutable ArtifactDiscussionHandoff
+// carrying the strict targets/constraints/non-goals/acceptance/open
+// questions, the Change Set Ref, and the user's decisions. The handoff
+// is the only input Plan generation consumes from the discussion.
+type FinishDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
+	// Handoff is the strict structured handoff body (canonical JSON
+	// validated against discussion-handoff.json).
+	Handoff []byte
+}
+
+// LayoutMigrationPreviewQuery projects the read-only Legacy Layout
+// Migration Preview of one Layout Version 1 workflow (TUI task 8, design
+// §7.4): the exact ordered moves and the canonical manifest hash.
+// Computing the Preview never moves, creates, or deletes anything.
+type LayoutMigrationPreviewQuery struct {
+	Workflow model.WorkflowID
+}
+
+func (LayoutMigrationPreviewQuery) isQuery() {}
+
+// PrepareLayoutMigrationCommand is the first explicit step of the Legacy
+// Layout Migration: it validates the Preview against the current facts,
+// persists the migration row (status PREPARED, the canonical manifest
+// hash), and records the LayoutMigrationIntent in the effect ledger so a
+// crash before any move leaves an exactly-recoverable intent. No file or
+// Worktree moves during Prepare.
+type PrepareLayoutMigrationCommand struct {
+	Workflow     model.WorkflowID
+	ManifestHash string
+}
+
+// ExecuteLayoutMigrationCommand is the second explicit step: it performs
+// the ordered moves of the bound manifest (git worktree move for the
+// Worktrees, safe path moves for the Artifacts), then advances the
+// persisted Layout facts to Version 2 and marks the migration COMPLETED.
+type ExecuteLayoutMigrationCommand struct {
+	Workflow     model.WorkflowID
+	ManifestHash string
 }
 
 // ReconcileCommand runs the Recovery sweep of the Kernel: it completes a
@@ -658,6 +868,7 @@ type ConfirmApplyPolicyCommand struct {
 
 func (CreateWorkflowCommand) isCommand()      {}
 func (DiscussRequirementCommand) isCommand()  {}
+func (FreezeDiscussionCommand) isCommand()    {}
 func (GeneratePlanCommand) isCommand()        {}
 func (CheckPlanCommand) isCommand()           {}
 func (ApprovePlanCommand) isCommand()         {}
@@ -672,6 +883,11 @@ func (CompileWorkflowCommand) isCommand()     {}
 func (ExecutionDryRunCommand) isCommand()     {}
 func (ApproveExecutionCommand) isCommand()    {}
 func (DispatchCommand) isCommand()            {}
+func (AdoptWorkspaceCommand) isCommand()      {}
+func (PrepareLayoutMigrationCommand) isCommand()      {}
+func (ExecuteLayoutMigrationCommand) isCommand()      {}
+func (PrepareNativeDiscussionCommand) isCommand()     {}
+func (FinishDiscussionCommand) isCommand()            {}
 func (ReconcileCommand) isCommand()           {}
 func (CommitPolicyConfirmCommand) isCommand() {}
 func (ReplacementPreviewCommand) isCommand()  {}
@@ -703,6 +919,9 @@ type Outcome struct {
 	// SessionID is the Session identity a planning command created (""
 	// for commands without one).
 	SessionID model.SessionID
+	// ChangeSet is the Change Set the freeze command wrote (nil for
+	// commands without one).
+	ChangeSet *ChangeSetView
 	// ExportErr reports a failed events.jsonl export. The export is a
 	// rebuildable audit file, never the recovery stream (design 21); the
 	// mutation itself is unaffected.

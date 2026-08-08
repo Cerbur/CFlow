@@ -133,6 +133,35 @@ func ResumeArgv(req ResumeRequest) []string {
 	return append(argv, "--resume", string(req.SessionID))
 }
 
+// InteractiveResume is the optional native interactive resume seam (TUI
+// task 11, design §9): the plain interactive claude resume of one
+// Session in the workflow Worktree, inheriting the caller's terminal. It
+// is only available when the binding's NativeInteractiveResume capability
+// is set; the argv is explicit and carries no bypass flag.
+func (a *Adapter) InteractiveResume(ctx context.Context, session agent.ProviderSessionID, cwd string) (agent.InteractiveResumeSpec, error) {
+	if err := ctx.Err(); err != nil {
+		return agent.InteractiveResumeSpec{}, err
+	}
+	if !bindingHasCap(a.binding.ResumeCapabilities, []string{"in_process"}) {
+		return agent.InteractiveResumeSpec{Capability: false}, nil
+	}
+	path, err := exec.LookPath(a.binding.Executable.Name)
+	if err != nil {
+		return agent.InteractiveResumeSpec{}, model.NewFault(model.CodeProviderProtocolUnsupported,
+			"claude executable cannot be resolved: "+err.Error())
+	}
+	if cwd != "" && !filepath.IsAbs(cwd) {
+		return agent.InteractiveResumeSpec{}, model.InvalidInputFault("claude working directory must be an absolute path")
+	}
+	return agent.InteractiveResumeSpec{
+		Executable: path,
+		Args:       []string{"--resume", string(session)},
+		Dir:        cwd,
+		Env:        safeEnv(),
+		Capability: true,
+	}, nil
+}
+
 // Adapter is the Claude Adapter over one immutable Registry binding
 // (design 14.2): detection, argv construction, and capability gates all
 // judge against this binding and nothing else.

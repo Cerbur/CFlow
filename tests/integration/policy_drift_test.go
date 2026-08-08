@@ -237,7 +237,7 @@ func TestResumeAfterInterruptWorktreeDrift(t *testing.T) {
 		_, err := a.Execute(ctx, app.DispatchCommand{Workflow: wf})
 		done <- err
 	}()
-	worktree := filepath.Join(fx.home, "worktrees", app.ProjectFor(fx.repo.Root).Key, string(wf), "tasks", "task-s01")
+	worktree := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo.Root).Key, string(wf), "tmp", "tasks", "task-s01")
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		iv := fx.Inspect(wf)

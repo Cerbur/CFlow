@@ -22,6 +22,7 @@ import (
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/decision"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/platform"
 	"cflow.local/cflow/internal/process"
@@ -46,6 +47,7 @@ type Application struct {
 	git        *gitflow.GitFlow
 	prompts    *agent.PromptRegistry
 	agent      agent.RuntimeOptions
+	layout     layout.Resolver
 	probe      probe // test seam: protocol-order observation, nil in production
 
 	mu        sync.Mutex
@@ -146,8 +148,9 @@ func New(opts Options) (*Application, error) {
 		redaction:          opts.Redaction,
 		supervisor:         sup,
 		git:                opts.GitFlow,
-		prompts:            opts.Prompts,
-		agent:              opts.Agent,
+prompts:          opts.Prompts,
+		agent:            opts.Agent,
+		layout:           layout.Resolver{Home: opts.Home, ProjectKey: opts.Project.Key},
 		stores:             map[model.WorkflowID]*store.Store{},
 		known:              map[model.WorkflowID]struct{}{},
 		procs:              map[model.ProcessID]process.Handle{},
@@ -233,6 +236,12 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryReplacementPreview(ctx, qq)
 	case ReportQuery:
 		return a.queryReport(ctx, qq)
+	case LayoutMigrationPreviewQuery:
+		return a.queryMigrationPreview(ctx, qq)
+	case ProjectWorkspaceQuery:
+		return a.queryWorkspace(ctx, qq)
+	case DiscussionReturnQuery:
+		return a.queryDiscussionReturn(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -389,6 +398,12 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 	switch cmd.(type) {
 	case DispatchCommand, RetryCommand:
 		out, err = a.executeDispatch(ctx, st, wf, restricted)
+	case FreezeDiscussionCommand:
+		out, err = a.executeFreeze(ctx, st, wf, cmd.(FreezeDiscussionCommand))
+	case ExecuteLayoutMigrationCommand:
+		out, err = a.executeMigration(ctx, st, wf, cmd.(ExecuteLayoutMigrationCommand))
+	case PrepareLayoutMigrationCommand:
+		out, err = a.prepareMigrationExecute(ctx, st, wf, cmd.(PrepareLayoutMigrationCommand))
 	default:
 		out, err = a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
 	}
@@ -649,6 +664,8 @@ func planningSessionOf(input model.Input) model.SessionID {
 		return in.Session
 	case model.WorkflowCompilationInput:
 		return in.Session
+	case model.PrepareNativeDiscussionInput:
+		return in.Session
 	}
 	return ""
 }
@@ -693,10 +710,15 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			return nil, "", model.InvalidInputFault("a discussion provider is required and bounded")
 		}
 		wf := model.WorkflowID(a.ids(model.IDWorkflow))
+		ws := a.layout.Workspace(wf)
+		wb := workspaceBranchOf(wf)
 		return model.WorkflowCommandInput{
 			Kind: model.CreateWorkflow, Workflow: wf,
-			Project:      model.ProjectID(a.project.Key),
-			TargetBranch: facts.Branch, BaseCommit: facts.Head,
+			Project:         model.ProjectID(a.project.Key),
+			TargetBranch:    facts.Branch,
+			BaseCommit:      facts.Head,
+			WorkspacePath:   ws,
+			WorkspaceBranch: wb,
 		}, wf, nil
 	case DiscussRequirementCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
@@ -710,6 +732,22 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			Text: c.Text, Provider: c.Provider,
 			Session: model.SessionID(a.ids(model.IDSession)),
 		}, wf, nil
+	case PrepareNativeDiscussionCommand:
+		return a.prepareNativeDiscussion(ctx, c)
+	case FinishDiscussionCommand:
+		return a.prepareFinish(ctx, c)
+	case FreezeDiscussionCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if !c.Session.Valid() {
+			return nil, "", model.InvalidInputFault("freezing the change set requires a discussion session identity")
+		}
+		// The freeze observes the Workspace and writes the immutable
+		// Change Set Revision itself (TUI task 5); the Kernel Input
+		// placeholder is unused by the dedicated freeze path.
+		return model.DispatchInput{}, wf, nil
 	case GeneratePlanCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {
@@ -812,7 +850,18 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		if err != nil {
 			return nil, "", err
 		}
-		return model.ExecutionDryRunInput{Preflight: preflight, RoutingRef: routingRef, BudgetRef: budgetRef}, wf, nil
+		// The frozen Change Set (the Workspace candidate the discussion
+		// finished) becomes an active reference of the Dry Run, so the
+		// Execution Approval preview binds its hash and the approval gates
+		// the Workspace behind the Adoption Gate (TUI task 6, design 8.4).
+		changeSetRef, err := a.latestChangeSetRef(ctx, wf)
+		if err != nil {
+			return nil, "", err
+		}
+		return model.ExecutionDryRunInput{
+			Preflight: preflight, RoutingRef: routingRef, BudgetRef: budgetRef,
+			ChangeSetRef: changeSetRef,
+		}, wf, nil
 	case ApproveExecutionCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {
@@ -830,6 +879,7 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			RoutingHash:      c.RoutingHash,
 			BudgetHash:       c.BudgetHash,
 			CommitPolicyHash: c.CommitPolicyHash,
+			ChangeSetHash:    c.ChangeSetHash,
 		}, wf, nil
 	case DispatchCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
@@ -840,6 +890,22 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		// approved execution artifacts; the kernel Input placeholder is
 		// unused by the dispatch path.
 		return model.DispatchInput{}, wf, nil
+	case AdoptWorkspaceCommand:
+		return a.prepareAdoption(ctx, c)
+	case PrepareLayoutMigrationCommand:
+		return a.prepareMigration(ctx, c)
+	case ExecuteLayoutMigrationCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.ManifestHash == "" {
+			return nil, "", model.InvalidInputFault("the migration requires the exact preview manifest hash")
+		}
+		// The Execute pass performs the ordered moves itself (design 6.1:
+		// an explicit Application-owned operation); the kernel Input
+		// placeholder is unused by the dedicated migration path.
+		return model.ReconcileInput{}, wf, nil
 	case ReconcileCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

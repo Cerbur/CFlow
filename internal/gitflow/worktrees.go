@@ -93,6 +93,49 @@ func (g *GitFlow) createIntegration(ctx context.Context, op CreateIntegration) (
 	return IntegrationWorktreeResult{Worktree: path, Branch: op.Branch, Head: entry.Head}, nil
 }
 
+// createWorkspace creates the single long-lived Workspace Branch/Worktree
+// from the recorded Base Head (design 8.1: created at workflow creation,
+// the cwd of every planning session and of adopted execution). The branch
+// must not already exist.
+func (g *GitFlow) createWorkspace(ctx context.Context, op CreateWorkspace) (GitResult, error) {
+	if err := validateBranchName(op.Branch); err != nil {
+		return nil, err
+	}
+	if err := validateHead(op.BaseHead); err != nil {
+		return nil, err
+	}
+	path, err := g.validateWorktreePath(ctx, op.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.requireCommit(ctx, op.BaseHead); err != nil {
+		return nil, err
+	}
+	ref := "refs/heads/" + op.Branch
+	if exists, err := g.refExists(ctx, ref); err != nil {
+		return nil, err
+	} else if exists {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: workspace branch already exists")
+	}
+	env := childEnv()
+	if _, _, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "worktree", "add", "-b", op.Branch, path, op.BaseHead); err != nil {
+		return nil, err
+	} else if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: workspace worktree could not be created")
+	}
+	entry, err := g.verifiedEntry(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Detached || entry.Branch != op.Branch || entry.Head != op.BaseHead {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: workspace worktree does not match the expected state")
+	}
+	return WorkspaceWorktreeResult{Worktree: path, Branch: op.Branch, Head: entry.Head}, nil
+}
+
 // createTask creates one isolated Task Branch/Worktree from the verified
 // Integration HEAD recorded when the Task became Ready (design 15.2). An
 // unknown BaseHead is a fail-closed expected-HEAD mismatch: the Task
@@ -318,6 +361,48 @@ func (g *GitFlow) removeWorktree(ctx context.Context, op RemoveWorktree) (GitRes
 			"gitflow: worktree removal refused (dirty, locked, or occupied): "+string(errOut))
 	}
 	return WorktreeRemovedResult{Path: clean}, nil
+}
+
+// moveWorktree moves one registered managed Worktree to a new canonical
+// path with `git worktree move <from> <to>` (design §7.4, TUI task 8).
+// The source must be a registered Worktree; the destination must not
+// exist and must be outside every existing worktree. A dirty or
+// in-progress source is refused (git refuses the move anyway); the
+// fail-closed post-move verification re-observes the registry and the
+// destination's HEAD.
+func (g *GitFlow) moveWorktree(ctx context.Context, op MoveWorktree) (GitResult, error) {
+	if op.From == "" || op.To == "" {
+		return nil, model.InvalidInputFault("gitflow: worktree move requires exact source and destination paths")
+	}
+	from := filepath.Clean(op.From)
+	to, err := g.validateWorktreePath(ctx, op.To)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := g.verifiedEntry(ctx, from)
+	if err != nil {
+		return nil, err
+	}
+	env := childEnv()
+	_, errOut, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "worktree", "move", from, to)
+	if err != nil {
+		return nil, err
+	}
+	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeCleanupTargetDirty,
+			"gitflow: worktree move refused (dirty, locked, or occupied): "+string(errOut))
+	}
+	// Fail-closed post-move verification: the destination is registered,
+	// carries the same Branch, and its HEAD is unchanged.
+	moved, err := g.verifiedEntry(ctx, to)
+	if err != nil {
+		return nil, err
+	}
+	if moved.Branch != entry.Branch || moved.Head != entry.Head {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: moved worktree identity changed during the move")
+	}
+	return WorktreeMovedResult{From: from, To: to, Head: moved.Head}, nil
 }
 
 // worktreeInProgress observes the state markers of one managed Worktree's

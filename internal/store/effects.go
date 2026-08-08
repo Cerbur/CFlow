@@ -103,6 +103,8 @@ func effectKindOf(i model.EffectIntent) (string, error) {
 		return "provider-cancel", nil
 	case model.PlanningWorktreeCreateIntent:
 		return "planning-worktree-create", nil
+	case model.WorkspaceWorktreeCreateIntent:
+		return "workspace-worktree-create", nil
 	case model.IntegrationWorktreeCreateIntent:
 		return "integration-worktree-create", nil
 	case model.TaskWorktreeCreateIntent:
@@ -115,6 +117,12 @@ func effectKindOf(i model.EffectIntent) (string, error) {
 		return "integration-merge", nil
 	case model.IntegrationRollbackIntent:
 		return "integration-rollback", nil
+	case model.WorkspaceMergeIntent:
+		return "workspace-merge", nil
+	case model.WorkspaceRollbackIntent:
+		return "workspace-rollback", nil
+	case model.LayoutMigrationIntent:
+		return "layout-migration", nil
 	case model.VerificationRunIntent:
 		return "verification-run", nil
 	case model.WorkflowCompileIntent:
@@ -157,6 +165,10 @@ func effectFromKind(kind string, payload []byte) (model.EffectIntent, error) {
 		var v model.PlanningWorktreeCreateIntent
 		err = json.Unmarshal(payload, &v)
 		return v, err
+	case "workspace-worktree-create":
+		var v model.WorkspaceWorktreeCreateIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
 	case "integration-worktree-create":
 		var v model.IntegrationWorktreeCreateIntent
 		err = json.Unmarshal(payload, &v)
@@ -179,6 +191,18 @@ func effectFromKind(kind string, payload []byte) (model.EffectIntent, error) {
 		return v, err
 	case "integration-rollback":
 		var v model.IntegrationRollbackIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "workspace-merge":
+		var v model.WorkspaceMergeIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "workspace-rollback":
+		var v model.WorkspaceRollbackIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "layout-migration":
+		var v model.LayoutMigrationIntent
 		err = json.Unmarshal(payload, &v)
 		return v, err
 	case "verification-run":

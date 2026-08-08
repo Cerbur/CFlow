@@ -237,12 +237,12 @@ func TestParallelTasksDispatchOverlapWhileDependentWaits(t *testing.T) {
 	}
 
 	// Each Task coded only inside its own Task Worktree created from the
-	// recorded Task Base (the Integration HEAD); the user workspace, the
-	// Planning Snapshot, and the Integration Worktree carry no coded file.
-	base := filepath.Join(fx.home, "worktrees", app.ProjectFor(fx.repo.Root).Key, string(wf))
+	// recorded Task Base (the verified Workspace Head, design 8.5); the
+	// user workspace and the Workspace carry no coded file.
+	base := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo.Root).Key, string(wf))
 	coded := filepath.Join("src", "calc", "divide.go")
 	for _, id := range []string{"task-s01", "task-s02", "task-s03"} {
-		wt := filepath.Join(base, "tasks", id)
+		wt := filepath.Join(base, "tmp", "tasks", id)
 		if !pathExists(filepath.Join(wt, coded)) {
 			t.Fatalf("the coded file must land in the Task Worktree %s", wt)
 		}
@@ -252,8 +252,7 @@ func TestParallelTasksDispatchOverlapWhileDependentWaits(t *testing.T) {
 	}
 	for _, root := range []string{
 		fx.repo.Root,
-		filepath.Join(base, "planning"),
-		filepath.Join(base, "integration"),
+		filepath.Join(base, "workspace"),
 	} {
 		if pathExists(filepath.Join(root, coded)) {
 			t.Fatalf("the coded file leaked into %s", root)

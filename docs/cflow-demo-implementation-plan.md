@@ -17,11 +17,13 @@
 
 ## Authority and exact inputs
 
+> **2026-08-07 已确认变更**：本 Plan（line-oriented Demo 的 Task 1–22 / Gate 1–3）已被确认的 TUI Workflow 方向取代。权威 TUI 设计见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`；TUI 实施顺序见 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md`。本文件作为历史基线保留；其中包含的 Safety Invariant 全部保留。
+
 - Approved PRD: `docs/cflow-prd.md` v0.2, SHA-256 `28765291866c197dbef2124c5e0bf066e3a3bebba1c72a85f9f99b18e00f66de`.
 - Approved design: `docs/cflow-demo-design.md` v0.1, SHA-256 `165bfe3867e514e021f62c673d46b19ceaca90ab0ba95ccfe3db82f0b677460a`.
 - Canonical domain language: `CONTEXT.md`.
 - This Plan fixes implementation-level names and dependency versions. A change to a product invariant, deep-module boundary, approval model, or fact authority requires a successor PRD/design revision before implementation continues.
-- The user approved this Plan and selected Subagent-Driven execution on 2026-08-03. Implementation is authorized in a separate Claude Code session, subject to the execution-time approval gates and constraints in this document; this Codex session does not implement it.
+- The user approved this Plan and selected Subagent-Driven execution on 2026-08-03. Implementation of the predecessor line-oriented Demo is authorized in a separate Claude Code session; this document describes that historical Demo only.
 
 ## Global Constraints
 
@@ -835,7 +837,7 @@ Run all approved Final-Verify Catalog entries in Integration Worktree, require u
 
 - [ ] **Step 4: Implement immutable report and full line CLI**
 
-Report is a read model over approved hashes, Git facts, Sessions, Attempts, Findings, evidence, migrations, security posture, Runtime build, and Apply state. Implement `cflow`, `list`, `status`, `resume`, `inspect`, `inspect task`, `logs`, `retry`, `pause`, `cancel`, `cleanup` dry-run entry, `dry-run`, `doctor`, and `apply` preflight entry; Gate 3 commands may return the stable not-yet-available Finding until their tasks land. No full-screen TUI.
+Report is a read model over approved hashes, Git facts, Sessions, Attempts, Findings, evidence, migrations, security posture, Runtime build, and Apply state. Implement `cflow`, `list`, `status`, `resume`, `inspect`, `inspect task`, `logs`, `retry`, `pause`, `cancel`, `cleanup` dry-run entry, `dry-run`, `doctor`, and `apply` preflight entry; Gate 3 commands may return the stable not-yet-available Finding until their tasks land. No full-screen TUI yet at the time this was written (old line-oriented Demo CLI); **Superseded by the confirmed 2026-08-07 TUI workflow direction** — see `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md`.
 
 - [ ] **Step 5: Run deterministic Gate 2 suite**
 
@@ -1059,7 +1061,7 @@ Validate the exact PRD Plan sections, inputs, producer Purpose/Session, and hash
 
 Run: `gofmt -w internal/app internal/decision internal/cli tests/integration && go test -race ./internal/app ./tests/integration -run 'TestPlan|TestWorkflow' && go test ./... && go vet ./...`
 
-Expected: PASS; CLI can create, discuss, inspect, revise, check, and approve using scripted stdin without a full-screen TUI.
+Expected: PASS; CLI can create, discuss, inspect, revise, check, and approve using scripted stdin without a full-screen TUI (headless mode remains the scripted/diagnostic front-end under the confirmed 2026-08-07 TUI workflow direction).
 
 ```bash
 git add internal/app internal/decision internal/cli tests/integration tests/testdata/plans
@@ -1965,7 +1967,8 @@ Expected: empty final status. The user still performs final release acceptance; 
 | Safe Cleanup | 20 | exact-target/partial recovery fixtures |
 | Full fault compatibility/security proof | 21 | release fault matrix |
 | Cross-platform single binary and self-Dogfood | 22 | Gate 3 candidate and acceptance report |
-| P1 OpenCode, Provider TUI, cost analytics; P2 cloud/Web | no task by design | excluded from Demo candidate |
+| P1 OpenCode, cost analytics; P2 cloud/Web | no task by design | excluded from Demo candidate |
+| Provider TUI attach | was excluded as P1 | **Superseded (2026-08-07)**: native Codex/Claude discussion is now part of the confirmed TUI workflow direction; see `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md` |
 
 ## Confirmed implementation-plan approval gate
 

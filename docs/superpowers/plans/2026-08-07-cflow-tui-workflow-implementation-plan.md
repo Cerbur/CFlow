@@ -174,6 +174,8 @@ func (r Resolver) Apply(wf model.WorkflowID, n int) string {
 
 同时提供 `DiscussionDir`、`PlansDir`、`SpecsDir`、`WorkflowsDir`、`ReviewsDir`、`SessionsDir`、`EvidenceDir`、`LogsDir`、`ReportsDir`、`StateDir`，并让安全路径注册表接受这些受管根。
 
+> **实现注记 (2026-08-07)**：`internal/security/paths.go` 无需改动——`preservedTreeNames` 已含 `projects`，现有 `CheckCleanupScratch` 与 `CheckPath` 天然拒绝把聚合 Workflow 树当作 exact scratch。由新增测试 `TestCheckCleanupScratchRejectsAggregatedWorkflowRoot`（paths_test.go）证明，因此 Task 2 未修改 `paths.go`。
+
 - [ ] **Step 4: 让 Artifact Store 使用聚合类型目录**
 
 保留 Legacy `artifact.New` Reader，新增：

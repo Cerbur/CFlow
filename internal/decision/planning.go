@@ -97,9 +97,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 		case model.PurposeReview:
 			// The independent Reviewer Session's verdict is evidence; the
 			// Kernel judges it (design 16.2: review never replaces
-			// deterministic verification).
+			// deterministic verification). A Reviewer Session without an
+			// execution Attempt is the Workspace Adoption Review of the
+			// adoption gate (TUI task 6, design 8.4).
 			if state.Workflow.Stage == model.StageExecution {
-				return decideReviewRunEnded(state, in, created)
+				if attemptBySession(state, created.ID) != nil {
+					return decideReviewRunEnded(state, in, created)
+				}
+				return decideAdoptionReviewRunEnded(state, in, created)
 			}
 		case model.PurposeFinalVerification:
 			// The independent Final Reviewer Session (Task 18, PRD 最终验
@@ -393,6 +398,11 @@ func decideArtifactWritten(state model.State, in model.EffectResultInput) (model
 	case model.ArtifactDiscussionTurn:
 		// The turn Artifact's identity is the Producer linkage to its
 		// Session lineage; no aggregate row records it.
+		return model.Decision{}, nil
+	case model.ArtifactDiscussionHandoff:
+		// The handoff's identity is the immutable structured body plus
+		// its Producer linkage; no aggregate row records it (design
+		// §9.2, TUI task 12).
 		return model.Decision{}, nil
 	case model.ArtifactPlanCheck:
 		return checkResultCommitted(state, in)

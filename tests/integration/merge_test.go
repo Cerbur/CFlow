@@ -229,3 +229,60 @@ func TestIntegrationMergeSerialNoFF(t *testing.T) {
 		t.Fatalf("unexpected fault: %v", err)
 	}
 }
+
+// TestFastForwardWorkingTreeDeliversFiles is the TUI task 15 failure
+// test: the working-tree fast-forward moves the user's original root to
+// the verified staging head — HEAD, Index, and the files themselves all
+// sync (no update-ref that leaves the files stale).
+func TestFastForwardWorkingTreeDeliversFiles(t *testing.T) {
+	fx := newIntegrationMergeFixture(t)
+	// The user's root is the repo root (clean, attached to main at base).
+	branch := fx.taskBranch("feature", "verified\n")
+	head := strings.TrimSpace(string(fx.repo.git("rev-parse", "refs/heads/"+branch)))
+
+	res, err := fx.flow.Execute(context.Background(), gitflow.FastForwardWorkingTree{
+		Root:     fx.repo.Root,
+		Branch:   "main",
+		Expected: fx.base,
+		New:      head,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ff, ok := res.(gitflow.FastForwardWorkingTreeResult)
+	if !ok {
+		t.Fatalf("result type = %T", res)
+	}
+	if ff.Head != head || !ff.Clean {
+		t.Fatalf("fast-forward result = %+v", ff)
+	}
+	if got := strings.TrimSpace(string(fx.repo.git("rev-parse", "HEAD"))); got != head {
+		t.Fatalf("user root HEAD = %s, want the staging head %s", got, head)
+	}
+	if got := strings.TrimSpace(string(fx.repo.git("status", "--porcelain"))); got != "" {
+		t.Fatalf("user root is not clean after the delivery: %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(fx.repo.Root, "calc.ts")); err != nil || string(got) != "verified\n" {
+		t.Fatalf("calc.ts = %q err=%v, want the verified content", got, err)
+	}
+}
+
+// TestFastForwardWorkingTreeRefusesDirtyRoot: a dirty user root is
+// refused with APPLY_TARGET_DIRTY and nothing moves.
+func TestFastForwardWorkingTreeRefusesDirtyRoot(t *testing.T) {
+	fx := newIntegrationMergeFixture(t)
+	branch := fx.taskBranch("feature", "verified\n")
+	head := strings.TrimSpace(string(fx.repo.git("rev-parse", "refs/heads/"+branch)))
+	if err := os.WriteFile(filepath.Join(fx.repo.Root, "wip.txt"), []byte("wip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := fx.flow.Execute(context.Background(), gitflow.FastForwardWorkingTree{
+		Root: fx.repo.Root, Branch: "main", Expected: fx.base, New: head,
+	})
+	if err == nil {
+		t.Fatal("a dirty root was delivered to")
+	}
+	if code, ok := model.CodeOf(err); !ok || code != model.CodeApplyTargetDirty {
+		t.Fatalf("fault = %v, want APPLY_TARGET_DIRTY", err)
+	}
+}

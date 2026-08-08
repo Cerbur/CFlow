@@ -60,9 +60,25 @@ type ProviderCancelIntent struct {
 
 func (ProviderCancelIntent) isEffectIntent() {}
 
+// WorkspaceWorktreeCreateIntent creates the single long-lived Workspace
+// Branch/Worktree of a new Workflow (design 8.1). BaseHead is the
+// expected-HEAD value the branch is created from; Branch and Path are the
+// identity facts the Application derived through the layout Resolver and
+// the PostgreSQL persisted (design 6.2 rule 6, TUI task 4).
+type WorkspaceWorktreeCreateIntent struct {
+	Workflow WorkflowID
+	BaseHead string
+	Branch   string
+	Path     string
+}
+
+func (WorkspaceWorktreeCreateIntent) isEffectIntent() {}
+
 // PlanningWorktreeCreateIntent creates the Planning Snapshot Worktree
 // fixed at the recorded Base Commit (design 15.2). The Base Commit is an
-// expected-HEAD value, fixed before the Effect (design 6.2 rule 6).
+// expected-HEAD value, fixes before the Effect (design 6.2 rule 6).
+// Task 4 keeps this only as the Legacy Layout path; new Workflows use
+// WorkspaceWorktreeCreateIntent.
 type PlanningWorktreeCreateIntent struct {
 	Workflow   WorkflowID
 	BaseCommit string
@@ -129,6 +145,73 @@ type IntegrationRollbackIntent struct {
 }
 
 func (IntegrationRollbackIntent) isEffectIntent() {}
+
+// WorkspaceMergeIntent merges one verified Task Branch into the single
+// long-lived Workspace (design 8.5, TUI task 7): ExpectedWorkspaceHead is
+// the current verified Workspace Head the merge must observe
+// (compare-and-sawp); TaskBranch and VerifiedCommit fix the exact Task
+// Branch and the accepted Commit the merge must bring in. Parallel sibling
+// Tasks may share an old Base, but every merge Intent fixes the LATEST
+// verified Workspace Head at scheduling time; merges are serial --no-ff
+// and never auto-rebase or rewrite Task history.
+type WorkspaceMergeIntent struct {
+	Node                NodeID
+	ExpectedWorkspaceHead string
+	TaskBranch          string
+	VerifiedCommit      string
+}
+
+func (WorkspaceMergeIntent) isEffectIntent() {}
+
+// WorkspaceRollbackIntent restores the managed Workspace Worktree to a
+// recorded pre-merge HEAD after a failed Workspace merge. Attempt fixes
+// the Attempt whose failure the rollback settles; FailureCode carries the
+// typed failure the Attempt settles with once the Worktree is restored
+// ("" means the default MERGE_CONFLICT).
+type WorkspaceRollbackIntent struct {
+	Head        string
+	Attempt     AttemptKey
+	FailureCode Code
+}
+
+func (WorkspaceRollbackIntent) isEffectIntent() {}
+
+// PathMoveKind is one migration move kind (TUI task 8).
+type PathMoveKind string
+
+const (
+	// MoveKindWorktree moves one managed Git Worktree.
+	MoveKindWorktree PathMoveKind = "worktree"
+	// MoveKindArtifact moves one managed directory or file.
+	MoveKindArtifact PathMoveKind = "artifact"
+)
+
+// PathMove is one exact source→destination move of a Legacy Layout
+// Migration. Branch and Head bind a Worktree move to its registered
+// identity.
+type PathMove struct {
+	Kind        PathMoveKind `json:"kind"`
+	Source      string       `json:"source"`
+	Destination string       `json:"destination"`
+	Branch      string       `json:"branch,omitempty"`
+	Head        string       `json:"head,omitempty"`
+}
+
+// LayoutMigrationIntent performs the explicit Legacy Layout Migration of
+// one Layout Version 1 workflow into the aggregated layout (design §7.4,
+// TUI task 8): the ordered PathMoves move the legacy Worktrees
+// (`git worktree move`) and the legacy Artifacts root (safe path move)
+// into the aggregated workflow root, and the persisted Layout facts
+// advance to Version 2. Moves is the exact ordered list the Preview
+// derived and Prepare bound by manifest hash; Done counts the moves
+// already completed (recovery continues from the actual state).
+type LayoutMigrationIntent struct {
+	Workflow WorkflowID
+	Moves    []PathMove
+	Done     int
+}
+
+func (LayoutMigrationIntent) isEffectIntent() {}
 
 // VerificationRunIntent runs one approved Catalog Entry by identity.
 type VerificationRunIntent struct {

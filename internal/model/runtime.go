@@ -290,16 +290,24 @@ const (
 	SessionActive      SessionStatus = "ACTIVE"
 	SessionInterrupted SessionStatus = "INTERRUPTED"
 	SessionPaused      SessionStatus = "PAUSED"
-	SessionCompleted   SessionStatus = "COMPLETED"
-	SessionFailed      SessionStatus = "FAILED"
-	SessionCancelled   SessionStatus = "CANCELLED"
-	SessionLost        SessionStatus = "LOST"
+	// SessionInteractiveIdle is the native interactive discussion state
+	// (design §9, TUI task 12): the Provider's turn has ended, no process
+	// is running, but the exact Session may be resumed interactively.
+	// Legal transitions include STARTING → INTERACTIVE_IDLE → ACTIVE →
+	// INTERACTIVE_IDLE and, after Finish, INTERACTIVE_IDLE → COMPLETED;
+	// Completed/Failed/Cancelled/Lost are never resumable.
+	SessionInteractiveIdle SessionStatus = "INTERACTIVE_IDLE"
+	SessionCompleted       SessionStatus = "COMPLETED"
+	SessionFailed          SessionStatus = "FAILED"
+	SessionCancelled       SessionStatus = "CANCELLED"
+	SessionLost            SessionStatus = "LOST"
 )
 
 // Valid reports whether s is a declared Session Status.
 func (s SessionStatus) Valid() bool {
 	switch s {
 	case SessionStarting, SessionActive, SessionInterrupted, SessionPaused,
+		SessionInteractiveIdle,
 		SessionCompleted, SessionFailed, SessionCancelled, SessionLost:
 		return true
 	}

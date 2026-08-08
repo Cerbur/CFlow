@@ -6,7 +6,7 @@ CFlow 是一个面向 Coding Agent 的 local-first 工作流 Runtime。它把一
 
 CFlow 不是 `codex` 或 `claude` 的薄封装。它负责可恢复的 Plan-to-Done 生命周期，并且只依据持久化证据推进状态，而不会因为 Agent 声称“已经完成”就判定成功。
 
-> **项目状态：**Demo 基础实现已经存在。具有完整证据的 Gate 3 Candidate 绑定到源码 Commit `68fd200`，详见[验收报告](docs/cflow-demo-acceptance-report.md)。当前分支在此之后增加了 CLI/Provider wiring 和文档修改，但尚未重新执行并固定新的 Gate 3 证据。因此当前分支应视为 post-candidate 开发状态，而不是已发布版本。
+> **项目状态：**TUI 工作流（Task 4–16）已实现，其确定性 Fake TUI Gate 是当前 **Internal Candidate**，详见[验收报告](docs/cflow-demo-acceptance-report.md)。2026-08-07 已确认 **TUI 工作流方向**：全屏 Bubble Tea TUI 成为默认主入口，需求讨论进入 Codex / Claude 原生 Terminal，采用聚合 Workflow 目录、唯一长期 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup——见 [TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与 [其实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。交互式终端上执行裸 `cflow` 会启动全屏 TUI；行式子命令（`cflow status`、`cflow plan` …）仍作为 headless CLI 保留。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood **尚未运行**，需要在新精确 Candidate Commit 上单独明确授权。
 
 ## 为什么需要 CFlow
 
@@ -76,7 +76,9 @@ Release 风格构建还会写入源码 Commit 与内嵌 Registry Hash。详见 [
 
 ## 当前 Demo 用法
 
-当前界面是行式、命令驱动的。直接执行 `cflow` 会显示命令树；PRD 中描述的完整引导式交互生命周期尚未作为一条连续循环提供。
+> 2026-08-07 已确认方向将用全屏 TUI 与原生需求讨论取代本行式入口。TUI 已实现：交互式终端上执行裸 `cflow` 启动全屏 TUI；下面的行式子命令仍作为 headless CLI 保留。
+
+当前界面是行式、命令驱动的。直接执行 `cflow` 会显示命令树；PRD 中描述的完整引导式交互生命周期已通过全屏 TUI 提供（交互式终端）或以行式子命令提供（headless）。
 
 Post-candidate CLI 当前通过 `CFLOW_PROVIDERS` 注册真实 Provider；未设置时默认仍是确定性 Fake Adapter。
 
@@ -99,7 +101,7 @@ printf '%s\n' '描述需要完成的修改及其约束。' | \
 
 Approval 命令需要交互确认，并且默认选择“否”。Provider 执行可能访问网络并产生模型费用；批准前应检查精确 Route、预算、命令、Git Identity/Signing 事实和权限边界。
 
-当前 Demo CLI 仍属于工程候选：`doctor` 中部分有状态检查仍会显示 `NOT_YET_AVAILABLE`，并且当前 post-candidate Provider wiring 尚未获得更新后的 Gate 3 证据。
+当前 Demo CLI 仍属于工程候选：`doctor` 中部分有状态检查仍会显示 `NOT_YET_AVAILABLE`，并且当前 post-candidate Provider wiring 尚未获得更新后的 Gate 3 证据。已确认的 2026-08-07 TUI 工作流任务将在此基础上加入 Bubble Tea TUI、原生 Codex/Claude 需求讨论、Foreground Runner、聚合 Workspace、workspace-aware Apply 与显式 Cleanup。
 
 ## 命令概览
 
@@ -145,13 +147,15 @@ Gate 1 和 Gate 2 只产生内部 Candidate。Gate 3 可以产生 Demo Complete 
 - [产品需求文档](docs/cflow-prd.md)
 - [技术设计](docs/cflow-demo-design.md)
 - [实现 Plan](docs/cflow-demo-implementation-plan.md)
+- [TUI 工作流设计（2026-08-07 已确认）](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md)
+- [TUI 工作流实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)
 - [Gate 3 验收报告](docs/cflow-demo-acceptance-report.md)
 - [Local-first 边界](docs/cflow-local-first.md)
 - [领域语言](CONTEXT.md)
 
 ## Demo 非目标
 
-不包含 Web UI、云端服务、任意 Workflow 脚本、自动 Push/PR、跨仓库 Workflow、OpenCode Adapter、Provider TUI Attach 或无限自主 Retry Loop。
+不包含 Web UI、云端服务、任意 Workflow 脚本、自动 Push/PR、跨仓库 Workflow、OpenCode Adapter 或无限自主 Retry Loop。（Provider TUI Attach 原列于非目标；2026-08-07 已确认的 TUI 工作流方向已将原生 Codex/Claude 需求讨论作为主链路的一部分，详见对应的 TUI 设计文档。）
 
 ## License
 

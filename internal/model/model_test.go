@@ -21,7 +21,7 @@ var (
 	allNodes   = []NodeStatus{NodePending, NodeReady, NodeRunning, NodeSucceeded, NodeFailed, NodeCancelled, NodeSkipped}
 	allPlans   = []PlanStatus{PlanDraft, PlanChecking, PlanChecked, PlanApproved, PlanStale, PlanRejected}
 	allRuns    = []RunStatus{RunStarting, RunRunning, RunQuiescing, RunStopping, RunInterrupted, RunBlocked, RunSucceeded, RunFailed, RunCancelled}
-	allSession = []SessionStatus{SessionStarting, SessionActive, SessionInterrupted, SessionPaused, SessionCompleted, SessionFailed, SessionCancelled, SessionLost}
+	allSession = []SessionStatus{SessionStarting, SessionActive, SessionInterrupted, SessionPaused, SessionInteractiveIdle, SessionCompleted, SessionFailed, SessionCancelled, SessionLost}
 	allAttempt = []AttemptStatus{AttemptReady, AttemptRunning, AttemptSucceeded, AttemptFailed, AttemptInterrupted, AttemptCancelled}
 )
 

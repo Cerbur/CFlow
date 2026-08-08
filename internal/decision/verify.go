@@ -35,6 +35,141 @@ func verifyFailureCode(node *model.Node) model.Code {
 	return model.CodeCommandFailed
 }
 
+// ---------------------------------------------------------------------------
+// Workspace Adoption Gate (TUI task 6, design 8.4)
+// ---------------------------------------------------------------------------
+
+// decideAdoptWorkspace starts the Workspace Adoption Gate of one
+// Execution-Approved Workflow whose Approval bound a frozen Change Set.
+// The Application already re-verified the Workspace facts (Change Set
+// re-observation, Commit Policy, Identity/Signing, Clean/Scope, Catalog
+// Verification) and resolved the approved independent-review route; the
+// Kernel revalidates the committed gates (aggregated workspace layout,
+// EXECUTION stage, running Runtime, the bound Change Set hash, an
+// unadopted Workspace, and a fresh independent Session) and records the
+// Adoption Review Session. The Session's PASS verdict advances
+// verified_workspace_head to the exact verified Candidate Head; a FAIL
+// verdict or a drifted Workspace Blocks the Workflow and preserves the
+// Workspace and the Target Branch.
+func decideAdoptWorkspace(state model.State, in model.AdoptWorkspaceInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to adopt")
+	}
+	if state.Workflow.LayoutVersion < 2 || state.Workflow.WorkspacePath == "" || state.Workflow.WorkspaceBranch == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the aggregated workspace layout")
+	}
+	if state.Workflow.Stage != model.StageExecution {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the EXECUTION stage")
+	}
+	if state.Workflow.Runtime != model.RuntimeRunning {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires a running workflow")
+	}
+	if state.Workflow.VerifiedWorkspaceHead != "" {
+		return model.Decision{}, model.InvalidInputFault("the workspace is already adopted")
+	}
+	facts := state.Workflow.ExecutionFacts
+	if facts == nil || facts.ChangeSetHash == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires an execution approval bound to a change set")
+	}
+	if in.ChangeSetHash == "" || in.ChangeSetHash != facts.ChangeSetHash {
+		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
+			"the change set hash does not match the execution approval facts")
+	}
+	if in.CandidateHead == "" || in.DirtyFingerprint == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the verified workspace facts")
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	if in.Route == "" {
+		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the approved review route")
+	}
+	b := &builder{state: state}
+	// The verified candidate facts are recorded when the gate starts: the
+	// runtime re-verified the exact Candidate Head and Dirty Fingerprint,
+	// and the PASS verdict later advances verified_workspace_head to them
+	// (design 8.4 step 6).
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.CandidateWorkspaceHead = in.CandidateHead
+	m.WorkspaceDirtyFingerprint = in.DirtyFingerprint
+	b.mutate(m)
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID: in.Session, Purpose: model.PurposeReview, Status: model.SessionStarting,
+	}, Provider: in.Route})
+	b.effect(model.ProviderStartIntent{
+		Session: in.Session,
+		Purpose: model.PurposeReview,
+		Route:   in.Route,
+	})
+	return b.decision(), nil
+}
+
+// decideAdoptionReviewRunEnded settles one Workspace Adoption Review
+// Session: the review pass is evidence (a structured PASS/FAIL verdict),
+// never the Runtime deciding success. A PASS writes the exact verified
+// Workspace facts (CandidateHead, VerifiedHead, and the clean Dirty
+// Fingerprint at the adopted Head) and opens dispatch to the adopted
+// Workspace; a FAIL or an unparsable verdict Blocks the Workflow with a
+// blocking Finding while the Workspace, the Change Set, and the Target
+// Branch stay untouched (design 8.4 step 7).
+func decideAdoptionReviewRunEnded(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
+	attempt := attemptBySession(state, created.ID)
+	if attempt != nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("adoption review session %s has an execution attempt", created.ID))
+	}
+	b := &builder{state: state}
+	b.mutate(sessionEnd(state, created, in))
+	if in.Session.Status != model.SessionCompleted {
+		code := in.FailureCode
+		if code == "" {
+			code = model.CodeAgentProcessCrashed
+		}
+		return adoptionFailure(b, state, created, code), nil
+	}
+	verdict, err := parseReviewVerdict(in.Body)
+	if err != nil {
+		return adoptionFailure(b, state, created, model.CodeSemanticReviewFailed), nil
+	}
+	if !verdict {
+		return adoptionFailure(b, state, created, model.CodeSemanticReviewFailed), nil
+	}
+	// The Adoption PASS advances the verified Workspace Head to the exact
+	// Candidate Head the Runtime re-verified and records the clean Dirty
+	// Fingerprint at that Head (design 8.4 step 6).
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.CandidateWorkspaceHead = state.Workflow.CandidateWorkspaceHead
+	m.VerifiedWorkspaceHead = state.Workflow.CandidateWorkspaceHead
+	m.WorkspaceDirtyFingerprint = in.EndDirtyFingerprint
+	b.mutate(m)
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workspace adopted")
+	return b.decision(), nil
+}
+
+// adoptionFailure Blocks the Workflow on a failed Workspace Adoption
+// Review: a blocking Finding is recorded and the Runtime moves to BLOCKED
+// while the Workspace, the Change Set, and the Target Branch stay
+// untouched (design 8.4 step 7).
+func adoptionFailure(b *builder, state model.State, created *model.Session, code model.Code) model.Decision {
+	pol, _ := model.Policy(code)
+	b.mutate(model.FindingAppendMutation{Finding: model.Finding{
+		ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+1)),
+		Code:     code,
+		Scope:    pol.Scope,
+		Subject:  string(created.ID),
+		Blocking: true,
+		Text:     code.String(),
+		Seq:      state.NextEventSeq,
+	}})
+	b.event(model.EventFindingOpened, "", model.AttemptKey{}, code, "workspace adoption review failed")
+	b.mutate(wfMutStatus(state, model.RuntimeBlocked))
+	b.event(model.EventWorkflowBlocked, "", model.AttemptKey{}, "", "workflow blocked by the workspace adoption review")
+	return b.decision()
+}
+
+// ---------------------------------------------------------------------------
+// Final Verify dispatch and settlement
+// ---------------------------------------------------------------------------
+
 // decideFinalVerifyDispatch allocates the Final Verify Node (Task 18,
 // PRD 最终验收): the RUNNING Attempt commits at the recorded Integration
 // HEAD, the independent Final Reviewer Session of the FINAL_VERIFICATION
@@ -76,7 +211,16 @@ func decideFinalVerifyDispatch(state model.State, in model.DispatchInput) (model
 		return model.Decision{}, model.InvalidInputFault(
 			"final verify allocation requires the final reviewer session and the approved route")
 	}
-	if state.Workflow.IntegrationHead == "" {
+	// The Final Verify runs over the full accepted delivery: on the
+	// aggregated workspace layout the Workspace verified Head is the
+	// complete result (design 8.5, TUI task 7); on the legacy layout the
+	// Integration Head is (Task 18).
+	if state.Workflow.LayoutVersion >= 2 {
+		if state.Workflow.VerifiedWorkspaceHead == "" {
+			return model.Decision{}, model.InvalidInputFault(
+				"final verify allocation requires a verified workspace head")
+		}
+	} else if state.Workflow.IntegrationHead == "" {
 		return model.Decision{}, model.InvalidInputFault(
 			"final verify allocation requires a recorded integration head")
 	}
@@ -105,11 +249,17 @@ func decideFinalVerifyDispatch(state model.State, in model.DispatchInput) (model
 			Status: model.ProcessStatusRunning, StartedAt: state.Now,
 		}})
 	}
+	head := state.Workflow.IntegrationHead
+	if state.Workflow.LayoutVersion >= 2 {
+		// Aggregated workspace layout (design 8.5, TUI task 7): the Final
+		// Verify covers the full verified Workspace result.
+		head = state.Workflow.VerifiedWorkspaceHead
+	}
 	b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
 		Key:       key,
 		Session:   in.Session,
 		Status:    model.AttemptRunning,
-		StartHead: state.Workflow.IntegrationHead,
+		StartHead: head,
 		StartedAt: state.Now,
 	}})
 	b.event(model.EventAttemptCreated, node.ID, key, "", "final verify attempt created")
@@ -123,7 +273,7 @@ func decideFinalVerifyDispatch(state model.State, in model.DispatchInput) (model
 		Catalog: model.CatalogRef{
 			Revision: facts.CatalogRevision, Hash: facts.CatalogHash,
 		},
-		CommitRange: state.Workflow.BaseCommit + ".." + state.Workflow.IntegrationHead,
+		CommitRange: state.Workflow.BaseCommit + ".." + head,
 	})
 	return b.decision(), nil
 }
@@ -364,16 +514,12 @@ func decideMergeDispatch(state model.State, in model.DispatchInput) (model.Decis
 		return model.Decision{}, model.InvalidInputFault(
 			"node " + string(node.ID) + " cannot be allocated from status " + string(node.Status))
 	}
-	if state.Workflow.IntegrationHead == "" {
-		return model.Decision{}, model.InvalidInputFault(
-			"merge allocation requires a recorded integration head")
-	}
 	taskNode, err := taskNodeOf(state, node)
 	if err != nil {
 		return model.Decision{}, err
 	}
 	if branchQuarantined(state, taskNode.Branch) || taskNode.Status == model.NodeFailed {
-		// A quarantined Branch never merges into the trusted Integration
+		// A quarantined Branch never merges into the trusted delivery
 		// chain (design 7.3 invariant 10, PRD 已确认 step 1).
 		return model.Decision{}, model.NewFault(model.CodeCommitDuringPolicyDriftWindow,
 			"the task branch is quarantined; the merge path is closed for it")
@@ -388,6 +534,41 @@ func decideMergeDispatch(state model.State, in model.DispatchInput) (model.Decis
 	b := &builder{state: state}
 	b.mutate(model.NodeStatusMutation{Node: node.ID, Status: model.NodeRunning, RetryCharged: node.RetryCharged})
 	b.event(model.EventNodeStarted, node.ID, key, "", "merge node started")
+	if state.Workflow.LayoutVersion >= 2 {
+		// Aggregated workspace layout (TUI task 7, design 8.5): the merge
+		// base is the current verified Workspace Head — the only legal
+		// Task base — and the serial --no-ff merge advances the same
+		// Workspace Branch. Sibling Tasks may share an old Base, but the
+		// Intent fixes the latest verified Head at scheduling time; no
+		// auto-rebase ever rewrites Task history. When no adoption ran
+		// (no Change Set bound), the Runtime-observed workspace Head the
+		// pass fixed at readiness is the merge base.
+		base := state.Workflow.VerifiedWorkspaceHead
+		if base == "" {
+			base = in.BaseHead
+		}
+		if base == "" {
+			return model.Decision{}, model.InvariantFault(fmt.Errorf("merge allocation requires a workspace head"))
+		}
+		b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
+			Key:       key,
+			Status:    model.AttemptRunning,
+			StartHead: base,
+			StartedAt: state.Now,
+		}})
+		b.event(model.EventAttemptCreated, node.ID, key, "", "merge attempt created")
+		b.effect(model.WorkspaceMergeIntent{
+			Node:                  node.ID,
+			ExpectedWorkspaceHead: base,
+			TaskBranch:            taskBranch(state.Workflow.ID, taskNode.ID),
+			VerifiedCommit:        taskAttempt.EndHead,
+		})
+		return b.decision(), nil
+	}
+	if state.Workflow.IntegrationHead == "" {
+		return model.Decision{}, model.InvalidInputFault(
+			"merge allocation requires a recorded integration head")
+	}
 	b.mutate(model.AttemptAppendMutation{Attempt: model.Attempt{
 		Key:       key,
 		Status:    model.AttemptRunning,
@@ -469,6 +650,87 @@ func decideIntegrationMergeFailed(state model.State, in model.EffectResultInput)
 // failed its post-merge checks settles with the typed code the executor
 // observed.
 func decideIntegrationRollbacked(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	attempt := state.Attempts[in.Attempt]
+	if attempt == nil || attempt.Status != model.AttemptRunning {
+		return model.Decision{}, model.InvalidInputFault("unknown or non-running attempt " + in.Attempt.String())
+	}
+	code := in.FailureCode
+	if code == "" {
+		code = model.CodeMergeConflict
+	}
+	return decideAttemptEnded(state, model.EffectResultInput{
+		Kind:        model.AttemptEnded,
+		Attempt:     attempt.Key,
+		Outcome:     model.OutcomeFailed,
+		FailureCode: code,
+		Evidence:    in.Evidence,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Workspace merge settlement (design 8.5, TUI task 7)
+// ---------------------------------------------------------------------------
+
+// decideWorkspaceMerged settles one successful serial --no-ff Workspace
+// merge: the Attempt succeeds with the Merge Commit evidence and the
+// VERIFIED Workspace Head advances to the Merge Commit — the aggregate's
+// VerifiedWorkspaceHead only ever moves through verified merges, so every
+// successor Task branches from the fully accepted history.
+func decideWorkspaceMerged(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	attempt := state.Attempts[in.Attempt]
+	if attempt == nil || attempt.Status != model.AttemptRunning {
+		return model.Decision{}, model.InvalidInputFault("unknown or non-running attempt " + in.Attempt.String())
+	}
+	node := state.Nodes[attempt.Key.Node]
+	if node == nil || node.Kind != model.NodeMerge {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("workspace merge result references a non-merge node"))
+	}
+	if in.EndHead == "" || in.EndHead == state.Workflow.VerifiedWorkspaceHead {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("workspace merge result did not advance the verified workspace head"))
+	}
+	b := &builder{state: state}
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.VerifiedWorkspaceHead = in.EndHead
+	commitEvidence := model.EvidenceRef{
+		Kind: model.EvidenceCommit, Hash: in.EndHead, Subject: state.Workflow.WorkspaceBranch,
+	}
+	settleNodeSucceeded(b, state, node, attempt, model.EffectResultInput{
+		Kind:         model.AttemptEnded,
+		Attempt:      attempt.Key,
+		Outcome:      model.OutcomeSucceeded,
+		EndHead:      in.EndHead,
+		Evidence:     commitEvidence,
+		EvidenceRefs: []model.EvidenceRef{commitEvidence},
+	}, m)
+	return b.decision(), nil
+}
+
+// decideWorkspaceMergeFailed records the failed Workspace merge and
+// requests the recorded Workspace Rollback: the managed Workspace Worktree
+// is restored to the pre-merge HEAD before the Attempt settles (design
+// 8.5, TUI task 7; PRD 已确认：Merge Conflict 处理).
+func decideWorkspaceMergeFailed(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	attempt := state.Attempts[in.Attempt]
+	if attempt == nil || attempt.Status != model.AttemptRunning {
+		return model.Decision{}, model.InvalidInputFault("unknown or non-running attempt " + in.Attempt.String())
+	}
+	if in.PreMergeHead == "" {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("workspace merge failure carries no pre-merge head"))
+	}
+	code := in.FailureCode
+	if code == "" {
+		code = model.CodeMergeConflict
+	}
+	b := &builder{state: state}
+	b.effect(model.WorkspaceRollbackIntent{Head: in.PreMergeHead, Attempt: attempt.Key, FailureCode: code})
+	return b.decision(), nil
+}
+
+// decideWorkspaceRollbacked settles the failed Workspace merge Attempt
+// after the managed Workspace Worktree was restored: a text conflict fails
+// with MERGE_CONFLICT (retryable), and a committed merge that failed its
+// post-merge checks settles with the typed code the executor observed.
+func decideWorkspaceRollbacked(state model.State, in model.EffectResultInput) (model.Decision, error) {
 	attempt := state.Attempts[in.Attempt]
 	if attempt == nil || attempt.Status != model.AttemptRunning {
 		return model.Decision{}, model.InvalidInputFault("unknown or non-running attempt " + in.Attempt.String())

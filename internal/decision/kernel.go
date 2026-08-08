@@ -30,6 +30,10 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideReconcile(state, in)
 	case model.DiscussRequirementInput:
 		return decideDiscussRequirement(state, in)
+	case model.PrepareNativeDiscussionInput:
+		return decidePrepareNativeDiscussion(state, in)
+	case model.FinishDiscussionInput:
+		return decideFinishDiscussion(state, in)
 	case model.GeneratePlanInput:
 		return decideGeneratePlan(state, in)
 	case model.CheckPlanInput:
@@ -44,6 +48,8 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideExecutionDryRun(state, in)
 	case model.ExecutionApprovalInput:
 		return decideExecutionApproval(state, in)
+	case model.AdoptWorkspaceInput:
+		return decideAdoptWorkspace(state, in)
 	case model.GraphInstallInput:
 		return decideGraphInstall(state, in)
 	case model.DispatchInput:
@@ -105,15 +111,21 @@ func (b *builder) decision() model.Decision { return b.d }
 // caller passes through the current values except the ones it changes.
 func wfMut(state model.State, stage model.WorkflowStage, rt model.RuntimeStatus, intent *model.CancelIntent) model.WorkflowMutation {
 	return model.WorkflowMutation{
-		ID:                state.Workflow.ID,
-		Project:           state.Workflow.Project,
-		Stage:             stage,
-		Runtime:           rt,
-		TargetBranch:      state.Workflow.TargetBranch,
-		BaseCommit:        state.Workflow.BaseCommit,
-		IntegrationBranch: state.Workflow.IntegrationBranch,
-		IntegrationHead:   state.Workflow.IntegrationHead,
-		CancelIntent:      intent,
+		ID:                        state.Workflow.ID,
+		Project:                   state.Workflow.Project,
+		Stage:                     stage,
+		Runtime:                   rt,
+		TargetBranch:              state.Workflow.TargetBranch,
+		BaseCommit:                state.Workflow.BaseCommit,
+		IntegrationBranch:         state.Workflow.IntegrationBranch,
+		IntegrationHead:           state.Workflow.IntegrationHead,
+		LayoutVersion:             state.Workflow.LayoutVersion,
+		WorkspacePath:             state.Workflow.WorkspacePath,
+		WorkspaceBranch:           state.Workflow.WorkspaceBranch,
+		CandidateWorkspaceHead:    state.Workflow.CandidateWorkspaceHead,
+		VerifiedWorkspaceHead:     state.Workflow.VerifiedWorkspaceHead,
+		WorkspaceDirtyFingerprint: state.Workflow.WorkspaceDirtyFingerprint,
+		CancelIntent:              intent,
 	}
 }
 

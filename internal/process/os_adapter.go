@@ -159,6 +159,46 @@ func envSlice(env map[string]string) []string {
 	return out
 }
 
+// StartInteractive launches one native interactive process (a provider
+// terminal, TUI task 11): the child inherits the terminal streams
+// directly (cmd.Stdin/Stdout/Stderr attached to the Terminal triple), so
+// no frame parser runs. The process is isolated in its own process group
+// and its PID + start token identity is captured exactly like a framed
+// process; the Supervisor still supports Stop/Wait/Inspect.
+func (a *OSAdapter) StartInteractive(ctx context.Context, h Handle, spec InteractiveSpec) (Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(spec.Executable, spec.Args...)
+	cmd.Dir = spec.Dir
+	cmd.Env = envSlice(spec.Env)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if spec.Terminal.In != nil {
+		cmd.Stdin = spec.Terminal.In
+	}
+	if spec.Terminal.Out != nil {
+		cmd.Stdout = spec.Terminal.Out
+	}
+	if spec.Terminal.Err != nil {
+		cmd.Stderr = spec.Terminal.Err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("process: start interactive %s: %w", spec.Executable, err)
+	}
+	pid := cmd.Process.Pid
+	token, err := platform.StartToken(pid)
+	if err != nil {
+		_ = platform.KillGroup(pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("process: read start token for pid %d: %w", pid, err)
+	}
+	return &osProcess{
+		cmd:      cmd,
+		identity: ProcessIdentity{PID: pid, StartToken: token},
+		pgid:     pid,
+	}, nil
+}
+
 // Signal delivers sig to the exact process group of the process. A group
 // that no longer exists is already gone: nil.
 func (a *OSAdapter) Signal(ctx context.Context, p Process, sig Signal) error {

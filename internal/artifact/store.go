@@ -58,6 +58,13 @@ var compatibilityRegistry = map[model.ArtifactType][]string{
 	// and parses them; no agent body schema applies).
 	model.ArtifactRoutingPolicy: {"1.0.0"},
 	model.ArtifactBudgetPolicy:  {"1.0.0"},
+	// Task 5 change set artifacts: the frozen candidate Change Set is a
+	// Runtime-authored canonical body fixed by the model.ChangeSet Go
+	// types (no agent body schema applies).
+	model.ArtifactChangeSet: {"1.0.0"},
+	// Task 12 handoff artifacts: the structured discussion handoff is a
+	// strict agent-authored body validated against discussion-handoff.json.
+	model.ArtifactDiscussionHandoff: {"1.0.0"},
 }
 
 // supportedVersion reports whether a declared Artifact Type's schema
@@ -88,9 +95,46 @@ const (
 	FailAfterRename FaultPoint = "fail-after-rename"
 )
 
+// layoutMode selects the on-disk directory layout a Store binds to
+// (design 7). The legacy layout places every workflow under
+// <root>/<workflow-id>/<type>/<revision>/<hash>; the aggregated workflow
+// layout places every artifact type under one of the fixed managed
+// directories of the workflow aggregated root
+// <root>/<type-dir>/<revision>/<hash>, where <root> is the workflow root
+// itself and the workflow id never appears as a path component.
+type layoutMode int
+
+const (
+	// layoutLegacy is the historical artifacts root layout; kept for
+	// read-only identification of existing workflows (design 7).
+	layoutLegacy layoutMode = iota
+	// layoutAggregated is the single-workflow aggregated layout: the
+	// Store root is exactly <home>/projects/<project-key>/<workflow-id>.
+	layoutAggregated
+)
+
+// aggregatedTypeDirs is the fixed type to directory mapping of the
+// aggregated workflow layout (design 7): every writable Artifact Type
+// maps to one of the seven managed artifact directories, and the legacy
+// artifacts/<workflow-id>/<type> path is never used.
+var aggregatedTypeDirs = map[model.ArtifactType]string{
+	model.ArtifactPlan:            "plans",
+	model.ArtifactSpec:            "specs",
+	model.ArtifactCatalog:         "specs", // verification catalog accompanies the spec
+	model.ArtifactWorkflow:        "workflows",
+	model.ArtifactDiscussionTurn:  "discussion",
+	model.ArtifactPlanCheck:       "reviews",
+	model.ArtifactReport:          "reports",
+	model.ArtifactCleanupManifest: "reports",  // cleanup manifest is the cleanup report
+	model.ArtifactRoutingPolicy:   "evidence", // Runtime-authored gate policy facts
+	model.ArtifactBudgetPolicy:    "evidence", // Runtime-authored gate policy facts
+}
+
 // Store is the immutable Artifact Store over one managed artifacts root.
 type Store struct {
 	root      string
+	layout    layoutMode
+	wf        model.WorkflowID // layoutAggregated only; fixed at construction
 	redaction security.Registry
 	inject    map[FaultPoint]struct{} // test-only injection points
 }
@@ -123,6 +167,44 @@ type ResolveRequest struct {
 // Security Guard). The redaction registry is the embedded CFlow-owned
 // rule set the Store applies to every body before serialization.
 func New(root string, redaction security.Registry) (*Store, error) {
+	return newRooted(root, redaction, layoutLegacy, "")
+}
+
+// NewWorkflow constructs an immutable Store over the aggregated root of
+// one workflow (design 7): <home>/projects/<project-key>/<workflow-id>.
+// The Store verifies root is exactly this workflow's aggregated root
+// (parent chain projects/<project-key>/<workflow-id>, each a safe single
+// path component) and uses the fixed type to directory mapping; the
+// legacy artifacts/<workflow-id>/<type> path is never used. The workflow
+// id is bound at construction: every reference written or read must
+// belong to this workflow.
+func NewWorkflow(root string, wf model.WorkflowID, redaction security.Registry) (*Store, error) {
+	if invalidWorkflowID(wf) {
+		return nil, model.InvalidInputFault("workflow id is not a safe managed path component")
+	}
+	if root == "" {
+		return nil, model.InvalidInputFault("workflow store root must be an absolute path")
+	}
+	clean := filepath.Clean(root)
+	if !filepath.IsAbs(clean) {
+		return nil, model.InvalidInputFault("workflow store root must be an absolute path")
+	}
+	if filepath.Base(clean) != string(wf) {
+		return nil, model.InvalidInputFault("workflow store root must be the workflow aggregated root")
+	}
+	projectKey := filepath.Base(filepath.Dir(clean))
+	if invalidWorkflowID(model.WorkflowID(projectKey)) {
+		return nil, model.InvalidInputFault("workflow store root must sit under a project key")
+	}
+	if filepath.Base(filepath.Dir(filepath.Dir(clean))) != "projects" {
+		return nil, model.InvalidInputFault("workflow store root must sit under the projects tree")
+	}
+	return newRooted(clean, redaction, layoutAggregated, wf)
+}
+
+// newRooted validates the shared construction invariants and builds the
+// Store without touching the filesystem layout.
+func newRooted(root string, redaction security.Registry, mode layoutMode, wf model.WorkflowID) (*Store, error) {
 	if root == "" {
 		return nil, model.InvalidInputFault("artifacts root must be an absolute path")
 	}
@@ -142,7 +224,38 @@ func New(root string, redaction security.Registry) (*Store, error) {
 			return nil, err
 		}
 	}
-	return &Store{root: clean, redaction: redaction}, nil
+	return &Store{root: clean, layout: mode, wf: wf, redaction: redaction}, nil
+}
+
+// typeDir maps an Artifact Type to its directory name in the bound
+// layout. The aggregated layout uses the fixed managed directories; the
+// legacy layout uses the raw type name.
+func (s *Store) typeDir(typ model.ArtifactType) (string, error) {
+	if s.layout == layoutAggregated {
+		dir, ok := aggregatedTypeDirs[typ]
+		if !ok {
+			return "", model.InvalidInputFault("artifact type has no aggregated layout directory")
+		}
+		return dir, nil
+	}
+	return string(typ), nil
+}
+
+// baseDir is the directory that holds the revision directories of one
+// artifact type. In the aggregated layout the workflow id is bound at
+// construction and never appears in the path.
+func (s *Store) baseDir(wf model.WorkflowID, typ model.ArtifactType) (string, error) {
+	dir, err := s.typeDir(typ)
+	if err != nil {
+		return "", err
+	}
+	if s.layout == layoutAggregated {
+		if wf != s.wf {
+			return "", model.InvalidInputFault("artifact workflow does not match the aggregated store workflow")
+		}
+		return filepath.Join(s.root, dir), nil
+	}
+	return filepath.Join(s.root, string(wf), dir), nil
 }
 
 // Put validates, redacts, and canonically serializes the body, writes one
@@ -205,8 +318,11 @@ func (s *Store) Get(ctx context.Context, ref model.ArtifactRef) ([]byte, error) 
 	if err := validateRef(ref); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(s.root, string(ref.Workflow), string(ref.Type),
-		strconv.Itoa(ref.Revision), ref.Hash)
+	base, err := s.baseDir(ref.Workflow, ref.Type)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(base, strconv.Itoa(ref.Revision), ref.Hash)
 	return s.readAndVerify(ctx, path, ref)
 }
 
@@ -226,7 +342,10 @@ func (s *Store) Resolve(ctx context.Context, req ResolveRequest) (model.Artifact
 	if req.Revision < 0 {
 		return model.ArtifactRef{}, model.InvalidInputFault("artifact revision must not be negative")
 	}
-	base := filepath.Join(s.root, string(req.WorkflowID), string(req.Type))
+	base, err := s.baseDir(req.WorkflowID, req.Type)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
 	revision := req.Revision
 	if revision == 0 {
 		entries, err := os.ReadDir(base)
@@ -266,6 +385,21 @@ func (s *Store) Resolve(ctx context.Context, req ResolveRequest) (model.Artifact
 	return ref, nil
 }
 
+// buildParentChain returns the ancestor directories that must exist
+// before a write, in creation order. The aggregated layout never
+// introduces a workflow id path component.
+func (s *Store) buildParentChain(wf model.WorkflowID, base, dir string) []string {
+	if s.layout == layoutAggregated {
+		return []string{s.root, base, dir}
+	}
+	return []string{
+		s.root,
+		filepath.Join(s.root, string(wf)),
+		base,
+		dir,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Write protocol machinery (design 10.2)
 // ---------------------------------------------------------------------------
@@ -276,7 +410,11 @@ func (s *Store) Resolve(ctx context.Context, req ResolveRequest) (model.Artifact
 // atomically without replacement, fsync the parent directory, and verify
 // the stored file through the Artifact Reader.
 func (s *Store) writeArtifact(ctx context.Context, req PutRequest, content []byte, facts redactionFacts, ref model.ArtifactRef) error {
-	dir := filepath.Join(s.root, string(req.WorkflowID), string(req.Type), strconv.Itoa(req.Revision))
+	base, err := s.baseDir(req.WorkflowID, req.Type)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(base, strconv.Itoa(req.Revision))
 	target := filepath.Join(dir, ref.Hash)
 
 	// Reject an existing target path even when the content appears equal;
@@ -298,12 +436,7 @@ func (s *Store) writeArtifact(ctx context.Context, req PutRequest, content []byt
 		return storeFault("artifact revision directory cannot be inspected")
 	}
 
-	for _, d := range []string{
-		s.root,
-		filepath.Join(s.root, string(req.WorkflowID)),
-		filepath.Join(s.root, string(req.WorkflowID), string(req.Type)),
-		dir,
-	} {
+	for _, d := range s.buildParentChain(req.WorkflowID, base, dir) {
 		if err := s.ensureDir(d); err != nil {
 			return err
 		}

@@ -45,7 +45,7 @@ func TestStopFirstCtrlCConvergesToPausedStop(t *testing.T) {
 	}()
 	// Let the coding Session start inside its Task Worktree, then send
 	// the first Ctrl+C.
-	worktree := filepath.Join(fx.home, "worktrees", app.ProjectFor(fx.repo.Root).Key, string(wf), "tasks", "task-s01")
+	worktree := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo.Root).Key, string(wf), "tmp", "tasks", "task-s01")
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		iv := fx.Inspect(wf)
@@ -118,7 +118,7 @@ func TestCancelPreservesEveryResource(t *testing.T) {
 	if _, err := a.Execute(context.Background(), app.DispatchCommand{Workflow: wf}); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	worktree := filepath.Join(fx.home, "worktrees", app.ProjectFor(fx.repo.Root).Key, string(wf), "tasks", "task-s01")
+	worktree := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo.Root).Key, string(wf), "tmp", "tasks", "task-s01")
 	if _, err := os.Stat(worktree); err != nil {
 		t.Fatalf("the task worktree never appeared: %v", err)
 	}

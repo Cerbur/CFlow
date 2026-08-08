@@ -437,9 +437,9 @@ func TestDirtyUserWorkspaceIsIsolatedAndRequiresConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create with confirmation: %v", err)
 	}
-	if pathExists(filepath.Join(fx.home, "worktrees", app.ProjectFor(fx.repo.Root).Key,
-		string(out.Workflow), "planning", "user-wip.txt")) {
-		t.Fatal("dirty user file leaked into the planning snapshot")
+	if pathExists(filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo.Root).Key,
+		string(out.Workflow), "workspace", "user-wip.txt")) {
+		t.Fatal("dirty user file leaked into the workspace")
 	}
 	requireFileContent(t, fx.repo.Path("user-wip.txt"), "uncommitted secret")
 

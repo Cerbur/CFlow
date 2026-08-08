@@ -34,7 +34,15 @@ type WorkflowMutation struct {
 	BaseCommit        string
 	IntegrationBranch string
 	IntegrationHead   string
-	CancelIntent      *CancelIntent
+
+	LayoutVersion             int
+	WorkspacePath             string
+	WorkspaceBranch           string
+	CandidateWorkspaceHead    string
+	VerifiedWorkspaceHead     string
+	WorkspaceDirtyFingerprint string
+
+	CancelIntent *CancelIntent
 }
 
 func (WorkflowMutation) isMutation() {}

@@ -229,7 +229,7 @@ func decideReplacementApproval(state model.State, in model.ReplacementApprovalIn
 		return model.Decision{}, model.InvalidInputFault("no execution facts to replace")
 	}
 	if !facts.Matches(in.PlanHash, in.SpecHashes, in.CatalogHash, in.WorkflowHash,
-		in.RoutingHash, in.BudgetHash, in.PreflightHash) {
+		in.RoutingHash, in.BudgetHash, in.PreflightHash, facts.ChangeSetHash) {
 		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
 			"the successor execution artifacts changed since the replacement preview; re-generate it")
 	}
@@ -282,17 +282,22 @@ func decideReplacementApproval(state model.State, in model.ReplacementApprovalIn
 	if err != nil {
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("replacement decision context cannot be serialized"))
 	}
+	refs := []model.ArtifactRef{
+		{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: planRevisionOf(state), Hash: facts.PlanHash},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
+	}
+	if facts.ChangeSetHash != "" && facts.ChangeSetRevision > 0 {
+		refs = append(refs, model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactChangeSet,
+			Revision: facts.ChangeSetRevision, Hash: facts.ChangeSetHash})
+	}
 	b := &builder{state: state}
 	b.mutate(model.ApprovalAppendMutation{Approval: model.Approval{
 		ID:   model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
 		Kind: model.ApprovalExecution,
 		Seq:  state.NextEventSeq,
-		Refs: []model.ArtifactRef{
-			{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: planRevisionOf(state), Hash: facts.PlanHash},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
-		},
+		Refs: refs,
 		Fingerprint:       facts.Fingerprint,
 		PreflightRevision: facts.PreflightRevision,
 		DecisionContext:   string(ctx),

@@ -694,3 +694,172 @@ func TestRecoveryEmptyLedgerReconcilesCleanly(t *testing.T) {
 		t.Fatalf("empty ledger produced dispositions %+v faults %+v", out.Dispositions, out.Faults)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Legacy Layout Migration crash windows (TUI task 8, design §7.4)
+// ---------------------------------------------------------------------------
+
+// migrationMoves is the canonical two-move migration list the crash-window
+// tests seed (an Artifact move and a Worktree move).
+func migrationMoves(t *testing.T, fx *recoveryFixture) []model.PathMove {
+	t.Helper()
+	legacyRoot := filepath.Join(fx.home, "worktrees", fx.projectKey, testWF)
+	aggRoot := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+	return []model.PathMove{
+		{
+			Kind: model.MoveKindArtifact,
+			Source:      filepath.Join(fx.home, "projects", fx.projectKey, "workflows", testWF, "artifacts"),
+			Destination: filepath.Join(aggRoot, "artifacts"),
+		},
+		{
+			Kind: model.MoveKindWorktree, Source: filepath.Join(legacyRoot, "integration"),
+			Destination: filepath.Join(aggRoot, "workspace"),
+			Branch:      "cflow/" + testWF + "/integration", Head: fx.baseHead,
+		},
+	}
+}
+
+
+// ensureMigrationArtifactSource creates the legacy artifacts root the
+// crash-window tests move.
+func ensureMigrationArtifactSource(t *testing.T, fx *recoveryFixture) string {
+	t.Helper()
+	src := filepath.Join(fx.home, "projects", fx.projectKey, "workflows", testWF, "artifacts")
+	if err := os.MkdirAll(src, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "seed.txt"), []byte("seed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return src
+}
+
+// TestRecoveryMigrationIntentAfterNoMovesIsSafeToRetry: the Intent was
+// persisted but nothing moved yet — every source still present, every
+// destination absent: SafeToRetry (continue from move 0).
+func TestRecoveryMigrationIntentAfterNoMovesIsSafeToRetry(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	ensureMigrationArtifactSource(t, fx)
+	fx.seedIntent(model.LayoutMigrationIntent{
+		Workflow: testWF, Moves: migrationMoves(t, fx), Done: 0,
+	})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.SafeToRetry)
+}
+
+// TestRecoveryMigrationAfterFirstMoveIsSafeToRetry: the first move landed
+// (source absent, destination present), the second did not: SafeToRetry
+// (continue from the first incomplete move).
+func TestRecoveryMigrationAfterFirstMoveIsSafeToRetry(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	moves := migrationMoves(t, fx)
+	ensureMigrationArtifactSource(t, fx)
+	// Land the first (artifact) move.
+	if err := os.MkdirAll(filepath.Dir(moves[0].Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moves[0].Source, moves[0].Destination); err != nil {
+		t.Fatalf("land first move: %v", err)
+	}
+	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 1})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.SafeToRetry)
+}
+
+// TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted: every move
+// landed but the DB facts did not advance: AlreadyCompleted (the DB
+// transaction is the next step).
+func TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	moves := migrationMoves(t, fx)
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.MkdirAll(filepath.Dir(moves[0].Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moves[0].Source, moves[0].Destination); err != nil {
+		t.Fatal(err)
+	}
+	// Move the integration worktree (source -> destination).
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.repo.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Execute(context.Background(), gitflow.MoveWorktree{
+		From: moves[1].Source, To: moves[1].Destination,
+	}); err != nil {
+		t.Fatalf("move integration worktree: %v", err)
+	}
+	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 2})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.AlreadyCompleted)
+}
+
+// TestRecoveryMigrationAfterDBAdvanceIsAlreadyCompleted: the persisted
+// Layout facts already advanced to Version 2: AlreadyCompleted, and the
+// intent is never re-run.
+func TestRecoveryMigrationAfterDBAdvanceIsAlreadyCompleted(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	fx.seedIntent(model.LayoutMigrationIntent{
+		Workflow: testWF, Moves: migrationMoves(t, fx), Done: 0,
+	})
+	// Advance the persisted Layout facts to Version 2.
+	st, err := store.Open(context.Background(), store.OpenOptions{
+		Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	view, err := st.View(context.Background(), store.StoreQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Transact(context.Background(), view.AggregateVersion, func(state model.State) (model.Decision, error) {
+		return model.Decision{Mutations: []model.Mutation{model.WorkflowMutation{
+			ID: testWF, Project: model.ProjectID(testProj),
+			Stage: state.Workflow.Stage, Runtime: state.Workflow.Runtime,
+			TargetBranch: state.Workflow.TargetBranch, BaseCommit: state.Workflow.BaseCommit,
+			IntegrationBranch: state.Workflow.IntegrationBranch,
+			IntegrationHead:   state.Workflow.IntegrationHead,
+			LayoutVersion:     2,
+			WorkspacePath:     filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
+			WorkspaceBranch:   "cflow/" + testWF + "/integration",
+			VerifiedWorkspaceHead: state.Workflow.IntegrationHead,
+			CandidateWorkspaceHead: state.Workflow.IntegrationHead,
+		}}}, nil
+	}); err != nil {
+		t.Fatalf("advance layout: %v", err)
+	}
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.AlreadyCompleted)
+}
+
+// TestRecoveryMigrationBothPathsPresentIsBlockedDrift: a destination
+// that exists while its source also exists is drift the user must act on.
+func TestRecoveryMigrationBothPathsPresentIsBlockedDrift(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	moves := migrationMoves(t, fx)
+	// Both the source and the destination exist for the artifact move.
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.MkdirAll(moves[0].Destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 0})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryMigrationNeitherPathPresentIsBlockedDrift: a move whose
+// source and destination are both absent cannot be explained: drift.
+func TestRecoveryMigrationNeitherPathPresentIsBlockedDrift(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	moves := migrationMoves(t, fx)
+	// Remove the artifact source and leave the destination absent.
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.RemoveAll(moves[0].Source); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 0})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
+}

@@ -324,13 +324,13 @@ func TestCreateWorkflowWritesStaticManifest(t *testing.T) {
 	}
 	text := string(manifest)
 	for _, want := range []string{
-		"schema_version: 1",
+		"schema_version: 2",
 		"workflow_id: " + string(wf),
 		"name: add divide",
 		"target_branch: main",
 		"initial_worktree_dirty: false",
-		"integration_branch: cflow/" + string(wf) + "/integration",
-		"planning_snapshot:",
+		"workspace_branch: cflow/" + string(wf) + "/workspace",
+		"workspace:",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("workflow.yaml missing %q:\n%s", want, text)
@@ -339,17 +339,17 @@ func TestCreateWorkflowWritesStaticManifest(t *testing.T) {
 	if !strings.Contains(text, "base_commit: ") {
 		t.Fatalf("workflow.yaml missing the base commit:\n%s", text)
 	}
-	// The snapshot worktree exists at the base.
+	// The workspace worktree exists at the base and is clean.
 	flow, _ := gitflow.NewGitFlow(fx.sup, fx.root)
 	facts, err := flow.Observe(context.Background(), gitflow.GitStatus{
-		Dir: filepath.Join(fx.home, "worktrees", ProjectFor(fx.root).Key, string(wf), "planning"),
+		Dir: filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key, string(wf), "workspace"),
 	})
 	if err != nil {
-		t.Fatalf("snapshot status: %v", err)
+		t.Fatalf("workspace status: %v", err)
 	}
 	st := facts.(gitflow.StatusFacts)
 	if st.Dirty.StagedCount+st.Dirty.UnstagedCount+st.Dirty.UntrackedCount != 0 {
-		t.Fatalf("planning snapshot is not clean: %+v", st.Dirty)
+		t.Fatalf("workspace is not clean: %+v", st.Dirty)
 	}
 }
 
@@ -533,5 +533,98 @@ func gitAt(t *testing.T, dir string, args ...string) {
 	cmd := execGit(dir, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// gitOut runs git and returns stdout without the trailing newline.
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := execGit(dir, args...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSuffix(string(out), "\n")
+}
+
+// workspacePath is the aggregated workspace root of one workflow under
+// the fixture home (design §8, layout.Resolver.Workspace).
+func (fx *planningFixture) workspacePath(wf model.WorkflowID) string {
+	return filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key, string(wf), "workspace")
+}
+
+// TestCreateWorkflowCreatesWritableWorkspaceAtBase asserts the TUI
+// workflow creation gate (Task 4): exactly one CFlow-managed worktree —
+// the long-lived Workspace on its deterministic CFlow-owned branch at the
+// recorded Base HEAD — is created, the workspace directory is writable
+// (planning sessions run in it), and the user's target branch never moves.
+func TestCreateWorkflowCreatesWritableWorkspaceAtBase(t *testing.T) {
+	fx := newPlanningFixture(t)
+	root := fx.root
+	baseHead := gitOut(t, root, "rev-parse", "HEAD")
+
+	wf, err := fx.create("native-discussion", false)
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+
+	wantBranch := "cflow/" + string(wf) + "/workspace"
+	ws := fx.workspacePath(wf)
+	if !pathExists(ws) {
+		t.Fatalf("workspace %s was not created", ws)
+	}
+	if head := gitOut(t, root, "rev-parse", "--verify", "refs/heads/"+wantBranch); head != baseHead {
+		t.Fatalf("workspace branch HEAD = %s, want base %s", head, baseHead)
+	}
+	if head := gitOut(t, root, "symbolic-ref", "HEAD"); head != "refs/heads/main" {
+		t.Fatalf("repository HEAD = %s, want main", head)
+	}
+	if v := gitOut(t, root, "worktree", "list", "--porcelain"); strings.Count(v, "worktree ") != 2 {
+		t.Fatalf("expected exactly two worktrees (main + workspace), got:\n%s", v)
+	}
+	probe := filepath.Join(ws, "probe.txt")
+	if err := os.WriteFile(probe, []byte("writable\n"), 0o600); err != nil {
+		t.Fatalf("workspace %s is not writable: %v", ws, err)
+	}
+	if head := gitOut(t, root, "rev-parse", "HEAD"); head != baseHead {
+		t.Fatalf("target branch main moved: %s -> %s", baseHead, head)
+	}
+}
+
+// TestProjectWorkspaceQueryProjectsAggregateFacts: the aggregate
+// workspace projection returns the project, the workflow summaries, the
+// selected lifecycle, and the legal actions in one bounded View.
+func TestProjectWorkspaceQueryProjectsAggregateFacts(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("workspace-demo", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qv, err := fx.app().Query(context.Background(), ProjectWorkspaceQuery{})
+	if err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	wv := qv.(WorkspaceView)
+	if wv.Project.Key != ProjectFor(fx.root).Key || wv.Project.Root != fx.root {
+		t.Fatalf("project = %+v", wv.Project)
+	}
+	if len(wv.Workflows) != 1 || wv.Workflows[0].ID != wf {
+		t.Fatalf("workflows = %+v", wv.Workflows)
+	}
+	if wv.Selected != wf {
+		t.Fatalf("selected = %s, want %s", wv.Selected, wf)
+	}
+	if wv.Lifecycle == nil || wv.Lifecycle.Status.Workflow != wf {
+		t.Fatalf("lifecycle = %+v", wv.Lifecycle)
+	}
+	if wv.Lifecycle.Status.Stage != model.StageRequirementDiscussion {
+		t.Fatalf("lifecycle stage = %s", wv.Lifecycle.Status.Stage)
+	}
+	if len(wv.LegalActions) == 0 {
+		t.Fatal("a fresh workflow must offer legal actions")
+	}
+	// Health is read-only: the git seam is available.
+	if !wv.Health.GitAvailable {
+		t.Fatal("git health unavailable")
 	}
 }

@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -216,4 +217,106 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestBareRootRunsTUIWithoutMutatingWorkflow is the TUI task 9 failure
+// test: a bare `cflow` on an interactive terminal calls the injected TUI
+// entry point and never touches a Workflow; the headless subcommands
+// behave exactly as before.
+func TestBareRootRunsTUIWithoutMutatingWorkflow(t *testing.T) {
+	called := false
+	home := t.TempDir()
+	t.Setenv("CFLOW_HOME", home)
+	var out, errBuf bytes.Buffer
+	root := cli.NewRoot(cli.Dependencies{
+		Build: fixtureBuild(),
+		RunTUI: func(context.Context) error {
+			called = true
+			return nil
+		},
+		IsTerminal: func() bool { return true },
+	})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs(nil)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("TUI not called for the bare root on an interactive terminal")
+	}
+	// No mutation: CFLOW_HOME has no database and no workflow directories.
+	requireNoMutations(t, home)
+}
+
+// TestBareRootWithoutTerminalReportsDiagnostic: a bare `cflow` without an
+// interactive terminal prints a stable diagnostic and never starts the
+// TUI or a mutation.
+func TestBareRootWithoutTerminalReportsDiagnostic(t *testing.T) {
+	called := false
+	home := t.TempDir()
+	t.Setenv("CFLOW_HOME", home)
+	var out, errBuf bytes.Buffer
+	root := cli.NewRoot(cli.Dependencies{
+		Build: fixtureBuild(),
+		RunTUI: func(context.Context) error {
+			called = true
+			return nil
+		},
+		IsTerminal: func() bool { return false },
+	})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs(nil)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("TUI called without an interactive terminal")
+	}
+	if !strings.Contains(out.String(), "no interactive terminal") {
+		t.Fatalf("no diagnostic for the non-terminal bare root: %q", out.String())
+	}
+	requireNoMutations(t, home)
+}
+
+// TestBareRootWithSubcommandStaysHeadless: an explicit subcommand (status)
+// never routes through the TUI.
+func TestBareRootWithSubcommandStaysHeadless(t *testing.T) {
+	called := false
+	home := t.TempDir()
+	t.Setenv("CFLOW_HOME", home)
+	var out, errBuf bytes.Buffer
+	root := cli.NewRoot(cli.Dependencies{
+		Build: fixtureBuild(),
+		RunTUI: func(context.Context) error {
+			called = true
+			return nil
+		},
+		IsTerminal: func() bool { return true },
+	})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"status"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("an explicit subcommand routed through the TUI")
+	}
+}
+
+// requireNoMutations asserts CFLOW_HOME carries no database and no
+// workflow directories (the bare root never mutates).
+func requireNoMutations(t *testing.T, home string) {
+	t.Helper()
+	if pathExists(filepath.Join(home, "cflow.db")) {
+		t.Fatal("bare root created a database")
+	}
+	if pathExists(filepath.Join(home, "projects")) {
+		entries, err := os.ReadDir(filepath.Join(home, "projects"))
+		if err == nil && len(entries) > 0 {
+			t.Fatalf("bare root created project directories: %v", entries)
+		}
+	}
 }

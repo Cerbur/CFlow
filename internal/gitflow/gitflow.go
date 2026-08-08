@@ -202,6 +202,17 @@ type CreatePlanningSnapshot struct {
 
 func (CreatePlanningSnapshot) isGitOperation() {}
 
+// CreateWorkspace creates the single long-lived Workspace Branch/Worktree
+// from BaseHead at the recorded Branch and Path (design 8.1; TUI task 4).
+// The branch must not already exist; the user's target branch never moves.
+type CreateWorkspace struct {
+	Branch   string // refname (without refs/heads/ prefix)
+	BaseHead string // full commit hash, the recorded Workflow Base
+	Path     string // canonical destination worktree path
+}
+
+func (CreateWorkspace) isGitOperation() {}
+
 // CreateIntegration creates the Integration Branch/Worktree from
 // BaseCommit (design 15.2, only after Execution Approval). The branch
 // must not already exist.
@@ -346,6 +357,44 @@ type RemoveWorktree struct {
 }
 
 func (RemoveWorktree) isGitOperation() {}
+
+// MoveWorktree moves one managed Git Worktree to a new canonical path
+// with `git worktree move` (design §7.4, TUI task 8: the explicit Legacy
+// Layout Migration). The source must be a registered Worktree and the
+// destination must not exist and must be outside every existing worktree;
+// the Worktree's attached Branch and HEAD follow the move untouched.
+// A dirty or in-progress source is refused (git worktree move refuses it
+// anyway); the fail-closed post-move verification re-observes the
+// registry and the destination.
+type MoveWorktree struct {
+	From string // exact canonical source Worktree path
+	To   string // exact canonical destination Worktree path
+}
+
+func (MoveWorktree) isGitOperation() {}
+
+// FastForwardWorkingTree delivers one verified Apply staging head to the
+// user's original working tree with `git merge --ff-only` (design §13.2,
+// TUI task 15): the Root must be clean and attached to the expected
+// Branch at the expected HEAD, the new head must be a descendant (a
+// fast-forward), and the resulting HEAD/Index/Worktree are re-verified.
+// No reset, force, stash, or checkout argv ever appears.
+type FastForwardWorkingTree struct {
+	Root     string // the user's original working tree root
+	Branch   string // the branch the root is attached to
+	Expected string // full commit hash, the recorded Target HEAD
+	New      string // full commit hash, the verified staging head
+}
+
+func (FastForwardWorkingTree) isGitOperation() {}
+
+// FastForwardWorkingTreeResult reports the observed delivery outcome.
+type FastForwardWorkingTreeResult struct {
+	Head  string
+	Clean bool
+}
+
+func (FastForwardWorkingTreeResult) isGitResult() {}
 
 // GitFacts is the closed union of structured facts. Facts are data, never
 // formatted prose: callers make decisions, GitFlow reports truth.
@@ -519,6 +568,15 @@ type PlanningSnapshotResult struct {
 
 func (PlanningSnapshotResult) isGitResult() {}
 
+// WorkspaceWorktreeResult reports the created Workspace worktree.
+type WorkspaceWorktreeResult struct {
+	Worktree string
+	Branch   string
+	Head     string
+}
+
+func (WorkspaceWorktreeResult) isGitResult() {}
+
 // IntegrationWorktreeResult reports the created Integration worktree.
 type IntegrationWorktreeResult struct {
 	Worktree string
@@ -654,6 +712,17 @@ type WorktreeRemovedResult struct {
 
 func (WorktreeRemovedResult) isGitResult() {}
 
+// WorktreeMovedResult reports the exact source and destination of one
+// moved Worktree (a crash after the move settles from the actual registry
+// state).
+type WorktreeMovedResult struct {
+	From string
+	To   string
+	Head string
+}
+
+func (WorktreeMovedResult) isGitResult() {}
+
 // ---------------------------------------------------------------------------
 // Observe / Execute dispatch
 // ---------------------------------------------------------------------------
@@ -691,6 +760,8 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.createPlanningSnapshot(ctx, op)
 	case CreateIntegration:
 		return g.createIntegration(ctx, op)
+	case CreateWorkspace:
+		return g.createWorkspace(ctx, op)
 	case CreateTask:
 		return g.createTask(ctx, op)
 	case CreateAuditRef:
@@ -711,6 +782,10 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.rollbackMerge(ctx, op)
 	case RemoveWorktree:
 		return g.removeWorktree(ctx, op)
+	case MoveWorktree:
+		return g.moveWorktree(ctx, op)
+	case FastForwardWorkingTree:
+		return g.fastForwardWorkingTree(ctx, op)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git operation")
 	}

@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"cflow.local/cflow/internal/artifact"
@@ -232,16 +233,27 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		return e.classifyMerge(ctx, wf, state, base, intent)
 	case model.IntegrationRollbackIntent:
 		return e.classifyRollback(ctx, wf, state, base, intent)
+	case model.WorkspaceMergeIntent:
+		return e.classifyWorkspaceMerge(ctx, wf, state, base, intent)
+	case model.WorkspaceRollbackIntent:
+		return e.classifyWorkspaceRollback(ctx, wf, state, base, intent)
+	case model.LayoutMigrationIntent:
+		return e.classifyLayoutMigration(ctx, wf, state, base, intent)
 	case model.GitAuditRefCreateIntent:
 		return e.classifyAuditRef(ctx, base, intent)
 	case model.TaskWorktreeCreateIntent:
-		return e.classifyTaskWorktree(ctx, wf, base, intent)
+		return e.classifyTaskWorktree(ctx, wf, state, base, intent)
 	case model.IntegrationWorktreeCreateIntent:
 		return e.classifyWorktreeAt(ctx, base, e.integrationPath(wf), "integration",
 			intent.BaseCommit, "")
 	case model.PlanningWorktreeCreateIntent:
 		return e.classifyWorktreeAt(ctx, base, e.planningPath(wf), "planning",
 			intent.BaseCommit, "")
+	case model.WorkspaceWorktreeCreateIntent:
+		// The Workspace branch is created by, and only by, this Intent's
+		// create (design 8.1); classify against the intent's own Path.
+		return e.classifyWorktreeAt(ctx, base, intent.Path, "workspace",
+			intent.BaseHead, intent.Branch)
 	case model.VerificationRunIntent:
 		return e.classifyVerification(ctx, wf, base, intent)
 	case model.ProviderStartIntent, model.ProviderResumeIntent:
@@ -341,6 +353,123 @@ func (e *RecoveryEngine) classifyRollback(ctx context.Context, wf model.Workflow
 	return base.with(BlockedDrift, "the integration worktree was not restored to the recorded pre-merge head"), nil
 }
 
+// classifyWorkspaceMerge classifies one unfinished WorkspaceMergeIntent
+// from the Workspace Worktree facts (design 8.5, TUI task 7): the
+// Expected Workspace Head is the compare-and-sawp value, the verified Task
+// Commit must be contained by the new Workspace Head, and a Git-clean
+// Workspace is required — a completed merge is never repeated. A terminal
+// Workflow whose Workspace was removed by a Cleanup no longer owes its
+// historical merge.
+func (e *RecoveryEngine) classifyWorkspaceMerge(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.WorkspaceMergeIntent) (IntentDisposition, error) {
+	if state.Workflow.Runtime.IsTerminal() {
+		if present, err := e.worktreeRegistered(ctx, e.workspacePath(wf)); err == nil && !present {
+			return base.with(AlreadyCompleted,
+				"the workspace worktree was removed by cleanup; the historical merge is not owed"), nil
+		}
+	}
+	status, err := e.workspaceStatus(ctx, wf, "")
+	if err != nil {
+		return base.with(FatalInvariant, "workspace worktree facts are unreadable: "+err.Error()), nil
+	}
+	head := status.Head
+	switch {
+	case head == intent.ExpectedWorkspaceHead && status.Clean():
+		// The merge is absent and the expected facts still match.
+		return base.with(SafeToRetry, "no workspace merge exists; the recorded expected head still matches"), nil
+	case head != intent.ExpectedWorkspaceHead && !status.Clean():
+		// The worktree changed and is dirty: cannot be uniquely explained.
+		if e.isDescendant(ctx, head, intent.ExpectedWorkspaceHead) {
+			return base.with(BlockedDrift, "the workspace is dirty after the merge"), nil
+		}
+		return base.with(FatalInvariant, "the workspace head is not a descendant of the recorded expected head and the worktree is dirty"), nil
+	case head != intent.ExpectedWorkspaceHead && status.Clean():
+		if !e.isDescendant(ctx, head, intent.ExpectedWorkspaceHead) {
+			return base.with(FatalInvariant, "the workspace head is not a descendant of the recorded expected head"), nil
+		}
+		if !e.isDescendant(ctx, head, intent.VerifiedCommit) {
+			return base.with(BlockedDrift, "the workspace head does not contain the verified task commit"), nil
+		}
+		return base.with(AlreadyCompleted, "the workspace head advanced with the verified task history contained"), nil
+	default:
+		return base.with(BlockedDrift, "the workspace is dirty before any merge"), nil
+	}
+}
+
+// classifyWorkspaceRollback classifies one unfinished
+// WorkspaceRollbackIntent: the recorded pre-merge HEAD is the expected
+// value. A terminal Workflow whose Workspace was removed by Cleanup no
+// longer owes its historical rollback.
+func (e *RecoveryEngine) classifyWorkspaceRollback(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.WorkspaceRollbackIntent) (IntentDisposition, error) {
+	if state.Workflow.Runtime.IsTerminal() {
+		if present, err := e.worktreeRegistered(ctx, e.workspacePath(wf)); err == nil && !present {
+			return base.with(AlreadyCompleted,
+				"the workspace worktree was removed by cleanup; the historical rollback is not owed"), nil
+		}
+	}
+	status, err := e.workspaceStatus(ctx, wf, intent.Head)
+	if err != nil {
+		return base.with(BlockedDrift, "workspace worktree facts are unreadable: "+err.Error()), nil
+	}
+	if status.Head == intent.Head && status.Clean() {
+		return base.with(AlreadyCompleted, "the workspace is restored to the recorded pre-merge head"), nil
+	}
+	return base.with(BlockedDrift, "the workspace was not restored to the recorded pre-merge head"), nil
+}
+
+// classifyLayoutMigration classifies one unfinished LayoutMigrationIntent
+// (TUI task 8, design §7.4) from the actual filesystem and persisted
+// facts across the four crash windows:
+//
+//  1. the Intent was persisted but nothing moved yet — every source is
+//     still at its legacy path: SafeToRetry (continue from move 0);
+//  2. some moves landed — the completed moves are counted from the
+//     actual state (sources absent, destinations present): SafeToRetry
+//     (continue from the first incomplete move);
+//  3. every move landed but the DB Layout facts did not advance —
+//     AlreadyCompleted for the moves (the DB transaction is the caller's
+//     next step);
+//  4. the persisted Layout facts already advanced to Version 2 —
+//     AlreadyCompleted.
+//
+// A move that is neither source-present nor destination-present, or a
+// destination that exists while its source also exists, is drift the
+// user must act on (BlockedDrift); an unusable manifest is a Fatal
+// Invariant.
+func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.LayoutMigrationIntent) (IntentDisposition, error) {
+	if state.Workflow.LayoutVersion >= 2 {
+		return base.with(AlreadyCompleted, "the workflow layout already advanced to version 2"), nil
+	}
+	if len(intent.Moves) == 0 {
+		return base.with(FatalInvariant, "the layout migration intent carries no moves"), nil
+	}
+	for i, mv := range intent.Moves {
+		srcPresent := e.pathExists(ctx, mv.Source)
+		dstPresent := e.pathExists(ctx, mv.Destination)
+		switch {
+		case srcPresent && !dstPresent:
+			// This move has not landed yet: continue from here.
+			return base.with(SafeToRetry, "layout migration move "+itoa(i)+" has not landed yet"), nil
+		case !srcPresent && dstPresent:
+			// This move landed; inspect the next one.
+		case srcPresent && dstPresent:
+			return base.with(BlockedDrift,
+				"layout migration source and destination both exist for move "+itoa(i)), nil
+		default:
+			return base.with(BlockedDrift,
+				"layout migration move "+itoa(i)+" has neither source nor destination"), nil
+		}
+	}
+	// Every move landed: the DB Layout facts advance in the next
+	// transaction (AlreadyCompleted for the moves themselves).
+	return base.with(AlreadyCompleted, "every layout migration move landed; the database facts advance next"), nil
+}
+
+// pathExists reports whether one path exists (stat, ignoring errors).
+func (e *RecoveryEngine) pathExists(ctx context.Context, path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // classifyAuditRef classifies one unfinished GitAuditRefCreateIntent with
 // expected-absent/expected-value semantics: the append-only Ref must
 // either not exist (safe to create) or carry exactly the expected value.
@@ -362,10 +491,15 @@ func (e *RecoveryEngine) classifyAuditRef(ctx context.Context, base IntentDispos
 
 // classifyTaskWorktree classifies one unfinished TaskWorktreeCreateIntent
 // from the Worktree registry: expected-absent/expected-value semantics
-// prevent a duplicate Worktree. The Worktree location is deterministic
-// (PRD 全局目录结构: worktrees/<project-key>/<workflow-id>/tasks/<node>).
-func (e *RecoveryEngine) classifyTaskWorktree(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.TaskWorktreeCreateIntent) (IntentDisposition, error) {
+// prevent a duplicate Worktree. The Worktree location is deterministic:
+// the aggregated temporary root <root>/tmp/tasks/<node> on Layout Version
+// 2 (design 8.5, TUI task 7), the legacy worktrees/<project-key>/
+// <workflow-id>/tasks/<node> on Layout 1 (PRD 全局目录结构).
+func (e *RecoveryEngine) classifyTaskWorktree(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.TaskWorktreeCreateIntent) (IntentDisposition, error) {
 	path := filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "tasks", string(intent.Node))
+	if state.Workflow.LayoutVersion >= 2 {
+		path = filepath.Join(e.home, "projects", e.projectKey, string(wf), "tmp", "tasks", string(intent.Node))
+	}
 	entries, err := e.worktreeEntries(ctx)
 	if err != nil {
 		// The registry cannot be read (e.g. the directory is not a Git
@@ -670,6 +804,18 @@ func (e *RecoveryEngine) integrationStatus(ctx context.Context, wf model.Workflo
 	return facts.(gitflow.StatusFacts), nil
 }
 
+// workspaceStatus observes the aggregated Workspace Worktree status
+// (design 8.5, TUI task 7: <home>/projects/<key>/<wf>/workspace).
+func (e *RecoveryEngine) workspaceStatus(ctx context.Context, wf model.WorkflowID, expectedHead string) (gitflow.StatusFacts, error) {
+	facts, err := e.git.Observe(ctx, gitflow.GitStatus{
+		Dir: e.workspacePath(wf), ExpectedHead: expectedHead, UntrackedAll: true,
+	})
+	if err != nil {
+		return gitflow.StatusFacts{}, err
+	}
+	return facts.(gitflow.StatusFacts), nil
+}
+
 // isDescendant reports whether from's history contains to (to is an
 // ancestor of from: rev-list from..to is empty).
 func (e *RecoveryEngine) isDescendant(ctx context.Context, from, to string) bool {
@@ -744,6 +890,12 @@ func (e *RecoveryEngine) integrationPath(wf model.WorkflowID) string {
 	return filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "integration")
 }
 
+// workspacePath is the aggregated Workspace Worktree root of one workflow
+// (design 8.5, TUI task 7): <home>/projects/<key>/<workflow-id>/workspace.
+func (e *RecoveryEngine) workspacePath(wf model.WorkflowID) string {
+	return filepath.Join(e.home, "projects", e.projectKey, string(wf), "workspace")
+}
+
 // planningPath is the deterministic Planning Snapshot location.
 func (e *RecoveryEngine) planningPath(wf model.WorkflowID) string {
 	return filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "planning")
@@ -768,4 +920,9 @@ func (b IntentDisposition) with(d Disposition, reason string) IntentDisposition 
 	b.Disposition = d
 	b.Reason = reason
 	return b
+}
+
+// itoa renders a small integer.
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }

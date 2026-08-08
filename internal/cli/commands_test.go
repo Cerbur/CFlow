@@ -64,6 +64,8 @@ func seedCLIProject(t *testing.T) (home string, proj app.Project) {
 	seedWorkflow(t, dbPath, model.WorkflowCommandInput{
 		Kind: model.CreateWorkflow, Workflow: "wf-1",
 		Project: model.ProjectID(proj.Key), TargetBranch: "main", BaseCommit: "abc123",
+		WorkspacePath:   "/home/projects/" + proj.Key + "/wf-1/workspace",
+		WorkspaceBranch: "cflow/wf-1/workspace",
 	})
 	return home, proj
 }

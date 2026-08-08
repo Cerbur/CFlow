@@ -48,15 +48,24 @@ func decideComplete(state model.State, in model.CompleteWorkflowInput) (model.De
 		return model.Decision{}, model.InvalidInputFault(
 			"completion requires the succeeded final verify attempt with evidence")
 	}
-	// The exact Integration Commit evidence: the head the Final Reviewer
-	// bound must still be the current Integration HEAD (design 16.2:
-	// completion is bound to the evidence subject it verified).
-	if fv.StartHead == "" || fv.StartHead != state.Workflow.IntegrationHead {
+	// The exact delivery Commit evidence: the head the Final Reviewer
+	// bound must still be the current delivery HEAD (design 16.2:
+	// completion is bound to the evidence subject it verified). On the
+	// aggregated workspace layout the verified Workspace Head is the
+	// delivery (design 8.5, TUI task 7); the legacy layout uses the
+	// Integration HEAD.
+	deliveryHead := state.Workflow.IntegrationHead
+	deliveryBranch := state.Workflow.IntegrationBranch
+	if state.Workflow.LayoutVersion >= 2 {
+		deliveryHead = state.Workflow.VerifiedWorkspaceHead
+		deliveryBranch = state.Workflow.WorkspaceBranch
+	}
+	if fv.StartHead == "" || fv.StartHead != deliveryHead {
 		return model.Decision{}, model.NewFault(model.CodeEvidenceSubjectChanged,
-			"the integration head moved after the final review; completion requires the exact verified head")
+			"the delivery head moved after the final review; completion requires the exact verified head")
 	}
 	// Every Merge Node's succeeded Attempt carries commit evidence on the
-	// recorded Integration Branch: the delivery chain's evidence subjects
+	// recorded delivery Branch: the delivery chain's evidence subjects
 	// are exact.
 	for _, n := range state.Nodes {
 		if n.Kind != model.NodeMerge {
@@ -67,7 +76,7 @@ func decideComplete(state model.State, in model.CompleteWorkflowInput) (model.De
 			return model.Decision{}, model.InvalidInputFault(
 				"completion requires a succeeded merge attempt for " + string(n.ID))
 		}
-		if !evidenceOn(ma.Evidence, model.EvidenceCommit, state.Workflow.IntegrationBranch) {
+		if !evidenceOn(ma.Evidence, model.EvidenceCommit, deliveryBranch) {
 			return model.Decision{}, model.NewFault(model.CodeEvidenceSubjectChanged,
 				"a merge attempt's commit evidence subject changed; completion requires the exact verified subjects")
 		}
@@ -140,13 +149,29 @@ func decideCreateWorkflow(state model.State, in model.WorkflowCommandInput) (mod
 	if in.TargetBranch == "" || in.BaseCommit == "" {
 		return model.Decision{}, model.InvalidInputFault("workflow creation requires a target branch and base commit")
 	}
+	if in.WorkspacePath == "" || in.WorkspaceBranch == "" {
+		return model.Decision{}, model.InvalidInputFault("workflow creation requires the workspace layout facts")
+	}
 	b := &builder{state: state}
-	b.mutate(wfMut(state, model.StageRequirementDiscussion, model.RuntimePending, nil))
+	m := wfMut(state, model.StageRequirementDiscussion, model.RuntimePending, nil)
+	// A create that carries the workspace layout records Layout Version 2
+	// and its canonical workspace facts (Task 4): new workflows run on a
+	// single long-lived Workspace; legacy workflows keep Layout 1 until an
+	// explicit migration (Task 8).
+	m.LayoutVersion = 2
+	m.WorkspacePath = in.WorkspacePath
+	m.WorkspaceBranch = in.WorkspaceBranch
+	b.mutate(m)
 	b.event(model.EventWorkflowCreated, "", model.AttemptKey{}, "", "workflow created")
-	// The Planning Snapshot Worktree is created at the recorded Base
-	// Commit; the expected HEAD is fixed before the Effect (design 15.2,
-	// 6.2 rule 6). The user's working tree is never touched.
-	b.effect(model.PlanningWorktreeCreateIntent{Workflow: in.Workflow, BaseCommit: in.BaseCommit})
+	// The Workspace Branch/Worktree is created at the recorded Base Head;
+	// the expected HEAD, Branch, and Path are fixed before the Effect
+	// (design 8.1, 6.2 rule 6). The user's working tree is never touched.
+	b.effect(model.WorkspaceWorktreeCreateIntent{
+		Workflow: in.Workflow,
+		BaseHead: in.BaseCommit,
+		Branch:   in.WorkspaceBranch,
+		Path:     in.WorkspacePath,
+	})
 	return b.decision(), nil
 }
 
@@ -190,6 +215,76 @@ func decideDiscussRequirement(state model.State, in model.DiscussRequirementInpu
 		Route:      in.Provider,
 		Supersedes: providerSessionOf(parent),
 	})
+	return b.decision(), nil
+}
+
+// decidePrepareNativeDiscussion establishes the exact CFlow Session of
+// one native interactive requirement discussion (design §9.1, TUI task
+// 12): the Kernel records the fresh Session as STARTING with no Provider
+// run — the TUI's blocking exec callback drives the Bridge, and the
+// Session becomes INTERACTIVE_IDLE when the turn ends. The Session is
+// persisted and recoverable before any terminal output.
+func decidePrepareNativeDiscussion(state model.State, in model.PrepareNativeDiscussionInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to discuss natively")
+	}
+	if state.Workflow.Stage != model.StageRequirementDiscussion {
+		return model.Decision{}, model.InvalidInputFault("native discussion requires the REQUIREMENT_DISCUSSION stage")
+	}
+	if !planningRuntimeAllowed(state.Workflow.Runtime) {
+		return model.Decision{}, model.InvalidInputFault("workflow cannot discuss natively from " + string(state.Workflow.Runtime))
+	}
+	if err := validateProvider(in.Provider); err != nil {
+		return model.Decision{}, err
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	b := &builder{state: state}
+	startIfNeeded(b, state)
+	parent := latestPlanningSession(state)
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID:         in.Session,
+		Purpose:    model.PurposePlanning,
+		Status:     model.SessionStarting,
+		Supersedes: supersedesOf(parent),
+	}, Provider: in.Provider})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion session prepared")
+	return b.decision(), nil
+}
+
+// decideFinishDiscussion settles one finished native discussion Session
+// COMPLETED and requests the immutable ArtifactDiscussionHandoff write
+// (design §9.2, TUI task 12): the handoff is the only discussion input
+// Plan generation consumes.
+func decideFinishDiscussion(state model.State, in model.FinishDiscussionInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to finish")
+	}
+	if state.Workflow.Stage != model.StageRequirementDiscussion {
+		return model.Decision{}, model.InvalidInputFault("finishing a discussion requires the REQUIREMENT_DISCUSSION stage")
+	}
+	session := findSessionState(state, in.Session)
+	if session == nil {
+		return model.Decision{}, model.InvalidInputFault("the discussion session is not bound to this workflow")
+	}
+	if session.Purpose != model.PurposePlanning {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("the finished session is not a discussion session"))
+	}
+	if len(in.Handoff) == 0 || len(in.Handoff) > maxTurnText {
+		return model.Decision{}, model.InvalidInputFault("the discussion handoff is required and bounded")
+	}
+	b := &builder{state: state}
+	b.mutate(model.SessionEndMutation{
+		ID: session.ID, Status: model.SessionCompleted, EndedAt: state.Now,
+	})
+	b.effect(model.ArtifactWriteIntent{
+		Ref:      model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactDiscussionHandoff},
+		Body:     in.Handoff,
+		Producer: model.PurposePlanning,
+		Session:  in.Session,
+	})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion finished")
 	return b.decision(), nil
 }
 
@@ -528,37 +623,57 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 	if state.Plan == nil {
 		return model.Decision{}, model.InvalidInputFault("execution approval requires the approved plan reference")
 	}
-	if !facts.Matches(in.PlanHash, in.SpecHashes, in.CatalogHash, in.WorkflowHash, in.RoutingHash, in.BudgetHash, in.CommitPolicyHash) {
+	if !facts.Matches(in.PlanHash, in.SpecHashes, in.CatalogHash, in.WorkflowHash, in.RoutingHash, in.BudgetHash, in.CommitPolicyHash, in.ChangeSetHash) {
 		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged, "execution facts changed since the approval preview")
+	}
+	refs := []model.ArtifactRef{
+		{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: state.Plan.Revision, Hash: facts.PlanHash},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
+		{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
+	}
+	if facts.ChangeSetHash != "" && facts.ChangeSetRevision > 0 {
+		// The frozen Change Set Revision the approval binds: the Workspace
+		// candidate is adopted (verified) before any normal Task starts
+		// (TUI task 6, design 8.4).
+		refs = append(refs, model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactChangeSet,
+			Revision: facts.ChangeSetRevision, Hash: facts.ChangeSetHash})
 	}
 	b := &builder{state: state}
 	b.mutate(model.ApprovalAppendMutation{Approval: model.Approval{
 		ID:   model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
 		Kind: model.ApprovalExecution,
 		Seq:  state.NextEventSeq,
-		Refs: []model.ArtifactRef{
-			{Workflow: state.Workflow.ID, Type: model.ArtifactPlan, Revision: state.Plan.Revision, Hash: facts.PlanHash},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactSpec, Revision: facts.SpecRevision, Hash: facts.SpecHashes[0]},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactCatalog, Revision: facts.CatalogRevision, Hash: facts.CatalogHash},
-			{Workflow: state.Workflow.ID, Type: model.ArtifactWorkflow, Revision: facts.WorkflowRevision, Hash: facts.WorkflowHash},
-		},
+		Refs: refs,
 		Fingerprint:       facts.Fingerprint,
 		PreflightRevision: facts.PreflightRevision,
 	}})
 	// The approval is the workflow's entry into EXECUTION: dispatch opens
-	// with a fresh Run (closing every prior gate run) and the deterministic
-	// Integration Branch is recorded.
+	// with a fresh Run (closing every prior gate run). On the aggregated
+	// workspace layout the Workspace (created at workflow creation, Task
+	// 4) IS the single delivery mainline — no Integration Branch/Worktree
+	// is created (design 8.5, TUI task 7). On the legacy Layout 1 the
+	// deterministic Integration Branch is recorded and its Worktree
+	// creation requested.
 	closePriorRuns(b, state)
 	b.mutate(model.RunAppendMutation{Run: newRun(state, model.RunRunning, true)})
-	b.mutate(wfWithIntegration(state, model.StageExecution, model.RuntimeRunning, integrationBranch(state.Workflow.ID)))
+	if state.Workflow.LayoutVersion >= 2 {
+		m := wfMut(state, model.StageExecution, model.RuntimeRunning, state.Workflow.CancelIntent)
+		m.WorkspaceBranch = state.Workflow.WorkspaceBranch
+		b.mutate(m)
+	} else {
+		b.mutate(wfWithIntegration(state, model.StageExecution, model.RuntimeRunning, integrationBranch(state.Workflow.ID)))
+	}
 	b.event(model.EventRunStarted, "", model.AttemptKey{}, "", "run started")
 	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "workflow resumed into execution")
 	b.event(model.EventExecutionApproved, "", model.AttemptKey{}, "", "execution approved")
 	b.event(model.EventStageChanged, "", model.AttemptKey{}, "", "stage changed to EXECUTION")
-	b.effect(model.IntegrationWorktreeCreateIntent{
-		Workflow:   state.Workflow.ID,
-		BaseCommit: state.Workflow.BaseCommit,
-	})
+	if state.Workflow.LayoutVersion < 2 {
+		b.effect(model.IntegrationWorktreeCreateIntent{
+			Workflow:   state.Workflow.ID,
+			BaseCommit: state.Workflow.BaseCommit,
+		})
+	}
 	return b.decision(), nil
 }
 
@@ -720,6 +835,18 @@ func decideExecutionDryRun(state model.State, in model.ExecutionDryRunInput) (mo
 			Revision: in.BudgetRef.Revision,
 			Path:     in.BudgetRef.String(),
 			Hash:     in.BudgetRef.Hash,
+		})
+	}
+	if in.ChangeSetRef.Hash != "" {
+		// The frozen Change Set the discussion froze becomes an active
+		// reference of the Execution Facts, so the Execution Approval
+		// preview binds its hash and the approval gates the Workspace
+		// behind the Adoption Gate (TUI task 6, design 8.4).
+		b.mutate(model.ArtifactRefMutation{
+			Type:     model.ArtifactChangeSet,
+			Revision: in.ChangeSetRef.Revision,
+			Path:     in.ChangeSetRef.String(),
+			Hash:     in.ChangeSetRef.Hash,
 		})
 	}
 	b.mutate(wfMutStatus(state, model.RuntimePaused))

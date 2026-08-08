@@ -27,6 +27,12 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		// identity facts live in workflow.yaml, not in the aggregate, so
 		// the Result Decision is empty (design 15.2).
 		return model.Decision{}, nil
+	case model.WorkspaceWorktreeCreated:
+		// The Workspace exists at the recorded Base Head on its
+		// deterministic branch; the identity facts live in workflow.yaml
+		// and in the aggregate's Workflow facts, so the Result Decision
+		// is empty (design 8.1, Task 4).
+		return model.Decision{}, nil
 	case model.ProviderRunEnded:
 		return decideProviderRunEnded(state, in)
 	case model.ArtifactWritten:
@@ -45,6 +51,12 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return decideIntegrationMergeFailed(state, in)
 	case model.IntegrationRollbacked:
 		return decideIntegrationRollbacked(state, in)
+	case model.WorkspaceMerged:
+		return decideWorkspaceMerged(state, in)
+	case model.WorkspaceMergeFailed:
+		return decideWorkspaceMergeFailed(state, in)
+	case model.WorkspaceRollbacked:
+		return decideWorkspaceRollbacked(state, in)
 	case model.GitAuditRefCreated:
 		// The append-only audit Ref exists; the aggregate records the
 		// Attempt evidence through the gate result, not a separate row.

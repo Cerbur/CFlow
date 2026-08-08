@@ -11,12 +11,20 @@ CFlow is not another thin wrapper around `codex` or `claude`. It owns the
 recoverable Plan-to-Done lifecycle and advances state only from persisted
 evidence—not from an agent saying that the work is complete.
 
-> **Project status:** the Demo implementation is present. The evidence-backed
-> Gate 3 candidate is tied to source commit `68fd200`; see the
-> [acceptance report](docs/cflow-demo-acceptance-report.md). The current branch
-> contains later CLI/provider wiring and documentation changes that have not
-> been re-attested by a new Gate 3 run. Treat it as post-candidate development,
-> not as a released build.
+> **Project status:** the TUI workflow (Tasks 4–16) is implemented and its
+> deterministic Fake TUI Gate is the current **Internal Candidate**; see the
+> [acceptance report](docs/cflow-demo-acceptance-report.md). On 2026-08-07 the
+> **TUI workflow direction was confirmed** (full-screen Bubble Tea TUI as the
+> default entry, native Codex/Claude requirement discussions, an aggregated
+> Workflow directory, a single long-lived Workspace, a foreground Runner,
+> workspace-aware Apply and explicit Cleanup) — see
+> [the TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md)
+> and [its implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
+> A bare `cflow` on an interactive terminal launches the full-screen TUI; the
+> line-oriented subcommands (`cflow status`, `cflow plan`, …) remain as the
+> headless CLI. The real Codex/Claude Native + Headless E2E and the
+> self-Dogfood are **not yet run** — they require separate explicit user
+> approval on a new exact candidate Commit.
 
 ## Why CFlow
 
@@ -99,6 +107,11 @@ and the [acceptance report](docs/cflow-demo-acceptance-report.md).
 
 ## Current Demo usage
 
+> The confirmed 2026-08-07 direction replaces this line-oriented entry with a
+> full-screen TUI and native requirement discussions; the TUI is **not yet
+> implemented**. Until the TUI tasks land, the interface remains the line-oriented
+> command-driven Demo below, and bare `cflow` still prints the command tree.
+
 The current interface is line-oriented and command-driven. Bare `cflow`
 prints the command tree; the fully guided interactive lifecycle described in
 the PRD is not yet exposed as one continuous loop.
@@ -130,7 +143,10 @@ commands, Git identity/signing facts, and permission boundary before approval.
 
 The Demo CLI is still an engineering candidate: several `doctor` stateful
 checks currently report `NOT_YET_AVAILABLE`, and the current post-candidate
-provider wiring has not received refreshed Gate 3 evidence.
+provider wiring has not received refreshed Gate 3 evidence. The confirmed
+2026-08-07 TUI workflow tasks will add the Bubble Tea TUI, native Codex/Claude
+requirement discussions, the Foreground Runner, aggregated Workspaces,
+workspace-aware Apply and explicit Cleanup on top of this runtime.
 
 ## Command map
 
@@ -189,6 +205,8 @@ it does not automatically attest later commits.
 - [Product requirements](docs/cflow-prd.md)
 - [Technical design](docs/cflow-demo-design.md)
 - [Implementation plan](docs/cflow-demo-implementation-plan.md)
+- [TUI workflow design (confirmed 2026-08-07)](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md)
+- [TUI workflow implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)
 - [Gate 3 acceptance report](docs/cflow-demo-acceptance-report.md)
 - [Local-first boundary](docs/cflow-local-first.md)
 - [Domain language](CONTEXT.md)
@@ -196,8 +214,10 @@ it does not automatically attest later commits.
 ## Non-goals for the Demo
 
 No Web UI, cloud service, arbitrary workflow scripts, automatic push/PR,
-cross-repository workflow, OpenCode adapter, Provider TUI attach, or unlimited
-autonomous retry loop.
+cross-repository workflow, OpenCode adapter, or unlimited autonomous retry
+loop. (Provider TUI attach was historically listed here; the confirmed
+2026-08-07 TUI workflow direction makes native Codex/Claude requirement
+discussions part of the main path — see the TUI design document.)
 
 ## License
 
