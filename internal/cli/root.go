@@ -30,22 +30,50 @@ import (
 // (design 19.2); a zero registry passes text through. OpenApplication
 // replaces the default Application construction: tests inject the Fake
 // Adapter with fixture scripts, production builds the GitFlow and the
-// embedded registries over the working directory.
+// embedded registries over the working directory. RunTUI is the default
+// full-screen entry point the bare `cflow` command calls on an
+// interactive terminal (design §1, TUI task 9); it never mutates a
+// Workflow by itself.
 type Dependencies struct {
 	Build           observe.BuildInfo
 	Redaction       security.Registry
 	OpenApplication func(ctx context.Context) (*app.Application, error)
+	RunTUI          func(ctx context.Context) error
+	// IsTerminal reports whether the process stdio is an interactive
+	// terminal (default: the real isatty check; tests inject false or a
+	// fake terminal).
+	IsTerminal func() bool
 }
 
 // NewRoot builds the cflow command tree. version, help, and doctor are
 // non-mutating: they never read, create, or modify CFLOW_HOME. The
-// project commands route exclusively through the Application.
+// project commands route exclusively through the Application. A bare
+// `cflow` on an interactive terminal launches the full-screen TUI;
+// every subcommand behaves exactly as before (the headless CLI is
+// preserved).
 func NewRoot(deps Dependencies) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "cflow",
 		Short:         "local-first coding-agent workflow lifecycle CLI",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 0 {
+				return cmd.Help()
+			}
+			if deps.RunTUI == nil {
+				return cmd.Help()
+			}
+			if terminal := deps.IsTerminal; terminal != nil && !terminal() {
+				// No interactive terminal: a stable diagnostic, never a
+				// mutation (design §1: bare cflow needs a TTY to run the
+				// TUI; the headless subcommands stay available).
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"cflow: no interactive terminal; run a subcommand (cflow status, cflow --help)")
+				return nil
+			}
+			return deps.RunTUI(cmd.Context())
+		},
 	}
 	root.AddCommand(newVersionCmd(deps.Build))
 	root.AddCommand(newDoctorCmd(deps.Build))
