@@ -305,6 +305,10 @@ const (
 	// WorkspaceRollbacked reports that the managed Workspace Worktree was
 	// restored to the recorded pre-merge HEAD.
 	WorkspaceRollbacked EffectResultKind = "workspace-rollbacked"
+	// LayoutMigrationCompleted reports that the explicit Legacy Layout
+	// Migration finished: every move landed and the persisted Layout facts
+	// advanced to Version 2 (TUI task 8).
+	LayoutMigrationCompleted EffectResultKind = "layout-migration-completed"
 	// GitAuditRefCreated reports one created append-only audit Ref.
 	GitAuditRefCreated EffectResultKind = "git-audit-ref-created"
 )
@@ -320,7 +324,8 @@ func (k EffectResultKind) Valid() bool {
 		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated,
 		VerificationRunEnded, IntegrationMerged, IntegrationMergeFailed,
 		IntegrationRollbacked, GitAuditRefCreated,
-		WorkspaceMerged, WorkspaceMergeFailed, WorkspaceRollbacked:
+		WorkspaceMerged, WorkspaceMergeFailed, WorkspaceRollbacked,
+		LayoutMigrationCompleted:
 		return true
 	}
 	return false

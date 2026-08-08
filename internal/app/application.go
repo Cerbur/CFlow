@@ -236,6 +236,8 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryReplacementPreview(ctx, qq)
 	case ReportQuery:
 		return a.queryReport(ctx, qq)
+	case LayoutMigrationPreviewQuery:
+		return a.queryMigrationPreview(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -394,6 +396,10 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 		out, err = a.executeDispatch(ctx, st, wf, restricted)
 	case FreezeDiscussionCommand:
 		out, err = a.executeFreeze(ctx, st, wf, cmd.(FreezeDiscussionCommand))
+	case ExecuteLayoutMigrationCommand:
+		out, err = a.executeMigration(ctx, st, wf, cmd.(ExecuteLayoutMigrationCommand))
+	case PrepareLayoutMigrationCommand:
+		out, err = a.prepareMigrationExecute(ctx, st, wf, cmd.(PrepareLayoutMigrationCommand))
 	default:
 		out, err = a.runDecisionLoop(ctx, st, wf, cmd, input, restricted)
 	}
@@ -876,6 +882,20 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		return model.DispatchInput{}, wf, nil
 	case AdoptWorkspaceCommand:
 		return a.prepareAdoption(ctx, c)
+	case PrepareLayoutMigrationCommand:
+		return a.prepareMigration(ctx, c)
+	case ExecuteLayoutMigrationCommand:
+		wf, err := a.resolveMutationWorkflow(c.Workflow)
+		if err != nil {
+			return nil, "", err
+		}
+		if c.ManifestHash == "" {
+			return nil, "", model.InvalidInputFault("the migration requires the exact preview manifest hash")
+		}
+		// The Execute pass performs the ordered moves itself (design 6.1:
+		// an explicit Application-owned operation); the kernel Input
+		// placeholder is unused by the dedicated migration path.
+		return model.ReconcileInput{}, wf, nil
 	case ReconcileCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

@@ -176,6 +176,43 @@ type WorkspaceRollbackIntent struct {
 
 func (WorkspaceRollbackIntent) isEffectIntent() {}
 
+// PathMoveKind is one migration move kind (TUI task 8).
+type PathMoveKind string
+
+const (
+	// MoveKindWorktree moves one managed Git Worktree.
+	MoveKindWorktree PathMoveKind = "worktree"
+	// MoveKindArtifact moves one managed directory or file.
+	MoveKindArtifact PathMoveKind = "artifact"
+)
+
+// PathMove is one exact source→destination move of a Legacy Layout
+// Migration. Branch and Head bind a Worktree move to its registered
+// identity.
+type PathMove struct {
+	Kind        PathMoveKind `json:"kind"`
+	Source      string       `json:"source"`
+	Destination string       `json:"destination"`
+	Branch      string       `json:"branch,omitempty"`
+	Head        string       `json:"head,omitempty"`
+}
+
+// LayoutMigrationIntent performs the explicit Legacy Layout Migration of
+// one Layout Version 1 workflow into the aggregated layout (design §7.4,
+// TUI task 8): the ordered PathMoves move the legacy Worktrees
+// (`git worktree move`) and the legacy Artifacts root (safe path move)
+// into the aggregated workflow root, and the persisted Layout facts
+// advance to Version 2. Moves is the exact ordered list the Preview
+// derived and Prepare bound by manifest hash; Done counts the moves
+// already completed (recovery continues from the actual state).
+type LayoutMigrationIntent struct {
+	Workflow WorkflowID
+	Moves    []PathMove
+	Done     int
+}
+
+func (LayoutMigrationIntent) isEffectIntent() {}
+
 // VerificationRunIntent runs one approved Catalog Entry by identity.
 type VerificationRunIntent struct {
 	Node        NodeID

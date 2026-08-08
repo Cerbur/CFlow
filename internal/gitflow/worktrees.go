@@ -363,6 +363,48 @@ func (g *GitFlow) removeWorktree(ctx context.Context, op RemoveWorktree) (GitRes
 	return WorktreeRemovedResult{Path: clean}, nil
 }
 
+// moveWorktree moves one registered managed Worktree to a new canonical
+// path with `git worktree move <from> <to>` (design §7.4, TUI task 8).
+// The source must be a registered Worktree; the destination must not
+// exist and must be outside every existing worktree. A dirty or
+// in-progress source is refused (git refuses the move anyway); the
+// fail-closed post-move verification re-observes the registry and the
+// destination's HEAD.
+func (g *GitFlow) moveWorktree(ctx context.Context, op MoveWorktree) (GitResult, error) {
+	if op.From == "" || op.To == "" {
+		return nil, model.InvalidInputFault("gitflow: worktree move requires exact source and destination paths")
+	}
+	from := filepath.Clean(op.From)
+	to, err := g.validateWorktreePath(ctx, op.To)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := g.verifiedEntry(ctx, from)
+	if err != nil {
+		return nil, err
+	}
+	env := childEnv()
+	_, errOut, exit, err := g.run(ctx, g.dir, env, defaultGitTimeout, "worktree", "move", from, to)
+	if err != nil {
+		return nil, err
+	}
+	if exit.Fact != process.FactProcessExit || exit.Code != 0 {
+		return nil, model.NewFault(model.CodeCleanupTargetDirty,
+			"gitflow: worktree move refused (dirty, locked, or occupied): "+string(errOut))
+	}
+	// Fail-closed post-move verification: the destination is registered,
+	// carries the same Branch, and its HEAD is unchanged.
+	moved, err := g.verifiedEntry(ctx, to)
+	if err != nil {
+		return nil, err
+	}
+	if moved.Branch != entry.Branch || moved.Head != entry.Head {
+		return nil, model.NewFault(model.CodeStateInvariantViolation,
+			"gitflow: moved worktree identity changed during the move")
+	}
+	return WorktreeMovedResult{From: from, To: to, Head: moved.Head}, nil
+}
+
 // worktreeInProgress observes the state markers of one managed Worktree's
 // gitdir: an unfinished merge/rebase/cherry-pick/revert/bisect or an
 // administrative lock file. The safe-clean gate refuses a target carrying

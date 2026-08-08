@@ -247,6 +247,17 @@ type ChangeSetView struct {
 	Dirty     bool
 }
 
+// MigrationPreviewView is the read-only Legacy Layout Migration preview:
+// the exact ordered moves and the canonical manifest hash the Prepare
+// binds (TUI task 8, design §7.4).
+type MigrationPreviewView struct {
+	Workflow     model.WorkflowID
+	From         int
+	To           int
+	Moves        []model.PathMove
+	ManifestHash string
+}
+
 // ExecutionPreviewView is the Execution Approval preview projection.
 type ExecutionPreviewView struct {
 	Workflow model.WorkflowID
@@ -423,6 +434,7 @@ func (LogsView) isView()               {}
 func (DiscoveryView) isView()          {}
 func (PlanView) isView()               {}
 func (ChangeSetView) isView()          {}
+func (MigrationPreviewView) isView()   {}
 func (ExecutionPreviewView) isView()   {}
 func (PolicyConfirmationView) isView() {}
 func (CancelSummaryView) isView()      {}
@@ -603,6 +615,36 @@ type AdoptWorkspaceCommand struct {
 	Workflow model.WorkflowID
 }
 
+// LayoutMigrationPreviewQuery projects the read-only Legacy Layout
+// Migration Preview of one Layout Version 1 workflow (TUI task 8, design
+// §7.4): the exact ordered moves and the canonical manifest hash.
+// Computing the Preview never moves, creates, or deletes anything.
+type LayoutMigrationPreviewQuery struct {
+	Workflow model.WorkflowID
+}
+
+func (LayoutMigrationPreviewQuery) isQuery() {}
+
+// PrepareLayoutMigrationCommand is the first explicit step of the Legacy
+// Layout Migration: it validates the Preview against the current facts,
+// persists the migration row (status PREPARED, the canonical manifest
+// hash), and records the LayoutMigrationIntent in the effect ledger so a
+// crash before any move leaves an exactly-recoverable intent. No file or
+// Worktree moves during Prepare.
+type PrepareLayoutMigrationCommand struct {
+	Workflow     model.WorkflowID
+	ManifestHash string
+}
+
+// ExecuteLayoutMigrationCommand is the second explicit step: it performs
+// the ordered moves of the bound manifest (git worktree move for the
+// Worktrees, safe path moves for the Artifacts), then advances the
+// persisted Layout facts to Version 2 and marks the migration COMPLETED.
+type ExecuteLayoutMigrationCommand struct {
+	Workflow     model.WorkflowID
+	ManifestHash string
+}
+
 // ReconcileCommand runs the Recovery sweep of the Kernel: it completes a
 // persisted Cancel intent, converges a QUIESCING or STOPPING Run whose
 // Attempts and processes settled, and Blocks a Workflow that carries a
@@ -726,6 +768,8 @@ func (ExecutionDryRunCommand) isCommand()     {}
 func (ApproveExecutionCommand) isCommand()    {}
 func (DispatchCommand) isCommand()            {}
 func (AdoptWorkspaceCommand) isCommand()      {}
+func (PrepareLayoutMigrationCommand) isCommand()      {}
+func (ExecuteLayoutMigrationCommand) isCommand()      {}
 func (ReconcileCommand) isCommand()           {}
 func (CommitPolicyConfirmCommand) isCommand() {}
 func (ReplacementPreviewCommand) isCommand()  {}

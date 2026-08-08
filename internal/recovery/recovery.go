@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"cflow.local/cflow/internal/artifact"
@@ -236,6 +237,8 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		return e.classifyWorkspaceMerge(ctx, wf, state, base, intent)
 	case model.WorkspaceRollbackIntent:
 		return e.classifyWorkspaceRollback(ctx, wf, state, base, intent)
+	case model.LayoutMigrationIntent:
+		return e.classifyLayoutMigration(ctx, wf, state, base, intent)
 	case model.GitAuditRefCreateIntent:
 		return e.classifyAuditRef(ctx, base, intent)
 	case model.TaskWorktreeCreateIntent:
@@ -411,6 +414,60 @@ func (e *RecoveryEngine) classifyWorkspaceRollback(ctx context.Context, wf model
 		return base.with(AlreadyCompleted, "the workspace is restored to the recorded pre-merge head"), nil
 	}
 	return base.with(BlockedDrift, "the workspace was not restored to the recorded pre-merge head"), nil
+}
+
+// classifyLayoutMigration classifies one unfinished LayoutMigrationIntent
+// (TUI task 8, design §7.4) from the actual filesystem and persisted
+// facts across the four crash windows:
+//
+//  1. the Intent was persisted but nothing moved yet — every source is
+//     still at its legacy path: SafeToRetry (continue from move 0);
+//  2. some moves landed — the completed moves are counted from the
+//     actual state (sources absent, destinations present): SafeToRetry
+//     (continue from the first incomplete move);
+//  3. every move landed but the DB Layout facts did not advance —
+//     AlreadyCompleted for the moves (the DB transaction is the caller's
+//     next step);
+//  4. the persisted Layout facts already advanced to Version 2 —
+//     AlreadyCompleted.
+//
+// A move that is neither source-present nor destination-present, or a
+// destination that exists while its source also exists, is drift the
+// user must act on (BlockedDrift); an unusable manifest is a Fatal
+// Invariant.
+func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.LayoutMigrationIntent) (IntentDisposition, error) {
+	if state.Workflow.LayoutVersion >= 2 {
+		return base.with(AlreadyCompleted, "the workflow layout already advanced to version 2"), nil
+	}
+	if len(intent.Moves) == 0 {
+		return base.with(FatalInvariant, "the layout migration intent carries no moves"), nil
+	}
+	for i, mv := range intent.Moves {
+		srcPresent := e.pathExists(ctx, mv.Source)
+		dstPresent := e.pathExists(ctx, mv.Destination)
+		switch {
+		case srcPresent && !dstPresent:
+			// This move has not landed yet: continue from here.
+			return base.with(SafeToRetry, "layout migration move "+itoa(i)+" has not landed yet"), nil
+		case !srcPresent && dstPresent:
+			// This move landed; inspect the next one.
+		case srcPresent && dstPresent:
+			return base.with(BlockedDrift,
+				"layout migration source and destination both exist for move "+itoa(i)), nil
+		default:
+			return base.with(BlockedDrift,
+				"layout migration move "+itoa(i)+" has neither source nor destination"), nil
+		}
+	}
+	// Every move landed: the DB Layout facts advance in the next
+	// transaction (AlreadyCompleted for the moves themselves).
+	return base.with(AlreadyCompleted, "every layout migration move landed; the database facts advance next"), nil
+}
+
+// pathExists reports whether one path exists (stat, ignoring errors).
+func (e *RecoveryEngine) pathExists(ctx context.Context, path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // classifyAuditRef classifies one unfinished GitAuditRefCreateIntent with
@@ -863,4 +920,9 @@ func (b IntentDisposition) with(d Disposition, reason string) IntentDisposition 
 	b.Disposition = d
 	b.Reason = reason
 	return b
+}
+
+// itoa renders a small integer.
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }

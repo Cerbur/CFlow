@@ -121,6 +121,8 @@ func effectKindOf(i model.EffectIntent) (string, error) {
 		return "workspace-merge", nil
 	case model.WorkspaceRollbackIntent:
 		return "workspace-rollback", nil
+	case model.LayoutMigrationIntent:
+		return "layout-migration", nil
 	case model.VerificationRunIntent:
 		return "verification-run", nil
 	case model.WorkflowCompileIntent:
@@ -197,6 +199,10 @@ func effectFromKind(kind string, payload []byte) (model.EffectIntent, error) {
 		return v, err
 	case "workspace-rollback":
 		var v model.WorkspaceRollbackIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "layout-migration":
+		var v model.LayoutMigrationIntent
 		err = json.Unmarshal(payload, &v)
 		return v, err
 	case "verification-run":

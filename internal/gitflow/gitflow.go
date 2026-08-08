@@ -358,6 +358,21 @@ type RemoveWorktree struct {
 
 func (RemoveWorktree) isGitOperation() {}
 
+// MoveWorktree moves one managed Git Worktree to a new canonical path
+// with `git worktree move` (design §7.4, TUI task 8: the explicit Legacy
+// Layout Migration). The source must be a registered Worktree and the
+// destination must not exist and must be outside every existing worktree;
+// the Worktree's attached Branch and HEAD follow the move untouched.
+// A dirty or in-progress source is refused (git worktree move refuses it
+// anyway); the fail-closed post-move verification re-observes the
+// registry and the destination.
+type MoveWorktree struct {
+	From string // exact canonical source Worktree path
+	To   string // exact canonical destination Worktree path
+}
+
+func (MoveWorktree) isGitOperation() {}
+
 // GitFacts is the closed union of structured facts. Facts are data, never
 // formatted prose: callers make decisions, GitFlow reports truth.
 type GitFacts interface{ isGitFacts() }
@@ -674,6 +689,17 @@ type WorktreeRemovedResult struct {
 
 func (WorktreeRemovedResult) isGitResult() {}
 
+// WorktreeMovedResult reports the exact source and destination of one
+// moved Worktree (a crash after the move settles from the actual registry
+// state).
+type WorktreeMovedResult struct {
+	From string
+	To   string
+	Head string
+}
+
+func (WorktreeMovedResult) isGitResult() {}
+
 // ---------------------------------------------------------------------------
 // Observe / Execute dispatch
 // ---------------------------------------------------------------------------
@@ -733,6 +759,8 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.rollbackMerge(ctx, op)
 	case RemoveWorktree:
 		return g.removeWorktree(ctx, op)
+	case MoveWorktree:
+		return g.moveWorktree(ctx, op)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git operation")
 	}

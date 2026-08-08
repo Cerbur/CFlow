@@ -555,6 +555,47 @@ func (s *Store) RegisterProject(ctx context.Context, id model.ProjectID, root, n
 	return nil
 }
 
+// RecordLayoutMigration inserts (or re-opens) the explicit Legacy Layout
+// Migration row of one workflow (layout_migrations, TUI task 8): status
+// PREPARED with the canonical manifest hash the Execute step binds. The
+// row is the persisted intent the Recovery engine reconciles.
+func (s *Store) RecordLayoutMigration(ctx context.Context, wf model.WorkflowID, id, manifestPath, manifestHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if wf == "" || id == "" || manifestPath == "" || manifestHash == "" {
+		return model.InvalidInputFault("layout migration identity, manifest path, and hash are required")
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO layout_migrations
+		(id, workflow_id, status, manifest_path, manifest_sha256, created_at)
+		VALUES (?, ?, 'PREPARED', ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = 'PREPARED', manifest_path = excluded.manifest_path,
+			manifest_sha256 = excluded.manifest_sha256, created_at = excluded.created_at`,
+		id, string(wf), manifestPath, manifestHash, now); err != nil {
+		return fmt.Errorf("record layout migration: %w", s.mapSQLError(err))
+	}
+	return nil
+}
+
+// MarkLayoutMigrationCompleted marks the migration row COMPLETED (the
+// persisted Layout facts already advanced; the marker is bookkeeping the
+// Recovery engine also derives from the Layout facts).
+func (s *Store) MarkLayoutMigrationCompleted(ctx context.Context, wf model.WorkflowID, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE layout_migrations SET status = 'COMPLETED', completed_at = ? WHERE id = ? AND workflow_id = ?`,
+		now, id, string(wf)); err != nil {
+		return fmt.Errorf("mark layout migration: %w", s.mapSQLError(err))
+	}
+	return nil
+}
+
+// ensureProject runs the Project identity check inside one transaction.
 func ensureProject(ctx context.Context, q querier, project model.ProjectID) error {
 	var n int
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE id = ?`, string(project)).Scan(&n); err != nil {
