@@ -59,7 +59,21 @@ type Model struct {
 	height int
 	ready  bool
 	err    error
+
+	// stop tracks the controlled-stop state (TUI task 14): the first
+	// Ctrl+C requests the controlled Pause; the second is the Force
+	// Stop of an active Runner.
+	stop stopState
 }
+
+// stopState is the two-phase stop state of an active Runner.
+type stopState int
+
+const (
+	stopIdle stopState = iota
+	stopFirstCtrlC
+	stopPauseAndExit
+)
 
 // NewModel returns the initial root model.
 func NewModel() Model { return newModel() }
@@ -80,7 +94,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 		return m, nil
 	case tea.KeyPressMsg:
-		if IsQuit(msg) || IsCtrlC(msg) {
+		if IsQuit(msg) {
+			if m.stop == stopIdle {
+				return m, tea.Quit
+			}
+			// An active Runner: q shows Pause and Exit instead of
+			// quitting directly (processes never orphan).
+			m.stop = stopPauseAndExit
+			return m, nil
+		}
+		if IsCtrlC(msg) {
+			if m.stop == stopIdle {
+				// The first Ctrl+C requests the controlled Pause.
+				m.stop = stopFirstCtrlC
+				return m, nil
+			}
+			// The second Ctrl+C is the Force Stop of an active Runner.
 			return m, tea.Quit
 		}
 		return m, nil

@@ -4,6 +4,7 @@ package tui
 // quits on q and Ctrl+C, and surfaces errors; the render is pure.
 
 import (
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -31,11 +32,35 @@ func TestModelResizeAndQuit(t *testing.T) {
 		t.Fatal("q produced no quit command")
 	}
 
-	// Ctrl+C quits too.
-	m3 := m2
-	_, cmd = m3.Update(tea.KeyPressMsg{Code: KeyCtrlCRune, Mod: tea.ModCtrl})
+	// Ctrl+C requests the controlled stop first; the second one quits.
+	var u3 tea.Model = m2
+	u3, cmd = u3.Update(tea.KeyPressMsg{Code: KeyCtrlCRune, Mod: tea.ModCtrl})
+	if cmd != nil {
+		t.Fatal("the first Ctrl+C must not quit directly; it requests the controlled pause")
+	}
+	u3, cmd = u3.Update(tea.KeyPressMsg{Code: KeyCtrlCRune, Mod: tea.ModCtrl})
 	if cmd == nil {
-		t.Fatal("Ctrl+C produced no quit command")
+		t.Fatal("the second Ctrl+C must force-stop")
+	}
+}
+
+// TestModelQWithActiveRunnerShowsPauseAndExit: with an active Runner, q
+// shows Pause and Exit instead of quitting directly.
+func TestModelQWithActiveRunnerShowsPauseAndExit(t *testing.T) {
+	m := newModel()
+	m.ready = true
+	m.stop = stopFirstCtrlC
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: KeyQuit})
+	if cmd != nil {
+		t.Fatal("q quit directly while a runner is active")
+	}
+	m2 := updated.(Model)
+	if m2.stop != stopPauseAndExit {
+		t.Fatalf("stop state = %d, want pause-and-exit", m2.stop)
+	}
+	got := RenderPauseExit()
+	if !strings.Contains(got, "Pause and Exit") {
+		t.Fatalf("pause-and-exit render = %q", got)
 	}
 }
 
