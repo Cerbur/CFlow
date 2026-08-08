@@ -176,6 +176,71 @@ type WorkflowSummary struct {
 	BaseCommit   string
 }
 
+// ProjectWorkspaceQuery is the TUI workspace projection (design §1, TUI
+// task 10): one bounded, read-only View that carries everything the
+// workspace screen renders — the Project identity, every Workflow
+// summary, the selected Workflow's lifecycle facts, the provider/git
+// health, and the legal actions — so the TUI never issues several
+// mutually-inconsistent Queries per frame.
+type ProjectWorkspaceQuery struct {
+	// Selected is the workflow the workspace screen focuses ("" = the
+	// first workflow, or the empty workspace).
+	Selected model.WorkflowID
+}
+
+func (ProjectWorkspaceQuery) isQuery() {}
+
+// WorkspaceView is the aggregate workspace projection.
+type WorkspaceView struct {
+	Project     ProjectView
+	Workflows   []WorkflowSummary
+	Selected    model.WorkflowID
+	Lifecycle   *WorkflowLifecycleView
+	Health      HealthView
+	LegalActions []LegalAction
+}
+
+// ProjectView is the project identity the workspace renders.
+type ProjectView struct {
+	Key  string
+	Root string
+	Name string
+}
+
+// WorkflowLifecycleView is the selected workflow's lifecycle facts the
+// workspace main column renders: the status projection plus the active
+// Plan revision and the blocking findings.
+type WorkflowLifecycleView struct {
+	Status     StatusView
+	Plan       *PlanView
+	Blocked    bool
+	Adopted    bool
+}
+
+// HealthView is the provider/git health of the workspace (read-only
+// probes; never a model request).
+type HealthView struct {
+	GitAvailable bool
+	Providers    []ProviderHealth
+}
+
+// ProviderHealth is one enabled Provider's detection summary.
+type ProviderHealth struct {
+	Name          string
+	Compatible    bool
+	Executable    string
+	CLIVersion    string
+}
+
+// LegalAction is one action the selected workflow may legally take right
+// now (the workspace renders them; the explicit commands execute them).
+type LegalAction struct {
+	Label string
+	Kind  model.WorkflowCommandKind
+	// Paused/Blocked/etc. action hints the TUI maps to commands.
+	Hint string
+}
+
 // ListView is the list projection.
 type ListView struct{ Workflows []WorkflowSummary }
 
@@ -429,6 +494,7 @@ type LogsView struct {
 
 func (ListView) isView()               {}
 func (StatusView) isView()             {}
+func (WorkspaceView) isView()          {}
 func (InspectView) isView()            {}
 func (LogsView) isView()               {}
 func (DiscoveryView) isView()          {}

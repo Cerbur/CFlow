@@ -590,3 +590,41 @@ func TestCreateWorkflowCreatesWritableWorkspaceAtBase(t *testing.T) {
 		t.Fatalf("target branch main moved: %s -> %s", baseHead, head)
 	}
 }
+
+// TestProjectWorkspaceQueryProjectsAggregateFacts: the aggregate
+// workspace projection returns the project, the workflow summaries, the
+// selected lifecycle, and the legal actions in one bounded View.
+func TestProjectWorkspaceQueryProjectsAggregateFacts(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("workspace-demo", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qv, err := fx.app().Query(context.Background(), ProjectWorkspaceQuery{})
+	if err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	wv := qv.(WorkspaceView)
+	if wv.Project.Key != ProjectFor(fx.root).Key || wv.Project.Root != fx.root {
+		t.Fatalf("project = %+v", wv.Project)
+	}
+	if len(wv.Workflows) != 1 || wv.Workflows[0].ID != wf {
+		t.Fatalf("workflows = %+v", wv.Workflows)
+	}
+	if wv.Selected != wf {
+		t.Fatalf("selected = %s, want %s", wv.Selected, wf)
+	}
+	if wv.Lifecycle == nil || wv.Lifecycle.Status.Workflow != wf {
+		t.Fatalf("lifecycle = %+v", wv.Lifecycle)
+	}
+	if wv.Lifecycle.Status.Stage != model.StageRequirementDiscussion {
+		t.Fatalf("lifecycle stage = %s", wv.Lifecycle.Status.Stage)
+	}
+	if len(wv.LegalActions) == 0 {
+		t.Fatal("a fresh workflow must offer legal actions")
+	}
+	// Health is read-only: the git seam is available.
+	if !wv.Health.GitAvailable {
+		t.Fatal("git health unavailable")
+	}
+}
