@@ -76,6 +76,28 @@ type DiscussRequirementInput struct {
 
 func (DiscussRequirementInput) isInput() {}
 
+// PrepareNativeDiscussionInput establishes the exact CFlow Session of one
+// native interactive requirement discussion (design §9.1, TUI task 12):
+// the Kernel records the fresh Session as STARTING so the TUI's blocking
+// exec callback runs the Bridge against a persisted, recoverable Session.
+type PrepareNativeDiscussionInput struct {
+	Provider string
+	Session  SessionID
+}
+
+func (PrepareNativeDiscussionInput) isInput() {}
+
+// FinishDiscussionInput settles one finished native discussion Session
+// and writes its immutable ArtifactDiscussionHandoff (design §9.2, TUI
+// task 12): the Kernel validates the Session is bound to the workflow,
+// settles it COMPLETED, and requests the handoff write.
+type FinishDiscussionInput struct {
+	Session SessionID
+	Handoff []byte
+}
+
+func (FinishDiscussionInput) isInput() {}
+
 // GeneratePlanInput is the /finish transition (PRD Plan 生成): the
 // planner produces a new immutable Plan Revision from the requirement
 // discussion lineage. The Plan body arrives through the Provider run

@@ -323,6 +323,22 @@ type MigrationPreviewView struct {
 	ManifestHash string
 }
 
+// DiscussionReturnView is the native discussion Return Page projection
+// (design §9.2, TUI task 12).
+type DiscussionReturnView struct {
+	Workflow model.WorkflowID
+	// Session is the bound interactive Session lineage ("" when no
+	// discussion session exists yet).
+	Session model.SessionID
+	// Provider is the approved Provider of the bound Session.
+	Provider string
+	// ChangeSet is the frozen Change Set Ref ("" until the first
+	// freeze).
+	ChangeSet *model.ArtifactRef
+	// Actions are the legal return actions of the page.
+	Actions []string
+}
+
 // ExecutionPreviewView is the Execution Approval preview projection.
 type ExecutionPreviewView struct {
 	Workflow model.WorkflowID
@@ -501,6 +517,7 @@ func (DiscoveryView) isView()          {}
 func (PlanView) isView()               {}
 func (ChangeSetView) isView()          {}
 func (MigrationPreviewView) isView()   {}
+func (DiscussionReturnView) isView()   {}
 func (ExecutionPreviewView) isView()   {}
 func (PolicyConfirmationView) isView() {}
 func (CancelSummaryView) isView()      {}
@@ -681,6 +698,39 @@ type AdoptWorkspaceCommand struct {
 	Workflow model.WorkflowID
 }
 
+// PrepareNativeDiscussionCommand establishes the exact CFlow Session of
+// one native interactive requirement discussion (design §9.1, TUI task
+// 12): it validates the workflow and the approved Provider route,
+// allocates the fresh Session identity, and returns the Provider
+// binding facts the TUI's blocking exec callback passes to the Bridge.
+type PrepareNativeDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Provider string
+}
+
+// DiscussionReturnQuery projects the native discussion Return Page: the
+// bound Session lineage, the Workspace facts, the frozen Change Set Ref
+// ("" until the first freeze), and the legal return actions.
+type DiscussionReturnQuery struct {
+	Workflow model.WorkflowID
+}
+
+func (DiscussionReturnQuery) isQuery() {}
+
+// FinishDiscussionCommand finishes one native requirement discussion
+// (design §9.2, TUI task 12): it freezes the current Change Set if none
+// exists yet, then writes the immutable ArtifactDiscussionHandoff
+// carrying the strict targets/constraints/non-goals/acceptance/open
+// questions, the Change Set Ref, and the user's decisions. The handoff
+// is the only input Plan generation consumes from the discussion.
+type FinishDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
+	// Handoff is the strict structured handoff body (canonical JSON
+	// validated against discussion-handoff.json).
+	Handoff []byte
+}
+
 // LayoutMigrationPreviewQuery projects the read-only Legacy Layout
 // Migration Preview of one Layout Version 1 workflow (TUI task 8, design
 // §7.4): the exact ordered moves and the canonical manifest hash.
@@ -836,6 +886,8 @@ func (DispatchCommand) isCommand()            {}
 func (AdoptWorkspaceCommand) isCommand()      {}
 func (PrepareLayoutMigrationCommand) isCommand()      {}
 func (ExecuteLayoutMigrationCommand) isCommand()      {}
+func (PrepareNativeDiscussionCommand) isCommand()     {}
+func (FinishDiscussionCommand) isCommand()            {}
 func (ReconcileCommand) isCommand()           {}
 func (CommitPolicyConfirmCommand) isCommand() {}
 func (ReplacementPreviewCommand) isCommand()  {}

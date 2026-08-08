@@ -399,6 +399,11 @@ func decideArtifactWritten(state model.State, in model.EffectResultInput) (model
 		// The turn Artifact's identity is the Producer linkage to its
 		// Session lineage; no aggregate row records it.
 		return model.Decision{}, nil
+	case model.ArtifactDiscussionHandoff:
+		// The handoff's identity is the immutable structured body plus
+		// its Producer linkage; no aggregate row records it (design
+		// §9.2, TUI task 12).
+		return model.Decision{}, nil
 	case model.ArtifactPlanCheck:
 		return checkResultCommitted(state, in)
 	case model.ArtifactSpec:

@@ -30,6 +30,10 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideReconcile(state, in)
 	case model.DiscussRequirementInput:
 		return decideDiscussRequirement(state, in)
+	case model.PrepareNativeDiscussionInput:
+		return decidePrepareNativeDiscussion(state, in)
+	case model.FinishDiscussionInput:
+		return decideFinishDiscussion(state, in)
 	case model.GeneratePlanInput:
 		return decideGeneratePlan(state, in)
 	case model.CheckPlanInput:

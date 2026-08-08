@@ -30,16 +30,18 @@ var schemaFiles = map[string]bool{
 	"catalog.json":        true,
 	"workflow.json":       true,
 	"workflow-patch.json": true,
+	"discussion-handoff.json": true,
 }
 
 // bodySchema maps each agent-authored Artifact Type to the embedded schema
 // that validates its body. report and cleanup-manifest are authored by the
 // Runtime itself and carry no agent body contract.
 var bodySchema = map[model.ArtifactType]string{
-	model.ArtifactPlan:     "plan-envelope.json",
-	model.ArtifactSpec:     "spec.json",
-	model.ArtifactCatalog:  "catalog.json",
-	model.ArtifactWorkflow: "workflow.json",
+	model.ArtifactPlan:             "plan-envelope.json",
+	model.ArtifactSpec:             "spec.json",
+	model.ArtifactCatalog:          "catalog.json",
+	model.ArtifactWorkflow:         "workflow.json",
+	model.ArtifactDiscussionHandoff: "discussion-handoff.json",
 }
 
 // ValidateBody validates a YAML (or JSON) body against the named embedded

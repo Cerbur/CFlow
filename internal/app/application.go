@@ -240,6 +240,8 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryMigrationPreview(ctx, qq)
 	case ProjectWorkspaceQuery:
 		return a.queryWorkspace(ctx, qq)
+	case DiscussionReturnQuery:
+		return a.queryDiscussionReturn(ctx, qq)
 	default:
 		return nil, model.InvalidInputFault("unsupported query")
 	}
@@ -662,6 +664,8 @@ func planningSessionOf(input model.Input) model.SessionID {
 		return in.Session
 	case model.WorkflowCompilationInput:
 		return in.Session
+	case model.PrepareNativeDiscussionInput:
+		return in.Session
 	}
 	return ""
 }
@@ -728,6 +732,10 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			Text: c.Text, Provider: c.Provider,
 			Session: model.SessionID(a.ids(model.IDSession)),
 		}, wf, nil
+	case PrepareNativeDiscussionCommand:
+		return a.prepareNativeDiscussion(ctx, c)
+	case FinishDiscussionCommand:
+		return a.prepareFinish(ctx, c)
 	case FreezeDiscussionCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)
 		if err != nil {

@@ -62,6 +62,9 @@ var compatibilityRegistry = map[model.ArtifactType][]string{
 	// Runtime-authored canonical body fixed by the model.ChangeSet Go
 	// types (no agent body schema applies).
 	model.ArtifactChangeSet: {"1.0.0"},
+	// Task 12 handoff artifacts: the structured discussion handoff is a
+	// strict agent-authored body validated against discussion-handoff.json.
+	model.ArtifactDiscussionHandoff: {"1.0.0"},
 }
 
 // supportedVersion reports whether a declared Artifact Type's schema

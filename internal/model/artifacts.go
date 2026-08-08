@@ -40,13 +40,20 @@ const (
 	// Agent-authored; its structure is fixed by these Go types and the
 	// artifact Hash (TUI task 5).
 	ArtifactChangeSet ArtifactType = "change-set"
+	// ArtifactDiscussionHandoff is one immutable, structured handoff of a
+	// finished native requirement discussion (design §9.2, TUI task 12):
+	// the strict targets/constraints/non-goals/acceptance criteria/open
+	// questions, the Change Set Ref, and the user's decisions. Plan
+	// generation consumes the handoff, never a terminal transcript.
+	ArtifactDiscussionHandoff ArtifactType = "discussion-handoff"
 )
 
 // Valid reports whether t is a declared Artifact Type.
 func (t ArtifactType) Valid() bool {
 	switch t {
 	case ArtifactPlan, ArtifactSpec, ArtifactWorkflow, ArtifactCatalog, ArtifactReport, ArtifactCleanupManifest,
-		ArtifactDiscussionTurn, ArtifactPlanCheck, ArtifactRoutingPolicy, ArtifactBudgetPolicy, ArtifactChangeSet:
+		ArtifactDiscussionTurn, ArtifactPlanCheck, ArtifactRoutingPolicy, ArtifactBudgetPolicy, ArtifactChangeSet,
+		ArtifactDiscussionHandoff:
 		return true
 	}
 	return false

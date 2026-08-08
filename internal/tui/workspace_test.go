@@ -87,3 +87,25 @@ func sampleWorkspaceModel() WorkspaceModel {
 		},
 	})
 }
+
+// TestMapDiscussionReturn: the Return Page maps the app projection and
+// renders every legal action; Finish freezes the Change Set.
+func TestMapDiscussionReturn(t *testing.T) {
+	p := MapDiscussionReturn(app.DiscussionReturnView{
+		Workflow: "wf-1", Session: "sess-1", Provider: "fake",
+		ChangeSet: &model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 1, Hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		Actions:   []string{"continue", "finish", "switch-agent", "pause", "cancel"},
+	})
+	if p.Session != "sess-1" || p.Provider != "fake" {
+		t.Fatalf("page = %+v", p)
+	}
+	if len(p.Actions) != 5 {
+		t.Fatalf("actions = %+v", p.Actions)
+	}
+	got := RenderDiscussionReturn(p)
+	for _, want := range []string{"Finish", "Continue Same Session", "change set: rev 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("return page misses %q:\n%s", want, got)
+		}
+	}
+}

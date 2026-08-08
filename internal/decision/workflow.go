@@ -218,6 +218,76 @@ func decideDiscussRequirement(state model.State, in model.DiscussRequirementInpu
 	return b.decision(), nil
 }
 
+// decidePrepareNativeDiscussion establishes the exact CFlow Session of
+// one native interactive requirement discussion (design §9.1, TUI task
+// 12): the Kernel records the fresh Session as STARTING with no Provider
+// run — the TUI's blocking exec callback drives the Bridge, and the
+// Session becomes INTERACTIVE_IDLE when the turn ends. The Session is
+// persisted and recoverable before any terminal output.
+func decidePrepareNativeDiscussion(state model.State, in model.PrepareNativeDiscussionInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to discuss natively")
+	}
+	if state.Workflow.Stage != model.StageRequirementDiscussion {
+		return model.Decision{}, model.InvalidInputFault("native discussion requires the REQUIREMENT_DISCUSSION stage")
+	}
+	if !planningRuntimeAllowed(state.Workflow.Runtime) {
+		return model.Decision{}, model.InvalidInputFault("workflow cannot discuss natively from " + string(state.Workflow.Runtime))
+	}
+	if err := validateProvider(in.Provider); err != nil {
+		return model.Decision{}, err
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	b := &builder{state: state}
+	startIfNeeded(b, state)
+	parent := latestPlanningSession(state)
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID:         in.Session,
+		Purpose:    model.PurposePlanning,
+		Status:     model.SessionStarting,
+		Supersedes: supersedesOf(parent),
+	}, Provider: in.Provider})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion session prepared")
+	return b.decision(), nil
+}
+
+// decideFinishDiscussion settles one finished native discussion Session
+// COMPLETED and requests the immutable ArtifactDiscussionHandoff write
+// (design §9.2, TUI task 12): the handoff is the only discussion input
+// Plan generation consumes.
+func decideFinishDiscussion(state model.State, in model.FinishDiscussionInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to finish")
+	}
+	if state.Workflow.Stage != model.StageRequirementDiscussion {
+		return model.Decision{}, model.InvalidInputFault("finishing a discussion requires the REQUIREMENT_DISCUSSION stage")
+	}
+	session := findSessionState(state, in.Session)
+	if session == nil {
+		return model.Decision{}, model.InvalidInputFault("the discussion session is not bound to this workflow")
+	}
+	if session.Purpose != model.PurposePlanning {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("the finished session is not a discussion session"))
+	}
+	if len(in.Handoff) == 0 || len(in.Handoff) > maxTurnText {
+		return model.Decision{}, model.InvalidInputFault("the discussion handoff is required and bounded")
+	}
+	b := &builder{state: state}
+	b.mutate(model.SessionEndMutation{
+		ID: session.ID, Status: model.SessionCompleted, EndedAt: state.Now,
+	})
+	b.effect(model.ArtifactWriteIntent{
+		Ref:      model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactDiscussionHandoff},
+		Body:     in.Handoff,
+		Producer: model.PurposePlanning,
+		Session:  in.Session,
+	})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion finished")
+	return b.decision(), nil
+}
+
 // decideGeneratePlan is the /finish transition (PRD Plan 生成): the
 // Workflow moves to PLAN_GENERATION and a planner Session produces a new
 // immutable Plan Revision. Re-generation after needs_revision or after an
