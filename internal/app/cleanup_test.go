@@ -620,7 +620,7 @@ func TestCleanupCrashAfterRemovalRecovers(t *testing.T) {
 	}
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
 	fx.RequireTaskBranchPresent()
-	fx.RequireWorktreePresent(fx.workspacePath())
+	fx.RequireWorktreeRemoved(fx.workspacePath())
 	fx.RequireBranchPresent(fx.integrationBranch())
 	fx.RequireWorkflowCompleted()
 }
@@ -642,9 +642,9 @@ func TestCleanupRemovesCleanWorktreesAndPreservesEvidence(t *testing.T) {
 		t.Fatalf("cleanup = %+v, want SUCCEEDED", out.Cleanup)
 	}
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
-	// The Workspace (the aggregated delivery mainline, design 8.5) is
-	// never a Cleanup target.
-	fx.RequireWorktreePresent(fx.workspacePath())
+	// The Workspace is a managed code directory of the explicit Cleanup
+	// (design §8.5, TUI task 15): it is removed.
+	fx.RequireWorktreeRemoved(fx.workspacePath())
 	// Branches, Commits, audit data, and the Workflow aggregate stay.
 	fx.RequireBranchPresent(fx.integrationBranch())
 	fx.RequireTaskBranchPresent()
@@ -700,7 +700,7 @@ func TestCleanupRemovesExactScratchPath(t *testing.T) {
 	}
 	fx.RequireWorktreeRemoved(fx.taskWorktreePath())
 	fx.RequireTaskBranchPresent()
-	fx.RequireWorktreePresent(fx.workspacePath())
+	fx.RequireWorktreeRemoved(fx.workspacePath())
 	fx.RequireWorkflowCompleted()
 }
 

@@ -373,6 +373,29 @@ type MoveWorktree struct {
 
 func (MoveWorktree) isGitOperation() {}
 
+// FastForwardWorkingTree delivers one verified Apply staging head to the
+// user's original working tree with `git merge --ff-only` (design §13.2,
+// TUI task 15): the Root must be clean and attached to the expected
+// Branch at the expected HEAD, the new head must be a descendant (a
+// fast-forward), and the resulting HEAD/Index/Worktree are re-verified.
+// No reset, force, stash, or checkout argv ever appears.
+type FastForwardWorkingTree struct {
+	Root     string // the user's original working tree root
+	Branch   string // the branch the root is attached to
+	Expected string // full commit hash, the recorded Target HEAD
+	New      string // full commit hash, the verified staging head
+}
+
+func (FastForwardWorkingTree) isGitOperation() {}
+
+// FastForwardWorkingTreeResult reports the observed delivery outcome.
+type FastForwardWorkingTreeResult struct {
+	Head  string
+	Clean bool
+}
+
+func (FastForwardWorkingTreeResult) isGitResult() {}
+
 // GitFacts is the closed union of structured facts. Facts are data, never
 // formatted prose: callers make decisions, GitFlow reports truth.
 type GitFacts interface{ isGitFacts() }
@@ -761,6 +784,8 @@ func (g *GitFlow) Execute(ctx context.Context, op GitOperation) (GitResult, erro
 		return g.removeWorktree(ctx, op)
 	case MoveWorktree:
 		return g.moveWorktree(ctx, op)
+	case FastForwardWorkingTree:
+		return g.fastForwardWorkingTree(ctx, op)
 	default:
 		return nil, model.InvalidInputFault("gitflow: unknown git operation")
 	}

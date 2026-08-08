@@ -576,30 +576,38 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 			"the apply verification evidence is missing before the delivery"), nil
 	}
 
-	// The final compare-and-swap fast-forward. The gitflow operation
-	// re-observes the expected head, verifies the fast-forward, and
-	// updates only through the expected-value argv; the outcome is the
-	// observed actual ref. A typed TARGET_HEAD_DRIFTED is a blocked
+	// The final delivery: a working-tree fast-forward. The gitflow
+	// operation re-observes the clean root, the attached Branch, and the
+	// expected head, then runs `git merge --ff-only <staging>` — the
+	// HEAD, Index, and Worktree files all move together (no update-ref
+	// that leaves the files stale). No reset/force/stash/checkout ever
+	// appears. A typed TARGET_HEAD_DRIFTED or a dirty root is a blocked
 	// delivery; any other failure is the unsettled crash path (the
 	// attempt stays RUNNING and the retry observes).
-	res, err := a.git.Execute(ctx, gitflow.UpdateRef{Ref: targetRef, New: stagingHead, Expected: att.TargetHead})
+	res, err := a.git.Execute(ctx, gitflow.FastForwardWorkingTree{
+		Root:     a.project.Root,
+		Branch:   targetBranch,
+		Expected: att.TargetHead,
+		New:      stagingHead,
+	})
 	if err != nil {
 		code, ok := model.CodeOf(err)
-		if ok && code == model.CodeTargetHeadChanged {
+		if ok && (code == model.CodeTargetHeadChanged || code == model.CodeApplyTargetDirty ||
+			code == model.CodeApplyTargetBranchChanged) {
 			return fail(code, err.Error()), nil
 		}
 		return model.EffectResultInput{}, err
 	}
-	ur, ok := res.(gitflow.UpdateRefResult)
+	ff, ok := res.(gitflow.FastForwardWorkingTreeResult)
 	if !ok {
-		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("target update has an unexpected result"))
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("target fast-forward has an unexpected result"))
 	}
-	if ur.Observed != stagingHead {
+	if ff.Head != stagingHead || !ff.Clean {
 		return fail(model.CodeTargetHeadChanged,
-			"the observed target ref does not match the delivered head"), nil
+			"the delivered working tree does not match the verified staging head"), nil
 	}
 	return model.EffectResultInput{
-		Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: intent.Apply, ObservedHead: ur.Observed,
+		Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: intent.Apply, ObservedHead: ff.Head,
 	}, nil
 }
 

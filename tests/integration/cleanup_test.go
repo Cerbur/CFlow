@@ -135,13 +135,10 @@ func TestCleanupDryRunThenExactExecuteRemovesManagedWorktrees(t *testing.T) {
 	if _, err := os.Stat(cf.taskWorktreePath()); err == nil {
 		t.Fatalf("task worktree still present")
 	}
-	// The Workspace (the aggregated delivery mainline, design 8.5) is
-	// never a Cleanup target.
-	if _, err := os.Stat(cf.integrationWorktreePath()); err != nil {
-		t.Fatalf("workspace was removed by cleanup: %v", err)
-	}
-	if _, err := os.Stat(cf.workspacePath()); err != nil {
-		t.Fatalf("workspace was removed: %v", err)
+	// The aggregated Workspace is a managed code directory of the
+	// explicit Cleanup (design §8.5, TUI task 15): it is removed.
+	if _, err := os.Stat(cf.workspacePath()); err == nil {
+		t.Fatalf("workspace still present after the cleanup")
 	}
 	// Branches and commits survive.
 	taskBranch := "cflow/" + string(cf.wf) + "/task-" + string(cf.taskNode())

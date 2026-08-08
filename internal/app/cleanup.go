@@ -97,6 +97,14 @@ func (a *Application) collectCleanupWorktreeItems(ctx context.Context, wf model.
 	if st.Workflow.IntegrationBranch != "" {
 		managed[a.integrationWorktreePath(wf)] = st.Workflow.IntegrationBranch
 	}
+	if st.Workflow.WorkspaceBranch != "" && st.Workflow.LayoutVersion >= 2 {
+		// The aggregated Workspace is the delivery mainline code directory
+		// of a Layout Version 2 workflow; the explicit Cleanup manifest
+		// lists it (design §8.5, TUI task 15 step 4). Artifacts,
+		// Discussion/Plan/Spec/Review/Evidence/Report, the DB, and the
+		// refs never enter the deletion set — only Worktrees do.
+		managed[a.layout.Workspace(wf)] = st.Workflow.WorkspaceBranch
+	}
 	for _, n := range st.Nodes {
 		if n == nil || n.Kind != model.NodeAgentTask {
 			continue
