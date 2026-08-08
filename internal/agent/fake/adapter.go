@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -500,4 +501,45 @@ func capsFromBinding(b agent.ProviderBinding) agent.Capabilities {
 		StructuredOutputSchemaOnResume: has(b.ResumeCapabilities, "structured_output"),
 		BudgetLimit:                    false, // the binding declares no native budget
 	}
+}
+
+// InteractiveResume is the optional native interactive resume seam (TUI
+// task 11): the fake reports the provider's resume command shape when
+// the binding's NativeInteractiveResume capability ("in_process") is
+// set, with an explicit argv and no bypass flag. The fake's executable
+// is the registry binding's configured name resolved on PATH.
+func (a *Adapter) InteractiveResume(ctx context.Context, session agent.ProviderSessionID, cwd string) (agent.InteractiveResumeSpec, error) {
+	if err := ctx.Err(); err != nil {
+		return agent.InteractiveResumeSpec{}, err
+	}
+	capable := false
+	for _, cap := range a.binding.ResumeCapabilities {
+		if cap == "in_process" {
+			capable = true
+			break
+		}
+	}
+	if !capable {
+		return agent.InteractiveResumeSpec{Capability: false}, nil
+	}
+	path, err := exec.LookPath(a.binding.Executable.Name)
+	if err != nil {
+		return agent.InteractiveResumeSpec{}, model.NewFault(model.CodeProviderProtocolUnsupported,
+			"fake executable cannot be resolved: "+err.Error())
+	}
+	if cwd != "" && !filepath.IsAbs(cwd) {
+		return agent.InteractiveResumeSpec{}, model.InvalidInputFault("fake working directory must be an absolute path")
+	}
+	return agent.InteractiveResumeSpec{
+		Executable: path,
+		Args:       []string{"resume", string(session)},
+		Dir:        cwd,
+		Env:        safeFakeEnv(),
+		Capability: true,
+	}, nil
+}
+
+// safeFakeEnv is the exact fake child environment (no parent leakage).
+func safeFakeEnv() map[string]string {
+	return map[string]string{"CFLOW_FAKE_INTERACTIVE": "1"}
 }

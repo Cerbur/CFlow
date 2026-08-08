@@ -425,3 +425,40 @@ func TestFakeCompactFrameForms(t *testing.T) {
 		t.Fatalf("compact failed payload must carry the message")
 	}
 }
+
+// TestInteractiveResumeReportsCapability: the fake's native interactive
+// resume reports the exact argv (resume <session-id>), the cwd, and no
+// bypass flag when the binding supports in-process resume.
+func TestInteractiveResumeReportsCapability(t *testing.T) {
+	// Put the fake's executable on PATH so the adapter's LookPath
+	// resolves it (the stub is never executed by this test).
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cflow-fake-agent"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	var ad agent.Adapter = newAdapter(t)
+	ia, ok := ad.(agent.InteractiveAdapter)
+	if !ok {
+		t.Fatal("the fake adapter must implement the interactive seam")
+	}
+	spec, err := ia.InteractiveResume(context.Background(), agent.ProviderSessionID("sess-1"), "/workspace")
+	requireNoError(t, err)
+	if !spec.Capability {
+		t.Fatal("the fake binding must declare the interactive capability")
+	}
+	if len(spec.Args) != 2 || spec.Args[0] != "resume" || spec.Args[1] != "sess-1" {
+		t.Fatalf("interactive argv = %v", spec.Args)
+	}
+	if spec.Dir != "/workspace" {
+		t.Fatalf("interactive cwd = %q, want /workspace", spec.Dir)
+	}
+	for _, arg := range spec.Args {
+		if arg == "--dangerously-bypass-approvals-and-sandbox" || arg == "--skip-git-repo-check" {
+			t.Fatalf("interactive argv carries a bypass flag: %v", spec.Args)
+		}
+	}
+	if spec.Executable == "" {
+		t.Fatal("interactive executable is empty")
+	}
+}

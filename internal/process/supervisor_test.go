@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"runtime"
 	"strings"
 	"testing"
@@ -517,4 +518,53 @@ func TestSupervisorStopOrphanNotReaped(t *testing.T) {
 		t.Fatalf("reap orphan: %v", err)
 	}
 	drain(t, events)
+}
+
+// TestInteractiveProcessRemainsSupervised is the TUI task 11 failure
+// test: a native interactive process launched through StartInteractive
+// keeps a recorded Process Identity and remains fully supervised
+// (Inspect reports it live and managed, Signal delivers, Wait returns
+// the exit).
+func TestInteractiveProcessRemainsSupervised(t *testing.T) {
+	fake, sup := process.NewFakeSupervisor()
+	ctx := context.Background()
+	var inR, _ = io.Pipe()
+	var _, outW = io.Pipe()
+	h, err := sup.StartInteractive(ctx, process.InteractiveSpec{
+		Executable: "/bin/provider",
+		Args:       []string{"resume", "sess-1"},
+		Dir:        "/workspace",
+		Terminal:   process.Terminal{In: inR, Out: outW, Err: outW},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Identity.PID == 0 || h.Identity.StartToken == 0 {
+		t.Fatalf("interactive handle identity = %+v", h.Identity)
+	}
+	fact, err := sup.Inspect(ctx, h.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fact.Running || !fact.Managed {
+		t.Fatalf("interactive identity is not live+managed: %+v", fact)
+	}
+	if err := sup.Signal(ctx, h.Handle, process.Terminate); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	fake.ExitGroup(h.Handle, 0)
+	exit, err := sup.Wait(ctx, h.Handle)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if exit.Code != 0 || exit.Fact != process.FactProcessExit {
+		t.Fatalf("interactive exit = %+v", exit)
+	}
+	fact, err = sup.Inspect(ctx, h.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fact.Running {
+		t.Fatalf("interactive identity still running after exit: %+v", fact)
+	}
 }

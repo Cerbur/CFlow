@@ -277,6 +277,12 @@ type Supervisor interface {
 	// Start launches a process from a shell-free ProcessSpec and
 	// returns its handle and framed output pipeline.
 	Start(context.Context, ProcessSpec) (Handle, Events, error)
+	// StartInteractive launches one native interactive process (a
+	// provider terminal: design §9, TUI task 11) with the terminal
+	// streams attached directly — no frame parser — while still
+	// recording its Process Identity and supporting Stop/Wait/Inspect.
+	// The process runs in its own process group.
+	StartInteractive(context.Context, InteractiveSpec) (InteractiveHandle, error)
 	// Signal delivers sig to the exact process group of Handle.
 	Signal(context.Context, Handle, Signal) error
 	// Wait blocks until the process is gone and returns its Exit.
@@ -285,6 +291,93 @@ type Supervisor interface {
 	Wait(context.Context, Handle) (Exit, error)
 	// Inspect reports whether an identity is live and still managed.
 	Inspect(context.Context, ProcessIdentity) (ProcessFact, error)
+}
+
+// Terminal is the inherited stdio triple of one interactive process.
+type Terminal struct {
+	In  io.Reader
+	Out io.Writer
+	Err io.Writer
+}
+
+// InteractiveSpec is the complete, shell-free description of one native
+// interactive process (TUI task 11). It mirrors ProcessSpec but attaches
+// the terminal streams directly; the child inherits them instead of
+// writing through the framed pipeline.
+type InteractiveSpec struct {
+	Executable string
+	Args       []string
+	Dir        string
+	Env        map[string]string
+	Terminal   Terminal
+}
+
+// InteractiveHandle is the handle plus the captured identity of one
+// native interactive process.
+type InteractiveHandle struct {
+	Handle   Handle
+	Identity ProcessIdentity
+}
+
+// InteractiveProcess is the live native interactive process an Adapter
+// starts.
+type InteractiveProcess interface {
+	Identity() ProcessIdentity
+	GroupID() int
+}
+
+// interactiveProcess is the supervisor-side state of one interactive
+// process (a native provider terminal: TUI task 11). It registers in the
+// same managed ledger as a framed process so Signal/Wait/Inspect work
+// unchanged, but it carries no framed event channel: the terminal streams
+// are inherited directly and no frame parser runs.
+type interactiveProcess = managed
+
+// StartInteractive launches a native interactive process through the
+// adapter's interactive seam and records its identity in the supervisor
+// ledger. The process is fully supervised: Signal/Wait/Inspect work
+// exactly as for a framed process.
+func (s *supervisor) StartInteractive(ctx context.Context, spec InteractiveSpec) (InteractiveHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return InteractiveHandle{}, err
+	}
+	if spec.Executable == "" {
+		return InteractiveHandle{}, model.InvalidInputFault("process: interactive executable is required")
+	}
+	ai, ok := s.adapter.(InteractiveAdapter)
+	if !ok {
+		return InteractiveHandle{}, model.InvalidInputFault("process: the adapter has no interactive seam")
+	}
+	s.mu.Lock()
+	s.nextID++
+	h := Handle{id: s.nextID}
+	s.mu.Unlock()
+	proc, err := ai.StartInteractive(ctx, h, spec)
+	if err != nil {
+		return InteractiveHandle{}, err
+	}
+	m := &managed{
+		h:      h,
+		proc:   proc,
+		exitCh: make(chan struct{}),
+		interactive: true,
+	}
+	s.mu.Lock()
+	if s.procs == nil {
+		s.procs = map[uint64]*managed{}
+	}
+	s.procs[h.id] = m
+	s.mu.Unlock()
+	go s.watchCancel(ctx, m)
+	go s.finalize(ctx, m)
+	return InteractiveHandle{Handle: h, Identity: proc.Identity()}, nil
+}
+
+// InteractiveAdapter is the optional Adapter seam for native interactive
+// processes (TUI task 11). A process started through this seam attaches
+// the terminal directly and never produces framed events.
+type InteractiveAdapter interface {
+	StartInteractive(context.Context, Handle, InteractiveSpec) (Process, error)
 }
 
 // Process is the live process an Adapter starts. Adapters own the OS
@@ -344,6 +437,11 @@ type managed struct {
 	spec   ProcessSpec
 	proc   Process
 	events chan Event
+
+	// interactive marks a native interactive process (TUI task 11): its
+	// terminal streams are inherited directly, so no frame pumps run and
+	// no events channel exists.
+	interactive bool
 
 	exitCh   chan struct{}
 	outDone  chan struct{}
@@ -488,6 +586,13 @@ func (s *supervisor) finalize(ctx context.Context, m *managed) {
 	m.err = err
 	s.mu.Unlock()
 
+	if m.interactive {
+		// A native interactive process: the terminal streams were
+		// inherited directly, so there are no framed streams to drain
+		// and no events channel to close.
+		close(m.exitCh)
+		return
+	}
 	<-m.outDone
 	<-m.errDone
 	if sc, ok := m.proc.(streamCloser); ok {

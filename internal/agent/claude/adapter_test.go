@@ -1588,3 +1588,24 @@ func TestMatrixProtocolDispositionsAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestInteractiveResumeArgvShape: the native interactive resume argv is
+// exactly `claude --resume <session-id>` in the workflow Worktree — no
+// bypass flag.
+func TestInteractiveResumeArgvShape(t *testing.T) {
+	sup := process.NewSupervisor(process.NewOSAdapter())
+	ad := claude.New(sup, claudeBinding(t))
+	if ia, ok := ad.(agent.InteractiveAdapter); ok {
+		spec, err := ia.InteractiveResume(context.Background(), agent.ProviderSessionID(capturedSessionID), "/workspace")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if spec.Capability {
+			requireExactArgs(t, spec.Args, "--resume", capturedSessionID)
+			requireAbsentArgs(t, spec.Args, "--dangerously-skip-permissions", "-C")
+			if spec.Dir != "/workspace" {
+				t.Fatalf("cwd = %q, want /workspace", spec.Dir)
+			}
+		}
+	}
+}

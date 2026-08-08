@@ -123,6 +123,38 @@ func (f *FakeAdapter) Signal(ctx context.Context, proc Process, sig Signal) erro
 	return nil
 }
 
+// StartInteractive registers a scripted interactive process (TUI task
+// 11): the same fakeProcess shape, so ExitGroup and EmitOutput script
+// the native terminal's end and output deterministically. The terminal
+// triple of the spec is recorded for the test's assertions.
+func (f *FakeAdapter) StartInteractive(ctx context.Context, h Handle, spec InteractiveSpec) (Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pid := 1000
+	for f.pidIndex[pid] != 0 {
+		pid++
+	}
+	f.tokenCounter++
+	outR, outW := io.Pipe()
+	errR, errW := io.Pipe()
+	p := &fakeProcess{
+		h:        h,
+		identity: ProcessIdentity{PID: pid, StartToken: f.tokenCounter},
+		pgid:     pid,
+		outR:     outR,
+		outW:     outW,
+		errR:     errR,
+		errW:     errW,
+		exitCh:   make(chan Exit, 1),
+	}
+	f.procs[h.id] = p
+	f.pidIndex[pid] = f.tokenCounter
+	return p, nil
+}
+
 // Wait returns the exit recorded by ExitGroup, or ctx.Err().
 func (f *FakeAdapter) Wait(ctx context.Context, proc Process) (Exit, error) {
 	p := proc.(*fakeProcess)
