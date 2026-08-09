@@ -18,12 +18,14 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -32,6 +34,7 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/security"
 )
 
 // errInjected is the sentinel every injected fault point returns.
@@ -126,6 +129,9 @@ type StoreView struct {
 	// PendingEffects are the committed, not-yet-resolved Effect Intents
 	// of the bound Workflow (design 6.2).
 	PendingEffects []PendingEffect
+	// LayoutMigration is the authoritative migration row for the bound
+	// Workflow, when one has been explicitly prepared.
+	LayoutMigration *LayoutMigrationRecord
 }
 
 // PendingEffect is one committed Effect Intent awaiting execution.
@@ -360,6 +366,28 @@ func (s *Store) View(ctx context.Context, q StoreQuery) (StoreView, error) {
 	}); err != nil {
 		return view, err
 	}
+	var hasLayoutMigrations int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='layout_migrations'`).Scan(&hasLayoutMigrations); err != nil {
+		return view, fmt.Errorf("probe layout migration table: %w", s.mapSQLError(err))
+	}
+	if hasLayoutMigrations == 1 {
+		var migration LayoutMigrationRecord
+		var migrationCount int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM layout_migrations WHERE workflow_id = ?`, string(s.workflowID())).Scan(&migrationCount); err != nil {
+			return view, fmt.Errorf("count layout migration rows: %w", s.mapSQLError(err))
+		}
+		if migrationCount > 1 {
+			return view, model.InvariantFault(fmt.Errorf("workflow %s has multiple authoritative layout migration rows", s.workflowID()))
+		}
+		err = s.db.QueryRowContext(ctx, `SELECT id, workflow_id, status, manifest_path, manifest_sha256
+			FROM layout_migrations WHERE workflow_id = ?`, string(s.workflowID())).Scan(
+			&migration.ID, &migration.Workflow, &migration.Status, &migration.ManifestPath, &migration.ManifestHash)
+		if err == nil {
+			view.LayoutMigration = &migration
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return view, fmt.Errorf("read layout migration view: %w", s.mapSQLError(err))
+		}
+	}
 	return view, nil
 }
 
@@ -565,36 +593,109 @@ type LayoutMigrationRecord struct {
 	ManifestHash string
 }
 
+// BackupFileEvidence binds the consistent SQLite snapshot created before
+// a layout migration intent: exact path, file SHA-256, and size.
+type BackupFileEvidence struct {
+	Path   string
+	SHA256 string
+	Size   int64
+}
+
 // BackupLayoutMigration creates a consistent, owner-only SQLite snapshot
 // before a layout migration intent is committed. It never overwrites an
 // existing path; an existing retry target must already be a valid SQLite
 // backup or Prepare blocks.
-func (s *Store) BackupLayoutMigration(ctx context.Context, path string) error {
+func (s *Store) BackupLayoutMigration(ctx context.Context, path string) (BackupFileEvidence, error) {
 	if path == "" {
-		return model.InvalidInputFault("layout migration backup path is required")
+		return BackupFileEvidence{}, model.InvalidInputFault("layout migration backup path is required")
 	}
 	if _, err := os.Lstat(path); err != nil {
 		if !os.IsNotExist(err) {
-			return err
+			return BackupFileEvidence{}, err
 		}
-		if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, path); err != nil {
-			return fmt.Errorf("create layout migration backup: %w", s.mapSQLError(err))
+		f, err := security.CreateSensitiveFile(path)
+		if err != nil {
+			return BackupFileEvidence{}, err
 		}
-		if err := os.Chmod(path, 0o600); err != nil {
-			return fmt.Errorf("secure layout migration backup: %w", err)
+		if err := f.Close(); err != nil {
+			return BackupFileEvidence{}, err
+		}
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			return BackupFileEvidence{}, err
+		}
+		err = conn.Raw(func(driverConn any) error {
+			backuper, ok := driverConn.(interface {
+				NewBackup(string) (*sqlite.Backup, error)
+			})
+			if !ok {
+				return fmt.Errorf("sqlite connection does not support online backup")
+			}
+			backup, err := backuper.NewBackup(path)
+			if err != nil {
+				return err
+			}
+			if _, err := backup.Step(-1); err != nil {
+				_ = backup.Finish()
+				return err
+			}
+			return backup.Finish()
+		})
+		_ = conn.Close()
+		if err != nil {
+			return BackupFileEvidence{}, fmt.Errorf("create layout migration backup: %w", err)
+		}
+		if err := syncFileAndParent(path); err != nil {
+			return BackupFileEvidence{}, err
+		}
+	} else {
+		if _, err := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); err != nil {
+			return BackupFileEvidence{}, err
 		}
 	}
 	backup, err := sql.Open("sqlite", fileDSN(path, true, s.busyTimeout))
 	if err != nil {
-		return fmt.Errorf("open layout migration backup: %w", err)
+		return BackupFileEvidence{}, fmt.Errorf("open layout migration backup: %w", err)
 	}
 	defer backup.Close()
 	var integrity string
 	if err := backup.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
-		return model.NewFault(model.CodeEvidenceSubjectChanged,
+		return BackupFileEvidence{}, model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the immutable layout migration database backup failed integrity verification")
 	}
-	return nil
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return BackupFileEvidence{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return BackupFileEvidence{}, err
+	}
+	sum := sha256.Sum256(body)
+	return BackupFileEvidence{Path: path, SHA256: fmt.Sprintf("%x", sum[:]), Size: info.Size()}, nil
+}
+
+func syncFileAndParent(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 // RecordLayoutMigration inserts the immutable identity of one explicit

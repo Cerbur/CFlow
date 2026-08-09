@@ -743,10 +743,25 @@ func renderMigrationPreview(w io.Writer, v app.MigrationPreviewView, red securit
 	r := newRenderer(red)
 	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
 	fmt.Fprintf(w, "layout: %d -> %d\n", v.From, v.To)
+	fmt.Fprintf(w, "status: %s\n", r.text(v.Status))
+	if v.MigrationID != "" {
+		fmt.Fprintf(w, "migration id: %s\n", r.text(v.MigrationID))
+	}
 	fmt.Fprintf(w, "manifest: %s\n", v.ManifestHash)
+	if v.ManifestPath != "" {
+		fmt.Fprintf(w, "manifest path: %s\n", r.text(v.ManifestPath))
+	}
+	if v.BackupPath != "" {
+		fmt.Fprintf(w, "backup: %s sha256=%s size=%d\n", r.text(v.BackupPath), r.text(v.BackupHash), v.BackupSize)
+	}
+	if v.SourceSnapshotHash != "" {
+		fmt.Fprintf(w, "source snapshot: %s\n", r.text(v.SourceSnapshotHash))
+	}
+	fmt.Fprintf(w, "database impact: layout %d -> %d; workspace=%s branch=%s head=%s\n",
+		v.From, v.To, r.text(v.ExpectedWorkspacePath), r.text(v.ExpectedWorkspaceBranch), r.text(v.ExpectedWorkspaceHead))
 	for i, move := range v.Moves {
-		fmt.Fprintf(w, "move %d: %s %s -> %s\n", i+1, move.Kind,
-			r.text(move.Source), r.text(move.Destination))
+		fmt.Fprintf(w, "move %d: %s %s -> %s branch=%s head=%s digest=%s\n", i+1, move.Kind,
+			r.text(move.Source), r.text(move.Destination), r.text(move.Branch), r.text(move.Head), r.text(move.Digest))
 	}
 }
 

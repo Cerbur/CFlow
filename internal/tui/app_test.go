@@ -91,6 +91,75 @@ func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
 	}
 }
 
+// preparedMigrationController returns a complete PREPARED migration
+// preview so the render test can assert the full evidence.
+type preparedMigrationController struct{}
+
+func (preparedMigrationController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	return app.Outcome{Workflow: "wf-legacy"}, nil
+}
+func (preparedMigrationController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Selected: "wf-legacy", Workflows: []app.WorkflowSummary{{ID: "wf-legacy", Runtime: model.RuntimePaused}},
+			Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-legacy", LayoutVersion: 1}},
+			LegalActions: []app.LegalAction{{Label: "Migrate layout", Hint: "layout-migration"}},
+		}, nil
+	case app.LayoutMigrationPreviewQuery:
+		return app.MigrationPreviewView{
+			Workflow: "wf-legacy", From: 1, To: 2, Status: "PREPARED",
+			MigrationID: "migration-wf-legacy-abc123", ManifestHash: "manifest-1",
+			ManifestPath: "/cflow/projects/p/wf-legacy/state/layout-migrations/migration-wf-legacy-abc123.json",
+			BackupPath:   "/cflow/projects/p/wf-legacy/state/layout-migrations/migration-wf-legacy-abc123.db.backup",
+			BackupHash:   "backup-1", BackupSize: 4096,
+			SourceSnapshotHash:      "snapshot-hash-1",
+			ExpectedWorkspacePath:   "/cflow/projects/p/wf-legacy/workspace",
+			ExpectedWorkspaceBranch: "cflow/wf-legacy/integration",
+			ExpectedWorkspaceHead:   "1111111111111111111111111111111111111111",
+			Moves: []model.PathMove{
+				{Kind: model.MoveKindWorktree, Source: "/cflow/worktrees/p/wf-legacy/integration",
+					Destination: "/cflow/projects/p/wf-legacy/workspace",
+					Branch:      "cflow/wf-legacy/integration", Head: "1111111111111111111111111111111111111111"},
+				{Kind: model.MoveKindArtifact, Source: "/cflow/projects/p/wf-legacy/workflows/wf-legacy/artifacts",
+					Destination: "/cflow/projects/p/wf-legacy/artifacts", Digest: "digest-1"},
+			},
+		}, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+func (preparedMigrationController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (preparedMigrationController) EscalateStop() {}
+
+// TestModelMigrationRenderShowsCompleteEvidence proves the TUI migration
+// page renders the full prepared evidence (finding 6): migration row/
+// status, manifest and backup identity, database impact, and per-move
+// branch/head/digest.
+func TestModelMigrationRenderShowsCompleteEvidence(t *testing.T) {
+	ctrl := &preparedMigrationController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = press(t, m, 'm', 0) // read-only Preview
+	out := render(m)
+	for _, want := range []string{
+		"status: PREPARED",
+		"migration id: migration-wf-legacy-abc123",
+		"manifest path:",
+		"backup:",
+		"source snapshot: snapshot-hash-1",
+		"database impact: workspace=",
+		"branch=cflow/wf-legacy/integration",
+		"digest=digest-1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("migration render missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func (r *recordingController) Execute(ctx context.Context, cmd app.Command) (app.Outcome, error) {
 	r.executed = append(r.executed, cmd)
 	return r.ctrl.Execute(ctx, cmd)

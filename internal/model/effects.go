@@ -210,6 +210,7 @@ type LayoutMigrationIntent struct {
 	MigrationID  string     `json:"migration_id"`
 	Workflow     WorkflowID `json:"workflow"`
 	ManifestHash string     `json:"manifest_hash"`
+	PreviewHash  string     `json:"preview_hash"`
 	Moves        []PathMove `json:"moves"`
 	// Done is retained for forward/backward codec compatibility. Recovery
 	// does not trust it: source/destination and Git registry facts are the

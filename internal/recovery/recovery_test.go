@@ -10,7 +10,9 @@ package recovery_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -251,7 +253,6 @@ func newRepo(t *testing.T) *gitRunner {
 // seedIntent commits one Effect Intent into the pending ledger.
 func (fx *recoveryFixture) seedIntent(intent model.EffectIntent) {
 	fx.t.Helper()
-	fx.pending = append(fx.pending, intent)
 	st, err := store.Open(context.Background(), store.OpenOptions{
 		Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now,
 	})
@@ -263,6 +264,48 @@ func (fx *recoveryFixture) seedIntent(intent model.EffectIntent) {
 	if err != nil {
 		fx.t.Fatalf("view: %v", err)
 	}
+	if migration, ok := intent.(model.LayoutMigrationIntent); ok {
+		preview := layout.MigrationPreview{Workflow: testWF, From: 1, To: 2, Moves: migration.Moves}
+		preview.ManifestHash = preview.Hash()
+		migration.Workflow = testWF
+		migration.MigrationID = "migration-wf-1-" + preview.ManifestHash[:16]
+		manifestPath := filepath.Join(fx.home, "projects", fx.projectKey, testWF, "state", "layout-migrations", migration.MigrationID+".json")
+		if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+			fx.t.Fatal(err)
+		}
+		backupPath := strings.TrimSuffix(manifestPath, ".json") + ".db.backup"
+		backup, err := st.BackupLayoutMigration(context.Background(), backupPath)
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		snapshot := layout.SourceSnapshot{AggregateVersion: uint64(view.AggregateVersion), LayoutVersion: 1,
+			IntegrationBranch: view.State.Workflow.IntegrationBranch, IntegrationHead: view.State.Workflow.IntegrationHead,
+			BaseCommit: view.State.Workflow.BaseCommit, PreviewHash: preview.ManifestHash}
+		snapshotBody, _ := json.Marshal(snapshot)
+		snapshotHash := sha256.Sum256(snapshotBody)
+		manifest := layout.MigrationManifest{MigrationID: migration.MigrationID, Workflow: testWF,
+			PreviewHash: preview.ManifestHash, From: 1, To: 2, Moves: migration.Moves,
+			Backup:         layout.BackupEvidence{Path: backup.Path, SHA256: backup.SHA256, Size: backup.Size},
+			SourceSnapshot: snapshot, SourceSnapshotHash: fmt.Sprintf("%x", snapshotHash[:]),
+			DatabaseImpact: layout.DatabaseImpact{FromLayoutVersion: 1, ToLayoutVersion: 2,
+				WorkspacePath:   filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
+				WorkspaceBranch: view.State.Workflow.IntegrationBranch, WorkspaceHead: view.State.Workflow.IntegrationHead}}
+		body, err := json.Marshal(manifest)
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		manifestHash := sha256.Sum256(body)
+		migration.ManifestHash = fmt.Sprintf("%x", manifestHash[:])
+		migration.PreviewHash = preview.ManifestHash
+		intent = migration
+		if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+			fx.t.Fatal(err)
+		}
+		if err := st.RecordLayoutMigration(context.Background(), testWF, migration.MigrationID, manifestPath, migration.ManifestHash); err != nil {
+			fx.t.Fatalf("record migration: %v", err)
+		}
+	}
+	fx.pending = append(fx.pending, intent)
 	if _, err := st.Transact(context.Background(), view.AggregateVersion, func(state model.State) (model.Decision, error) {
 		return model.Decision{Effect: intent}, nil
 	}); err != nil {
@@ -1034,6 +1077,25 @@ func TestRecoveryMigrationAfterFirstMoveIsSafeToRetry(t *testing.T) {
 	fx.seedIntent(migrationIntent(moves, 1))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.SafeToRetry)
+}
+
+func TestRecoveryMigrationOutOfOrderLandedMoveIsBlocked(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	moves := migrationMoves(t, fx)
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.MkdirAll(filepath.Dir(moves[1].Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.repo.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Execute(context.Background(), gitflow.MoveWorktree{From: moves[1].Source, To: moves[1].Destination}); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(migrationIntent(moves, 1))
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
 }
 
 // TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted: every move

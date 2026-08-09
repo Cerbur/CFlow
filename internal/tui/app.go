@@ -22,6 +22,7 @@ import (
 	"cflow.local/cflow/internal/foreground"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/native"
+	"cflow.local/cflow/internal/security"
 )
 
 // Dependencies is what the TUI needs to run: the same command-tree
@@ -1477,9 +1478,25 @@ func hints(p Page) string {
 func renderMigration(m Model) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "legacy layout migration %s\n", m.migration.Workflow)
-	fmt.Fprintf(&b, "layout: %d -> %d\nmanifest: %s\n", m.migration.From, m.migration.To, m.migration.ManifestHash)
+	r := func(value string) string { return redactMigrationText(m.deps.CLI.Redaction, value) }
+	fmt.Fprintf(&b, "layout: %d -> %d\nstatus: %s\nmanifest: %s\n", m.migration.From, m.migration.To, r(m.migration.Status), r(m.migration.ManifestHash))
+	if m.migration.MigrationID != "" {
+		fmt.Fprintf(&b, "migration id: %s\n", r(m.migration.MigrationID))
+	}
+	if m.migration.ManifestPath != "" {
+		fmt.Fprintf(&b, "manifest path: %s\n", r(m.migration.ManifestPath))
+	}
+	if m.migration.BackupPath != "" {
+		fmt.Fprintf(&b, "backup: %s sha256=%s size=%d\n", r(m.migration.BackupPath), r(m.migration.BackupHash), m.migration.BackupSize)
+	}
+	if m.migration.SourceSnapshotHash != "" {
+		fmt.Fprintf(&b, "source snapshot: %s\n", r(m.migration.SourceSnapshotHash))
+	}
+	fmt.Fprintf(&b, "database impact: workspace=%s branch=%s head=%s\n",
+		r(m.migration.ExpectedWorkspacePath), r(m.migration.ExpectedWorkspaceBranch), r(m.migration.ExpectedWorkspaceHead))
 	for i, move := range m.migration.Moves {
-		fmt.Fprintf(&b, "%d. %s\n   %s\n   -> %s\n", i+1, move.Kind, move.Source, move.Destination)
+		fmt.Fprintf(&b, "%d. %s\n   %s\n   -> %s\n   branch=%s head=%s digest=%s\n",
+			i+1, move.Kind, r(move.Source), r(move.Destination), r(move.Branch), r(move.Head), r(move.Digest))
 	}
 	switch m.migrationConfirm {
 	case migrationConfirmPrepare:
@@ -1488,6 +1505,22 @@ func renderMigration(m Model) string {
 		b.WriteString("\nExecute the exact persisted migration intent? [y/N]\n")
 	}
 	return b.String()
+}
+
+func redactMigrationText(reg security.Registry, value string) string {
+	if value == "" {
+		return "-"
+	}
+	red := security.NewRedactor(reg)
+	frame, err := red.WriteFrame([]byte(value))
+	if err != nil {
+		return "[REDACTED]"
+	}
+	flushed, err := red.Flush()
+	if err != nil {
+		return "[REDACTED]"
+	}
+	return frame.Text + flushed.Text
 }
 
 func renderCreate(m Model) string {

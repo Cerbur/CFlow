@@ -317,13 +317,21 @@ type ChangeSetView struct {
 // the exact ordered moves and the canonical manifest hash the Prepare
 // binds (TUI task 8, design §7.4).
 type MigrationPreviewView struct {
-	Workflow     model.WorkflowID
-	From         int
-	To           int
-	Moves        []model.PathMove
-	ManifestHash string
-	MigrationID  string
-	Status       string
+	Workflow                model.WorkflowID
+	From                    int
+	To                      int
+	Moves                   []model.PathMove
+	ManifestHash            string
+	MigrationID             string
+	Status                  string
+	ManifestPath            string
+	BackupPath              string
+	BackupHash              string
+	BackupSize              int64
+	SourceSnapshotHash      string
+	ExpectedWorkspacePath   string
+	ExpectedWorkspaceBranch string
+	ExpectedWorkspaceHead   string
 }
 
 // DiscussionReturnView is the native discussion Return Page projection

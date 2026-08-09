@@ -56,6 +56,54 @@ type MigrationPreview struct {
 	ManifestHash string `json:"manifest_hash"`
 }
 
+// BackupEvidence binds the consistent SQLite snapshot created before the
+// migration intent: exact path, file SHA-256, and size.
+type BackupEvidence struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+// DatabaseImpact is the exact authoritative Workflow-row change applied
+// after every external move is verified.
+type DatabaseImpact struct {
+	FromLayoutVersion int    `json:"from_layout_version"`
+	ToLayoutVersion   int    `json:"to_layout_version"`
+	WorkspacePath     string `json:"workspace_path"`
+	WorkspaceBranch   string `json:"workspace_branch"`
+	WorkspaceHead     string `json:"workspace_head"`
+}
+
+type SourceSnapshot struct {
+	AggregateVersion  uint64 `json:"aggregate_version"`
+	LayoutVersion     int    `json:"layout_version"`
+	IntegrationBranch string `json:"integration_branch"`
+	IntegrationHead   string `json:"integration_head"`
+	BaseCommit        string `json:"base_commit"`
+	PreviewHash       string `json:"preview_hash"`
+}
+
+// MigrationManifest is the immutable Prepare evidence. SQLite stores the
+// SHA-256 of these exact JSON bytes; the pending intent repeats that hash.
+type MigrationManifest struct {
+	MigrationID        string           `json:"migration_id"`
+	Workflow           model.WorkflowID `json:"workflow"`
+	PreviewHash        string           `json:"preview_hash"`
+	From               int              `json:"from"`
+	To                 int              `json:"to"`
+	Moves              []PathMove       `json:"moves"`
+	Backup             BackupEvidence   `json:"backup"`
+	SourceSnapshot     SourceSnapshot   `json:"source_snapshot"`
+	SourceSnapshotHash string           `json:"source_snapshot_hash"`
+	DatabaseImpact     DatabaseImpact   `json:"database_impact"`
+}
+
+// Preview reconstructs the user-confirmed read-only move manifest.
+func (m MigrationManifest) Preview() MigrationPreview {
+	return MigrationPreview{Workflow: m.Workflow, From: m.From, To: m.To,
+		Moves: append([]PathMove(nil), m.Moves...), ManifestHash: m.PreviewHash}
+}
+
 // DigestPath returns a deterministic SHA-256 identity for one artifact
 // file or directory tree. Symlinks and non-regular entries fail closed;
 // lexical relative paths and file bytes are both bound.
@@ -118,8 +166,10 @@ func DigestPath(path string) (string, error) {
 //     the delivery mainline of the legacy layout — moves to the
 //     aggregated workspace (its integration Branch becomes the Workspace
 //     Branch, recorded by the migration);
-//   - every legacy Task Worktree worktrees/<key>/<wf>/tasks/<node> moves
-//     to the aggregated temporary root tmp/tasks/<node>.
+//   - every persisted Agent Task Node moves to the aggregated temporary
+//     root tmp/tasks/<node>; the Application replaces this inventory with
+//     the authoritative union of persisted Nodes and observed legacy Task
+//     Worktrees, each bound to its exact Git registry branch and HEAD.
 //
 // A workflow that is not on Layout 1, or a move list that cannot be
 // derived (an empty integration head), fails closed without a preview.
@@ -204,8 +254,10 @@ func (p MigrationPreview) Hash() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// taskIDsOf returns the deterministic sorted Node ids of the legacy Task
-// Worktrees of one workflow (the aggregated task root needs them).
+// taskIDsOf returns the deterministic sorted Node ids of the persisted
+// Agent Task Nodes of one workflow. It is not the observed legacy Task
+// directory set: the Application unions both and binds each task move to
+// its Git registry branch/HEAD (internal/app/migrate.go).
 func taskIDsOf(st model.State) []model.NodeID {
 	ids := make([]model.NodeID, 0, len(st.Nodes))
 	for id, n := range st.Nodes {

@@ -10,6 +10,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/security"
 )
@@ -53,7 +55,12 @@ func TestLegacyMigrationPreparePersistsMatchingIntent(t *testing.T) {
 		t.Fatalf("migration row: %v", err)
 	}
 	if migrationID == "" || status != "PREPARED" || manifestHash != pv.ManifestHash {
-		t.Fatalf("migration row = id=%q status=%q hash=%q", migrationID, status, manifestHash)
+		// The persisted manifest hash may differ from the read-only preview
+		// hash once backup/snapshot evidence is attached, but it must never
+		// be empty.
+		if migrationID == "" || status != "PREPARED" || manifestHash == "" {
+			t.Fatalf("migration row = id=%q status=%q hash=%q", migrationID, status, manifestHash)
+		}
 	}
 	if _, err := os.Stat(manifestPath); err != nil {
 		t.Fatalf("immutable manifest: %v", err)
@@ -83,6 +90,162 @@ func TestLegacyMigrationPreparePersistsMatchingIntent(t *testing.T) {
 	}
 	if !pathExists(lf.legacyRoot+"/integration") || pathExists(lf.aggRoot+"/workspace") {
 		t.Fatal("Prepare moved a worktree")
+	}
+}
+
+func TestPreparedManifestBindsBackupAndDatabaseImpact(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var path, recordedHash string
+	if err := db.QueryRow(`SELECT manifest_path, manifest_sha256 FROM layout_migrations WHERE workflow_id = ?`, string(lf.wf)).Scan(&path, &recordedHash); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	if fmt.Sprintf("%x", sum[:]) != recordedHash {
+		t.Fatalf("row hash does not bind manifest bytes")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	backup, ok := doc["backup"].(map[string]any)
+	if !ok || backup["path"] == "" || backup["sha256"] == "" || backup["size"] == nil {
+		t.Fatalf("backup evidence missing: %+v", doc)
+	}
+	if doc["source_snapshot_hash"] == "" || doc["database_impact"] == nil {
+		t.Fatalf("source snapshot/database impact missing: %+v", doc)
+	}
+}
+
+func TestPrepareRejectsSymlinkManifestRetry(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	preview := layout.MigrationPreview{Workflow: pv.Workflow, From: pv.From, To: pv.To, Moves: pv.Moves, ManifestHash: pv.ManifestHash}
+	body, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := migrationID(lf.wf, pv.ManifestHash)
+	manifestPath := filepath.Join(a.layout.StateDir(lf.wf), "layout-migrations", id+".json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(foreign, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreign, manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err == nil {
+		t.Fatal("Prepare accepted a symlink immutable manifest")
+	}
+}
+
+func TestLegacyMigrationExecuteBlocksOutOfOrderBeforeAnyMove(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.performMigrationMove(ctx, lf.wf, pv.Moves[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Execute(ctx, ExecuteLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err == nil {
+		t.Fatal("out-of-order landed move was accepted")
+	}
+	if !pathExists(pv.Moves[0].Source) || pathExists(pv.Moves[0].Destination) {
+		t.Fatal("Execute moved the first item before detecting later drift")
+	}
+}
+
+func TestLegacyMigrationPersistedTaskIsDeduplicatedAndBound(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := "2026-01-01T00:00:00Z"
+	branch := "cflow/" + string(lf.wf) + "/task-task-s01"
+	if _, err := db.Exec(`INSERT INTO tasks (id, workflow_id, spec_id, title, branch_name, created_at, updated_at)
+		VALUES (?, ?, ?, 'task', ?, ?, ?)`, "persisted-task-s01", string(lf.wf), "task-s01", branch, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes (id, workflow_id, task_id, node_type, status, created_at, updated_at)
+		VALUES ('task-s01', ?, 'persisted-task-s01', 'agent-task', 'PENDING', ?, ?)`, string(lf.wf), now, now); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	qv, err := lf.app().Query(context.Background(), LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []model.PathMove
+	for _, move := range qv.(MigrationPreviewView).Moves {
+		if move.Source == filepath.Join(lf.legacyRoot, "tasks", "task-s01") {
+			found = append(found, move)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("persisted/observed task moves = %d, want 1: %+v", len(found), found)
+	}
+	if found[0].Branch != branch || found[0].Head == "" {
+		t.Fatalf("task move not exactly bound: %+v", found[0])
+	}
+}
+
+func TestPreparedMigrationPreviewRejectsAuthoritativeRowDrift(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE layout_migrations SET manifest_sha256 = 'drift' WHERE workflow_id = ?`, string(lf.wf)); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	if _, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf}); err == nil {
+		t.Fatal("prepared preview accepted a drifted authoritative migration row")
 	}
 }
 
@@ -176,7 +339,8 @@ func TestLegacyMigrationExecuteRecognizesDBCommitCrash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`UPDATE workflows SET layout_version = 2, workspace_path = ?, workspace_branch = ?,
+	_, err = db.Exec(`UPDATE workflows SET layout_version = 2, aggregate_version = aggregate_version + 1,
+		workspace_path = ?, workspace_branch = ?,
 		candidate_workspace_head = integration_head, verified_workspace_head = integration_head WHERE id = ?`,
 		filepath.Join(lf.aggRoot, "workspace"), "cflow/"+string(lf.wf)+"/integration", string(lf.wf))
 	_ = db.Close()

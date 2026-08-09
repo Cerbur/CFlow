@@ -11,6 +11,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -22,15 +24,15 @@ import (
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/platform"
+	"cflow.local/cflow/internal/security"
 	"cflow.local/cflow/internal/store"
 )
 
 // migrationPreview derives the full Legacy Layout Migration Preview of
-// one workflow: the pure layout.Preview moves plus every legacy Task
-// Worktree discovered under worktrees/<key>/<wf>/tasks/ (the aggregate
-// does not persist Task Nodes until the graph is installed, so the
-// legacy directory is the authoritative inventory). The read is a
-// read-only directory listing; nothing is moved, created, or deleted.
+// one workflow. Persisted Agent Task Nodes and observed legacy task
+// directories are unioned by Node ID; every task appears exactly once and
+// is bound to its exact Git registry branch and HEAD.
 func (a *Application) migrationPreview(ctx context.Context, wf model.WorkflowID, state model.State) (layout.MigrationPreview, error) {
 	preview, err := layout.Preview(wf, 1, 2, a.project.Key, a.home, state)
 	if err != nil {
@@ -41,33 +43,63 @@ func (a *Application) migrationPreview(ctx context.Context, wf model.WorkflowID,
 	if err != nil {
 		return layout.MigrationPreview{}, err
 	}
-	names := make([]string, 0, len(entries))
+	nameSet := map[string]struct{}{}
+	for id, node := range state.Nodes {
+		if node != nil && node.Kind == model.NodeAgentTask {
+			nameSet[string(id)] = struct{}{}
+		}
+	}
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		names = append(names, e.Name())
+		nameSet[e.Name()] = struct{}{}
+	}
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
 	}
 	sort.Strings(names)
+	// layout.Preview includes persisted-node task moves without observable
+	// HEADs. Replace that inventory with the authoritative union below.
+	baseMoves := preview.Moves[:0]
+	for _, move := range preview.Moves {
+		if move.Kind == model.MoveKindWorktree && strictlyInside(move.Source, legacyTasks) {
+			continue
+		}
+		baseMoves = append(baseMoves, move)
+	}
+	preview.Moves = baseMoves
+	registryFacts, err := a.git.Observe(ctx, gitflow.WorktreeList{})
+	if err != nil {
+		return layout.MigrationPreview{}, err
+	}
+	registry := map[string]gitflow.WorktreeEntry{}
+	for _, entry := range registryFacts.(gitflow.WorktreeFacts).Entries {
+		registry[filepath.Clean(entry.Path)] = entry
+	}
 	for _, name := range names {
 		node := model.NodeID(name)
 		source := filepath.Join(legacyTasks, name)
-		facts, err := a.git.Observe(ctx, gitflow.GitStatus{Dir: source})
-		if err != nil {
+		entry, ok := registry[filepath.Clean(source)]
+		if !ok || entry.Detached || entry.Head == "" {
 			return layout.MigrationPreview{}, model.NewFault(model.CodeEvidenceSubjectChanged,
-				"legacy task worktree is unreadable: "+source)
+				"legacy task worktree is absent or detached in the Git registry")
 		}
-		status, ok := facts.(gitflow.StatusFacts)
-		if !ok || status.Head == "" {
-			return layout.MigrationPreview{}, model.InvariantFault(
-				fmt.Errorf("legacy task worktree has no observable head"))
+		expectedBranch := "cflow/" + string(wf) + "/task-" + name
+		if persisted := state.Nodes[node]; persisted != nil && persisted.Branch != "" {
+			expectedBranch = persisted.Branch
+		}
+		if entry.Branch != expectedBranch {
+			return layout.MigrationPreview{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+				"legacy task worktree branch drifted")
 		}
 		preview.Moves = append(preview.Moves, model.PathMove{
 			Kind:        model.MoveKindWorktree,
 			Source:      source,
 			Destination: a.layout.Task(wf, node),
-			Branch:      "cflow/" + string(wf) + "/task-" + name,
-			Head:        status.Head,
+			Branch:      entry.Branch,
+			Head:        entry.Head,
 		})
 	}
 	// Legacy Artifact revisions live below artifacts/<workflow>/<type>.
@@ -137,9 +169,33 @@ func (a *Application) queryMigrationPreview(ctx context.Context, q LayoutMigrati
 			if intent.Workflow != wf || intent.MigrationID == "" || intent.ManifestHash == "" || len(intent.Moves) == 0 {
 				return nil, model.InvariantFault(fmt.Errorf("the persisted layout migration intent is incomplete"))
 			}
+			if view.LayoutMigration == nil || view.LayoutMigration.ID != intent.MigrationID ||
+				view.LayoutMigration.Status != "PREPARED" || view.LayoutMigration.ManifestHash != intent.ManifestHash {
+				return nil, model.NewFault(model.CodeEvidenceSubjectChanged,
+					"the authoritative layout migration row does not match its pending intent")
+			}
+			manifest, err := readMigrationManifest(view.LayoutMigration.ManifestPath, view.LayoutMigration.ManifestHash)
+			expectedManifestPath := filepath.Join(a.layout.StateDir(wf), "layout-migrations", intent.MigrationID+".json")
+			if err != nil || filepath.Clean(view.LayoutMigration.ManifestPath) != filepath.Clean(expectedManifestPath) ||
+				manifest.MigrationID != intent.MigrationID || manifest.Workflow != wf ||
+				manifest.DatabaseImpact.WorkspacePath != a.layout.Workspace(wf) ||
+				manifest.DatabaseImpact.WorkspaceBranch != view.State.Workflow.IntegrationBranch ||
+				manifest.DatabaseImpact.WorkspaceHead != view.State.Workflow.IntegrationHead ||
+				manifest.SourceSnapshot.AggregateVersion+1 != uint64(view.AggregateVersion) ||
+				manifest.SourceSnapshot.LayoutVersion != 1 ||
+				!samePathMoves(manifest.Moves, intent.Moves) {
+				return nil, model.NewFault(model.CodeEvidenceSubjectChanged,
+					"the immutable layout migration manifest does not match its pending intent")
+			}
 			return MigrationPreviewView{
 				Workflow: wf, From: 1, To: 2, Moves: append([]model.PathMove(nil), intent.Moves...),
 				ManifestHash: intent.ManifestHash, MigrationID: intent.MigrationID, Status: "PREPARED",
+				ManifestPath: view.LayoutMigration.ManifestPath,
+				BackupPath:   manifest.Backup.Path, BackupHash: manifest.Backup.SHA256, BackupSize: manifest.Backup.Size,
+				SourceSnapshotHash:      manifest.SourceSnapshotHash,
+				ExpectedWorkspacePath:   manifest.DatabaseImpact.WorkspacePath,
+				ExpectedWorkspaceBranch: manifest.DatabaseImpact.WorkspaceBranch,
+				ExpectedWorkspaceHead:   manifest.DatabaseImpact.WorkspaceHead,
 			}, nil
 		}
 	}
@@ -153,6 +209,9 @@ func (a *Application) queryMigrationPreview(ctx context.Context, q LayoutMigrati
 	return MigrationPreviewView{
 		Workflow: preview.Workflow, From: preview.From, To: preview.To,
 		Moves: preview.Moves, ManifestHash: preview.ManifestHash, Status: "PREVIEW",
+		ExpectedWorkspacePath:   a.layout.Workspace(wf),
+		ExpectedWorkspaceBranch: view.State.Workflow.IntegrationBranch,
+		ExpectedWorkspaceHead:   view.State.Workflow.IntegrationHead,
 	}, nil
 }
 
@@ -210,30 +269,61 @@ func (a *Application) prepareMigrationExecute(ctx context.Context, st *store.Sto
 		return Outcome{}, model.NewFault(model.CodeApprovalInputChanged,
 			"the migration preview changed since it was displayed; re-preview before preparing")
 	}
-	// The sources must still match the bound manifest: a drift between the
-	// Preview and the Prepare is refused with nothing persisted.
-	if err := a.verifyMigrationSources(ctx, preview.Moves); err != nil {
-		return Outcome{}, err
+	// Preflight the complete manifest before persisting evidence. Prepare
+	// only accepts an entirely pending sequence; no destination may exist.
+	firstPending, err := a.preflightMigrationMoves(ctx, preview.Moves, false)
+	if err != nil || firstPending != 0 {
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"layout migration Prepare requires every move to be pending")
 	}
 	id := migrationID(wf, preview.ManifestHash)
 	manifestPath := filepath.Join(a.layout.StateDir(wf), "layout-migrations", id+".json")
-	if err := a.writeMigrationManifest(ctx, wf, preview, manifestPath); err != nil {
+	if err := a.ensureWorktreeParent(manifestPath); err != nil {
 		return Outcome{}, err
 	}
 	backupPath := strings.TrimSuffix(manifestPath, ".json") + ".db.backup"
-	if err := st.BackupLayoutMigration(ctx, backupPath); err != nil {
+	backup, err := st.BackupLayoutMigration(ctx, backupPath)
+	if err != nil {
 		return Outcome{}, err
 	}
-	if err := st.RecordLayoutMigration(ctx, wf, id, manifestPath, preview.ManifestHash); err != nil {
+	snapshot := layout.SourceSnapshot{
+		AggregateVersion: uint64(view.AggregateVersion), LayoutVersion: state.Workflow.LayoutVersion,
+		IntegrationBranch: state.Workflow.IntegrationBranch, IntegrationHead: state.Workflow.IntegrationHead,
+		BaseCommit: state.Workflow.BaseCommit, PreviewHash: preview.ManifestHash,
+	}
+	snapshotBody, _ := json.Marshal(snapshot)
+	snapshotSum := sha256.Sum256(snapshotBody)
+	manifest := layout.MigrationManifest{
+		MigrationID: id, Workflow: wf, PreviewHash: preview.ManifestHash,
+		From: preview.From, To: preview.To, Moves: append([]model.PathMove(nil), preview.Moves...),
+		Backup:         layout.BackupEvidence{Path: backup.Path, SHA256: backup.SHA256, Size: backup.Size},
+		SourceSnapshot: snapshot, SourceSnapshotHash: fmt.Sprintf("%x", snapshotSum[:]),
+		DatabaseImpact: layout.DatabaseImpact{FromLayoutVersion: 1, ToLayoutVersion: 2,
+			WorkspacePath: a.layout.Workspace(wf), WorkspaceBranch: state.Workflow.IntegrationBranch,
+			WorkspaceHead: state.Workflow.IntegrationHead},
+	}
+	manifestBody, err := json.Marshal(manifest)
+	if err != nil {
+		return Outcome{}, model.InvariantFault(fmt.Errorf("migration manifest cannot be serialized"))
+	}
+	manifestSum := sha256.Sum256(manifestBody)
+	manifestHash := fmt.Sprintf("%x", manifestSum[:])
+	if err := a.writeMigrationManifest(manifestBody, manifestPath); err != nil {
+		return Outcome{}, err
+	}
+	if err := st.RecordLayoutMigration(ctx, wf, id, manifestPath, manifestHash); err != nil {
 		return Outcome{}, err
 	}
 	intent := model.LayoutMigrationIntent{
-		MigrationID: id, Workflow: wf, ManifestHash: preview.ManifestHash,
+		MigrationID: id, Workflow: wf, ManifestHash: manifestHash, PreviewHash: preview.ManifestHash,
 		Moves: append([]model.PathMove(nil), preview.Moves...),
 	}
 	for _, pending := range view.PendingEffects {
 		if existing, ok := pending.Intent.(model.LayoutMigrationIntent); ok {
-			if existing.MigrationID == id && existing.ManifestHash == preview.ManifestHash {
+			if existing.MigrationID == id && existing.ManifestHash == manifestHash {
 				return Outcome{Workflow: wf, Stage: state.Workflow.Stage, Runtime: state.Workflow.Runtime}, nil
 			}
 			return Outcome{}, model.NewFault(model.CodeEvidenceSubjectChanged,
@@ -260,22 +350,18 @@ func migrationID(wf model.WorkflowID, manifestHash string) string {
 	return "migration-" + string(wf) + "-" + short
 }
 
-// writeMigrationManifest persists the canonical migration manifest (the
-// ordered moves) under the workflow's state directory through the
-// security guard, so the Execute step and the Recovery engine read the
-// exact bound moves.
-func (a *Application) writeMigrationManifest(ctx context.Context, wf model.WorkflowID, preview layout.MigrationPreview, path string) error {
-	if err := a.ensureWorktreeParent(path); err != nil {
-		return err
-	}
-	data, err := json.Marshal(preview)
-	if err != nil {
-		return model.InvariantFault(fmt.Errorf("migration manifest cannot be serialized"))
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+// writeMigrationManifest persists the immutable migration manifest (the
+// full MigrationManifest bytes, whose SHA-256 is the recorded manifest
+// hash) under the workflow's state directory through the security guard,
+// so the Execute step and the Recovery engine read the exact bound moves.
+func (a *Application) writeMigrationManifest(data []byte, path string) error {
+	f, err := security.CreateSensitiveFile(path)
 	if err != nil {
 		if !os.IsExist(err) {
 			return model.InvariantFault(fmt.Errorf("migration manifest cannot be persisted"))
+		}
+		if _, checkErr := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); checkErr != nil {
+			return checkErr
 		}
 		existing, readErr := os.ReadFile(path)
 		if readErr != nil || string(existing) != string(data) {
@@ -295,16 +381,36 @@ func (a *Application) writeMigrationManifest(ctx context.Context, wf model.Workf
 	if err := f.Close(); err != nil {
 		return model.InvariantFault(fmt.Errorf("migration manifest cannot be closed"))
 	}
-	return nil
+	return syncManagedFileAndDir(path)
+}
+
+func syncManagedFileAndDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 // executeMigration performs the ordered moves of the bound manifest and
-// advances the persisted Layout facts to Version 2. The first pass
-// performs every move (git worktree move for the Worktrees, safe path
-// moves for the Artifacts); the final Decision records the Layout
-// mutation and the migration completion. A crash inside the moves leaves
-// the Intent pending with Done counting the completed moves; recovery
-// continues from the actual state.
+// advances the persisted Layout facts to Version 2. It preflights the
+// entire immutable manifest before the first side effect and reconstructs
+// progress only as a landed prefix followed by a pending suffix.
 func (a *Application) executeMigration(ctx context.Context, st *store.Store, wf model.WorkflowID, cmd ExecuteLayoutMigrationCommand) (Outcome, error) {
 	if cmd.ManifestHash == "" {
 		return Outcome{}, model.InvalidInputFault("the migration requires the exact preview manifest hash")
@@ -321,54 +427,49 @@ func (a *Application) executeMigration(ctx context.Context, st *store.Store, wf 
 	if err != nil {
 		return Outcome{}, err
 	}
-	if record.ManifestHash != cmd.ManifestHash {
-		return Outcome{}, model.NewFault(model.CodeApprovalInputChanged,
-			"the execute confirmation does not match the persisted migration manifest")
-	}
 	intent, effectID, err := persistedMigrationIntent(view.PendingEffects, wf, record)
 	if err != nil {
 		return Outcome{}, err
+	}
+	if cmd.ManifestHash != record.ManifestHash && cmd.ManifestHash != intent.PreviewHash {
+		return Outcome{}, model.NewFault(model.CodeApprovalInputChanged,
+			"the execute confirmation does not match the persisted migration manifest")
 	}
 	manifest, err := readMigrationManifest(record.ManifestPath, record.ManifestHash)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if !samePathMoves(intent.Moves, manifest.Moves) {
+	expectedManifestPath := filepath.Join(a.layout.StateDir(wf), "layout-migrations", record.ID+".json")
+	if record.Status != "PREPARED" || filepath.Clean(record.ManifestPath) != filepath.Clean(expectedManifestPath) ||
+		manifest.MigrationID != record.ID || manifest.Workflow != wf ||
+		manifest.DatabaseImpact.WorkspacePath != a.layout.Workspace(wf) ||
+		manifest.DatabaseImpact.WorkspaceBranch != state.Workflow.IntegrationBranch ||
+		manifest.DatabaseImpact.WorkspaceHead != state.Workflow.IntegrationHead ||
+		!samePathMoves(intent.Moves, manifest.Moves) {
 		return Outcome{}, model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the persisted layout migration intent does not match its immutable manifest")
 	}
 
-	// The ordered manifest plus source/destination/Git registry facts are
-	// the recoverable progress ledger. A landed move is verified and
-	// skipped; an unlanded move is verified and executed; ambiguous facts
-	// stably block. Execute never derives a new move list from live paths.
-	for i, mv := range intent.Moves {
-		src, dst := pathPresent(mv.Source), pathPresent(mv.Destination)
-		switch {
-		case src && !dst:
-			if err := a.verifyMigrationMove(ctx, mv, mv.Source); err != nil {
-				return Outcome{}, err
-			}
-			if err := a.performMigrationMove(ctx, wf, mv); err != nil {
-				return Outcome{}, err
-			}
-			if !pathPresent(mv.Destination) || pathPresent(mv.Source) {
-				return Outcome{}, model.NewFault(model.CodeEvidenceSubjectChanged,
-					fmt.Sprintf("layout migration move %d did not settle to its destination", i))
-			}
-			if err := a.verifyMigrationMove(ctx, mv, mv.Destination); err != nil {
-				return Outcome{}, err
-			}
-		case !src && dst:
-			if err := a.verifyMigrationMove(ctx, mv, mv.Destination); err != nil {
-				return Outcome{}, err
-			}
-		case src && dst:
+	// Preflight the complete immutable manifest first: only an exactly
+	// landed prefix followed by a pending suffix may proceed, and the DB
+	// may not have advanced while any move is still pending.
+	firstPending, err := a.preflightMigrationMoves(ctx, intent.Moves, state.Workflow.LayoutVersion == 2)
+	if err != nil {
+		return Outcome{}, err
+	}
+	// Only after the complete manifest preflight proves a landed prefix
+	// followed by a pending suffix may the first pending move execute.
+	for i := firstPending; i < len(intent.Moves); i++ {
+		mv := intent.Moves[i]
+		if err := a.performMigrationMove(ctx, wf, mv); err != nil {
+			return Outcome{}, err
+		}
+		if !pathPresent(mv.Destination) || pathPresent(mv.Source) {
 			return Outcome{}, model.NewFault(model.CodeEvidenceSubjectChanged,
-				fmt.Sprintf("layout migration move %d has both source and destination", i))
-		default:
-			return Outcome{}, model.NewFault(model.CodeEvidenceSubjectChanged,
-				fmt.Sprintf("layout migration move %d has neither source nor destination", i))
+				fmt.Sprintf("layout migration move %d did not settle to its destination", i))
+		}
+		if err := a.verifyMigrationMove(ctx, mv, mv.Destination); err != nil {
+			return Outcome{}, err
 		}
 	}
 
@@ -395,10 +496,10 @@ func (a *Application) executeMigration(ctx context.Context, st *store.Store, wf 
 			IntegrationBranch:      s.Workflow.IntegrationBranch,
 			IntegrationHead:        s.Workflow.IntegrationHead,
 			LayoutVersion:          2,
-			WorkspacePath:          a.layout.Workspace(wf),
-			WorkspaceBranch:        s.Workflow.IntegrationBranch,
-			VerifiedWorkspaceHead:  s.Workflow.IntegrationHead,
-			CandidateWorkspaceHead: s.Workflow.IntegrationHead,
+			WorkspacePath:          manifest.DatabaseImpact.WorkspacePath,
+			WorkspaceBranch:        manifest.DatabaseImpact.WorkspaceBranch,
+			VerifiedWorkspaceHead:  manifest.DatabaseImpact.WorkspaceHead,
+			CandidateWorkspaceHead: manifest.DatabaseImpact.WorkspaceHead,
 			CancelIntent:           s.Workflow.CancelIntent,
 		}
 		b.mutate(m)
@@ -413,6 +514,43 @@ func (a *Application) executeMigration(ctx context.Context, st *store.Store, wf 
 		return Outcome{}, err
 	}
 	return Outcome{Workflow: wf, Stage: state.Workflow.Stage, Runtime: state.Workflow.Runtime}, nil
+}
+
+func (a *Application) preflightMigrationMoves(ctx context.Context, moves []model.PathMove, dbAdvanced bool) (int, error) {
+	firstPending := len(moves)
+	pendingSeen := false
+	for i, mv := range moves {
+		src, dst := pathPresent(mv.Source), pathPresent(mv.Destination)
+		switch {
+		case src && !dst:
+			if dbAdvanced {
+				return 0, model.NewFault(model.CodeEvidenceSubjectChanged,
+					fmt.Sprintf("database advanced before migration move %d landed", i))
+			}
+			pendingSeen = true
+			if firstPending == len(moves) {
+				firstPending = i
+			}
+			if err := a.verifyMigrationMove(ctx, mv, mv.Source); err != nil {
+				return 0, err
+			}
+		case !src && dst:
+			if pendingSeen {
+				return 0, model.NewFault(model.CodeEvidenceSubjectChanged,
+					fmt.Sprintf("layout migration move %d landed out of order", i))
+			}
+			if err := a.verifyMigrationMove(ctx, mv, mv.Destination); err != nil {
+				return 0, err
+			}
+		case src && dst:
+			return 0, model.NewFault(model.CodeEvidenceSubjectChanged,
+				fmt.Sprintf("layout migration move %d has both source and destination", i))
+		default:
+			return 0, model.NewFault(model.CodeEvidenceSubjectChanged,
+				fmt.Sprintf("layout migration move %d has neither source nor destination", i))
+		}
+	}
+	return firstPending, nil
 }
 
 func persistedMigrationIntent(pending []store.PendingEffect, wf model.WorkflowID, record store.LayoutMigrationRecord) (model.LayoutMigrationIntent, string, error) {
@@ -433,16 +571,63 @@ func persistedMigrationIntent(pending []store.PendingEffect, wf model.WorkflowID
 	return model.LayoutMigrationIntent{}, "", model.InvariantFault(fmt.Errorf("prepared layout migration has no recoverable intent"))
 }
 
-func readMigrationManifest(path, hash string) (layout.MigrationPreview, error) {
+func readMigrationManifest(path, hash string) (layout.MigrationManifest, error) {
+	if _, err := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); err != nil {
+		return layout.MigrationManifest{}, err
+	}
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return layout.MigrationPreview{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the immutable layout migration manifest cannot be read")
 	}
-	var manifest layout.MigrationPreview
-	if err := json.Unmarshal(body, &manifest); err != nil || manifest.Hash() != hash || manifest.ManifestHash != hash {
-		return layout.MigrationPreview{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+	sum := sha256.Sum256(body)
+	var manifest layout.MigrationManifest
+	if err := json.Unmarshal(body, &manifest); err != nil || fmt.Sprintf("%x", sum[:]) != hash {
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the immutable layout migration manifest failed hash validation")
+	}
+	preview := manifest.Preview()
+	if manifest.MigrationID == "" || manifest.Workflow == "" || manifest.PreviewHash == "" ||
+		preview.Hash() != manifest.PreviewHash || manifest.SourceSnapshotHash == "" ||
+		manifest.DatabaseImpact.FromLayoutVersion != 1 || manifest.DatabaseImpact.ToLayoutVersion != 2 ||
+		manifest.DatabaseImpact.WorkspacePath == "" || manifest.DatabaseImpact.WorkspaceBranch == "" ||
+		manifest.DatabaseImpact.WorkspaceHead == "" {
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the immutable layout migration manifest is incomplete")
+	}
+	snapshotBody, _ := json.Marshal(manifest.SourceSnapshot)
+	snapshotSum := sha256.Sum256(snapshotBody)
+	if fmt.Sprintf("%x", snapshotSum[:]) != manifest.SourceSnapshotHash ||
+		manifest.SourceSnapshot.PreviewHash != manifest.PreviewHash {
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the layout migration source snapshot identity is invalid")
+	}
+	expectedBackup := strings.TrimSuffix(path, ".json") + ".db.backup"
+	if manifest.Backup.Path != expectedBackup || manifest.Backup.SHA256 == "" || manifest.Backup.Size <= 0 {
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the layout migration backup evidence is incomplete")
+	}
+	if _, err := security.CheckPath(security.PathRequest{Path: manifest.Backup.Path, Kind: security.KindFile}); err != nil {
+		return layout.MigrationManifest{}, err
+	}
+	backupBody, err := os.ReadFile(manifest.Backup.Path)
+	if err != nil {
+		return layout.MigrationManifest{}, err
+	}
+	backupSum := sha256.Sum256(backupBody)
+	if int64(len(backupBody)) != manifest.Backup.Size || fmt.Sprintf("%x", backupSum[:]) != manifest.Backup.SHA256 {
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the immutable layout migration backup identity drifted")
+	}
+	db, err := sql.Open("sqlite", "file:"+manifest.Backup.Path+"?mode=ro")
+	if err != nil {
+		return layout.MigrationManifest{}, err
+	}
+	defer db.Close()
+	var integrity string
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+		return layout.MigrationManifest{}, model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the immutable layout migration backup failed integrity verification")
 	}
 	return manifest, nil
 }
@@ -608,8 +793,9 @@ func strictlyInside(path, root string) bool {
 
 // movePath performs one safe path move under the managed home: the
 // source must be inside the managed home and the destination must not
-// exist. The moved content keeps its modes; the destination parent is
-// created 0700.
+// exist. The move uses an atomic no-replace primitive so a destination
+// created after the preflight is never overwritten. The moved content
+// keeps its modes; the destination parent is created 0700.
 func movePath(ctx context.Context, source, destination string) error {
 	if source == "" || destination == "" {
 		return model.InvalidInputFault("migration move requires exact paths")
@@ -620,14 +806,17 @@ func movePath(ctx context.Context, source, destination string) error {
 		}
 		return err
 	}
-	if _, err := os.Lstat(destination); err == nil {
-		return model.NewFault(model.CodeEvidenceSubjectChanged,
-			"migration destination already exists: "+destination)
-	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
 	}
-	return os.Rename(source, destination)
+	if err := platform.AtomicRenameNoReplace(source, destination); err != nil {
+		if os.IsExist(err) {
+			return model.NewFault(model.CodeEvidenceSubjectChanged,
+				"migration destination already exists: "+destination)
+		}
+		return err
+	}
+	return nil
 }
 
 // decisionBuilder is a minimal Decision builder for the migration's
