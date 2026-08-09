@@ -555,10 +555,51 @@ func (s *Store) RegisterProject(ctx context.Context, id model.ProjectID, root, n
 	return nil
 }
 
-// RecordLayoutMigration inserts (or re-opens) the explicit Legacy Layout
-// Migration row of one workflow (layout_migrations, TUI task 8): status
-// PREPARED with the canonical manifest hash the Execute step binds. The
-// row is the persisted intent the Recovery engine reconciles.
+// LayoutMigrationRecord is the authoritative SQLite identity/status of an
+// explicit legacy-layout migration.
+type LayoutMigrationRecord struct {
+	ID           string
+	Workflow     model.WorkflowID
+	Status       string
+	ManifestPath string
+	ManifestHash string
+}
+
+// BackupLayoutMigration creates a consistent, owner-only SQLite snapshot
+// before a layout migration intent is committed. It never overwrites an
+// existing path; an existing retry target must already be a valid SQLite
+// backup or Prepare blocks.
+func (s *Store) BackupLayoutMigration(ctx context.Context, path string) error {
+	if path == "" {
+		return model.InvalidInputFault("layout migration backup path is required")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, path); err != nil {
+			return fmt.Errorf("create layout migration backup: %w", s.mapSQLError(err))
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("secure layout migration backup: %w", err)
+		}
+	}
+	backup, err := sql.Open("sqlite", fileDSN(path, true, s.busyTimeout))
+	if err != nil {
+		return fmt.Errorf("open layout migration backup: %w", err)
+	}
+	defer backup.Close()
+	var integrity string
+	if err := backup.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+		return model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the immutable layout migration database backup failed integrity verification")
+	}
+	return nil
+}
+
+// RecordLayoutMigration inserts the immutable identity of one explicit
+// Legacy Layout Migration. Repeating the exact same Prepare is idempotent;
+// an attempt to reuse the identity with different manifest facts blocks.
 func (s *Store) RecordLayoutMigration(ctx context.Context, wf model.WorkflowID, id, manifestPath, manifestHash string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -567,29 +608,107 @@ func (s *Store) RecordLayoutMigration(ctx context.Context, wf model.WorkflowID, 
 		return model.InvalidInputFault("layout migration identity, manifest path, and hash are required")
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO layout_migrations
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("record layout migration: %w", s.mapSQLError(err))
+	}
+	defer func() { _ = tx.Rollback() }()
+	var existing LayoutMigrationRecord
+	err = tx.QueryRowContext(ctx, `SELECT id, workflow_id, status, manifest_path, manifest_sha256
+		FROM layout_migrations WHERE workflow_id = ? ORDER BY created_at, id LIMIT 1`, string(wf)).Scan(
+		&existing.ID, &existing.Workflow, &existing.Status, &existing.ManifestPath, &existing.ManifestHash)
+	switch {
+	case err == nil:
+		if existing.ID != id || existing.ManifestPath != manifestPath || existing.ManifestHash != manifestHash ||
+			(existing.Status != "PREPARED" && existing.Status != "COMPLETED") {
+			return model.NewFault(model.CodeEvidenceSubjectChanged,
+				"layout migration identity or immutable manifest facts changed")
+		}
+		return nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("read layout migration: %w", s.mapSQLError(err))
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO layout_migrations
 		(id, workflow_id, status, manifest_path, manifest_sha256, created_at)
-		VALUES (?, ?, 'PREPARED', ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			status = 'PREPARED', manifest_path = excluded.manifest_path,
-			manifest_sha256 = excluded.manifest_sha256, created_at = excluded.created_at`,
-		id, string(wf), manifestPath, manifestHash, now); err != nil {
+		VALUES (?, ?, 'PREPARED', ?, ?, ?)`, id, string(wf), manifestPath, manifestHash, now)
+	if err != nil {
+		return fmt.Errorf("record layout migration: %w", s.mapSQLError(err))
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("record layout migration: %w", s.mapSQLError(err))
 	}
 	return nil
 }
 
+// LayoutMigration returns the single persisted migration of a Workflow.
+// Multiple rows are an invariant violation because only one forward
+// Layout 1 -> 2 adoption is legal.
+func (s *Store) LayoutMigration(ctx context.Context, wf model.WorkflowID) (LayoutMigrationRecord, error) {
+	if wf == "" {
+		return LayoutMigrationRecord{}, model.InvalidInputFault("layout migration workflow is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, status, manifest_path, manifest_sha256
+		FROM layout_migrations WHERE workflow_id = ? ORDER BY created_at, id`, string(wf))
+	if err != nil {
+		return LayoutMigrationRecord{}, fmt.Errorf("read layout migration: %w", s.mapSQLError(err))
+	}
+	defer rows.Close()
+	var out LayoutMigrationRecord
+	for rows.Next() {
+		if out.ID != "" {
+			return LayoutMigrationRecord{}, model.InvariantFault(fmt.Errorf("workflow %s has multiple layout migrations", wf))
+		}
+		if err := rows.Scan(&out.ID, &out.Workflow, &out.Status, &out.ManifestPath, &out.ManifestHash); err != nil {
+			return LayoutMigrationRecord{}, fmt.Errorf("scan layout migration: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return LayoutMigrationRecord{}, err
+	}
+	if out.ID == "" {
+		return LayoutMigrationRecord{}, model.InvalidInputFault("layout migration has not been prepared")
+	}
+	return out, nil
+}
+
 // MarkLayoutMigrationCompleted marks the migration row COMPLETED (the
 // persisted Layout facts already advanced; the marker is bookkeeping the
 // Recovery engine also derives from the Layout facts).
-func (s *Store) MarkLayoutMigrationCompleted(ctx context.Context, wf model.WorkflowID, id string) error {
+func (s *Store) MarkLayoutMigrationCompleted(ctx context.Context, wf model.WorkflowID, id, effectID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if wf == "" || id == "" || effectID == "" {
+		return model.InvalidInputFault("layout migration completion requires matching migration and effect identities")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mark layout migration: %w", s.mapSQLError(err))
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE layout_migrations SET status = 'COMPLETED', completed_at = ? WHERE id = ? AND workflow_id = ?`,
-		now, id, string(wf)); err != nil {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE layout_migrations SET status = 'COMPLETED', completed_at = ?
+		 WHERE id = ? AND workflow_id = ? AND status IN ('PREPARED','COMPLETED')`,
+		now, id, string(wf))
+	if err != nil {
+		return fmt.Errorf("mark layout migration: %w", s.mapSQLError(err))
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the layout migration completion identity/status no longer matches")
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE effects SET status = 'RESULTED'
+		WHERE id = ? AND workflow_id = ? AND kind = 'layout-migration' AND status = 'PENDING'`,
+		effectID, string(wf))
+	if err != nil {
+		return fmt.Errorf("settle layout migration intent: %w", s.mapSQLError(err))
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the layout migration effect identity/status no longer matches")
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("mark layout migration: %w", s.mapSQLError(err))
 	}
 	return nil

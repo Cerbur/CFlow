@@ -12,6 +12,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -51,6 +54,55 @@ type MigrationPreview struct {
 	Moves []PathMove `json:"moves"`
 	// ManifestHash is the canonical SHA-256 of the ordered moves.
 	ManifestHash string `json:"manifest_hash"`
+}
+
+// DigestPath returns a deterministic SHA-256 identity for one artifact
+// file or directory tree. Symlinks and non-regular entries fail closed;
+// lexical relative paths and file bytes are both bound.
+func DigestPath(path string) (string, error) {
+	root := filepath.Clean(path)
+	h := sha256.New()
+	err := filepath.WalkDir(root, func(current string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+			return fmt.Errorf("artifact migration path contains an unsupported entry")
+		}
+		rel, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		kind := "f"
+		if info.IsDir() {
+			kind = "d"
+		}
+		_, _ = io.WriteString(h, kind+"\x00"+filepath.ToSlash(rel)+"\x00")
+		if info.Mode().IsRegular() {
+			f, err := os.Open(current)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(h, f)
+			closeErr := f.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			_, _ = io.WriteString(h, "\x00")
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // Preview computes the deterministic Legacy Layout Migration moves of one

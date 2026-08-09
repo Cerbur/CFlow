@@ -11,8 +11,11 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"cflow.local/cflow/internal/artifact"
@@ -20,6 +23,185 @@ import (
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/security"
 )
+
+// TestLegacyMigrationPreparePersistsMatchingIntent proves the Prepare
+// durability boundary: the immutable migration row and the recoverable
+// effect intent must both exist, carry the same migration identity/hash,
+// and precede every filesystem move.
+func TestLegacyMigrationPreparePersistsMatchingIntent(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var migrationID, status, manifestPath, manifestHash string
+	if err := db.QueryRow(`SELECT id, status, manifest_path, manifest_sha256
+		FROM layout_migrations WHERE workflow_id = ?`, string(lf.wf)).Scan(
+		&migrationID, &status, &manifestPath, &manifestHash); err != nil {
+		t.Fatalf("migration row: %v", err)
+	}
+	if migrationID == "" || status != "PREPARED" || manifestHash != pv.ManifestHash {
+		t.Fatalf("migration row = id=%q status=%q hash=%q", migrationID, status, manifestHash)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("immutable manifest: %v", err)
+	}
+	backupPath := strings.TrimSuffix(manifestPath, ".json") + ".db.backup"
+	backup, err := sql.Open("sqlite", "file:"+backupPath+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open migration database backup: %v", err)
+	}
+	defer backup.Close()
+	var integrity string
+	if err := backup.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+		t.Fatalf("migration database backup integrity = %q, err=%v", integrity, err)
+	}
+	var payload []byte
+	if err := db.QueryRow(`SELECT payload_json FROM effects
+		WHERE workflow_id = ? AND kind = 'layout-migration' AND status = 'PENDING'`,
+		string(lf.wf)).Scan(&payload); err != nil {
+		t.Fatalf("pending migration intent: %v", err)
+	}
+	var intent model.LayoutMigrationIntent
+	if err := json.Unmarshal(payload, &intent); err != nil {
+		t.Fatal(err)
+	}
+	if intent.MigrationID != migrationID || intent.ManifestHash != manifestHash || len(intent.Moves) != len(pv.Moves) {
+		t.Fatalf("intent = %+v, row id/hash = %s/%s", intent, migrationID, manifestHash)
+	}
+	if !pathExists(lf.legacyRoot+"/integration") || pathExists(lf.aggRoot+"/workspace") {
+		t.Fatal("Prepare moved a worktree")
+	}
+}
+
+// TestLegacyMigrationExecuteContinuesAfterOneMove proves Execute is driven
+// by the persisted intent and reconstructible source/destination facts. A
+// crash after one landed move must continue; it must not recompute a fresh
+// preview and reject the now-absent source.
+func TestLegacyMigrationExecuteContinuesAfterOneMove(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.performMigrationMove(ctx, lf.wf, pv.Moves[0]); err != nil {
+		t.Fatalf("land first move: %v", err)
+	}
+	if _, err := a.Execute(ctx, ExecuteLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatalf("resume execute: %v", err)
+	}
+	if got := lf.fx.status(lf.wf); got.WorkspacePath != filepath.Join(lf.aggRoot, "workspace") {
+		t.Fatalf("workspace path = %q", got.WorkspacePath)
+	}
+}
+
+// TestLegacyMigrationExecuteContinuesAfterEveryMove exercises every
+// per-step crash boundary of the persisted manifest. The source/destination
+// and Git registry facts uniquely reconstruct progress without overwrite.
+func TestLegacyMigrationExecuteContinuesAfterEveryMove(t *testing.T) {
+	seed := newLegacyMigrationFixture(t)
+	view, err := seed.app().Query(context.Background(), LayoutMigrationPreviewQuery{Workflow: seed.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moveCount := len(view.(MigrationPreviewView).Moves)
+	for completed := 1; completed <= moveCount; completed++ {
+		t.Run(fmt.Sprintf("after-move-%d", completed), func(t *testing.T) {
+			lf := newLegacyMigrationFixture(t)
+			ctx := context.Background()
+			a := lf.app()
+			qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pv := qv.(MigrationPreviewView)
+			if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < completed; i++ {
+				if err := a.performMigrationMove(ctx, lf.wf, pv.Moves[i]); err != nil {
+					t.Fatalf("land move %d: %v", i, err)
+				}
+			}
+			if _, err := a.Execute(ctx, ExecuteLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+				t.Fatalf("continue after %d moves: %v", completed, err)
+			}
+			if got := lf.fx.status(lf.wf); got.LayoutVersion != 2 {
+				t.Fatalf("layout version = %d", got.LayoutVersion)
+			}
+		})
+	}
+}
+
+// TestLegacyMigrationExecuteRecognizesDBCommitCrash exercises the final
+// crash window: every move and the authoritative Layout 2 facts committed,
+// but the migration/effect status marker did not. Execute only settles the
+// matching markers and reports completion.
+func TestLegacyMigrationExecuteRecognizesDBCommitCrash(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatal(err)
+	}
+	for i, move := range pv.Moves {
+		if err := a.performMigrationMove(ctx, lf.wf, move); err != nil {
+			t.Fatalf("move %d: %v", i, err)
+		}
+	}
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`UPDATE workflows SET layout_version = 2, workspace_path = ?, workspace_branch = ?,
+		candidate_workspace_head = integration_head, verified_workspace_head = integration_head WHERE id = ?`,
+		filepath.Join(lf.aggRoot, "workspace"), "cflow/"+string(lf.wf)+"/integration", string(lf.wf))
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Execute(ctx, ExecuteLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatalf("recognize db commit: %v", err)
+	}
+	db, err = openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var migrationStatus, effectStatus string
+	if err := db.QueryRow(`SELECT status FROM layout_migrations WHERE workflow_id = ?`, string(lf.wf)).Scan(&migrationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM effects WHERE workflow_id = ? AND kind = 'layout-migration'`, string(lf.wf)).Scan(&effectStatus); err != nil {
+		t.Fatal(err)
+	}
+	if migrationStatus != "COMPLETED" || effectStatus != "RESULTED" {
+		t.Fatalf("statuses = migration:%s effect:%s", migrationStatus, effectStatus)
+	}
+}
 
 // legacyMigrationFixture builds one Layout Version 1 workflow over the
 // real repository with its legacy roots.
@@ -210,6 +392,27 @@ func TestLegacyMigrationPrepareRejectsStaleManifest(t *testing.T) {
 	}
 	if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
 		t.Fatalf("stale manifest fault = %v", err)
+	}
+}
+
+// TestLegacyMigrationRejectsPathsOutsideManagedRoots proves a persisted
+// move cannot escape the exact legacy source roots or aggregated
+// destination root, even if both paths otherwise exist.
+func TestLegacyMigrationRejectsPathsOutsideManagedRoots(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	outside := filepath.Join(t.TempDir(), "foreign.txt")
+	if err := os.WriteFile(outside, []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := lf.app().performMigrationMove(context.Background(), lf.wf, model.PathMove{
+		Kind: model.MoveKindArtifact, Source: outside,
+		Destination: filepath.Join(lf.aggRoot, "foreign.txt"),
+	})
+	if err == nil {
+		t.Fatal("migration accepted a source outside its managed legacy roots")
+	}
+	if !pathExists(outside) || pathExists(filepath.Join(lf.aggRoot, "foreign.txt")) {
+		t.Fatal("rejected foreign move changed the filesystem")
 	}
 }
 

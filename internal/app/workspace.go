@@ -102,6 +102,9 @@ func workflowBlocked(st model.State) bool {
 // them). The actions never mutate by themselves.
 func legalActions(st StatusView) []LegalAction {
 	var actions []LegalAction
+	if st.LayoutVersion == 1 {
+		actions = append(actions, LegalAction{Label: "Migrate layout", Hint: "layout-migration"})
+	}
 	switch st.Runtime {
 	case model.RuntimePaused:
 		if st.Stage == model.StageWorkflowGeneration {

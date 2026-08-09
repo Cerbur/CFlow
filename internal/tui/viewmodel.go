@@ -20,13 +20,14 @@ import (
 type Action string
 
 const (
-	ActionNone   Action = ""
-	ActionResume Action = "resume"
-	ActionPause  Action = "pause"
-	ActionCancel Action = "cancel"
-	ActionAdopt  Action = "adopt"
+	ActionNone    Action = ""
+	ActionResume  Action = "resume"
+	ActionPause   Action = "pause"
+	ActionCancel  Action = "cancel"
+	ActionAdopt   Action = "adopt"
 	ActionInspect Action = "inspect"
 	ActionDiscuss Action = "discuss"
+	ActionMigrate Action = "layout-migration"
 )
 
 // WorkflowItem is one workspace row of the workflow column.
@@ -61,8 +62,8 @@ type PlanItem struct {
 
 // WorkspaceModel is the pure renderable workspace model.
 type WorkspaceModel struct {
-	Project  app.ProjectView
-	Selected WorkflowItem
+	Project   app.ProjectView
+	Selected  WorkflowItem
 	Workflows []WorkflowItem
 	Lifecycle *LifecycleItem
 	Health    app.HealthView
@@ -75,7 +76,7 @@ type WorkspaceModel struct {
 // permits.
 func MapWorkspace(v app.WorkspaceView) WorkspaceModel {
 	m := WorkspaceModel{
-		Project:  v.Project,
+		Project:   v.Project,
 		Workflows: make([]WorkflowItem, 0, len(v.Workflows)),
 	}
 	selected := v.Selected
@@ -152,6 +153,9 @@ func legalActionsOf(actions []app.LegalAction) []Action {
 		}
 		if a.Hint == "blocked" {
 			set[ActionInspect] = true
+		}
+		if a.Hint == "layout-migration" {
+			set[ActionMigrate] = true
 		}
 	}
 	out := make([]Action, 0, len(set))

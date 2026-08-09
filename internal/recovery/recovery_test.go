@@ -21,6 +21,7 @@ import (
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/recovery"
@@ -961,11 +962,20 @@ func migrationMoves(t *testing.T, fx *recoveryFixture) []model.PathMove {
 	t.Helper()
 	legacyRoot := filepath.Join(fx.home, "worktrees", fx.projectKey, testWF)
 	aggRoot := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+	digestRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(digestRoot, "seed.txt"), []byte("seed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := layout.DigestPath(digestRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return []model.PathMove{
 		{
 			Kind:        model.MoveKindArtifact,
 			Source:      filepath.Join(fx.home, "projects", fx.projectKey, "workflows", testWF, "artifacts"),
 			Destination: filepath.Join(aggRoot, "artifacts"),
+			Digest:      digest,
 		},
 		{
 			Kind: model.MoveKindWorktree, Source: filepath.Join(legacyRoot, "integration"),
@@ -989,15 +999,20 @@ func ensureMigrationArtifactSource(t *testing.T, fx *recoveryFixture) string {
 	return src
 }
 
+func migrationIntent(moves []model.PathMove, done int) model.LayoutMigrationIntent {
+	return model.LayoutMigrationIntent{
+		MigrationID: "migration-wf-1-manifest", Workflow: testWF,
+		ManifestHash: "manifest-test", Moves: moves, Done: done,
+	}
+}
+
 // TestRecoveryMigrationIntentAfterNoMovesIsSafeToRetry: the Intent was
 // persisted but nothing moved yet — every source still present, every
 // destination absent: SafeToRetry (continue from move 0).
 func TestRecoveryMigrationIntentAfterNoMovesIsSafeToRetry(t *testing.T) {
 	fx := newRecoveryFixture(t)
 	ensureMigrationArtifactSource(t, fx)
-	fx.seedIntent(model.LayoutMigrationIntent{
-		Workflow: testWF, Moves: migrationMoves(t, fx), Done: 0,
-	})
+	fx.seedIntent(migrationIntent(migrationMoves(t, fx), 0))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.SafeToRetry)
 }
@@ -1016,7 +1031,7 @@ func TestRecoveryMigrationAfterFirstMoveIsSafeToRetry(t *testing.T) {
 	if err := os.Rename(moves[0].Source, moves[0].Destination); err != nil {
 		t.Fatalf("land first move: %v", err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 1})
+	fx.seedIntent(migrationIntent(moves, 1))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.SafeToRetry)
 }
@@ -1044,7 +1059,7 @@ func TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("move integration worktree: %v", err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 2})
+	fx.seedIntent(migrationIntent(moves, 2))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.AlreadyCompleted)
 }
@@ -1054,9 +1069,22 @@ func TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted(t *testing.T) {
 // intent is never re-run.
 func TestRecoveryMigrationAfterDBAdvanceIsAlreadyCompleted(t *testing.T) {
 	fx := newRecoveryFixture(t)
-	fx.seedIntent(model.LayoutMigrationIntent{
-		Workflow: testWF, Moves: migrationMoves(t, fx), Done: 0,
-	})
+	moves := migrationMoves(t, fx)
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.MkdirAll(filepath.Dir(moves[0].Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moves[0].Source, moves[0].Destination); err != nil {
+		t.Fatal(err)
+	}
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.repo.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Execute(context.Background(), gitflow.MoveWorktree{From: moves[1].Source, To: moves[1].Destination}); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(migrationIntent(moves, len(moves)))
 	// Advance the persisted Layout facts to Version 2.
 	st, err := store.Open(context.Background(), store.OpenOptions{
 		Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now,
@@ -1099,7 +1127,7 @@ func TestRecoveryMigrationBothPathsPresentIsBlockedDrift(t *testing.T) {
 	if err := os.MkdirAll(moves[0].Destination, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 0})
+	fx.seedIntent(migrationIntent(moves, 0))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.BlockedDrift)
 }
@@ -1114,7 +1142,51 @@ func TestRecoveryMigrationNeitherPathPresentIsBlockedDrift(t *testing.T) {
 	if err := os.RemoveAll(moves[0].Source); err != nil {
 		t.Fatal(err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 0})
+	fx.seedIntent(migrationIntent(moves, 0))
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryMigrationWorktreeIdentityDriftIsBlocked proves path
+// existence alone is not recovery evidence: the Git registry entry must
+// match the immutable branch/head in the persisted intent.
+func TestRecoveryMigrationWorktreeIdentityDriftIsBlocked(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	move := migrationMoves(t, fx)[1]
+	move.Head = "0000000000000000000000000000000000000001"
+	fx.seedIntent(model.LayoutMigrationIntent{
+		MigrationID: "migration-wf-test", Workflow: testWF,
+		ManifestHash: "manifest-test", Moves: []model.PathMove{move},
+	})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryMigrationArtifactIdentityDriftIsBlocked proves a landed
+// destination is not accepted merely because a path exists: its content
+// digest must still match the immutable intent.
+func TestRecoveryMigrationArtifactIdentityDriftIsBlocked(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	move := migrationMoves(t, fx)[0]
+	ensureMigrationArtifactSource(t, fx)
+	digest, err := layout.DigestPath(move.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	move.Digest = digest
+	if err := os.MkdirAll(filepath.Dir(move.Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(move.Source, move.Destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(move.Destination, "seed.txt"), []byte("drift\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(model.LayoutMigrationIntent{
+		MigrationID: "migration-wf-test", Workflow: testWF,
+		ManifestHash: "manifest-test", Moves: []model.PathMove{move},
+	})
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.BlockedDrift)
 }

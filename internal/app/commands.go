@@ -249,6 +249,7 @@ type StatusView struct {
 	Workflow          model.WorkflowID
 	Stage             model.WorkflowStage
 	Runtime           model.RuntimeStatus
+	LayoutVersion     int
 	TargetBranch      string
 	BaseCommit        string
 	IntegrationBranch string
@@ -321,6 +322,8 @@ type MigrationPreviewView struct {
 	To           int
 	Moves        []model.PathMove
 	ManifestHash string
+	MigrationID  string
+	Status       string
 }
 
 // DiscussionReturnView is the native discussion Return Page projection

@@ -87,6 +87,7 @@ const (
 	PageCreate
 	PageCancel
 	PagePauseExit
+	PageMigration
 )
 
 // navPages is the lifecycle navigation order (left/right on the
@@ -119,13 +120,15 @@ type Model struct {
 	// to the first healthy provider).
 	provider string
 
-	discussion DiscussionPage
-	plan       app.PlanView
-	preview    app.ExecutionPreviewView
-	approval   ApprovalModel
-	execution  ExecutionModel
-	terminal   TerminalModel
-	cancel     app.CancelSummaryView
+	discussion       DiscussionPage
+	plan             app.PlanView
+	preview          app.ExecutionPreviewView
+	approval         ApprovalModel
+	execution        ExecutionModel
+	terminal         TerminalModel
+	cancel           app.CancelSummaryView
+	migration        app.MigrationPreviewView
+	migrationConfirm migrationConfirmation
 
 	// pendingDecision is the Runtime's reason the Foreground Runner
 	// stopped at (design §11.2): the Execution page surfaces the
@@ -157,6 +160,14 @@ type Model struct {
 	// resume committed.
 	resumeThenRun bool
 }
+
+type migrationConfirmation uint8
+
+const (
+	migrationConfirmNone migrationConfirmation = iota
+	migrationConfirmPrepare
+	migrationConfirmExecute
+)
 
 // stopState is the two-phase stop state of an active Runner.
 type stopState int
@@ -378,6 +389,10 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 		if v, ok := msg.view.(app.CancelSummaryView); ok {
 			m.cancel = v
 		}
+	case PageMigration:
+		if v, ok := msg.view.(app.MigrationPreviewView); ok {
+			m.migration = v
+		}
 	}
 	return m, nil
 }
@@ -405,6 +420,10 @@ func (m Model) reloadCmd() tea.Cmd {
 	case PageCancel:
 		cmds = append(cmds, func() tea.Msg {
 			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
+		})
+	case PageMigration:
+		cmds = append(cmds, func() tea.Msg {
+			return m.queryProjectionMsg(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
 		})
 	}
 	return tea.Batch(cmds...)
@@ -524,6 +543,15 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.terminal.Confirmed = false
 		m.terminal.Yes = false
 		return m, m.reloadCmd()
+	case app.PrepareLayoutMigrationCommand:
+		m.migrationConfirm = migrationConfirmNone
+		m.status = "layout migration prepared; immutable intent persisted"
+		return m, m.reloadCmd()
+	case app.ExecuteLayoutMigrationCommand:
+		m.migrationConfirm = migrationConfirmNone
+		m.status = "legacy layout migrated"
+		m.page = PageWorkspace
+		return m, m.reloadCmd()
 	}
 	return m, m.reloadCmd()
 }
@@ -613,6 +641,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleCreateKey(msg)
 	case PageCancel:
 		return m.handleCancelKey(msg)
+	case PageMigration:
+		return m.handleMigrationKey(msg)
 	case PageWorkspace:
 		return m.handleWorkspaceKey(msg)
 	case PageDiscussion:
@@ -773,6 +803,58 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, func() tea.Msg {
 			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 		}
+	case msg.Code == 'm' || msg.Code == 'M':
+		if m.selected == "" || !hasAction(m.workspace.Actions, ActionMigrate) {
+			m.status = "layout migration is not a legal action"
+			return m, nil
+		}
+		m.page = PageMigration
+		m.migration = app.MigrationPreviewView{}
+		m.migrationConfirm = migrationConfirmNone
+		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
+	}
+	return m, nil
+}
+
+func hasAction(actions []Action, want Action) bool {
+	for _, action := range actions {
+		if action == want {
+			return true
+		}
+	}
+	return false
+}
+
+// handleMigrationKey owns the explicit TUI Preview -> Prepare -> Execute
+// protocol. Enter and n are No at both confirmations; only y executes a
+// typed Application command bound to the displayed manifest hash.
+func (m Model) handleMigrationKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
+	if m.migrationConfirm != migrationConfirmNone {
+		switch {
+		case msg.Code == 'y' || msg.Code == 'Y':
+			confirm := m.migrationConfirm
+			m.migrationConfirm = migrationConfirmNone
+			if confirm == migrationConfirmPrepare {
+				return m, m.executeCmd(app.PrepareLayoutMigrationCommand{Workflow: m.selected, ManifestHash: m.migration.ManifestHash})
+			}
+			return m, m.executeCmd(app.ExecuteLayoutMigrationCommand{Workflow: m.selected, ManifestHash: m.migration.ManifestHash})
+		case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
+			m.migrationConfirm = migrationConfirmNone
+			m.status = "layout migration confirmation declined"
+			return m, nil
+		}
+		return m, nil
+	}
+	switch {
+	case msg.Code == 'p' || msg.Code == 'P':
+		m.migrationConfirm = migrationConfirmPrepare
+		return m, nil
+	case msg.Code == 'e' || msg.Code == 'E':
+		m.migrationConfirm = migrationConfirmExecute
+		return m, nil
+	case msg.Code == tea.KeyEsc:
+		m.page = PageWorkspace
+		return m, nil
 	}
 	return m, nil
 }
@@ -1353,6 +1435,9 @@ func render(m Model) string {
 		b.WriteString(hints(m.page))
 	case PagePauseExit:
 		b.WriteString(RenderPauseExit())
+	case PageMigration:
+		b.WriteString(renderMigration(m))
+		b.WriteString(hints(m.page))
 	}
 	if m.status != "" {
 		fmt.Fprintf(&b, "\nstatus: %s\n", m.status)
@@ -1364,7 +1449,7 @@ func render(m Model) string {
 func hints(p Page) string {
 	switch p {
 	case PageWorkspace:
-		return "\n↑/↓ select workflow  ←/→ lifecycle  n create  r resume  p pause  x cancel  q quit\n"
+		return "\n↑/↓ select workflow  ←/→ lifecycle  n create  r resume  p pause  m migrate  x cancel  q quit\n"
 	case PageDiscussion:
 		return "\n↑/↓ action  Enter run  b workspace\n"
 	case PagePlanApproval:
@@ -1383,8 +1468,26 @@ func hints(p Page) string {
 		return "\nEnter/y cancel (default no), n/esc back\n"
 	case PagePauseExit:
 		return ""
+	case PageMigration:
+		return "\np prepare  e execute  y confirm  Enter/n default no  Esc back\n"
 	}
 	return ""
+}
+
+func renderMigration(m Model) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "legacy layout migration %s\n", m.migration.Workflow)
+	fmt.Fprintf(&b, "layout: %d -> %d\nmanifest: %s\n", m.migration.From, m.migration.To, m.migration.ManifestHash)
+	for i, move := range m.migration.Moves {
+		fmt.Fprintf(&b, "%d. %s\n   %s\n   -> %s\n", i+1, move.Kind, move.Source, move.Destination)
+	}
+	switch m.migrationConfirm {
+	case migrationConfirmPrepare:
+		b.WriteString("\nPersist immutable manifest and recoverable intent? [y/N]\n")
+	case migrationConfirmExecute:
+		b.WriteString("\nExecute the exact persisted migration intent? [y/N]\n")
+	}
+	return b.String()
 }
 
 func renderCreate(m Model) string {

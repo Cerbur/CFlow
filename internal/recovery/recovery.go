@@ -38,6 +38,7 @@ import (
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/security"
@@ -436,20 +437,55 @@ func (e *RecoveryEngine) classifyWorkspaceRollback(ctx context.Context, wf model
 // user must act on (BlockedDrift); an unusable manifest is a Fatal
 // Invariant.
 func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.LayoutMigrationIntent) (IntentDisposition, error) {
-	if state.Workflow.LayoutVersion == 2 {
-		return base.with(AlreadyCompleted, "the workflow layout already advanced to version 2"), nil
-	}
-	if state.Workflow.LayoutVersion != 1 {
+	dbAdvanced := state.Workflow.LayoutVersion == 2
+	if state.Workflow.LayoutVersion != 1 && !dbAdvanced {
 		return base.with(FatalInvariant, "the workflow carries an unsupported layout version"), nil
+	}
+	if intent.MigrationID == "" || intent.ManifestHash == "" || intent.Workflow != wf {
+		return base.with(FatalInvariant, "the layout migration intent identity is incomplete or mismatched"), nil
 	}
 	if len(intent.Moves) == 0 {
 		return base.with(FatalInvariant, "the layout migration intent carries no moves"), nil
 	}
+	var worktrees map[string]gitflow.WorktreeEntry
+	if hasMigrationWorktree(intent.Moves) {
+		var err error
+		worktrees, err = e.worktreeEntries(ctx)
+		if err != nil {
+			return base.with(BlockedDrift, "the Git worktree registry is unreadable"), nil
+		}
+	}
 	for i, mv := range intent.Moves {
 		srcPresent := e.pathExists(ctx, mv.Source)
 		dstPresent := e.pathExists(ctx, mv.Destination)
+		if mv.Kind == model.MoveKindArtifact && srcPresent != dstPresent {
+			at := mv.Source
+			if dstPresent {
+				at = mv.Destination
+			}
+			digest, err := layout.DigestPath(at)
+			if err != nil || mv.Digest == "" || digest != mv.Digest {
+				return base.with(BlockedDrift,
+					"layout migration artifact identity drifted for move "+itoa(i)), nil
+			}
+		}
+		if mv.Kind == model.MoveKindWorktree && srcPresent != dstPresent {
+			at := mv.Source
+			if dstPresent {
+				at = mv.Destination
+			}
+			entry, ok := worktrees[filepath.Clean(at)]
+			if !ok || entry.Head != mv.Head || entry.Branch != mv.Branch || (mv.Branch == "" && !entry.Detached) {
+				return base.with(BlockedDrift,
+					"layout migration Git worktree identity drifted for move "+itoa(i)), nil
+			}
+		}
 		switch {
 		case srcPresent && !dstPresent:
+			if dbAdvanced {
+				return base.with(BlockedDrift,
+					"the database advanced but layout migration move "+itoa(i)+" did not land"), nil
+			}
 			// This move has not landed yet: continue from here.
 			return base.with(SafeToRetry, "layout migration move "+itoa(i)+" has not landed yet"), nil
 		case !srcPresent && dstPresent:
@@ -465,6 +501,15 @@ func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.W
 	// Every move landed: the DB Layout facts advance in the next
 	// transaction (AlreadyCompleted for the moves themselves).
 	return base.with(AlreadyCompleted, "every layout migration move landed; the database facts advance next"), nil
+}
+
+func hasMigrationWorktree(moves []model.PathMove) bool {
+	for _, move := range moves {
+		if move.Kind == model.MoveKindWorktree {
+			return true
+		}
+	}
+	return false
 }
 
 // pathExists reports whether one path exists (stat, ignoring errors).

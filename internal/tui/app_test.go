@@ -26,6 +26,71 @@ type recordingController struct {
 	escalated int
 }
 
+type migrationController struct{ executed []app.Command }
+
+func (m *migrationController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	m.executed = append(m.executed, cmd)
+	return app.Outcome{Workflow: "wf-legacy"}, nil
+}
+func (m *migrationController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Selected: "wf-legacy", Workflows: []app.WorkflowSummary{{ID: "wf-legacy", Runtime: model.RuntimePaused}},
+			Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-legacy", LayoutVersion: 1}},
+			LegalActions: []app.LegalAction{{Label: "Migrate layout", Hint: "layout-migration"}},
+		}, nil
+	case app.LayoutMigrationPreviewQuery:
+		return app.MigrationPreviewView{Workflow: "wf-legacy", From: 1, To: 2,
+			ManifestHash: "manifest-1", Moves: []model.PathMove{{Kind: model.MoveKindArtifact, Source: "/old", Destination: "/new"}}}, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+func (*migrationController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*migrationController) EscalateStop() {}
+
+// TestModelMigrationEntryPointsDefaultNo drives the TUI's explicit
+// Preview/Prepare/Execute surface. Enter at either confirmation is No;
+// only an explicit y sends the typed mutation command.
+func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
+	ctrl := &migrationController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = press(t, m, 'm', 0) // read-only Preview
+	if !strings.Contains(render(m), "manifest-1") {
+		t.Fatalf("migration preview page not opened:\n%s", render(m))
+	}
+	m = press(t, m, 'p', 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("Enter confirmed Prepare: %v", ctrl.executed)
+	}
+	m = press(t, m, 'p', 0)
+	m = press(t, m, 'y', 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("explicit y did not Prepare: %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.PrepareLayoutMigrationCommand); !ok {
+		t.Fatalf("Prepare command type = %T", ctrl.executed[0])
+	}
+	m = press(t, m, 'e', 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("Enter confirmed Execute: %v", ctrl.executed)
+	}
+	m = press(t, m, 'e', 0)
+	m = press(t, m, 'y', 0)
+	if len(ctrl.executed) != 2 {
+		t.Fatalf("explicit y did not Execute: %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[1].(app.ExecuteLayoutMigrationCommand); !ok {
+		t.Fatalf("Execute command type = %T", ctrl.executed[1])
+	}
+}
+
 func (r *recordingController) Execute(ctx context.Context, cmd app.Command) (app.Outcome, error) {
 	r.executed = append(r.executed, cmd)
 	return r.ctrl.Execute(ctx, cmd)

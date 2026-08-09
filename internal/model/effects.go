@@ -155,10 +155,10 @@ func (IntegrationRollbackIntent) isEffectIntent() {}
 // verified Workspace Head at scheduling time; merges are serial --no-ff
 // and never auto-rebase or rewrite Task history.
 type WorkspaceMergeIntent struct {
-	Node                NodeID
+	Node                  NodeID
 	ExpectedWorkspaceHead string
-	TaskBranch          string
-	VerifiedCommit      string
+	TaskBranch            string
+	VerifiedCommit        string
 }
 
 func (WorkspaceMergeIntent) isEffectIntent() {}
@@ -195,6 +195,7 @@ type PathMove struct {
 	Destination string       `json:"destination"`
 	Branch      string       `json:"branch,omitempty"`
 	Head        string       `json:"head,omitempty"`
+	Digest      string       `json:"digest,omitempty"`
 }
 
 // LayoutMigrationIntent performs the explicit Legacy Layout Migration of
@@ -206,9 +207,14 @@ type PathMove struct {
 // derived and Prepare bound by manifest hash; Done counts the moves
 // already completed (recovery continues from the actual state).
 type LayoutMigrationIntent struct {
-	Workflow WorkflowID
-	Moves    []PathMove
-	Done     int
+	MigrationID  string     `json:"migration_id"`
+	Workflow     WorkflowID `json:"workflow"`
+	ManifestHash string     `json:"manifest_hash"`
+	Moves        []PathMove `json:"moves"`
+	// Done is retained for forward/backward codec compatibility. Recovery
+	// does not trust it: source/destination and Git registry facts are the
+	// authoritative per-step progress.
+	Done int `json:"done,omitempty"`
 }
 
 func (LayoutMigrationIntent) isEffectIntent() {}

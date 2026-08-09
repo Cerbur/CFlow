@@ -180,7 +180,8 @@ func workflowSummary(st model.State) WorkflowSummary {
 func statusView(st model.State) StatusView {
 	v := StatusView{
 		Workflow: st.Workflow.ID, Stage: st.Workflow.Stage, Runtime: st.Workflow.Runtime,
-		TargetBranch: st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
+		LayoutVersion: st.Workflow.LayoutVersion,
+		TargetBranch:  st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
 		IntegrationBranch:         st.Workflow.IntegrationBranch,
 		IntegrationHead:           st.Workflow.IntegrationHead,
 		WorkspacePath:             st.Workflow.WorkspacePath,

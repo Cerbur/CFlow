@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
 	"cflow.local/cflow/internal/process"
+	"cflow.local/cflow/internal/security"
 )
 
 // projectCommands builds the stateful command surface.
@@ -666,7 +668,86 @@ func projectCommands(deps Dependencies) []*cobra.Command {
 	applyCmd := findCommand(cmds, "apply")
 	applyCmd.Flags().Bool("execute", false, "the explicit delivery: the compare-and-swap fast-forward of the target branch")
 	applyCmd.Flags().Bool("confirm", false, "the explicit commit-policy / apply-catalog confirmation of a blocked apply attempt")
+	cmds = append(cmds, newLayoutMigrationCmd(deps))
 	return cmds
+}
+
+// newLayoutMigrationCmd exposes the explicit Preview -> Prepare -> Execute
+// protocol to headless users. Prepare and Execute render the exact
+// manifest and require a default-negative confirmation.
+func newLayoutMigrationCmd(deps Dependencies) *cobra.Command {
+	root := &cobra.Command{Use: "layout-migration", Short: "explicitly migrate a legacy workflow layout"}
+	root.AddCommand(&cobra.Command{
+		Use: "preview [workflow-id]", Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := commandContext(cmd, nil)
+			defer stop()
+			a, err := openApplication(ctx, deps)
+			if err != nil {
+				return err
+			}
+			view, err := a.Query(ctx, app.LayoutMigrationPreviewQuery{Workflow: workflowArg(args)})
+			if err != nil {
+				return err
+			}
+			renderMigrationPreview(cmd.OutOrStdout(), view.(app.MigrationPreviewView), deps.Redaction)
+			return nil
+		},
+	})
+	root.AddCommand(layoutMigrationMutationCmd(deps, "prepare"))
+	root.AddCommand(layoutMigrationMutationCmd(deps, "execute"))
+	return root
+}
+
+func layoutMigrationMutationCmd(deps Dependencies, step string) *cobra.Command {
+	return &cobra.Command{
+		Use: step + " [workflow-id]", Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := commandContext(cmd, nil)
+			defer stop()
+			a, err := openApplication(ctx, deps)
+			if err != nil {
+				return err
+			}
+			wf := workflowArg(args)
+			view, err := a.Query(ctx, app.LayoutMigrationPreviewQuery{Workflow: wf})
+			if err != nil {
+				return err
+			}
+			preview := view.(app.MigrationPreviewView)
+			renderMigrationPreview(cmd.OutOrStdout(), preview, deps.Redaction)
+			fmt.Fprintf(cmd.OutOrStdout(), "%s layout migration %s? [y/N] ", step, preview.ManifestHash)
+			line, err := readLine(cmd)
+			if err != nil {
+				return err
+			}
+			if !strings.EqualFold(strings.TrimSpace(line), "y") {
+				return model.InvalidInputFault("layout migration " + step + " aborted")
+			}
+			var out app.Outcome
+			if step == "prepare" {
+				out, err = a.Execute(ctx, app.PrepareLayoutMigrationCommand{Workflow: wf, ManifestHash: preview.ManifestHash})
+			} else {
+				out, err = a.Execute(ctx, app.ExecuteLayoutMigrationCommand{Workflow: wf, ManifestHash: preview.ManifestHash})
+			}
+			if err != nil {
+				return err
+			}
+			renderOutcome(cmd.OutOrStdout(), app.ExecuteLayoutMigrationCommand{}, out, deps.Redaction)
+			return nil
+		},
+	}
+}
+
+func renderMigrationPreview(w io.Writer, v app.MigrationPreviewView, red security.Registry) {
+	r := newRenderer(red)
+	fmt.Fprintf(w, "workflow: %s\n", v.Workflow)
+	fmt.Fprintf(w, "layout: %d -> %d\n", v.From, v.To)
+	fmt.Fprintf(w, "manifest: %s\n", v.ManifestHash)
+	for i, move := range v.Moves {
+		fmt.Fprintf(w, "move %d: %s %s -> %s\n", i+1, move.Kind,
+			r.text(move.Source), r.text(move.Destination))
+	}
 }
 
 // executeExecutionDryRun runs the Execution Dry Run command and renders

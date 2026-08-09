@@ -210,6 +210,23 @@ func TestStatusUnknownWorkflowExits2(t *testing.T) {
 	requireExit(t, out, code, 2)
 }
 
+// TestLayoutMigrationHeadlessEntryPoints keeps Preview, Prepare, and
+// Execute available as explicit headless routes; none may be hidden behind
+// an automatic migration during another command.
+func TestLayoutMigrationHeadlessEntryPoints(t *testing.T) {
+	root := cli.NewRoot(cli.Dependencies{})
+	for _, args := range [][]string{
+		{"layout-migration", "preview"},
+		{"layout-migration", "prepare"},
+		{"layout-migration", "execute"},
+	} {
+		cmd, remaining, err := root.Find(args)
+		if err != nil || len(remaining) != 0 || cmd == root {
+			t.Fatalf("route %v missing: cmd=%v remaining=%v err=%v", args, cmd, remaining, err)
+		}
+	}
+}
+
 // TestLogsRenderAuthoritativeEvents: logs renders the redacted Event
 // sequence with stable Codes and sequence numbers.
 func TestLogsRenderAuthoritativeEvents(t *testing.T) {
