@@ -538,10 +538,13 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 			supersedes = se.Supersedes
 		}
 		if _, err := q.ExecContext(ctx, `INSERT INTO sessions
-			(id, workflow_id, supersedes_session_id, purpose, provider, provider_session_id, status, started_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, workflow_id, supersedes_session_id, purpose, provider, provider_session_id, status,
+			 context_bundle_revision, context_bundle_path, context_bundle_sha256, started_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			se.ID, st.Workflow.ID, supersedes, string(se.Purpose),
-			nullIfEmpty(m.Provider), nullIfEmpty(se.ProviderSessionID), string(se.Status), nowText); err != nil {
+			nullIfEmpty(m.Provider), nullIfEmpty(se.ProviderSessionID), string(se.Status),
+			intOrNil(se.ContextBundleRevision), nullIfEmpty(se.ContextBundlePath), nullIfEmpty(se.ContextBundleSha256),
+			nowText); err != nil {
 			return fmt.Errorf("insert session: %w", err)
 		}
 		return nil

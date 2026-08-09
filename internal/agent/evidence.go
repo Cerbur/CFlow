@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"cflow.local/cflow/internal/model"
@@ -195,7 +196,9 @@ func ensureSensitiveDir(path string) error {
 // existing file — e.g. the managed bootstrap or a prior interactive turn
 // created it — is verified as a safe owner-only regular file and opened
 // for append, so a native Session's evidence accumulates across Runtime
-// instances (design §9, TUI task 12).
+// instances (design §9, TUI task 12). The existing-file open carries
+// O_NOFOLLOW so a symlink swapped in after the guarded CheckPath can never
+// be followed (closing the TOCTOU symlink-follow window).
 func openEventFile(path string) (*os.File, error) {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -210,7 +213,7 @@ func openEventFile(path string) (*os.File, error) {
 	if _, err := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	return os.OpenFile(path, os.O_APPEND|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 }
 
 // appendEvent persists one redacted complete event line for a Session,

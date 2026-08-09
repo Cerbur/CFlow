@@ -521,9 +521,14 @@ func (r *Runtime) Bootstrap(ctx context.Context, req BootstrapRequest) (*Bootstr
 			}
 			// Stop the start run: the interactive terminal continues the
 			// exact Session through the Bridge. The adapter's controlled
-			// stop unregisters the run at its next event boundary.
+			// stop unregisters the run at its next event boundary. A stop
+			// failure fails the bootstrap closed (the Session was already
+			// established; the caller must not proceed as if the start run
+			// is fully stopped).
 			lr.cancel()
-			_ = ad.Cancel(ctx, RunHandle{RunID: cfg.runID, Session: session.session.ID, ProviderSessionID: ev.SessionID})
+			if err := ad.Cancel(ctx, RunHandle{RunID: cfg.runID, Session: session.session.ID, ProviderSessionID: ev.SessionID}); err != nil {
+				return nil, err
+			}
 			break
 		}
 		// A frame before the start event (bounded redacted evidence only;

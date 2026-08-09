@@ -122,7 +122,11 @@ func (a *Application) prepareSwitchAgent(ctx context.Context, c SwitchAgentComma
 	// The immutable redacted Context Bundle of the superseded Session is
 	// created and persisted through the same machinery the automatic
 	// fallback uses (design 14.4); the switch reason rides in the bundle
-	// Decisions so the successor Session's context is durable.
+	// Decisions so the successor Session's context is durable. The created
+	// bundle reference is carried on the Kernel input: the Kernel persists
+	// the reference on the new Session row and the managed bootstrap reads
+	// the bundle content back from the evidence root, so the successor
+	// Provider starts with the prior discussion context (design §9.4).
 	rt, err := a.agentRuntime(ctx, view.State)
 	if err != nil {
 		return nil, "", err
@@ -130,15 +134,17 @@ func (a *Application) prepareSwitchAgent(ctx context.Context, c SwitchAgentComma
 	if rt != nil {
 		defer rt.Close()
 	}
+	var bundle agent.ContextBundle
 	if rt != nil {
 		ctxIn := a.resumeContext(ctx, wf, s.ID, s.Provider)
 		ctxIn.Decisions = append([]string(nil), "switch-agent: "+c.Reason)
-		if _, err := rt.CreateContextBundle(ctx, agent.ContextBundleRequest{
+		bundle, err = rt.CreateContextBundle(ctx, agent.ContextBundleRequest{
 			SessionID:         s.ID,
 			ProviderSessionID: agent.ProviderSessionID(s.ProviderSessionID),
 			Purpose:           s.Purpose,
 			Context:           ctxIn,
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, "", err
 		}
 	}
@@ -148,6 +154,10 @@ func (a *Application) prepareSwitchAgent(ctx context.Context, c SwitchAgentComma
 		Reason:     c.Reason,
 		Supersedes: c.Session,
 		Process:    model.ProcessID(a.ids(model.IDProcess)),
+		// The bundle reference the Kernel persists with the new Session.
+		ContextBundleRevision: bundle.Revision,
+		ContextBundlePath:     bundle.Path,
+		ContextBundleSha256:   bundle.Hash,
 	}, wf, nil
 }
 
@@ -505,7 +515,11 @@ func (a *Application) resolvePlanGenerationInputs(ctx context.Context, wf model.
 	csRef, cerr := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactChangeSet})
 	hasHandoff := herr == nil && handoffRef.Hash != ""
 	hasChangeSet := cerr == nil && csRef.Hash != ""
-	if a.hasNativeDiscussion(ctx, wf) {
+	native, err := a.hasNativeDiscussion(ctx, wf)
+	if err != nil {
+		return model.ArtifactRef{}, model.ArtifactRef{}, err
+	}
+	if native {
 		if !hasHandoff || !hasChangeSet {
 			return model.ArtifactRef{}, model.ArtifactRef{}, model.NewFault(model.CodeApprovalInputChanged,
 				"plan generation requires both the discussion handoff and the frozen change set")
@@ -528,19 +542,21 @@ func (a *Application) resolvePlanGenerationInputs(ctx context.Context, wf model.
 
 // hasNativeDiscussion reports whether the workflow carries an in-progress
 // native discussion: a planning Session that is still resumable
-// (non-terminal) with a bound Provider Session identity.
-func (a *Application) hasNativeDiscussion(ctx context.Context, wf model.WorkflowID) bool {
+// (non-terminal) with a bound Provider Session identity. The aggregate read
+// failure is propagated — an unreadable aggregate must fail closed, never
+// silently classify the workflow as legacy headless.
+func (a *Application) hasNativeDiscussion(ctx context.Context, wf model.WorkflowID) (bool, error) {
 	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
 	if err != nil {
-		return false
+		return false, err
 	}
 	for i := range view.State.Sessions {
 		s := view.State.Sessions[i]
 		if s.Purpose == model.PurposePlanning && s.ProviderSessionID != "" && !s.Status.IsTerminal() {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // findSessionState returns one Session of the aggregate.

@@ -916,6 +916,95 @@ func TestPlanGenerationRequiresHandoffAndChangeSet(t *testing.T) {
 	}
 }
 
+// TestPlanGenerationRefusedWithoutHandoffForNativeLineage (remediation
+// plan requirement 5, kernel gate): a workflow WITH a native discussion
+// lineage (a bound, resumable interactive Planning Session plus its
+// managed Process record) must NOT generate a Plan from zero refs — the
+// legacy terminal-transcript fallback never applies to a native lineage.
+func TestPlanGenerationRefusedWithoutHandoffForNativeLineage(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-native", Purpose: model.PurposePlanning, Status: model.SessionInteractiveIdle,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	st.Processes = append(st.Processes, model.ProcessRecord{
+		ID: "p-1", Session: "s-native", Purpose: model.PurposePlanning, Status: model.ProcessStatusExited,
+	})
+	if _, err := decision.Decide(st, model.GeneratePlanInput{Provider: "fake", Session: "s-new"}); err == nil {
+		t.Fatal("plan generation without a handoff was accepted for a native discussion lineage")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
+		t.Fatalf("zero-ref native lineage fault = %v, want APPROVAL_INPUT_CHANGED", err)
+	}
+}
+
+// TestPlanGenerationLegacyHeadlessFallbackAllowed (remediation plan
+// requirement 5, kernel gate): a PURE headless workflow (no native lineage)
+// keeps the documented legacy discussion-turn fallback for the headless
+// CLI — zero-ref plan generation is allowed there.
+func TestPlanGenerationLegacyHeadlessFallbackAllowed(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	// Legacy headless discussion sessions carry a provider binding but never
+	// a managed process record; they are terminal (COMPLETED).
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-legacy-1", Purpose: model.PurposePlanning, Status: model.SessionCompleted,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-legacy-2", Purpose: model.PurposePlanning, Status: model.SessionCompleted,
+		Provider: "fake", ProviderSessionID: "ps-2",
+	})
+	if _, err := decision.Decide(st, model.GeneratePlanInput{Provider: "fake", Session: "s-new"}); err != nil {
+		t.Fatalf("pure headless zero-ref plan generation was refused: %v", err)
+	}
+}
+
+// TestNativeDiscussionReturnRejectsForeignProcess (security finding, defense
+// in depth): the return Decision re-validates that the settled managed
+// Process record is bound to the EXACT returned Session — a process of a
+// sibling Session can never settle this turn.
+func TestNativeDiscussionReturnRejectsForeignProcess(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-1", Purpose: model.PurposePlanning, Status: model.SessionActive,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-2", Purpose: model.PurposePlanning, Status: model.SessionActive,
+		Provider: "fake", ProviderSessionID: "ps-2",
+	})
+	st.Processes = append(st.Processes, model.ProcessRecord{
+		ID: "p-2", Session: "s-2", Purpose: model.PurposePlanning, Status: model.ProcessStatusRunning,
+	})
+	_, err := decision.Decide(st, model.NativeDiscussionReturnInput{
+		Session: "s-1", Process: "p-2", ExitCode: 0,
+		Provider: "fake", ProviderSession: "ps-1",
+	})
+	if err == nil {
+		t.Fatal("a return carrying a process bound to another session was accepted")
+	}
+	if code, ok := model.CodeOf(err); !ok || code != model.CodeSessionIndependenceViolation {
+		t.Fatalf("foreign-process return fault = %v, want SESSION_INDEPENDENCE_VIOLATION", err)
+	}
+}
+
+// TestFinishDiscussionRequiresResumableSession (security finding, defense
+// in depth): the Kernel enforces the resumable-status precondition
+// (STARTING/INTERACTIVE_IDLE) so a direct-kernel double-finish cannot write
+// a second handoff from a terminal Session.
+func TestFinishDiscussionRequiresResumableSession(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-1", Purpose: model.PurposePlanning, Status: model.SessionCompleted,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	_, err := decision.Decide(st, model.FinishDiscussionInput{
+		Session: "s-1", Handoff: []byte(`{"targets":"t"}`),
+	})
+	if err == nil {
+		t.Fatal("finish of a non-resumable session was accepted")
+	}
+}
+
 func TestExecutionApprovalAdvancesToExecution(t *testing.T) {
 	state := fixtureAwaitingExecutionApproval("workflow-a")
 	got, err := decision.Decide(state, model.ExecutionApprovalInput{WorkflowHash: "workflow-a",

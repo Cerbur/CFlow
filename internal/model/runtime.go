@@ -384,6 +384,13 @@ type Session struct {
 	Status            SessionStatus
 	Supersedes        SessionID
 	Provider          string
+	// ContextBundleRevision, ContextBundlePath, and ContextBundleSha256 are
+	// the persisted immutable Context Bundle reference of a successor
+	// Session (design §9.4, TUI task 12): the switch's bundle is recorded
+	// with the new Session row, mirroring the sessions table columns.
+	ContextBundleRevision int
+	ContextBundlePath     string
+	ContextBundleSha256   string
 }
 
 // ProcessStatus is the operational status of a managed process record.

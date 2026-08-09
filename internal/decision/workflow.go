@@ -288,6 +288,14 @@ func decideFinishDiscussion(state model.State, in model.FinishDiscussionInput) (
 	if session.Purpose != model.PurposePlanning {
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("the finished session is not a discussion session"))
 	}
+	// Finish is legal only on a resumable interactive Session: a terminal
+	// Session (COMPLETED/FAILED/CANCELLED/LOST) must never be finished again
+	// — a direct-kernel double-finish would write a second Handoff from an
+	// immutable outcome (defense in depth; the Application gates too).
+	if session.Status != model.SessionStarting && session.Status != model.SessionInteractiveIdle {
+		return model.Decision{}, model.InvalidInputFault(
+			"finishing requires a resumable discussion session; the session is " + string(session.Status))
+	}
 	if session.ProviderSessionID == "" {
 		return model.Decision{}, model.NewFault(model.CodeProviderSessionIDMissing,
 			"the discussion session has no bound provider session; finish it after the managed bootstrap")
@@ -348,6 +356,13 @@ func decideNativeDiscussionReturn(state model.State, in model.NativeDiscussionRe
 	}
 	if process.Status != model.ProcessStatusRunning {
 		return model.Decision{}, model.InvalidInputFault("the returned discussion process is not running")
+	}
+	// The settled managed Process must be bound to the EXACT returned
+	// Session: a process of a sibling Session can never settle this turn
+	// (defense in depth; the Application gates too).
+	if process.Session != in.Session {
+		return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"the returned process is not bound to the discussion session")
 	}
 	b := &builder{state: state}
 	b.mutate(model.ProcessEndMutation{
@@ -464,6 +479,14 @@ func decideSwitchAgent(state model.State, in model.SwitchAgentInput) (model.Deci
 		ID: in.Session, Purpose: model.PurposePlanning,
 		Status:     model.SessionStarting,
 		Supersedes: in.Supersedes,
+		// The immutable Context Bundle the superseded Session's switch
+		// created is persisted with the new Session row (design §9.4, TUI
+		// task 12): the successor's managed bootstrap reads the same bundle
+		// content so the successor Provider starts with the prior discussion
+		// context.
+		ContextBundleRevision: in.ContextBundleRevision,
+		ContextBundlePath:     in.ContextBundlePath,
+		ContextBundleSha256:   in.ContextBundleSha256,
 	}, Provider: in.Provider})
 	b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
 		ID: in.Process, Session: in.Session, Purpose: model.PurposePlanning,
@@ -507,12 +530,21 @@ func decideGeneratePlan(state model.State, in model.GeneratePlanInput) (model.De
 	if err := validateFreshSession(state, in.Session); err != nil {
 		return model.Decision{}, err
 	}
-	// Plan generation is gated on the immutable discussion inputs: when the
-	// input claims a native Discussion Handoff or a frozen Change Set, it
-	// must carry BOTH exact Revisions (design §9.4, TUI task 12). Plan
-	// generation never consumes a terminal transcript.
-	if (in.HandoffRef.Hash != "" || in.ChangeSetRef.Hash != "") &&
-		(in.HandoffRef.Hash == "" || in.ChangeSetRef.Hash == "") {
+	// Plan generation is gated on the immutable discussion inputs (design
+	// §9.4, TUI task 12): when the input claims a native Discussion Handoff
+	// or a frozen Change Set, it must carry BOTH exact Revisions, and a
+	// workflow WITH a native discussion lineage never falls back to the
+	// terminal transcript — it requires the Handoff + frozen Change Set even
+	// when the input carries no refs (a cancelled or finished-without-handoff
+	// native discussion is still a native lineage). A pure headless workflow
+	// without a native lineage keeps the documented legacy turn fallback for
+	// the headless CLI (AGENTS.md).
+	if in.HandoffRef.Hash == "" && in.ChangeSetRef.Hash == "" {
+		if hasNativeDiscussionLineage(state) {
+			return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
+				"plan generation requires both the discussion handoff and the frozen change set for a native discussion")
+		}
+	} else if in.HandoffRef.Hash == "" || in.ChangeSetRef.Hash == "" {
 		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
 			"plan generation requires both the discussion handoff and the frozen change set")
 	}
@@ -672,6 +704,44 @@ func providerSessionOf(s *model.Session) string {
 		return ""
 	}
 	return s.ProviderSessionID
+}
+
+// hasNativeDiscussionLineage reports whether the aggregate carries a native
+// interactive discussion lineage (design §9, TUI task 12): a Planning
+// Session that went through the managed bootstrap carries a bound Provider
+// Session id. The plan-generation gate uses the lineage to refuse the legacy
+// discussion-turn fallback: the native path requires the Handoff + frozen
+// Change Set, never a terminal transcript. A resumable interactive Session
+// (STARTING/ACTIVE/INTERACTIVE_IDLE) is native; a terminal Planning Session
+// is native only when it carries a managed Process record (prepare/switch
+// append one) — a COMPLETED native discussion that finished without a
+// Handoff is still a native lineage, while a legacy headless discussion turn
+// (COMPLETED, no managed process) is not.
+func hasNativeDiscussionLineage(state model.State) bool {
+	for i := range state.Sessions {
+		s := &state.Sessions[i]
+		if s.Purpose != model.PurposePlanning || s.ProviderSessionID == "" {
+			continue
+		}
+		if !s.Status.IsTerminal() {
+			return true
+		}
+		if sessionHasManagedProcess(state, s.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionHasManagedProcess reports whether one Session has a managed Process
+// record (the native interactive turn ledger, design 13.3).
+func sessionHasManagedProcess(state model.State, id model.SessionID) bool {
+	for i := range state.Processes {
+		if state.Processes[i].Session == id {
+			return true
+		}
+	}
+	return false
 }
 
 // decideStart starts the first Run: PENDING→RUNNING with an open dispatch

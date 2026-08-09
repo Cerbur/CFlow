@@ -150,6 +150,15 @@ type SwitchAgentInput struct {
 	Supersedes SessionID
 	// Process is the managed Process identity of the new Session's chain.
 	Process ProcessID
+	// ContextBundleRevision, ContextBundlePath, and ContextBundleSha256 are
+	// the immutable redacted Context Bundle the superseded Session's switch
+	// created (design §9.4, TUI task 12): the reference is persisted on the
+	// new Session row and the bundle content rides the successor's managed
+	// bootstrap input, so the successor Provider starts with the prior
+	// discussion context.
+	ContextBundleRevision int
+	ContextBundlePath     string
+	ContextBundleSha256   string
 }
 
 func (SwitchAgentInput) isInput() {}

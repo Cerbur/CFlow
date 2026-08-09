@@ -97,7 +97,9 @@ const queryFindings = `
 
 const querySessions = `
 	SELECT id, COALESCE(supersedes_session_id, ''), purpose,
-	       COALESCE(provider, ''), COALESCE(provider_session_id, ''), status
+	       COALESCE(provider, ''), COALESCE(provider_session_id, ''), status,
+	       COALESCE(context_bundle_revision, 0), COALESCE(context_bundle_path, ''),
+	       COALESCE(context_bundle_sha256, '')
 	FROM sessions WHERE workflow_id = ? ORDER BY id`
 
 const queryProcesses = `
@@ -428,7 +430,8 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 	// Sessions.
 	if err := forEachRow(ctx, q, querySessions, []any{workflow}, func(row rowScanner) error {
 		var se model.Session
-		if err := row.Scan(&se.ID, &se.Supersedes, &se.Purpose, &se.Provider, &se.ProviderSessionID, &se.Status); err != nil {
+		if err := row.Scan(&se.ID, &se.Supersedes, &se.Purpose, &se.Provider, &se.ProviderSessionID, &se.Status,
+			&se.ContextBundleRevision, &se.ContextBundlePath, &se.ContextBundleSha256); err != nil {
 			return fmt.Errorf("scan session: %w", err)
 		}
 		st.Sessions = append(st.Sessions, se)

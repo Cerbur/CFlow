@@ -486,8 +486,15 @@ func routedPurposeOf(purpose model.AgentPurpose) bool {
 // contextBundleRefOf extracts the immutable Context Bundle handoff
 // reference of a Session start input ("" when the input carries none).
 func contextBundleRefOf(base any) string {
-	if c, ok := base.(*codingSessionInput); ok && c.ContextBundle != nil {
-		return c.ContextBundle.Path
+	switch c := base.(type) {
+	case *codingSessionInput:
+		if c.ContextBundle != nil {
+			return c.ContextBundle.Path
+		}
+	case *nativeBootstrapInput:
+		if c.ContextBundle != nil {
+			return c.ContextBundle.Path
+		}
 	}
 	return ""
 }

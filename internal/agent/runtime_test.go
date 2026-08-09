@@ -789,3 +789,55 @@ func waitSessionActive(t *testing.T, rt *agent.Runtime, providerSessionID string
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// bootstrapFixture is a planning bootstrap stream whose session_started
+// establishes the Provider's own session id.
+func bootstrapFixture(sessionID string) string {
+	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":%q,"exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":%q,"at_ms":0}
+{"type":"assistant_message","text":"bootstrap","at_ms":10}
+{"type":"session_finished","result":{},"at_ms":20}`, sessionID, sessionID)
+}
+
+// failingCancelAdapter wraps one Adapter and returns a fixed error from
+// Cancel, so a test can assert the Runtime propagates the controlled-stop
+// failure instead of swallowing it.
+type failingCancelAdapter struct {
+	agent.Adapter
+	cancelErr error
+}
+
+func (a *failingCancelAdapter) Cancel(ctx context.Context, handle agent.RunHandle) error {
+	if a.cancelErr != nil {
+		return a.cancelErr
+	}
+	return a.Adapter.Cancel(ctx, handle)
+}
+
+// TestBootstrapPropagatesControlledStopError (fail-closed security finding):
+// Runtime.Bootstrap must return the controlled-stop error instead of
+// swallowing it after the start event.
+func TestBootstrapPropagatesControlledStopError(t *testing.T) {
+	reg, err := agent.LoadProviderRegistry()
+	requireNoError(t, err)
+	inner := fake.New(reg)
+	requireNoError(t, inner.LoadScript([]byte(bootstrapFixture("provider-sess-1"))))
+	ad := &failingCancelAdapter{Adapter: inner, cancelErr: fmt.Errorf("controlled stop failed")}
+	rt, err := agent.NewRuntime(agent.RuntimeOptions{
+		Now:         fixedClock,
+		IDs:         model.SequentialIDSource(),
+		Registry:    reg,
+		Redaction:   testRedactionRegistry(),
+		EvidenceDir: tempRoot(t),
+		Adapters:    map[string]agent.Adapter{"fake": ad},
+	})
+	requireNoError(t, err)
+	defer func() { _ = rt.Close() }()
+	_, err = rt.Bootstrap(context.Background(), agent.BootstrapRequest{
+		Purpose: model.PurposePlanning, Provider: "fake",
+		Prompt: "discuss the requirement", SessionID: "cflow-sess-1",
+	})
+	if err == nil {
+		t.Fatal("bootstrap swallowed the controlled-stop error")
+	}
+}

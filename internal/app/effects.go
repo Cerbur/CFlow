@@ -484,6 +484,18 @@ func (a *Application) nativeBootstrap(ctx context.Context, wf model.WorkflowID, 
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
+	// The switch successor's bootstrap reads the superseded discussion's
+	// immutable Context Bundle (design §9.4, TUI task 12): the bundle content
+	// rides the managed bootstrap input so the successor Provider starts
+	// with the prior discussion context. A missing bundle fails closed.
+	if sw, ok := cmd.(model.SwitchAgentInput); ok && sw.Supersedes != "" {
+		bundle, ok := rt.FallbackBundle(sw.Supersedes)
+		if !ok {
+			return model.EffectResultInput{}, model.NewFault(model.CodeStateInvariantViolation,
+				"the switch successor's context bundle is not readable")
+		}
+		input = attachBundleInput(input, &bundle)
+	}
 	res, err := rt.Bootstrap(ctx, agent.BootstrapRequest{
 		Purpose: intent.Purpose, Provider: intent.Route,
 		Prompt: renderPrompt(prompt.Body, input), Input: input,
@@ -626,14 +638,29 @@ func (a *Application) successorHandoff(rt *agent.Runtime, session model.SessionI
 	return agent.ProviderSessionID(lostProviderSessionID), &b
 }
 
+// nativeBootstrapInput is the structured input of one native discussion
+// Session bootstrap (design §9.1, TUI task 12): for a switch the immutable
+// redacted Context Bundle handoff of the superseded Session rides the input
+// (the native counterpart of codingSessionInput.ContextBundle), so the
+// successor Provider's start reads the prior discussion context. It is never
+// a credential or an unredacted transcript.
+type nativeBootstrapInput struct {
+	Requirement   string               `json:"requirement"`
+	ContextBundle *agent.ContextBundle `json:"context_bundle,omitempty"`
+}
+
 // attachBundleInput attaches the immutable redacted Context Bundle
-// handoff of an automatic fallback to one Session start input (nil
-// bundle leaves the input unchanged).
+// handoff to one Session start input (nil bundle leaves the input
+// unchanged). Both the automatic fallback's coding input and the native
+// discussion bootstrap input carry the bundle.
 func attachBundleInput(input any, bundle *agent.ContextBundle) any {
 	if bundle == nil {
 		return input
 	}
-	if c, ok := input.(*codingSessionInput); ok {
+	switch c := input.(type) {
+	case *codingSessionInput:
+		c.ContextBundle = bundle
+	case *nativeBootstrapInput:
 		c.ContextBundle = bundle
 	}
 	return input
@@ -942,6 +969,14 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 		return struct {
 			Requirement string `json:"requirement"`
 		}{Requirement: in.Text}, nil
+	}
+	if _, ok := cmd.(model.SwitchAgentInput); ok {
+		// The switch successor's native bootstrap input: the immutable
+		// redacted Context Bundle of the superseded discussion is attached by
+		// nativeBootstrap (the bundle content lives in the evidence root and
+		// is read back through the Runtime's FallbackBundle seam), so the
+		// successor Provider starts with the prior discussion context.
+		return &nativeBootstrapInput{}, nil
 	}
 	store, err := a.artifactStore(wf)
 	if err != nil {

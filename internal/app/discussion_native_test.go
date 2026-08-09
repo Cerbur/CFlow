@@ -12,6 +12,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"cflow.local/cflow/internal/agent"
@@ -19,6 +20,22 @@ import (
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 )
+
+// recordingAdapter wraps one Adapter and records the Input of the first
+// Start request, so a test can assert the managed bootstrap input carried
+// the switch successor's Context Bundle content.
+type recordingAdapter struct {
+	agent.Adapter
+	mu    sync.Mutex
+	input any
+}
+
+func (r *recordingAdapter) Start(ctx context.Context, req agent.StartRequest) (agent.Run, error) {
+	r.mu.Lock()
+	r.input = req.Input
+	r.mu.Unlock()
+	return r.Adapter.Start(ctx, req)
+}
 
 // bootstrapScript is a planning fixture whose session_started establishes
 // the Provider's own session id; the managed bootstrap stops the start run
@@ -244,13 +261,18 @@ func TestNativeDiscussionSwitchRequiresDifferentProvider(t *testing.T) {
 
 	// Different provider (a second named fake instance bound to the
 	// registry's codex entry): the switch creates a new Session whose
-	// bootstrap establishes the new Provider's own session id.
+	// bootstrap establishes the new Provider's own session id and reads the
+	// superseded discussion's immutable Context Bundle.
 	reg, err := agent.LoadProviderRegistry()
 	if err != nil {
 		t.Fatal(err)
 	}
 	ad := namedFake(reg, "codex")
-	swA := fx.appWithAdapters(map[string]agent.Adapter{"codex": ad}, bootstrapScriptDialect("cflow.dialect.codex-jsonl.v1", "codex-sess-1"))
+	if err := ad.LoadScript([]byte(bootstrapScriptDialect("cflow.dialect.codex-jsonl.v1", "codex-sess-1"))); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingAdapter{Adapter: ad}
+	swA := fx.appWithAdapters(map[string]agent.Adapter{"codex": rec})
 	swOut, err := swA.Execute(context.Background(), SwitchAgentCommand{
 		Workflow: wf, Session: out.SessionID, Provider: "codex", Reason: "switch to codex for detail",
 	})
@@ -280,6 +302,11 @@ func TestNativeDiscussionSwitchRequiresDifferentProvider(t *testing.T) {
 	if news.Supersedes != out.SessionID || news.Provider != "codex" || news.ProviderSessionID != "codex-sess-1" {
 		t.Fatalf("switched session = %+v", *news)
 	}
+	// The successor session record carries the created Context Bundle
+	// reference (the sessions table context_bundle columns).
+	if news.ContextBundleRevision < 1 || news.ContextBundlePath == "" || news.ContextBundleSha256 == "" {
+		t.Fatalf("the switched session record does not carry the context bundle reference: %+v", *news)
+	}
 	if old == nil {
 		t.Fatal("the superseded session is missing")
 	}
@@ -291,6 +318,48 @@ func TestNativeDiscussionSwitchRequiresDifferentProvider(t *testing.T) {
 	}
 	if !foundReason {
 		t.Fatalf("the switch reason was not persisted as a finding: %+v", iv.Status.Findings)
+	}
+	// The successor managed bootstrap input carries the bundle CONTENT, so
+	// the successor Provider starts with the prior discussion context.
+	rec.mu.Lock()
+	gotInput := rec.input
+	rec.mu.Unlock()
+	if gotInput == nil {
+		t.Fatal("the switch bootstrap carried no managed start input")
+	}
+	nb, ok := gotInput.(*nativeBootstrapInput)
+	if !ok {
+		t.Fatalf("switch bootstrap input type = %T, want *nativeBootstrapInput", gotInput)
+	}
+	if nb.ContextBundle == nil {
+		t.Fatal("the switch bootstrap input did not carry the context bundle")
+	}
+	if nb.ContextBundle.Path != news.ContextBundlePath ||
+		nb.ContextBundle.Revision != news.ContextBundleRevision ||
+		nb.ContextBundle.Hash != news.ContextBundleSha256 {
+		t.Fatalf("bootstrap input bundle = rev %d %s @ %s, want rev %d %s @ %s",
+			nb.ContextBundle.Revision, nb.ContextBundle.Hash, nb.ContextBundle.Path,
+			news.ContextBundleRevision, news.ContextBundleSha256, news.ContextBundlePath)
+	}
+}
+
+// TestHasNativeDiscussionPropagatesReadError (fail-open closure, security
+// finding): hasNativeDiscussion never swallows an aggregate read error — a
+// workflow with an unreadable aggregate must fail closed (plan generation
+// is refused), never silently classified as "no native discussion".
+func TestHasNativeDiscussionPropagatesReadError(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("native-discussion", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, a := fx.prepareNative(t, wf, "provider-sess-1")
+	returnNative(t, a, wf, out.SessionID, 0, "provider-sess-1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.hasNativeDiscussion(ctx, wf); err == nil {
+		t.Fatal("hasNativeDiscussion swallowed the aggregate read error")
 	}
 }
 
