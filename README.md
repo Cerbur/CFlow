@@ -11,20 +11,19 @@ CFlow is not another thin wrapper around `codex` or `claude`. It owns the
 recoverable Plan-to-Done lifecycle and advances state only from persisted
 evidence—not from an agent saying that the work is complete.
 
-> **Project status:** the TUI workflow (Tasks 4–16) is implemented and its
-> deterministic Fake TUI Gate is the current **Internal Candidate**; see the
-> [acceptance report](docs/cflow-demo-acceptance-report.md). On 2026-08-07 the
-> **TUI workflow direction was confirmed** (full-screen Bubble Tea TUI as the
-> default entry, native Codex/Claude requirement discussions, an aggregated
-> Workflow directory, a single long-lived Workspace, a foreground Runner,
-> workspace-aware Apply and explicit Cleanup) — see
-> [the TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md)
-> and [its implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
-> A bare `cflow` on an interactive terminal launches the full-screen TUI; the
-> line-oriented subcommands (`cflow status`, `cflow plan`, …) remain as the
-> headless CLI. The real Codex/Claude Native + Headless E2E and the
-> self-Dogfood are **not yet run** — they require separate explicit user
-> approval on a new exact candidate Commit.
+> **Project status:** the 2026-08-07 TUI direction is confirmed and the
+> runnable root TUI is now wired end to end: it loads the read-only project
+> workspace, navigates the lifecycle pages, drives the native discussion,
+> approvals, foreground Runner, protected Apply, and explicit Cleanup through
+> the shared Application, and implements the controlled-stop protocol. The
+> deterministic Fake TUI Gate (`TestTUIPlanToApplyAndCleanup` through the
+> real root TUI and a Fake terminal) is the current **Internal Candidate**;
+> see the [acceptance report](docs/cflow-demo-acceptance-report.md), the
+> [TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md),
+> and the [implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
+> The real Codex/Claude Native + Headless E2E and the self-Dogfood are
+> **not yet run** — they require separate explicit user approval on a new
+> exact candidate Commit.
 
 ## Why CFlow
 
@@ -36,8 +35,8 @@ evidence—not from an agent saying that the work is complete.
   independent reviews determine progress.
 - **Recoverable execution:** SQLite state, immutable artifacts, Git facts,
   process facts, and evidence are reconciled after interruption or failure.
-- **Isolated parallel work:** independent tasks run in separate Git worktrees
-  and merge serially into a CFlow-owned Integration Branch.
+- **Isolated parallel work:** independent tasks run in temporary Git worktrees
+  and merge serially into the Workflow's single long-lived Workspace branch.
 - **Protected delivery:** completion never changes the user's Target Branch;
   `cflow apply` stages, re-verifies, and compare-and-swap fast-forwards it.
 - **Bounded autonomy:** retries, budgets, provider routes, commands, and
@@ -55,7 +54,7 @@ Requirement discussion
   -> user Execution Approval
   -> isolated Task Worktrees
   -> deterministic verification + independent review
-  -> serial Integration merges
+  -> serial merges into the Workflow Workspace
   -> Final Verification + report
   -> completed Workflow
   -> explicit protected Apply
@@ -77,6 +76,10 @@ state transition.
 | GitFlow | Repository facts, worktrees, commit gates, merge, quarantine, and Apply |
 | Verification Engine | Approved command catalog, deterministic checks, and evidence |
 | Recovery Engine | Reconciliation across database, artifacts, Git, processes, and evidence |
+| TUI | Bubble Tea root Model wired to the shared Application: workspace, lifecycle pages, and explicit confirmations |
+| Foreground Runner | Bounded `DriveOnce` loop that stops at decisions, terminal states, or safe-stop conditions |
+| Native Session Bridge | Supervised interactive resume of provider sessions in the Workflow Workspace |
+| Layout Resolver | Aggregated Workflow paths, explicit legacy migration, and cleanup targets |
 
 All external processes are intended to use executable-plus-argv invocation.
 Dynamic workflows cannot contain arbitrary shell, Python, or TypeScript code.
@@ -105,16 +108,15 @@ Release-style builds additionally stamp the source commit and embedded
 registry hashes. See [`scripts/check-cross-build.sh`](scripts/check-cross-build.sh)
 and the [acceptance report](docs/cflow-demo-acceptance-report.md).
 
-## Current Demo usage
+## Current usage
 
-> The confirmed 2026-08-07 direction replaces this line-oriented entry with a
-> full-screen TUI and native requirement discussions; the TUI is **not yet
-> implemented**. Until the TUI tasks land, the interface remains the line-oriented
-> command-driven Demo below, and bare `cflow` still prints the command tree.
-
-The current interface is line-oriented and command-driven. Bare `cflow`
-prints the command tree; the fully guided interactive lifecycle described in
-the PRD is not yet exposed as one continuous loop.
+On an interactive terminal, bare `cflow` enters the full-screen TUI: it loads
+the project workspace, navigates the lifecycle (discussion, plan and execution
+approvals, execution/runner, blocked decisions, report, apply, cleanup), and
+drives every state change through the shared Application. The line-oriented
+subcommands remain as the headless CLI for scripts and non-TTY environments.
+Without a TTY, bare `cflow` prints a stable diagnostic and does not mutate
+state.
 
 Real providers are currently registered in the post-candidate CLI through
 `CFLOW_PROVIDERS`. Without it, the deterministic Fake Adapter remains the
@@ -141,12 +143,14 @@ Approval commands are interactive and default to “no.” Provider execution ma
 use the network and incur model cost. Review the exact routes, budgets,
 commands, Git identity/signing facts, and permission boundary before approval.
 
-The Demo CLI is still an engineering candidate: several `doctor` stateful
-checks currently report `NOT_YET_AVAILABLE`, and the current post-candidate
-provider wiring has not received refreshed Gate 3 evidence. The confirmed
-2026-08-07 TUI workflow tasks will add the Bubble Tea TUI, native Codex/Claude
-requirement discussions, the Foreground Runner, aggregated Workspaces,
-workspace-aware Apply and explicit Cleanup on top of this runtime.
+Several `doctor` stateful checks still report `NOT_YET_AVAILABLE`. Real
+Codex/Claude Native + Headless E2E and self-Dogfood have not been rerun for
+this branch; they require separate approval on an exact candidate commit.
+
+The aggregated layout, Workspace adoption, native discussion bridge, and
+Foreground Runner exist behind typed Application APIs, but the root TUI does
+not yet make them operable. The current headless discussion path remains the
+line-oriented `discuss` command shown above.
 
 ## Command map
 
@@ -190,6 +194,7 @@ tests:
 ./scripts/gate1.sh <artifact-dir>
 ./scripts/gate2.sh <artifact-dir>
 ./scripts/gate3.sh <artifact-dir>
+./scripts/gate-tui.sh <new-empty-artifact-dir>
 ```
 
 Gate 1 and Gate 2 are internal candidates. Gate 3 can produce a Demo Complete
@@ -199,6 +204,12 @@ the Dogfood flow performs protected Apply.
 
 Historical evidence is evidence for its exact binary and source commit only;
 it does not automatically attest later commits.
+
+The current `TestTUIPlanToApplyAndCleanup` exercises Application methods and
+standalone TUI models directly; it does not launch the root TUI through fake
+terminal input and currently stops before Report, Apply, and Cleanup. Until
+that gap is closed, a passing Fake TUI Gate must not be treated as evidence of
+the complete interactive lifecycle.
 
 ## Documentation
 
