@@ -232,8 +232,18 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	})
 
 	// ---- execution + workspace adoption + foreground runner ----
-	waitOutput("r resume & run")
-	keys("r") // resume & run
+	// The Execution page first renders the stale projection (the dry run
+	// paused the workflow, so Resume is still a legal action) and only after
+	// the post-approval projection reload renders the reloaded signal: the
+	// workflow is now RUNNING, so Resume is no longer a legal action and the
+	// hint drops the resume ("start the runner" instead of "resume & run").
+	// The marker is the diff renderer's changed fragment ("start the
+	// runner") — the hint keeps the common "r " prefix on screen, so the
+	// contiguous "r start the runner" is not guaranteed to be written.
+	// Waiting on the fragment guards the reload — pressing r before it would
+	// hit the stale Resume projection.
+	waitOutput("start the runner")
+	keys("r") // start the runner
 	// The runner stops at the Workspace Adoption Gate (the execution
 	// approval bound the frozen Change Set).
 	waitBuffer("decision panel rendered", func(s string) bool {

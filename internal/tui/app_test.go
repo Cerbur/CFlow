@@ -293,16 +293,22 @@ func TestModelWorkspaceResumeRequiresLegalAction(t *testing.T) {
 }
 
 // executionController is the Execution page seam: the workspace projection
-// and the DriveOnce result the test controls.
+// and the DriveOnce result the test controls. resumeErr, when set, makes
+// the Runtime reject the Resume command (the stale-projection case: the
+// workspace still shows Resume against an already-RUNNING workflow).
 type executionController struct {
 	executed   []app.Command
 	driveCalls int
 	actions    []app.LegalAction
 	runtime    model.RuntimeStatus
+	resumeErr  error
 }
 
 func (c *executionController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
 	c.executed = append(c.executed, cmd)
+	if _, ok := cmd.(app.ResumeWorkflowCommand); ok && c.resumeErr != nil {
+		return app.Outcome{}, c.resumeErr
+	}
 	return app.Outcome{Workflow: "wf-1"}, nil
 }
 func (c *executionController) Query(_ context.Context, q app.Query) (app.View, error) {
@@ -362,12 +368,75 @@ func TestModelExecutionResumeDrivenByLegalActions(t *testing.T) {
 	}
 }
 
+// TestModelExecutionResumeRejectedStartsRunner covers the stale-projection
+// window after an execution approval: the workflow is already RUNNING but
+// the workspace projection still renders Resume as a legal action. Pressing
+// r issues a ResumeWorkflowCommand the Kernel rejects; the rejected resume
+// must clear the pending resume-then-run and fall back to starting the
+// Foreground Runner directly (DriveOnce is a safe bounded step over the
+// already-running workflow).
+func TestModelExecutionResumeRejectedStartsRunner(t *testing.T) {
+	ctrl := &executionController{
+		actions:   []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		runtime:   model.RuntimeRunning,
+		resumeErr: model.InvalidInputFault("resume rejected: workflow is already running"),
+	}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.page = PageExecution
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("execution r executed %v, want exactly the rejected resume", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("execution resume command type = %T", ctrl.executed[0])
+	}
+	if ctrl.driveCalls != 1 {
+		t.Fatalf("the runner was not started after the rejected resume (drive calls = %d)", ctrl.driveCalls)
+	}
+	if m.resumeThenRun {
+		t.Fatal("resumeThenRun was not cleared after the rejected resume")
+	}
+}
+
+// TestModelExecutionHintDrivenByLegalActions pins the reloaded-UI signal of
+// the E2E: the Execution page hint is driven by the Runtime LegalActions.
+// A PAUSED workflow (Resume legal) renders "r resume & run"; once the
+// post-approval projection reloads the RUNNING workflow (no Resume legal)
+// the hint drops the resume and renders "r start the runner".
+func TestModelExecutionHintDrivenByLegalActions(t *testing.T) {
+	paused := &executionController{
+		actions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		runtime: model.RuntimePaused,
+	}
+	m := load(t, testModel(&recordingController{ctrl: paused}))
+	m.page = PageExecution
+	if got := render(m); !strings.Contains(got, "r resume & run") {
+		t.Fatalf("paused execution hint lost the resume:\n%s", got)
+	}
+
+	running := &executionController{
+		actions: []app.LegalAction{{Label: "Pause", Kind: model.PauseWorkflow}},
+		runtime: model.RuntimeRunning,
+	}
+	m2 := load(t, testModel(&recordingController{ctrl: running}))
+	m2.page = PageExecution
+	got := render(m2)
+	if !strings.Contains(got, "r start the runner") {
+		t.Fatalf("running execution hint did not drop the resume:\n%s", got)
+	}
+	if strings.Contains(got, "resume & run") {
+		t.Fatalf("running execution hint still offers the resume:\n%s", got)
+	}
+}
+
 // createController is the Create page seam: it answers the workspace load
 // and the DiscoveryQuery with the target Git facts the test controls, and
-// records every CreateWorkflowCommand.
+// records every CreateWorkflowCommand. discoveryErr, when set, makes the
+// DiscoveryQuery fail so no target facts ever load.
 type createController struct {
-	executed []app.Command
-	dirty    bool
+	executed     []app.Command
+	dirty        bool
+	discoveryErr error
 }
 
 func (c *createController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
@@ -382,6 +451,9 @@ func (c *createController) Query(_ context.Context, q app.Query) (app.View, erro
 			Health:  app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{{Name: "fake", Compatible: true}}},
 		}, nil
 	case app.DiscoveryQuery:
+		if c.discoveryErr != nil {
+			return nil, c.discoveryErr
+		}
 		return app.DiscoveryView{
 			Branch: "main", Head: "0123456789abcdef",
 			Dirty: c.dirty, DirtyFingerprint: "sha256:deadbeef",
@@ -483,6 +555,29 @@ func TestCreateCleanTargetCreatesWithoutDirtyFlag(t *testing.T) {
 	}
 	if cc.ConfirmDirty {
 		t.Fatalf("clean target create carried a dirty flag: %+v", cc)
+	}
+}
+
+// TestCreateMissingFactsYFailsClosed: when the DiscoveryQuery projection has
+// not loaded (createDirty == nil), an explicit y on the confirmation never
+// issues CreateWorkflowCommand — the create is fail-closed on the missing
+// target facts instead of guessing the dirty state.
+func TestCreateMissingFactsYFailsClosed(t *testing.T) {
+	ctrl := &createController{dirty: true, discoveryErr: model.InvalidInputFault("discovery failed")}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	if got := render(m); !strings.Contains(got, "loading git facts") {
+		t.Fatalf("create page without the queried facts:\n%s", got)
+	}
+	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
+	m = press(t, m, 'y', 0)          // confirm without the target facts
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("y created without the target facts: %v", ctrl.executed)
+	}
+	if got := render(m); !strings.Contains(got, "target facts unavailable") {
+		t.Fatalf("create page did not refuse the missing facts:\n%s", got)
 	}
 }
 

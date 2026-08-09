@@ -464,6 +464,18 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			m.forceStop()
 			return m, tea.Quit
 		}
+		if _, ok := msg.cmd.(app.ResumeWorkflowCommand); ok && m.resumeThenRun {
+			// The Execution page requested the resume as the run start but
+			// the Runtime rejected it (the stale projection can still show
+			// Resume right after an execution approval while the workflow is
+			// already RUNNING). Clear the pending resume and fall back to
+			// starting the Foreground Runner directly: DriveOnce is a safe
+			// bounded step that stops when it cannot progress. Without this
+			// the pending resume-then-run would stay dangling and a later
+			// successful resume would double-start the runner.
+			m.resumeThenRun = false
+			return m, m.startRunner()
+		}
 		return m, nil
 	}
 	switch msg.cmd.(type) {
@@ -1542,7 +1554,15 @@ func (m Model) hints() string {
 	case PageExecutionApproval:
 		return "\ns generate specs  w compile workflow  d dry run  Enter/y confirm  q quit\n"
 	case PageExecution:
-		return "\nr resume & run  a adopt workspace  ←/→ panes  b workspace\n"
+		// The hint is driven by the Runtime LegalActions: "r resume & run"
+		// only while the Runtime permits Resume (a PAUSED workflow); once the
+		// post-approval projection reloads the RUNNING workflow the hint
+		// becomes the plain "r start the runner" (the runner is started
+		// directly; it resumes first only when Resume is legal).
+		if hasAction(m.workspace.Actions, ActionResume) {
+			return "\nr resume & run  a adopt workspace  ←/→ panes  b workspace\n"
+		}
+		return "\nr start the runner  a adopt workspace  ←/→ panes  b workspace\n"
 	case PageBlocked:
 		return blockedHints(m.workspace)
 	case PageTerminal:
