@@ -15,8 +15,10 @@ import (
 	"path/filepath"
 	"testing"
 
+	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/security"
 )
 
 // legacyMigrationFixture builds one Layout Version 1 workflow over the
@@ -29,6 +31,7 @@ type legacyMigrationFixture struct {
 
 	legacyRoot string // worktrees/<key>/<wf>
 	aggRoot    string // projects/<key>/<wf>
+	legacyRef  model.ArtifactRef
 }
 
 // newLegacyMigrationFixture creates a workflow through the real pipeline
@@ -102,6 +105,18 @@ func newLegacyMigrationFixture(t *testing.T) *legacyMigrationFixture {
 	if err := os.MkdirAll(filepath.Join(filepath.Dir(legacyWFYaml), "artifacts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	legacyStore, err := artifact.New(filepath.Join(filepath.Dir(legacyWFYaml), "artifacts"), security.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRef, err := legacyStore.Put(context.Background(), artifact.PutRequest{
+		WorkflowID: wf, Type: model.ArtifactReport, Revision: 1,
+		SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+		Body: []byte("legacy report"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	aggregatedWFYaml := filepath.Join(fx.home, "projects", key, string(wf), "workflow.yaml")
 	if err := os.Rename(aggregatedWFYaml, legacyWFYaml); err != nil {
 		t.Fatalf("move fixture manifest to legacy root: %v", err)
@@ -110,6 +125,7 @@ func newLegacyMigrationFixture(t *testing.T) *legacyMigrationFixture {
 		t: t, fx: fx, wf: wf, key: key,
 		legacyRoot: legacyRoot,
 		aggRoot:    filepath.Join(fx.home, "projects", key, string(wf)),
+		legacyRef:  legacyRef,
 	}
 }
 
@@ -160,9 +176,20 @@ func TestLegacyMigrationPreviewPrepareExecute(t *testing.T) {
 	if !pathExists(filepath.Join(lf.aggRoot, "tmp", "tasks", "task-s01")) {
 		t.Fatal("the task worktree was not migrated")
 	}
-	// The artifacts root moved into the aggregated root.
-	if !pathExists(filepath.Join(lf.aggRoot, "artifacts")) {
-		t.Fatal("the artifacts root was not migrated")
+	// Every legacy revision is readable through the Layout 2 Store after
+	// migration; the historical artifacts/<wf>/<type> shape is gone.
+	workflowStore, err := artifact.NewWorkflow(lf.aggRoot, lf.wf, security.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := workflowStore.Resolve(ctx, artifact.ResolveRequest{
+		WorkflowID: lf.wf, Type: model.ArtifactReport, Revision: lf.legacyRef.Revision,
+	})
+	if err != nil {
+		t.Fatalf("resolve migrated artifact: %v", err)
+	}
+	if ref.Hash != lf.legacyRef.Hash {
+		t.Fatalf("migrated artifact hash = %s, want %s", ref.Hash, lf.legacyRef.Hash)
 	}
 	// The workflow is now Layout 2 with the workspace facts.
 	st := lf.fx.status(lf.wf)

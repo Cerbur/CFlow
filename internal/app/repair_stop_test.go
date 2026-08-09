@@ -1347,7 +1347,10 @@ func TestInterruptedDispatchConvergesToPausedStop(t *testing.T) {
 	}()
 	// Let the coding Session start inside its Task Worktree, then send
 	// the first Ctrl+C.
-	worktree := filepath.Join(a.taskWorktreePath(wf, "task-s01"))
+	worktree, err := a.taskWorktreePath(context.Background(), wf, "task-s01")
+	if err != nil {
+		t.Fatalf("resolve task worktree: %v", err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(worktree); err == nil {
@@ -1413,7 +1416,10 @@ func driftWindowQuarantineFixture(t *testing.T, fx *planningFixture, a *Applicat
 		_, err := a.Execute(ctx, DispatchCommand{Workflow: wf})
 		done <- err
 	}()
-	worktree := filepath.Join(a.taskWorktreePath(wf, "task-s01"))
+	worktree, err := a.taskWorktreePath(context.Background(), wf, "task-s01")
+	if err != nil {
+		t.Fatalf("resolve task worktree: %v", err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(worktree); err == nil {
@@ -1596,7 +1602,7 @@ func TestReplacementPreviewToApproveEndToEnd(t *testing.T) {
 		t.Fatalf("the manifest self-hash must be persisted and displayed")
 	}
 	// The persisted manifest body carries the embedded hash.
-	body, err := a.readReconciliationManifest(wf, pv.Manifest.Revision)
+	body, err := a.readReconciliationManifest(context.Background(), wf, pv.Manifest.Revision)
 	if err != nil || body == nil {
 		t.Fatalf("the reconciliation manifest must be persisted: %v", err)
 	}

@@ -109,13 +109,21 @@ func (a *Application) collectCleanupWorktreeItems(ctx context.Context, wf model.
 		if n == nil || n.Kind != model.NodeAgentTask {
 			continue
 		}
-		managed[a.taskWorktreePath(wf, n.ID)] = "cflow/" + string(wf) + "/task-" + string(n.ID)
+		path, err := a.taskWorktreePath(ctx, wf, n.ID)
+		if err != nil {
+			return nil, err
+		}
+		managed[path] = "cflow/" + string(wf) + "/task-" + string(n.ID)
 	}
 	for _, att := range st.ApplyAttempts {
 		if att.Number < 1 {
 			continue
 		}
-		managed[a.applyWorktreePath(wf, att.Number)] = a.applyBranchName(wf, att.Number)
+		path, err := a.applyWorktreePath(ctx, wf, att.Number)
+		if err != nil {
+			return nil, err
+		}
+		managed[path] = a.applyBranchName(wf, att.Number)
 	}
 	registry, err := a.observeWorktreeRegistry(ctx)
 	if err != nil {
@@ -355,9 +363,13 @@ func (a *Application) validateCleanupScratch(path string) error {
 // <home>/worktrees/<key>/<workflow-id>/ on Layout 1 — and owned by the
 // effective user. A mismatch is CLEANUP_FACT_MISMATCH and deletes
 // nothing.
-func (a *Application) validateCleanupWorktreeTarget(wf model.WorkflowID, path string) error {
+func (a *Application) validateCleanupWorktreeTarget(ctx context.Context, wf model.WorkflowID, path string) error {
 	root := filepath.Join(a.home, "worktrees", a.project.Key, string(wf))
-	if a.workflowLayout(context.Background(), wf) >= 2 {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return err
+	}
+	if version == 2 {
 		root = a.layout.WorkflowRoot(wf)
 	}
 	if !strings.HasPrefix(path, root+string(filepath.Separator)) {
@@ -425,7 +437,7 @@ func (a *Application) cleanupWorktreeRemove(ctx context.Context, wf model.Workfl
 		return model.EffectResultInput{Kind: model.CleanupItemRemovedResult,
 			CleanupAttempt: intent.Cleanup, ItemIndex: intent.Item}, nil
 	}
-	if err := a.validateCleanupWorktreeTarget(wf, item.CanonicalPath); err != nil {
+	if err := a.validateCleanupWorktreeTarget(ctx, wf, item.CanonicalPath); err != nil {
 		code, _ := model.CodeOf(err)
 		if code == "" {
 			code = model.CodeCleanupFactsChanged

@@ -58,8 +58,8 @@ type MigrationPreview struct {
 // workflow root. It is a pure function of the paths and the recorded
 // facts: reading it never touches the filesystem.
 //
-//   - the legacy Artifacts root projects/<key>/workflows/<wf>/artifacts
-//     moves into the aggregated root's artifacts/;
+//   - the Application adds one move per existing legacy Artifact Type so
+//     revisions are reshaped into the aggregate category/type mapping;
 //   - the legacy Planning Snapshot worktrees/<key>/<wf>/planning moves to
 //     the aggregated temporary root tmp/planning;
 //   - the legacy Integration Worktree worktrees/<key>/<wf>/integration —
@@ -83,7 +83,7 @@ func Preview(wf model.WorkflowID, from, to int, projectKey, home string, st mode
 	}
 	if st.Workflow.ID != wf || st.Workflow.LayoutVersion != from {
 		return MigrationPreview{}, model.InvalidInputFault(
-			"the workflow is not a Layout "+itoa(from)+" workflow; nothing to migrate")
+			"the workflow is not a Layout " + itoa(from) + " workflow; nothing to migrate")
 	}
 	if st.Workflow.IntegrationHead == "" {
 		return MigrationPreview{}, model.InvalidInputFault(
@@ -123,12 +123,6 @@ func Preview(wf model.WorkflowID, from, to int, projectKey, home string, st mode
 			Branch:      "cflow/" + string(wf) + "/task-" + string(node),
 		})
 	}
-	// The legacy Artifacts root moves into the aggregated root.
-	moves = append(moves, PathMove{
-		Kind:        MoveKindArtifact,
-		Source:      filepath.Join(home, "projects", key, "workflows", string(wf), "artifacts"),
-		Destination: filepath.Join(aggRoot, "artifacts"),
-	})
 	// The static workflow.yaml manifest follows the Artifacts.
 	moves = append(moves, PathMove{
 		Kind:        MoveKindArtifact,

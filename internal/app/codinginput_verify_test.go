@@ -31,7 +31,10 @@ func TestCodingSessionInputOwnSpec(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("put spec artifact: %v", err)
 	}
-	in := a.sessionInput(ctx, wf, model.DispatchInput{Node: "task-s02"})
+	in, err := a.sessionInput(ctx, wf, model.DispatchInput{Node: "task-s02"})
+	if err != nil {
+		t.Fatalf("session input: %v", err)
+	}
 	ci, ok := in.(*codingSessionInput)
 	if !ok {
 		t.Fatalf("session input is %T, want *codingSessionInput (value %+v)", in, in)

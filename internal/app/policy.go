@@ -195,7 +195,10 @@ func (a *Application) activeWorktreeHeads(ctx context.Context, wf model.Workflow
 		if n.Kind != model.NodeAgentTask || n.Status != model.NodeRunning {
 			continue
 		}
-		path := a.taskWorktreePath(wf, n.ID)
+		path, err := a.taskWorktreePath(ctx, wf, n.ID)
+		if err != nil {
+			continue
+		}
 		status, err := a.observeWorktree(ctx, path, "")
 		if err != nil || status.Head == "" {
 			continue
@@ -331,19 +334,25 @@ func (a *Application) settleDriftConfirmation(ctx context.Context, st *store.Sto
 // reconciliationManifestPath is the deterministic persisted Reconciliation
 // Manifest location of one workflow revision (the Recovery Engine reads
 // the same path to recompute and compare).
-func (a *Application) reconciliationManifestPath(wf model.WorkflowID, revision int) string {
-	return filepath.Join(a.agent.EvidenceDir, "reconciliation", string(wf),
-		fmt.Sprintf("manifest-%d.json", revision))
+func (a *Application) reconciliationManifestPath(ctx context.Context, wf model.WorkflowID, revision int) (string, error) {
+	root, err := a.workflowEvidenceDir(ctx, wf)
+	if err != nil {
+		return "", err
+	}
+	if root == "" {
+		return "", model.InvalidInputFault("no evidence root is configured for the reconciliation manifest")
+	}
+	return filepath.Join(root, "reconciliation", fmt.Sprintf("manifest-%d.json", revision)), nil
 }
 
 // writeReconciliationManifest persists the immutable manifest body and
 // returns its self-hash (the Replacement Execution Approval binds the
 // Revision and Hash; Recovery recomputes the classification and compares).
-func (a *Application) writeReconciliationManifest(wf model.WorkflowID, revision int, body []byte) (string, error) {
-	if a.agent.EvidenceDir == "" {
-		return "", model.InvalidInputFault("no evidence root is configured for the reconciliation manifest")
+func (a *Application) writeReconciliationManifest(ctx context.Context, wf model.WorkflowID, revision int, body []byte) (string, error) {
+	path, err := a.reconciliationManifestPath(ctx, wf, revision)
+	if err != nil {
+		return "", err
 	}
-	path := a.reconciliationManifestPath(wf, revision)
 	if err := mkdirAll0700(filepath.Dir(path)); err != nil {
 		return "", err
 	}

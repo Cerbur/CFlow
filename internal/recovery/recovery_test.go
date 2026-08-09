@@ -10,6 +10,7 @@ package recovery_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
@@ -200,6 +201,18 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 			return st.View(ctx, store.StoreQuery{})
 		},
 		OpenArtifacts: func(ctx context.Context, wf model.WorkflowID) (*artifact.Store, error) {
+			var version int
+			db, err := sql.Open("sqlite", fx.dbPath)
+			if err != nil {
+				return nil, err
+			}
+			defer db.Close()
+			if err := db.QueryRowContext(ctx, `SELECT layout_version FROM workflows WHERE id = ?`, wf).Scan(&version); err != nil {
+				return nil, err
+			}
+			if version == 2 {
+				return artifact.NewWorkflow(filepath.Join(home, "projects", key, string(wf)), wf, security.Registry{})
+			}
 			return artifact.New(filepath.Join(home, "projects", key, "workflows", string(wf), "artifacts"), security.Registry{})
 		},
 	})
@@ -207,6 +220,18 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 		t.Fatalf("new recovery engine: %v", err)
 	}
 	return fx
+}
+
+func (fx *recoveryFixture) setLayoutVersion(version int) {
+	fx.t.Helper()
+	db, err := sql.Open("sqlite", fx.dbPath)
+	if err != nil {
+		fx.t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE workflows SET layout_version = ? WHERE id = ?`, version, testWF); err != nil {
+		fx.t.Fatal(err)
+	}
 }
 
 func newRepo(t *testing.T) *gitRunner {
@@ -524,6 +549,28 @@ func TestRecoveryVerificationManifestDispositions(t *testing.T) {
 	requireDisposition(t, out, recovery.AlreadyCompleted)
 }
 
+// TestRecoveryLayout2VerificationEvidence reads deterministic evidence from
+// the aggregate workflow evidence directory, not the legacy global root.
+func TestRecoveryLayout2VerificationEvidence(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	fx.setLayoutVersion(2)
+	dir := filepath.Join(fx.home, "projects", fx.projectKey, testWF, "evidence", "verification")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fmt.Sprintf(`{"Node":"%s","CatalogRef":{"Revision":1,"Hash":"%s"},"CommitRange":"%s..%s","Passed":true}`,
+		mergeNode, strings.Repeat("a", 64), fx.baseHead, fx.taskHead)
+	if err := os.WriteFile(filepath.Join(dir, mergeNode+".json"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(model.VerificationRunIntent{
+		Node:        mergeNode,
+		Catalog:     model.CatalogRef{Revision: 1, Hash: strings.Repeat("a", 64)},
+		CommitRange: fx.baseHead + ".." + fx.taskHead,
+	})
+	requireDisposition(t, mustReconcile(t, fx), recovery.AlreadyCompleted)
+}
+
 // TestRecoveryArtifactDispositions: an ArtifactWriteIntent whose exact
 // Revision exists in the Artifact Store is ALREADY_COMPLETED; an absent
 // Revision is SAFE_TO_RETRY; a Revision whose file was deleted afterwards
@@ -582,6 +629,57 @@ func TestRecoveryArtifactDispositions(t *testing.T) {
 	})
 	out = mustReconcile(t, orphan)
 	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryLayout2FixedRevisionCrashWindows proves fixed-revision
+// inspection uses the Layout 2 aggregate category/type path. A completed
+// write without an intent hash is recognized, while an orphaned revision
+// directory is blocked rather than retried.
+func TestRecoveryLayout2FixedRevisionCrashWindows(t *testing.T) {
+	write := func(fx *recoveryFixture) model.ArtifactRef {
+		fx.t.Helper()
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			fx.t.Fatal(err)
+		}
+		store, err := artifact.NewWorkflow(root, testWF, security.Registry{})
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		ref, err := store.Put(context.Background(), artifact.PutRequest{
+			WorkflowID: testWF, Type: model.ArtifactReport, Revision: 3,
+			SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+			Body: []byte("layout-two-report"),
+		})
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		return ref
+	}
+
+	t.Run("completed", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		write(fx)
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+		requireDisposition(t, mustReconcile(t, fx), recovery.AlreadyCompleted)
+	})
+
+	t.Run("orphaned", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		ref := write(fx)
+		path := filepath.Join(fx.home, "projects", fx.projectKey, testWF,
+			"reports", "report", "3", ref.Hash)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
 }
 
 // TestRecoveryProviderSessionDispositions: a ProviderStartIntent whose
@@ -707,7 +805,7 @@ func migrationMoves(t *testing.T, fx *recoveryFixture) []model.PathMove {
 	aggRoot := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
 	return []model.PathMove{
 		{
-			Kind: model.MoveKindArtifact,
+			Kind:        model.MoveKindArtifact,
 			Source:      filepath.Join(fx.home, "projects", fx.projectKey, "workflows", testWF, "artifacts"),
 			Destination: filepath.Join(aggRoot, "artifacts"),
 		},
@@ -718,7 +816,6 @@ func migrationMoves(t *testing.T, fx *recoveryFixture) []model.PathMove {
 		},
 	}
 }
-
 
 // ensureMigrationArtifactSource creates the legacy artifacts root the
 // crash-window tests move.
@@ -819,12 +916,12 @@ func TestRecoveryMigrationAfterDBAdvanceIsAlreadyCompleted(t *testing.T) {
 			ID: testWF, Project: model.ProjectID(testProj),
 			Stage: state.Workflow.Stage, Runtime: state.Workflow.Runtime,
 			TargetBranch: state.Workflow.TargetBranch, BaseCommit: state.Workflow.BaseCommit,
-			IntegrationBranch: state.Workflow.IntegrationBranch,
-			IntegrationHead:   state.Workflow.IntegrationHead,
-			LayoutVersion:     2,
-			WorkspacePath:     filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
-			WorkspaceBranch:   "cflow/" + testWF + "/integration",
-			VerifiedWorkspaceHead: state.Workflow.IntegrationHead,
+			IntegrationBranch:      state.Workflow.IntegrationBranch,
+			IntegrationHead:        state.Workflow.IntegrationHead,
+			LayoutVersion:          2,
+			WorkspacePath:          filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
+			WorkspaceBranch:        "cflow/" + testWF + "/integration",
+			VerifiedWorkspaceHead:  state.Workflow.IntegrationHead,
 			CandidateWorkspaceHead: state.Workflow.IntegrationHead,
 		}}}, nil
 	}); err != nil {

@@ -83,7 +83,10 @@ func (a *Application) prepareAdoption(ctx context.Context, c AdoptWorkspaceComma
 	if facts == nil || facts.ChangeSetHash == "" || facts.ChangeSetRevision < 1 {
 		return nil, "", model.InvalidInputFault("workspace adoption requires an execution approval bound to a change set")
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return nil, "", err
+	}
 	status, err := a.observeChangeSetStatus(ctx, cwd)
 	if err != nil {
 		return nil, "", err
@@ -275,12 +278,16 @@ func (a *Application) verifyAdoptionCatalog(ctx context.Context, wf model.Workfl
 		return model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the approved catalog has no task-verify entry for the adoption")
 	}
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return err
+	}
 	manifest, err := engine.Run(ctx, verify.VerificationRequest{
 		Node:        "workspace-adoption",
 		Catalog:     cat,
 		CommandID:   commandID,
 		Purpose:     verify.PurposeTaskVerify,
-		Worktree:    a.planningCWD(ctx, wf),
+		Worktree:    cwd,
 		CommitRange: base + ".." + head,
 	})
 	if err != nil {
@@ -318,7 +325,10 @@ func (a *Application) adoptionReviewProviderStart(ctx context.Context, wf model.
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the review purpose")
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -378,24 +388,24 @@ func (a *Application) adoptionReviewSessionInput(ctx context.Context, wf model.W
 	}
 	base := view.State.Workflow.BaseCommit
 	return struct {
-		ChangeSet    string `json:"change_set"`
-		Plan         string `json:"plan"`
-		Spec         string `json:"spec"`
-		Catalog      string `json:"catalog"`
-		Workflow     string `json:"workflow"`
-		Workspace    string `json:"workspace"`
-		CommitRange  string `json:"commit_range"`
-		Diff         string `json:"diff"`
+		ChangeSet     string `json:"change_set"`
+		Plan          string `json:"plan"`
+		Spec          string `json:"spec"`
+		Catalog       string `json:"catalog"`
+		Workflow      string `json:"workflow"`
+		Workspace     string `json:"workspace"`
+		CommitRange   string `json:"commit_range"`
+		Diff          string `json:"diff"`
 		CandidateHead string `json:"candidate_head"`
 	}{
-		ChangeSet:    string(readArtifact(ctx, store, wf, model.ArtifactChangeSet)),
-		Plan:         string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-		Spec:         string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		Catalog:      string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		Workflow:     string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
-		Workspace:    cwd,
-		CommitRange:  base + ".." + changeSet.CandidateHead,
-		Diff:         a.gitDiff(ctx, cwd, base+".."+changeSet.CandidateHead),
+		ChangeSet:     string(readArtifact(ctx, store, wf, model.ArtifactChangeSet)),
+		Plan:          string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
+		Spec:          string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+		Catalog:       string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		Workflow:      string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		Workspace:     cwd,
+		CommitRange:   base + ".." + changeSet.CandidateHead,
+		Diff:          a.gitDiff(ctx, cwd, base+".."+changeSet.CandidateHead),
 		CandidateHead: changeSet.CandidateHead,
 	}, nil
 }

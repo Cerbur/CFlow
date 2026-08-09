@@ -58,7 +58,10 @@ func (a *Application) applyStagingCreate(ctx context.Context, wf model.WorkflowI
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("apply attempt %s is missing", intent.Apply))
 	}
 	targetBranch := view.State.Workflow.TargetBranch
-	deliveryBranch, _, _ := a.deliveryFacts(ctx, wf, view.State)
+	deliveryBranch, _, _, err := a.deliveryFacts(ctx, wf, view.State)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	integrationBranch := deliveryBranch
 
 	// 1. The workspace gate (PRD step 1: clean and attached to the
@@ -150,12 +153,20 @@ func (a *Application) applyWorkspaceGate(ctx context.Context, targetBranch, targ
 // worktrees/<project-key>/<workflow-id>/apply-<n> on Layout 1 (PRD 全局
 // 目录结构; each attempt stages in its own isolated Worktree, preserved
 // for inspection and retry).
-func (a *Application) applyWorktreePath(wf model.WorkflowID, number int) string {
-	if a.workflowLayout(context.Background(), wf) >= 2 {
-		return a.layout.Apply(wf, number)
+func (a *Application) applyWorktreePath(ctx context.Context, wf model.WorkflowID, number int) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf),
-		fmt.Sprintf("apply-%d", number))
+	switch version {
+	case 1:
+		return filepath.Join(a.home, "worktrees", a.project.Key, string(wf),
+			fmt.Sprintf("apply-%d", number)), nil
+	case 2:
+		return a.layout.Apply(wf, number), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("unsupported workflow layout version %d", version))
+	}
 }
 
 // applyBranchName is the deterministic Apply Branch of one attempt.
@@ -168,7 +179,10 @@ func (a *Application) applyBranchName(wf model.WorkflowID, number int) string {
 // (a re-run after a block or an interruption), verifying the registry
 // entry matches the branch.
 func (a *Application) applyWorktreeEnsure(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt) (string, error) {
-	path := a.applyWorktreePath(wf, att.Number)
+	path, err := a.applyWorktreePath(ctx, wf, att.Number)
+	if err != nil {
+		return "", err
+	}
 	branch := a.applyBranchName(wf, att.Number)
 	facts, err := a.git.Observe(ctx, gitflow.WorktreeList{})
 	if err != nil {
@@ -483,7 +497,10 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("apply attempt %s is missing", intent.Apply))
 	}
 	targetBranch := view.State.Workflow.TargetBranch
-	deliveryBranch, _, _ := a.deliveryFacts(ctx, wf, view.State)
+	deliveryBranch, _, _, err := a.deliveryFacts(ctx, wf, view.State)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	integrationBranch := deliveryBranch
 	targetRef := "refs/heads/" + targetBranch
 
@@ -571,7 +588,8 @@ func (a *Application) applyFastForward(ctx context.Context, wf model.WorkflowID,
 		return fail(model.CodeCommandIdentityChanged,
 			"the apply verification catalog identity changed before the delivery"), nil
 	}
-	if a.applyVerificationManifestHash(wf, att) == "" {
+	manifestHash, err := a.applyVerificationManifestHash(ctx, wf, att)
+	if err != nil || manifestHash == "" {
 		return fail(model.CodeEvidenceSubjectChanged,
 			"the apply verification evidence is missing before the delivery"), nil
 	}

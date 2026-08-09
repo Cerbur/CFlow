@@ -77,17 +77,23 @@ func (a *Application) queryCancelSummary(ctx context.Context, q CancelSummaryQue
 	// state and the unmerged Commit facts are observed per Worktree.
 	// Layout Version 2 workflows run their planning sessions inside the
 	// single Workspace (design 8.1), so the Workspace is listed there.
+	planningPath, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
 	entries := []CancelWorktree{
-		{Path: a.planningCWD(ctx, wf), Branch: "detached@base"},
+		{Path: planningPath, Branch: "detached@base"},
 		{Path: a.integrationWorktreePath(wf), Branch: st.Workflow.IntegrationBranch},
 	}
 	for id, n := range st.Nodes {
 		if n.Kind != model.NodeAgentTask {
 			continue
 		}
-		entries = append(entries, CancelWorktree{
-			Path: a.taskWorktreePath(wf, id), Branch: n.Branch,
-		})
+		path, err := a.taskWorktreePath(ctx, wf, id)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, CancelWorktree{Path: path, Branch: n.Branch})
 	}
 	for i := range entries {
 		status, err := a.observeWorktree(ctx, entries[i].Path, "")
@@ -335,7 +341,7 @@ func (a *Application) replacementPreviewInput(ctx context.Context, wf model.Work
 	if err != nil {
 		return model.ReplacementPreviewInput{}, err
 	}
-	if _, err := a.writeReconciliationManifest(wf, manifest.Revision, body); err != nil {
+	if _, err := a.writeReconciliationManifest(ctx, wf, manifest.Revision, body); err != nil {
 		return model.ReplacementPreviewInput{}, err
 	}
 
@@ -541,10 +547,11 @@ func nodeDefinitionEqual(a, b compile.WorkflowNode, aDeps, bDeps []string) bool 
 // latestManifestRevision is the highest persisted Reconciliation
 // Manifest Revision of one workflow.
 func (a *Application) latestManifestRevision(ctx context.Context, wf model.WorkflowID) (int, error) {
-	if a.agent.EvidenceDir == "" {
+	root, err := a.workflowEvidenceDir(ctx, wf)
+	if err != nil || root == "" {
 		return 0, nil
 	}
-	entries, err := os.ReadDir(filepath.Join(a.agent.EvidenceDir, "reconciliation", string(wf)))
+	entries, err := os.ReadDir(filepath.Join(root, "reconciliation"))
 	if err != nil {
 		return 0, nil
 	}
@@ -560,11 +567,12 @@ func (a *Application) latestManifestRevision(ctx context.Context, wf model.Workf
 
 // readReconciliationManifest reads one persisted manifest body (nil when
 // absent).
-func (a *Application) readReconciliationManifest(wf model.WorkflowID, revision int) ([]byte, error) {
-	if a.agent.EvidenceDir == "" {
-		return nil, nil
+func (a *Application) readReconciliationManifest(ctx context.Context, wf model.WorkflowID, revision int) ([]byte, error) {
+	path, err := a.reconciliationManifestPath(ctx, wf, revision)
+	if err != nil {
+		return nil, err
 	}
-	body, err := os.ReadFile(a.reconciliationManifestPath(wf, revision))
+	body, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -620,7 +628,7 @@ func (a *Application) queryReplacementPreview(ctx context.Context, q Replacement
 		WorkflowHash:         facts.WorkflowHash,
 	}
 	if rev, err := a.latestManifestRevision(ctx, wf); err == nil && rev > 0 {
-		if body, err := a.readReconciliationManifest(wf, rev); err == nil && body != nil {
+		if body, err := a.readReconciliationManifest(ctx, wf, rev); err == nil && body != nil {
 			var m model.ReconciliationManifest
 			if jsonUnmarshal(body, &m) == nil {
 				out.Manifest = m

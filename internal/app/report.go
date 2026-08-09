@@ -82,8 +82,12 @@ func (a *Application) reportInput(ctx context.Context, build observe.BuildInfo, 
 	}
 	in.VerificationManifests = a.verificationManifests(ctx, wfOf(st))
 	in.Migration.Applied, in.Migration.SchemaVersion = a.appliedMigrations(ctx, wfOf(st))
+	wfDir, err := a.workflowDir(ctx, wfOf(st))
+	if err != nil {
+		return observe.ReportInput{}, err
+	}
 	in.EventExport = observe.ReportEventExport{
-		Path:   filepath.Join(a.workflowDir(wfOf(st)), "events.jsonl"),
+		Path:   filepath.Join(wfDir, "events.jsonl"),
 		From:   1,
 		To:     nextEventSeq - 1,
 		Stable: true,
@@ -155,10 +159,11 @@ func (a *Application) appliedMigrations(ctx context.Context, wf model.WorkflowID
 // verificationManifests reads every persisted Evidence Manifest of one
 // workflow from the managed evidence root (design 16.2).
 func (a *Application) verificationManifests(ctx context.Context, wf model.WorkflowID) []model.EvidenceManifest {
-	if a.agent.EvidenceDir == "" {
+	root, err := a.workflowEvidenceDir(ctx, wf)
+	if err != nil || root == "" {
 		return nil
 	}
-	dir := filepath.Join(a.agent.EvidenceDir, "verification", string(wf))
+	dir := filepath.Join(root, "verification")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil

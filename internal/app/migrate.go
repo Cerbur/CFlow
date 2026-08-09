@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
@@ -55,6 +56,35 @@ func (a *Application) migrationPreview(ctx context.Context, wf model.WorkflowID,
 			Destination: a.layout.Task(wf, node),
 			Branch:      "cflow/" + string(wf) + "/task-" + name,
 		})
+	}
+	// Legacy Artifact revisions live below artifacts/<workflow>/<type>.
+	// Add one exact move per existing declared Type into the same aggregate
+	// category/type directory NewWorkflow reads. Unknown entries block
+	// rather than being guessed or copied.
+	legacyTypes := filepath.Join(a.home, "projects", a.project.Key, "workflows",
+		string(wf), "artifacts", string(wf))
+	if artifactEntries, readErr := os.ReadDir(legacyTypes); readErr == nil {
+		for _, entry := range artifactEntries {
+			if !entry.IsDir() {
+				return layout.MigrationPreview{}, model.InvariantFault(
+					fmt.Errorf("legacy artifact root contains a non-directory entry %s", entry.Name()))
+			}
+			typ := model.ArtifactType(entry.Name())
+			if !typ.Valid() {
+				return layout.MigrationPreview{}, model.InvalidInputFault(
+					"legacy artifact root contains an unknown type " + entry.Name())
+			}
+			destination, err := artifact.WorkflowTypeDir(a.layout.WorkflowRoot(wf), typ)
+			if err != nil {
+				return layout.MigrationPreview{}, err
+			}
+			preview.Moves = append(preview.Moves, model.PathMove{
+				Kind: model.MoveKindArtifact, Source: filepath.Join(legacyTypes, entry.Name()),
+				Destination: destination,
+			})
+		}
+	} else if !os.IsNotExist(readErr) {
+		return layout.MigrationPreview{}, readErr
 	}
 	preview.ManifestHash = preview.Hash()
 	return preview, nil
@@ -235,14 +265,14 @@ func (a *Application) executeMigration(ctx context.Context, st *store.Store, wf 
 			ID: s.Workflow.ID, Project: s.Workflow.Project,
 			Stage: s.Workflow.Stage, Runtime: s.Workflow.Runtime,
 			TargetBranch: s.Workflow.TargetBranch, BaseCommit: s.Workflow.BaseCommit,
-			IntegrationBranch: s.Workflow.IntegrationBranch,
-			IntegrationHead:   s.Workflow.IntegrationHead,
-			LayoutVersion:     2,
-			WorkspacePath:     a.layout.Workspace(wf),
-			WorkspaceBranch:   s.Workflow.IntegrationBranch,
-			VerifiedWorkspaceHead: s.Workflow.IntegrationHead,
+			IntegrationBranch:      s.Workflow.IntegrationBranch,
+			IntegrationHead:        s.Workflow.IntegrationHead,
+			LayoutVersion:          2,
+			WorkspacePath:          a.layout.Workspace(wf),
+			WorkspaceBranch:        s.Workflow.IntegrationBranch,
+			VerifiedWorkspaceHead:  s.Workflow.IntegrationHead,
 			CandidateWorkspaceHead: s.Workflow.IntegrationHead,
-			CancelIntent:          s.Workflow.CancelIntent,
+			CancelIntent:           s.Workflow.CancelIntent,
 		}
 		b.mutate(m)
 		b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "legacy layout migrated to the aggregated workspace")

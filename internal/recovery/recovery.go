@@ -255,7 +255,7 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		return e.classifyWorktreeAt(ctx, base, intent.Path, "workspace",
 			intent.BaseHead, intent.Branch)
 	case model.VerificationRunIntent:
-		return e.classifyVerification(ctx, wf, base, intent)
+		return e.classifyVerification(ctx, wf, state, base, intent)
 	case model.ProviderStartIntent, model.ProviderResumeIntent:
 		var session model.SessionID
 		switch t := intent.(type) {
@@ -266,7 +266,7 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		}
 		return e.classifyProviderSession(base, state, session)
 	case model.ArtifactWriteIntent:
-		return e.classifyArtifact(ctx, wf, base, intent)
+		return e.classifyArtifact(ctx, wf, state, base, intent)
 	case model.WorkflowCompileIntent:
 		return e.classifyWorkflowCompile(ctx, wf, base)
 	case model.ManagedProcessStopIntent:
@@ -436,8 +436,11 @@ func (e *RecoveryEngine) classifyWorkspaceRollback(ctx context.Context, wf model
 // user must act on (BlockedDrift); an unusable manifest is a Fatal
 // Invariant.
 func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.LayoutMigrationIntent) (IntentDisposition, error) {
-	if state.Workflow.LayoutVersion >= 2 {
+	if state.Workflow.LayoutVersion == 2 {
 		return base.with(AlreadyCompleted, "the workflow layout already advanced to version 2"), nil
+	}
+	if state.Workflow.LayoutVersion != 1 {
+		return base.with(FatalInvariant, "the workflow carries an unsupported layout version"), nil
 	}
 	if len(intent.Moves) == 0 {
 		return base.with(FatalInvariant, "the layout migration intent carries no moves"), nil
@@ -496,9 +499,14 @@ func (e *RecoveryEngine) classifyAuditRef(ctx context.Context, base IntentDispos
 // 2 (design 8.5, TUI task 7), the legacy worktrees/<project-key>/
 // <workflow-id>/tasks/<node> on Layout 1 (PRD 全局目录结构).
 func (e *RecoveryEngine) classifyTaskWorktree(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.TaskWorktreeCreateIntent) (IntentDisposition, error) {
-	path := filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "tasks", string(intent.Node))
-	if state.Workflow.LayoutVersion >= 2 {
+	var path string
+	switch state.Workflow.LayoutVersion {
+	case 1:
+		path = filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "tasks", string(intent.Node))
+	case 2:
 		path = filepath.Join(e.home, "projects", e.projectKey, string(wf), "tmp", "tasks", string(intent.Node))
+	default:
+		return base.with(FatalInvariant, "the workflow carries an unsupported layout version"), nil
 	}
 	entries, err := e.worktreeEntries(ctx)
 	if err != nil {
@@ -547,8 +555,8 @@ func (e *RecoveryEngine) classifyWorktreeAt(ctx context.Context, base IntentDisp
 // from the persisted Evidence Manifest: the manifest is the unique proof
 // the run completed (already_completed); its absence with the expected
 // Worktree facts still matching is safe to retry.
-func (e *RecoveryEngine) classifyVerification(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.VerificationRunIntent) (IntentDisposition, error) {
-	manifest, err := e.readVerificationManifest(wf, intent.Node)
+func (e *RecoveryEngine) classifyVerification(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.VerificationRunIntent) (IntentDisposition, error) {
+	manifest, err := e.readVerificationManifest(wf, state.Workflow.LayoutVersion, intent.Node)
 	if err != nil {
 		return base.with(BlockedDrift, "verification evidence is unreadable"), nil
 	}
@@ -706,7 +714,7 @@ func (e *RecoveryEngine) classifyProviderSession(base IntentDisposition, state m
 // content file proves the write completed; a directory without its
 // content file is an orphan (blocked — the file vanished after the
 // write); an absent revision is safe to write.
-func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.ArtifactWriteIntent) (IntentDisposition, error) {
+func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.ArtifactWriteIntent) (IntentDisposition, error) {
 	store, err := e.openArtifacts(ctx, wf)
 	if err != nil {
 		return base.with(BlockedDrift, "artifact facts are unreadable"), nil
@@ -727,7 +735,18 @@ func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.Workflow
 			return base.with(AlreadyCompleted, "the artifact revision reads back with the exact identity"), nil
 		}
 	}
-	dir := filepath.Join(e.artifactRoot(wf), string(wf), string(intent.Ref.Type), fmt.Sprintf("%d", intent.Ref.Revision))
+	var dir string
+	switch state.Workflow.LayoutVersion {
+	case 1:
+		dir = filepath.Join(e.legacyArtifactRoot(wf), string(wf), string(intent.Ref.Type), fmt.Sprintf("%d", intent.Ref.Revision))
+	case 2:
+		dir, err = artifact.WorkflowRevisionDir(e.workflowRoot(wf), intent.Ref.Type, intent.Ref.Revision)
+		if err != nil {
+			return base.with(FatalInvariant, "the aggregate artifact revision path is invalid"), nil
+		}
+	default:
+		return base.with(FatalInvariant, "the workflow layout version cannot select an artifact path"), nil
+	}
 	entries, err := os.ReadDir(dir)
 	switch {
 	case err == nil:
@@ -866,11 +885,19 @@ type verificationManifest struct {
 	Passed      bool   `json:"Passed"`
 }
 
-func (e *RecoveryEngine) readVerificationManifest(wf model.WorkflowID, node model.NodeID) (*verificationManifest, error) {
-	if e.evidenceDir == "" {
-		return nil, nil
+func (e *RecoveryEngine) readVerificationManifest(wf model.WorkflowID, layoutVersion int, node model.NodeID) (*verificationManifest, error) {
+	var path string
+	switch layoutVersion {
+	case 1:
+		if e.evidenceDir == "" {
+			return nil, nil
+		}
+		path = filepath.Join(e.evidenceDir, "verification", string(wf), string(node)+".json")
+	case 2:
+		path = filepath.Join(e.workflowRoot(wf), "evidence", "verification", string(node)+".json")
+	default:
+		return nil, model.InvariantFault(fmt.Errorf("recovery: unsupported workflow layout version %d", layoutVersion))
 	}
-	path := filepath.Join(e.evidenceDir, "verification", string(wf), string(node)+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -901,8 +928,12 @@ func (e *RecoveryEngine) planningPath(wf model.WorkflowID) string {
 	return filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "planning")
 }
 
-// artifactRoot is the deterministic Artifact Store root of one workflow.
-func (e *RecoveryEngine) artifactRoot(wf model.WorkflowID) string {
+func (e *RecoveryEngine) workflowRoot(wf model.WorkflowID) string {
+	return filepath.Join(e.home, "projects", e.projectKey, string(wf))
+}
+
+// legacyArtifactRoot is the deterministic legacy Artifact Store root.
+func (e *RecoveryEngine) legacyArtifactRoot(wf model.WorkflowID) string {
 	return filepath.Join(e.home, "projects", e.projectKey, "workflows", string(wf), "artifacts")
 }
 

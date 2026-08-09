@@ -1032,11 +1032,19 @@ func (a *Application) writeStoreView(ctx context.Context, wf model.WorkflowID) (
 // Version 2 (design 8.5, TUI task 7: 临时并行 Task Worktree), and the
 // legacy worktrees/<project-key>/<workflow-id>/tasks/<node> on Layout 1
 // (PRD 全局目录结构).
-func (a *Application) taskWorktreePath(wf model.WorkflowID, node model.NodeID) string {
-	if a.workflowLayout(context.Background(), wf) >= 2 {
-		return a.layout.Task(wf, node)
+func (a *Application) taskWorktreePath(ctx context.Context, wf model.WorkflowID, node model.NodeID) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "tasks", string(node))
+	switch version {
+	case 1:
+		return filepath.Join(a.home, "worktrees", a.project.Key, string(wf), "tasks", string(node)), nil
+	case 2:
+		return a.layout.Task(wf, node), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("unsupported workflow layout version %d", version))
+	}
 }
 
 // observedTaskBaseHead is the current verified Task Base HEAD observed at
@@ -1051,7 +1059,11 @@ func (a *Application) observedTaskBaseHead(ctx context.Context, wf model.Workflo
 	}
 	path := a.integrationWorktreePath(wf)
 	if state.Workflow.LayoutVersion >= 2 {
-		path = a.planningCWD(ctx, wf)
+		var err error
+		path, err = a.planningCWD(ctx, wf)
+		if err != nil {
+			return "", err
+		}
 	}
 	facts, err := a.git.Observe(ctx, gitflow.GitStatus{Dir: path})
 	if err != nil {
@@ -1087,15 +1099,15 @@ type codingSessionInput struct {
 	ContextBundle *agent.ContextBundle `json:"context_bundle,omitempty"`
 }
 
-func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowID, node model.NodeID) any {
+func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowID, node model.NodeID) (any, error) {
 	store, err := a.artifactStore(wf)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	body := readArtifact(ctx, store, wf, model.ArtifactSpec)
 	bodies, err := splitSpecSetBody(body)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	// The Compiler names each Task node "task-<spec-id>"; hand the coding
 	// Session ONLY its own Spec so a multi-Spec workflow (Task 12) can
@@ -1115,11 +1127,15 @@ func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowI
 		}
 	}
 	if nodeSpec == "" {
-		return nil
+		return nil, nil
+	}
+	worktree, err := a.taskWorktreePath(ctx, wf, node)
+	if err != nil {
+		return nil, err
 	}
 	return &codingSessionInput{
 		Spec:     nodeSpec,
 		Catalog:  string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		Worktree: a.taskWorktreePath(wf, node),
-	}
+		Worktree: worktree,
+	}, nil
 }

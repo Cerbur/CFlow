@@ -6,6 +6,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -86,11 +87,19 @@ func (a *Application) knownWorkflows(ctx context.Context) ([]model.WorkflowID, e
 	return st.ListWorkflowIDs(ctx, model.ProjectID(a.project.Key))
 }
 
-func (a *Application) workflowDir(wf model.WorkflowID) string {
-	if a.workflowLayout(context.Background(), wf) >= 2 {
-		return a.layout.WorkflowRoot(wf)
+func (a *Application) workflowDir(ctx context.Context, wf model.WorkflowID) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
 	}
-	return a.legacyWorkflowDir(wf)
+	switch version {
+	case 1:
+		return a.legacyWorkflowDir(wf), nil
+	case 2:
+		return a.layout.WorkflowRoot(wf), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
 }
 
 func (a *Application) legacyWorkflowDir(wf model.WorkflowID) string {
@@ -104,15 +113,21 @@ func (a *Application) workflowsDir() string {
 // ensureWorkflowDir creates the workflow directory chain 0700 through the
 // security guard (design 19.1). Mutations only; the events export lives
 // there (design 21).
-func (a *Application) ensureWorkflowDir(wf model.WorkflowID) error {
+func (a *Application) ensureWorkflowDir(ctx context.Context, wf model.WorkflowID) error {
 	dirs := []string{
 		filepath.Join(a.home, "projects"),
 		filepath.Join(a.home, "projects", a.project.Key),
 	}
-	if a.workflowLayout(context.Background(), wf) >= 2 {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return err
+	}
+	if version == 2 {
 		dirs = append(dirs, a.layout.WorkflowRoot(wf))
-	} else {
+	} else if version == 1 {
 		dirs = append(dirs, a.workflowsDir(), a.legacyWorkflowDir(wf))
+	} else {
+		return model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
 	}
 	for _, dir := range dirs {
 		if _, err := os.Stat(dir); err == nil {
@@ -128,10 +143,31 @@ func (a *Application) ensureWorkflowDir(wf model.WorkflowID) error {
 // exportEvents appends one committed Event window to the workflow's
 // events.jsonl audit export (design 21).
 func (a *Application) exportEvents(ctx context.Context, wf model.WorkflowID, events []model.Event) error {
-	if err := a.ensureWorkflowDir(wf); err != nil {
+	if err := a.ensureWorkflowDir(ctx, wf); err != nil {
 		return err
 	}
-	return observe.ExportEvents(filepath.Join(a.workflowDir(wf), "events.jsonl"), events, a.redaction)
+	dir, err := a.workflowDir(ctx, wf)
+	if err != nil {
+		return err
+	}
+	return observe.ExportEvents(filepath.Join(dir, "events.jsonl"), events, a.redaction)
+}
+
+// workflowEvidenceDir selects the deterministic evidence root. Layout 2 is
+// workflow-local; Layout 1 retains only the configured legacy global root.
+func (a *Application) workflowEvidenceDir(ctx context.Context, wf model.WorkflowID) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
+	}
+	switch version {
+	case 1:
+		return a.agent.EvidenceDir, nil
+	case 2:
+		return a.layout.EvidenceDir(wf), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
 }
 
 func workflowSummary(st model.State) WorkflowSummary {

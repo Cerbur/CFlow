@@ -150,20 +150,6 @@ func runCLIWithError(t *testing.T, home string, args ...string) (string, int) {
 	return msg, cli.ExitCode(err)
 }
 
-// seedWorkflowDir mirrors the Application's workflow directory layout so
-// list can enumerate the persisted workflow.
-func seedWorkflowDir(t *testing.T, home, wf string) {
-	t.Helper()
-	root, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join(home, "projects", app.ProjectFor(root).Key, "workflows", wf)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func requireExit(t *testing.T, out string, code, want int) {
 	t.Helper()
 	if code != want {
@@ -190,11 +176,10 @@ func TestListOnEmptyHome(t *testing.T) {
 	}
 }
 
-// TestListShowsSeededWorkflow: list enumerates the project's persisted
-// workflow directories and hydrates each from the database.
+// TestListShowsSeededWorkflow: list enumerates SQLite-authoritative rows;
+// no workflow directory is required.
 func TestListShowsSeededWorkflow(t *testing.T) {
 	home, _ := seedCLIProject(t)
-	seedWorkflowDir(t, home, "wf-1")
 	out, code := runCLI(t, home, "list")
 	requireExit(t, out, code, 0)
 	for _, want := range []string{"wf-1", "REQUIREMENT_DISCUSSION", "PENDING"} {

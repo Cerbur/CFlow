@@ -402,12 +402,18 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
-	input := a.sessionInput(ctx, wf, cmd)
+	input, err := a.sessionInput(ctx, wf, cmd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	req := agent.StartRequest{
 		Purpose:    intent.Purpose,
 		Provider:   intent.Route,
@@ -476,8 +482,15 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
 			"session is not known to the agent runtime")
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.sessionInput(ctx, wf, cmd)
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
@@ -485,8 +498,8 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		ProviderSessionID: agent.ProviderSessionID(providerSessionID),
 		Purpose:           intent.Purpose,
 		Provider:          provider,
-		Prompt:            renderPrompt(prompt.Body, a.sessionInput(ctx, wf, cmd)),
-		Input:             a.sessionInput(ctx, wf, cmd),
+		Prompt:            renderPrompt(prompt.Body, input),
+		Input:             input,
 		CWD:               cwd,
 		Context:           a.resumeContext(ctx, wf, intent.Session, provider),
 	})
@@ -606,7 +619,10 @@ func (a *Application) taskWorktreeCreate(ctx context.Context, wf model.WorkflowI
 	if a.git == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
 	}
-	path := a.taskWorktreePath(wf, intent.Node)
+	path, err := a.taskWorktreePath(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	if err := a.ensureWorktreeParent(path); err != nil {
 		return model.EffectResultInput{}, err
 	}
@@ -650,7 +666,10 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the implementation purpose")
 	}
-	cwd := a.taskWorktreePath(wf, intent.Node)
+	cwd, err := a.taskWorktreePath(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	// The RUNNING Attempt already committed; only now may the Coding
 	// Session start (design 12: an in-memory queued goroutine is not an
 	// in-flight Attempt).
@@ -686,7 +705,10 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	// and re-establishes the lineage through Supersedes (design 14.4,
 	// PRD 已确认：Session Resume 失败与跨 Provider 上下文交接).
 	supersedes, bundle := a.successorHandoff(rt, intent.Session)
-	sessionIn := a.sessionInput(ctx, wf, cmd)
+	sessionIn, err := a.sessionInput(ctx, wf, cmd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:  intent.Purpose,
 		Provider: intent.Route,
@@ -862,15 +884,15 @@ func renderPrompt(body string, input any) string {
 // the latest discussion-turn Artifact body when one exists; for Spec
 // generation, the approved Plan and the active Verification Catalog; for
 // Workflow optimization, the Spec and the eligible routes.
-func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd model.Input) any {
+func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd model.Input) (any, error) {
 	if in, ok := cmd.(model.DiscussRequirementInput); ok {
 		return struct {
 			Requirement string `json:"requirement"`
-		}{Requirement: in.Text}
+		}{Requirement: in.Text}, nil
 	}
 	store, err := a.artifactStore(wf)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	switch cmd.(type) {
 	case model.SpecGenerationInput:
@@ -880,7 +902,7 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 		}{
 			Plan:    string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
 			Catalog: string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		}
+		}, nil
 	case model.WorkflowCompilationInput:
 		return struct {
 			Spec           string   `json:"spec"`
@@ -888,7 +910,7 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 		}{
 			Spec:           string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
 			EligibleRoutes: eligibleRouteNames(),
-		}
+		}, nil
 	case model.DispatchInput:
 		// The coding Session receives only the approved context: the Spec
 		// set, the Verification Catalog it references, and the Task
@@ -897,20 +919,20 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 	}
 	if _, ok := cmd.(model.GeneratePlanInput); !ok {
 		if _, ok := cmd.(model.CheckPlanInput); !ok {
-			return nil
+			return nil, nil
 		}
 	}
 	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactDiscussionTurn})
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	body, err := store.Get(ctx, ref)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	return struct {
 		Requirement string `json:"requirement"`
-	}{Requirement: string(body)}
+	}{Requirement: string(body)}, nil
 }
 
 // readArtifact reads the active Revision body of one Artifact Type

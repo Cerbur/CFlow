@@ -245,6 +245,34 @@ func (s *Store) typeDir(typ model.ArtifactType) (string, error) {
 	return string(typ), nil
 }
 
+// WorkflowTypeDir returns the fixed aggregate directory for one Artifact
+// Type below an already validated workflow root. Migration and Recovery use
+// this same mapping as NewWorkflow so they cannot reconstruct a divergent
+// Layout 2 path.
+func WorkflowTypeDir(root string, typ model.ArtifactType) (string, error) {
+	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return "", model.InvalidInputFault("workflow artifact root must be an absolute clean path")
+	}
+	dir, ok := aggregatedTypeDirs[typ]
+	if !ok {
+		return "", model.InvalidInputFault("artifact type has no aggregated layout directory")
+	}
+	return filepath.Join(root, dir, string(typ)), nil
+}
+
+// WorkflowRevisionDir returns the aggregate directory of one immutable
+// Artifact Revision.
+func WorkflowRevisionDir(root string, typ model.ArtifactType, revision int) (string, error) {
+	if revision < 1 {
+		return "", model.InvalidInputFault("artifact revision must be positive")
+	}
+	base, err := WorkflowTypeDir(root, typ)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, strconv.Itoa(revision)), nil
+}
+
 // baseDir is the directory that holds the revision directories of one
 // artifact type. In the aggregated layout the workflow id is bound at
 // construction and never appears in the path; the Artifact Type separates
@@ -258,7 +286,7 @@ func (s *Store) baseDir(wf model.WorkflowID, typ model.ArtifactType) (string, er
 		if wf != s.wf {
 			return "", model.InvalidInputFault("artifact workflow does not match the aggregated store workflow")
 		}
-		return filepath.Join(s.root, dir, string(typ)), nil
+		return WorkflowTypeDir(s.root, typ)
 	}
 	return filepath.Join(s.root, string(wf), dir), nil
 }

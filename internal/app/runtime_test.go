@@ -420,12 +420,16 @@ func TestResumeFallbackReportsLostFactsForKernelCharge(t *testing.T) {
 	if err := ad.LoadScript([]byte(resumeMissingScript)); err != nil {
 		t.Fatal(err)
 	}
+	evidenceDir := fx.app().layout.SessionsDir(wf)
+	if err := os.MkdirAll(evidenceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	rt, err := agent.NewRuntime(agent.RuntimeOptions{
 		Now:         fx.now,
 		IDs:         fx.ids,
 		Registry:    reg,
 		Redaction:   security.Registry{},
-		EvidenceDir: filepath.Join(fx.home, "evidence"),
+		EvidenceDir: evidenceDir,
 		Adapters:    map[string]agent.Adapter{"fake": ad},
 	})
 	if err != nil {
