@@ -343,6 +343,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	case error:
 		m.err = msg
+		// A renderer failure never leaves a background runner: clear the
+		// ownership state (design §16: the Runtime is unchanged; the user
+		// can recover through the Headless CLI).
+		m.clearRunner()
 		return m, nil
 	}
 	return m, nil
@@ -462,7 +466,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			// The pause failed; the user still asked to exit. Never
 			// leave a background runner: force-stop and quit.
 			m.forceStop()
-			return m, tea.Quit
+			return m.quit()
 		}
 		if _, ok := msg.cmd.(app.ResumeWorkflowCommand); ok && m.resumeThenRun {
 			// The Execution page requested the resume as the run start but
@@ -474,7 +478,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			// the pending resume-then-run would stay dangling and a later
 			// successful resume would double-start the runner.
 			m.resumeThenRun = false
-			return m, m.startRunner()
+			return m.startRunner()
 		}
 		return m, nil
 	}
@@ -490,7 +494,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		if m.stop == stopPauseAndExit {
 			// The Pause and Exit confirmation: the pause completed, so
 			// no background process is left; finish the exit.
-			return m, tea.Quit
+			return m.quit()
 		}
 		m.status = "workflow paused (controlled stop)"
 		m.pendingDecision = ""
@@ -501,7 +505,8 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		if m.resumeThenRun {
 			// The Execution page requested the resume as the run start.
 			m.resumeThenRun = false
-			return m, tea.Batch(m.reloadCmd(), m.startRunner())
+			m, run := m.startRunner()
+			return m, tea.Batch(m.reloadCmd(), run)
 		}
 		return m, m.reloadCmd()
 	case app.CancelWorkflowCommand:
@@ -596,9 +601,13 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 }
 
 // applyRunnerDone handles the terminal result of the Foreground Runner.
+// Every terminal path clears the ownership state exactly once: the run
+// closure's defer unsubscribes the event subscription, and this clears
+// running, runCancel, and eventCh (Task 6).
 func (m Model) applyRunnerDone(msg runnerDoneMsg) (Model, tea.Cmd) {
 	m.running = false
 	m.runCancel = nil
+	m.eventCh = nil
 	if msg.err != nil {
 		m.err = msg.err
 		return m, nil
@@ -634,7 +643,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.selected != "" {
 				// The first Ctrl+C requests the controlled Pause: the
 				// typed command closes dispatch and stops the managed
-				// processes (never just a local flag).
+				// processes, and the run context is cancelled so the real
+				// Runner stops (never just a local flag).
+				if m.runCancel != nil {
+					m.runCancel()
+				}
 				cmds = append(cmds, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected}))
 			}
 			return m, tea.Batch(cmds...)
@@ -642,7 +655,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// The second Ctrl+C is the Force Stop of the active Runner
 			// (and of any running controlled stop).
 			m.forceStop()
-			return m, tea.Quit
+			return m.quit()
 		}
 	}
 	// Tab cycles the lifecycle pages from any page (left/right keep
@@ -723,6 +736,28 @@ func (m *Model) forceStop() {
 	}
 }
 
+// clearRunner resets the Foreground Runner ownership state (design §11,
+// Task 6): it cancels any live run context and clears running, runCancel,
+// and eventCh. It never unsubscribes the event sink — the run closure's
+// defer owns the subscription and drops it exactly once — so terminal
+// paths never double-clean. Idempotent and safe on every terminal path.
+func (m *Model) clearRunner() {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	m.running = false
+	m.runCancel = nil
+	m.eventCh = nil
+}
+
+// quit cleans the Foreground Runner ownership state and returns the quit
+// command (design §12.1): a quit never leaves an active Runner running or
+// a dangling event subscription.
+func (m Model) quit() (Model, tea.Cmd) {
+	m.clearRunner()
+	return m, tea.Quit
+}
+
 // executeCmd runs one typed Application Command and delivers its Outcome.
 func (m Model) executeCmd(cmd app.Command) tea.Cmd {
 	return func() tea.Msg {
@@ -747,7 +782,7 @@ func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
 		}
 		m.forceStop()
-		return m, tea.Quit
+		return m.quit()
 	case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
 		m.stop = stopIdle
 		m.page = m.prevPage
@@ -1246,7 +1281,7 @@ func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.resumeThenRun = true
 			return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
 		}
-		return m, m.startRunner()
+		return m.startRunner()
 	case msg.Code == 'a' || msg.Code == 'A':
 		if m.pendingDecision != "" {
 			m.status = "adopting the workspace…"
@@ -1387,17 +1422,25 @@ func (m Model) handleCancelKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 // startRunner launches the Foreground Runner over the shared
 // controller: it drives the approved workflow to a terminal state, a
 // user decision, or a safe stop, streaming the committed events into
-// the Execution page.
-func (m Model) startRunner() tea.Cmd {
+// the Execution page. The root Model owns the runner lifecycle (design
+// §11): startRunner returns the updated Model with running, runCancel,
+// eventCh and the subscription set. Starting a Run while one is already
+// active is refused (idempotent guard) — no second runner and no second
+// subscription.
+func (m Model) startRunner() (Model, tea.Cmd) {
+	if m.running {
+		m.status = "a runner is already active"
+		return m, nil
+	}
 	if m.selected == "" {
-		return nil
+		return m, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	ch, id := m.sink.Subscribe()
 	m.runCancel = cancel
 	m.running = true
-	ch, id := m.sink.Subscribe()
 	m.eventCh = ch
-	return tea.Batch(
+	return m, tea.Batch(
 		func() tea.Msg {
 			defer m.sink.Unsubscribe(id)
 			r := &foreground.Runner{

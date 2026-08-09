@@ -10,10 +10,12 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/foreground"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 )
@@ -1169,6 +1171,301 @@ func TestModelQShowsPauseAndExit(t *testing.T) {
 	_, cmd = m7.Update(tea.KeyPressMsg{Code: KeyQuit})
 	if cmd != nil {
 		t.Fatal("q after the first Ctrl+C quit directly")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: Foreground Runner ownership
+// ---------------------------------------------------------------------------
+
+// blockingController drives the Foreground Runner into a bounded wait: its
+// DriveOnce returns a DriveWaiting outcome whose channel never closes, so
+// the Runner blocks until its run context is cancelled (design §12.1).
+type blockingController struct {
+	executed []app.Command
+	wait     chan struct{}
+}
+
+func (c *blockingController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+
+func (c *blockingController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeRunning}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{Workflow: "wf-1", Stage: model.StageExecution, Runtime: model.RuntimeRunning},
+		},
+		Health: app.HealthView{GitAvailable: true},
+	}, nil
+}
+
+func (c *blockingController) DriveOnce(_ context.Context, _ model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{Kind: app.DriveWaiting, Wait: c.wait}, nil
+}
+
+func (*blockingController) EscalateStop() {}
+
+// runBatchMessages runs a Batch command's sub-commands to completion and
+// returns their messages. The synchronous test harness cannot run a
+// blocking Runner, so the cancellation tests run it in a goroutine.
+func runBatchMessages(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	var results []tea.Msg
+	switch batch := msg.(type) {
+	case tea.BatchMsg:
+		for _, c := range batch {
+			if c != nil {
+				results = append(results, c())
+			}
+		}
+	default:
+		results = append(results, msg)
+	}
+	return results
+}
+
+// hasRunnerStopped reports whether the messages contain the Runner's
+// terminal result with the given stop reason.
+func hasRunnerStopped(msgs []tea.Msg, reason foreground.StopReason) bool {
+	for _, msg := range msgs {
+		if rd, ok := msg.(runnerDoneMsg); ok && rd.err == nil {
+			return rd.res.Reason == reason
+		}
+	}
+	return false
+}
+
+// TestRunnerStartOwnsState: the root Model owns the Foreground Runner
+// lifecycle (design §11, Task 6): startRunner returns the updated Model
+// with running, runCancel, eventCh and the subscription set, and the
+// runner-done terminal path clears them exactly once.
+func TestRunnerStartOwnsState(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m2, runCmd := m.startRunner()
+	if !m2.running || m2.runCancel == nil || m2.eventCh == nil {
+		t.Fatalf("runner ownership after start: running=%v runCancel=%v eventCh=%v",
+			m2.running, m2.runCancel == nil, m2.eventCh == nil)
+	}
+	if runCmd == nil {
+		t.Fatal("startRunner returned no runner command")
+	}
+
+	// A terminal run clears the ownership state exactly once.
+	m3 := runCmds(t, m2, runCmd)
+	if m3.running || m3.runCancel != nil || m3.eventCh != nil {
+		t.Fatalf("runner ownership after done: running=%v runCancel=%v eventCh=%v",
+			m3.running, m3.runCancel != nil, m3.eventCh != nil)
+	}
+}
+
+// TestRunnerDuplicateStartRefused: starting a Run while one is already
+// active is refused (Task 6): no second runner command and no second
+// subscription (the event channel is unchanged).
+func TestRunnerDuplicateStartRefused(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m, firstCmd := m.startRunner()
+	firstCh := m.eventCh
+	if firstCmd == nil {
+		t.Fatal("the first start produced no runner command")
+	}
+
+	m2, secondCmd := m.startRunner()
+	if secondCmd != nil {
+		t.Fatal("duplicate start issued a second runner command")
+	}
+	if m2.eventCh != firstCh {
+		t.Fatal("duplicate start replaced the event subscription")
+	}
+	if !m2.running {
+		t.Fatal("duplicate start cleared the running state")
+	}
+	if !strings.Contains(m2.status, "already active") {
+		t.Fatalf("duplicate start status = %q", m2.status)
+	}
+}
+
+// TestRunnerRunKeyRefusesDuplicate: pressing r while a Runner is active
+// refuses the second start (the Execution page never spawns a second
+// runner or a second subscription).
+func TestRunnerRunKeyRefusesDuplicate(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+	m.page = PageExecution
+
+	m, _ = m.startRunner()
+	m2 := press(t, m, 'r', 0)
+	if !strings.Contains(m2.status, "already active") {
+		t.Fatalf("r on an active runner status = %q", m2.status)
+	}
+	if ctrl.driveCalls != 0 {
+		t.Fatalf("duplicate r drove the runner again (drive calls = %d)", ctrl.driveCalls)
+	}
+}
+
+// TestModelPauseAndExitCancelsRunner: y on the Pause and Exit
+// confirmation cancels the REAL Runner (the run context is cancelled) so
+// the runner stops with StopCancelled — a quit never leaves a process.
+func TestModelPauseAndExitCancelsRunner(t *testing.T) {
+	ctrl := &blockingController{wait: make(chan struct{})}
+	rec := &recordingController{ctrl: ctrl}
+	m := load(t, testModel(rec))
+	m.selected = "wf-1"
+	m.page = PageExecution
+
+	m, runCmd := m.startRunner()
+	if !m.running || m.runCancel == nil {
+		t.Fatalf("runner did not start: running=%v runCancel=%v", m.running, m.runCancel == nil)
+	}
+	done := make(chan []tea.Msg, 1)
+	go func() {
+		done <- runBatchMessages(runCmd)
+	}()
+
+	// q shows the Pause and Exit confirmation instead of quitting directly.
+	m2, cmd := m.Update(tea.KeyPressMsg{Code: KeyQuit})
+	if cmd != nil {
+		t.Fatal("q quit directly while a runner is active")
+	}
+	m2m := m2.(Model)
+	if m2m.page != PagePauseExit || m2m.stop != stopPauseAndExit {
+		t.Fatalf("q state = page %d stop %d, want pause-and-exit", m2m.page, m2m.stop)
+	}
+
+	// y requests the controlled pause and cancels the real runner.
+	_, yCmd := m2m.Update(tea.KeyPressMsg{Code: 'y'})
+	if yCmd == nil {
+		t.Fatal("y produced no pause command")
+	}
+	if pauseMsg := yCmd(); pauseMsg == nil {
+		t.Fatal("the pause command produced no message")
+	}
+	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
+		t.Fatalf("y did not request the controlled pause: %v", rec.executed)
+	}
+
+	// The real runner stopped with StopCancelled (the run context was
+	// cancelled on the controlled-stop path).
+	select {
+	case msgs := <-done:
+		if !hasRunnerStopped(msgs, foreground.StopCancelled) {
+			t.Fatalf("the runner did not stop with StopCancelled: %#v", msgs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner was not cancelled by the pause-and-exit")
+	}
+}
+
+// TestModelCtrlCCancelsRunnerOnPause: the first Ctrl+C requests the
+// controlled Pause AND cancels the real Runner (the run context is
+// cancelled), so the runner stops with StopCancelled instead of driving
+// on.
+func TestModelCtrlCCancelsRunnerOnPause(t *testing.T) {
+	ctrl := &blockingController{wait: make(chan struct{})}
+	rec := &recordingController{ctrl: ctrl}
+	m := load(t, testModel(rec))
+	m.selected = "wf-1"
+	m.page = PageExecution
+
+	m, runCmd := m.startRunner()
+	done := make(chan []tea.Msg, 1)
+	go func() {
+		done <- runBatchMessages(runCmd)
+	}()
+
+	// The first Ctrl+C requests the controlled pause and cancels the
+	// runner.
+	m2 := press(t, m, KeyCtrlCRune, tea.ModCtrl)
+	if m2.stop != stopFirstCtrlC {
+		t.Fatalf("stop = %d, want first-ctrl-c", m2.stop)
+	}
+	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
+		t.Fatalf("the first Ctrl+C did not request the controlled pause: %v", rec.executed)
+	}
+
+	select {
+	case msgs := <-done:
+		if !hasRunnerStopped(msgs, foreground.StopCancelled) {
+			t.Fatalf("the runner did not stop with StopCancelled: %#v", msgs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner was not cancelled by the first Ctrl+C")
+	}
+}
+
+// TestModelCtrlCSecondForceStopCleansUp: the second Ctrl+C escalates the
+// controlled stop to the force-kill phase (EscalateStop), quits, and
+// cleans the runner ownership state.
+func TestModelCtrlCSecondForceStopCleansUp(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	rec := &recordingController{ctrl: ctrl}
+	m := load(t, testModel(rec))
+	m.selected = "wf-1"
+
+	m, _ = m.startRunner()
+	m2 := press(t, m, KeyCtrlCRune, tea.ModCtrl)
+	if m2.stop != stopFirstCtrlC {
+		t.Fatalf("stop = %d, want first-ctrl-c", m2.stop)
+	}
+	m3, quitCmd := m2.Update(tea.KeyPressMsg{Code: KeyCtrlCRune, Mod: tea.ModCtrl})
+	if rec.escalated != 1 {
+		t.Fatalf("the second Ctrl+C did not escalate: %d", rec.escalated)
+	}
+	if quitCmd == nil {
+		t.Fatal("the second Ctrl+C did not quit")
+	}
+	mm := m3.(Model)
+	if mm.running || mm.runCancel != nil || mm.eventCh != nil {
+		t.Fatalf("the second Ctrl+C left runner ownership: running=%v runCancel=%v eventCh=%v",
+			mm.running, mm.runCancel != nil, mm.eventCh != nil)
+	}
+}
+
+// TestRunnerDoneClearsEventChannel pins the applyRunnerDone terminal path:
+// a runner error resets running, runCancel, AND the event channel (no
+// stale subscription field is left on the Model).
+func TestRunnerDoneClearsEventChannel(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m, runCmd := m.startRunner()
+	m = runCmds(t, m, runCmd)
+	if m.running || m.runCancel != nil || m.eventCh != nil {
+		t.Fatalf("runner done left ownership: running=%v runCancel=%v eventCh=%v",
+			m.running, m.runCancel != nil, m.eventCh != nil)
+	}
+}
+
+// TestRunnerRendererErrorClearsOwnership: a renderer failure (an error
+// message) never leaves a background Runner — the ownership state is
+// cleared (design §16: the Runtime is unchanged; the user recovers
+// through the Headless CLI).
+func TestRunnerRendererErrorClearsOwnership(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m, _ = m.startRunner()
+	m2 := step(t, m, model.InvalidInputFault("renderer exploded"))
+	if m2.running || m2.runCancel != nil || m2.eventCh != nil {
+		t.Fatalf("renderer error left runner ownership: running=%v runCancel=%v eventCh=%v",
+			m2.running, m2.runCancel != nil, m2.eventCh != nil)
 	}
 }
 
