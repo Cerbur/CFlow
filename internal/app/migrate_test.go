@@ -166,6 +166,60 @@ func TestPrepareRejectsSymlinkManifestRetry(t *testing.T) {
 	}
 }
 
+// TestLegacyMigrationPrepareIsIdempotentOnRetry proves the Prepare
+// durability contract: a crash mid-Prepare leaves the immutable manifest
+// on disk, and re-running the exact same Prepare (the designed recovery
+// action) must succeed idempotently — it must not hard-fail, must not
+// create a second migration row, and must not alter the manifest bytes.
+func TestLegacyMigrationPrepareIsIdempotentOnRetry(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatalf("prepare #1: %v", err)
+	}
+	manifestPath := filepath.Join(a.layout.StateDir(lf.wf), "layout-migrations",
+		migrationID(lf.wf, pv.ManifestHash)+".json")
+	before, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest after prepare #1: %v", err)
+	}
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatalf("prepare #2 (idempotent retry): %v", err)
+	}
+	after, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest after prepare #2: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("the immutable manifest bytes changed across the idempotent retry")
+	}
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var rowCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM layout_migrations WHERE workflow_id = ?`, string(lf.wf)).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("migration rows = %d, want exactly 1", rowCount)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM layout_migrations WHERE workflow_id = ?`, string(lf.wf)).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "PREPARED" {
+		t.Fatalf("migration status = %q, want PREPARED", status)
+	}
+}
+
 func TestLegacyMigrationExecuteBlocksOutOfOrderBeforeAnyMove(t *testing.T) {
 	lf := newLegacyMigrationFixture(t)
 	ctx := context.Background()

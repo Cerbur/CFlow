@@ -289,8 +289,19 @@ func (a *Application) prepareMigrationExecute(ctx context.Context, st *store.Sto
 	if err != nil {
 		return Outcome{}, err
 	}
+	// The source snapshot records the aggregate version the migration was
+	// prepared against, excluding the migration intent's own commit. On an
+	// idempotent retry the intent is already pending (its commit advanced
+	// the version), so subtract one to reproduce the identical immutable
+	// manifest bytes the first Prepare persisted.
+	snapshotVersion := uint64(view.AggregateVersion)
+	for _, pending := range view.PendingEffects {
+		if existing, ok := pending.Intent.(model.LayoutMigrationIntent); ok && existing.MigrationID == id {
+			snapshotVersion = uint64(view.AggregateVersion) - 1
+		}
+	}
 	snapshot := layout.SourceSnapshot{
-		AggregateVersion: uint64(view.AggregateVersion), LayoutVersion: state.Workflow.LayoutVersion,
+		AggregateVersion: snapshotVersion, LayoutVersion: state.Workflow.LayoutVersion,
 		IntegrationBranch: state.Workflow.IntegrationBranch, IntegrationHead: state.Workflow.IntegrationHead,
 		BaseCommit: state.Workflow.BaseCommit, PreviewHash: preview.ManifestHash,
 	}
@@ -355,11 +366,11 @@ func migrationID(wf model.WorkflowID, manifestHash string) string {
 // hash) under the workflow's state directory through the security guard,
 // so the Execute step and the Recovery engine read the exact bound moves.
 func (a *Application) writeMigrationManifest(data []byte, path string) error {
-	f, err := security.CreateSensitiveFile(path)
-	if err != nil {
-		if !os.IsExist(err) {
-			return model.InvariantFault(fmt.Errorf("migration manifest cannot be persisted"))
-		}
+	if _, err := os.Lstat(path); err == nil {
+		// The manifest already exists (a crash mid-Prepare left it on
+		// disk): it must be a regular managed file, and its bytes must be
+		// identical — the manifest is immutable. A symlink or a different
+		// content fails closed.
 		if _, checkErr := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); checkErr != nil {
 			return checkErr
 		}
@@ -369,6 +380,12 @@ func (a *Application) writeMigrationManifest(data []byte, path string) error {
 				"the immutable layout migration manifest already exists with different content")
 		}
 		return nil
+	} else if !os.IsNotExist(err) {
+		return model.InvariantFault(fmt.Errorf("migration manifest cannot be persisted"))
+	}
+	f, err := security.CreateSensitiveFile(path)
+	if err != nil {
+		return model.InvariantFault(fmt.Errorf("migration manifest cannot be persisted"))
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
