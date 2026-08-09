@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/security"
@@ -100,8 +101,8 @@ const (
 // <root>/<workflow-id>/<type>/<revision>/<hash>; the aggregated workflow
 // layout places every artifact type under one of the fixed managed
 // directories of the workflow aggregated root
-// <root>/<type-dir>/<revision>/<hash>, where <root> is the workflow root
-// itself and the workflow id never appears as a path component.
+// <root>/<type-dir>/<artifact-type>/<revision>/<hash>, where <root> is the
+// workflow root itself and the workflow id never appears as a path component.
 type layoutMode int
 
 const (
@@ -115,19 +116,22 @@ const (
 
 // aggregatedTypeDirs is the fixed type to directory mapping of the
 // aggregated workflow layout (design 7): every writable Artifact Type
-// maps to one of the seven managed artifact directories, and the legacy
-// artifacts/<workflow-id>/<type> path is never used.
+// maps to one of the seven managed artifact directories. The Artifact Type
+// remains a child path component so types sharing a category never collide;
+// the legacy artifacts/<workflow-id>/<type> path is never used.
 var aggregatedTypeDirs = map[model.ArtifactType]string{
-	model.ArtifactPlan:            "plans",
-	model.ArtifactSpec:            "specs",
-	model.ArtifactCatalog:         "specs", // verification catalog accompanies the spec
-	model.ArtifactWorkflow:        "workflows",
-	model.ArtifactDiscussionTurn:  "discussion",
-	model.ArtifactPlanCheck:       "reviews",
-	model.ArtifactReport:          "reports",
-	model.ArtifactCleanupManifest: "reports",  // cleanup manifest is the cleanup report
-	model.ArtifactRoutingPolicy:   "evidence", // Runtime-authored gate policy facts
-	model.ArtifactBudgetPolicy:    "evidence", // Runtime-authored gate policy facts
+	model.ArtifactPlan:              "plans",
+	model.ArtifactSpec:              "specs",
+	model.ArtifactCatalog:           "specs", // verification catalog accompanies the spec
+	model.ArtifactWorkflow:          "workflows",
+	model.ArtifactDiscussionTurn:    "discussion",
+	model.ArtifactPlanCheck:         "reviews",
+	model.ArtifactReport:            "reports",
+	model.ArtifactCleanupManifest:   "reports",    // cleanup manifest is the cleanup report
+	model.ArtifactRoutingPolicy:     "evidence",   // Runtime-authored gate policy facts
+	model.ArtifactBudgetPolicy:      "evidence",   // Runtime-authored gate policy facts
+	model.ArtifactChangeSet:         "evidence",   // frozen candidate/workspace facts
+	model.ArtifactDiscussionHandoff: "discussion", // structured native discussion handoff
 }
 
 // Store is the immutable Artifact Store over one managed artifacts root.
@@ -243,7 +247,8 @@ func (s *Store) typeDir(typ model.ArtifactType) (string, error) {
 
 // baseDir is the directory that holds the revision directories of one
 // artifact type. In the aggregated layout the workflow id is bound at
-// construction and never appears in the path.
+// construction and never appears in the path; the Artifact Type separates
+// entries that share one managed category.
 func (s *Store) baseDir(wf model.WorkflowID, typ model.ArtifactType) (string, error) {
 	dir, err := s.typeDir(typ)
 	if err != nil {
@@ -253,7 +258,7 @@ func (s *Store) baseDir(wf model.WorkflowID, typ model.ArtifactType) (string, er
 		if wf != s.wf {
 			return "", model.InvalidInputFault("artifact workflow does not match the aggregated store workflow")
 		}
-		return filepath.Join(s.root, dir), nil
+		return filepath.Join(s.root, dir, string(typ)), nil
 	}
 	return filepath.Join(s.root, string(wf), dir), nil
 }
@@ -390,7 +395,17 @@ func (s *Store) Resolve(ctx context.Context, req ResolveRequest) (model.Artifact
 // introduces a workflow id path component.
 func (s *Store) buildParentChain(wf model.WorkflowID, base, dir string) []string {
 	if s.layout == layoutAggregated {
-		return []string{s.root, base, dir}
+		chain := []string{s.root}
+		rel, err := filepath.Rel(s.root, dir)
+		if err != nil || rel == "." || filepath.IsAbs(rel) {
+			return chain
+		}
+		current := s.root
+		for _, part := range strings.Split(rel, string(filepath.Separator)) {
+			current = filepath.Join(current, part)
+			chain = append(chain, current)
+		}
+		return chain
 	}
 	return []string{
 		s.root,

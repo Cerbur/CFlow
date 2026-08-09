@@ -105,16 +105,29 @@ func (a *Application) agentRuntime(ctx context.Context, st model.State) (*agent.
 // lazily (per-workflow root under the workflow directory, PRD 全局目录
 // 结构).
 func (a *Application) artifactStore(wf model.WorkflowID) (*artifact.Store, error) {
+	layoutVersion, err := a.workflowLayoutVersion(context.Background(), wf)
+	if err != nil {
+		return nil, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if s := a.artifacts[wf]; s != nil {
+	if s := a.artifacts[wf]; s != nil && a.artifactLayouts[wf] == layoutVersion {
 		return s, nil
 	}
-	st, err := artifact.New(filepath.Join(a.workflowDir(wf), "artifacts"), a.redaction)
+	var st *artifact.Store
+	switch layoutVersion {
+	case 1:
+		st, err = artifact.New(filepath.Join(a.legacyWorkflowDir(wf), "artifacts"), a.redaction)
+	case 2:
+		st, err = artifact.NewWorkflow(a.layout.WorkflowRoot(wf), wf, a.redaction)
+	default:
+		return nil, model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, layoutVersion))
+	}
 	if err != nil {
 		return nil, err
 	}
 	a.artifacts[wf] = st
+	a.artifactLayouts[wf] = layoutVersion
 	return st, nil
 }
 
@@ -128,18 +141,36 @@ func (a *Application) planningWorktreePath(wf model.WorkflowID) string {
 // the open write Store when the caller holds it, else from a read view
 // (design §7: 1 = legacy planning snapshot, 2 = aggregated workspace).
 func (a *Application) workflowLayout(ctx context.Context, wf model.WorkflowID) int {
+	version, _ := a.workflowLayoutVersion(ctx, wf)
+	return version
+}
+
+// workflowLayoutVersion returns the authoritative persisted layout binding.
+// Artifact selection fails closed when the workflow cannot be read or carries
+// an unsupported value; it must never silently treat an unknown workflow as
+// legacy.
+func (a *Application) workflowLayoutVersion(ctx context.Context, wf model.WorkflowID) (int, error) {
 	a.mu.Lock()
 	st := a.stores[wf]
 	a.mu.Unlock()
 	if st != nil {
-		if view, err := st.View(ctx, store.StoreQuery{}); err == nil {
-			return view.State.Workflow.LayoutVersion
+		view, err := st.View(ctx, store.StoreQuery{})
+		if err != nil {
+			return 0, err
 		}
+		if view.State.Workflow.ID != wf {
+			return 0, model.InvalidInputFault("no such workflow: " + string(wf))
+		}
+		return view.State.Workflow.LayoutVersion, nil
 	}
-	if view, err := a.readAggregate(ctx, wf, store.StoreQuery{}); err == nil {
-		return view.State.Workflow.LayoutVersion
+	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
+	if err != nil {
+		return 0, err
 	}
-	return 0
+	if view.State.Workflow.ID != wf {
+		return 0, model.InvalidInputFault("no such workflow: " + string(wf))
+	}
+	return view.State.Workflow.LayoutVersion, nil
 }
 
 // planningCWD returns the deterministic session cwd of the planning

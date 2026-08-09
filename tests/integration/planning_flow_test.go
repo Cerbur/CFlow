@@ -444,7 +444,7 @@ func TestDirtyUserWorkspaceIsIsolatedAndRequiresConfirmation(t *testing.T) {
 	requireFileContent(t, fx.repo.Path("user-wip.txt"), "uncommitted secret")
 
 	manifest, err := os.ReadFile(filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo.Root).Key,
-		"workflows", string(out.Workflow), "workflow.yaml"))
+		string(out.Workflow), "workflow.yaml"))
 	if err != nil {
 		t.Fatalf("read workflow.yaml: %v", err)
 	}

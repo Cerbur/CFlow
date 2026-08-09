@@ -22,7 +22,11 @@ func (a *Application) queryWorkspace(ctx context.Context, q ProjectWorkspaceQuer
 	view := WorkspaceView{
 		Project: ProjectView{Key: a.project.Key, Root: a.project.Root, Name: filepath.Base(a.project.Root)},
 	}
-	for _, wf := range a.knownWorkflows() {
+	ids, err := a.knownWorkflows(ctx)
+	if err != nil {
+		return nil, orCtx(ctx, err)
+	}
+	for _, wf := range ids {
 		agg, err := a.readAggregate(ctx, wf, store.StoreQuery{})
 		if err != nil {
 			return nil, orCtx(ctx, err)

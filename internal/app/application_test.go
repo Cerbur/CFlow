@@ -294,6 +294,29 @@ func TestStatusDoesNotMigrateOrTakeWriter(t *testing.T) {
 	probe.RequireAbsent(t, "migration", "project-writer")
 }
 
+// TestListUsesSQLiteWithoutWorkflowDirectories: SQLite is authoritative for
+// workflow enumeration. A fresh process must list a persisted workflow even
+// when no legacy or aggregated workflow directory is present.
+func TestListUsesSQLiteWithoutWorkflowDirectories(t *testing.T) {
+	app, _ := fixtureApplication(t)
+	projects := filepath.Join(app.home, "projects")
+	if err := os.Rename(projects, filepath.Join(app.home, "detached-projects-fixture")); err != nil {
+		t.Fatalf("detach workflow directories: %v", err)
+	}
+	fresh, err := New(Options{
+		Home: app.home, Project: app.project, CflowVersion: app.cflowVer,
+		Now: app.now, IDs: model.SequentialIDSource(), Supervisor: app.supervisor,
+		GitFlow: app.git,
+	})
+	requireNoError(t, err)
+	view, err := fresh.Query(context.Background(), ListQuery{})
+	requireNoError(t, err)
+	workflows := view.(ListView).Workflows
+	if len(workflows) != 1 || workflows[0].ID != "workflow-1" {
+		t.Fatalf("SQLite workflows = %+v, want workflow-1", workflows)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // mutation behavior
 // ---------------------------------------------------------------------------

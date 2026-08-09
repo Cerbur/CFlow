@@ -317,10 +317,14 @@ func TestCreateWorkflowWritesStaticManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	manifest, err := os.ReadFile(filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key,
-		"workflows", string(wf), "workflow.yaml"))
+	root := filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key, string(wf))
+	manifest, err := os.ReadFile(filepath.Join(root, "workflow.yaml"))
 	if err != nil {
 		t.Fatalf("read workflow.yaml: %v", err)
+	}
+	if pathExists(filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key,
+		"workflows", string(wf))) {
+		t.Fatal("layout version 2 created a legacy workflow directory")
 	}
 	text := string(manifest)
 	for _, want := range []string{
@@ -394,6 +398,16 @@ func TestDiscussionPersistsSessionAndTurnArtifact(t *testing.T) {
 	}
 	if turn.SessionID != string(out.SessionID) || !strings.Contains(turn.User, "division by zero") {
 		t.Fatalf("turn artifact = %+v", turn)
+	}
+	aggregated := filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key,
+		string(wf), "discussion", string(model.ArtifactDiscussionTurn), "1")
+	if !pathExists(aggregated) {
+		t.Fatalf("layout version 2 discussion artifact missing from %s", aggregated)
+	}
+	legacy := filepath.Join(fx.home, "projects", ProjectFor(fx.root).Key,
+		"workflows", string(wf), "artifacts")
+	if pathExists(legacy) {
+		t.Fatalf("layout version 2 discussion artifact created legacy root %s", legacy)
 	}
 }
 

@@ -22,9 +22,9 @@ import (
 // legacyMigrationFixture builds one Layout Version 1 workflow over the
 // real repository with its legacy roots.
 type legacyMigrationFixture struct {
-	t  *testing.T
-	fx *planningFixture
-	wf model.WorkflowID
+	t   *testing.T
+	fx  *planningFixture
+	wf  model.WorkflowID
 	key string
 
 	legacyRoot string // worktrees/<key>/<wf>
@@ -42,13 +42,6 @@ func newLegacyMigrationFixture(t *testing.T) *legacyMigrationFixture {
 	wf, err := fx.create("legacy-demo", false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
-	}
-	// Run one discussion turn so the legacy Artifacts root exists (the
-	// discussion-turn Artifact is written into projects/<key>/workflows/
-	// <wf>/artifacts).
-	if _, err := fx.app(discussionScript("d1", "division by zero must error")).Execute(context.Background(),
-		DiscussRequirementCommand{Workflow: wf, Text: "division by zero must error", Provider: "fake"}); err != nil {
-		t.Fatalf("discuss: %v", err)
 	}
 	// The aggregated workspace was created by the create; remove the
 	// registered Worktree (git worktree remove, never a bare directory
@@ -98,15 +91,20 @@ func newLegacyMigrationFixture(t *testing.T) *legacyMigrationFixture {
 	if err := setIntegrationHead(t, dbPath, wf, base); err != nil {
 		t.Fatalf("record integration head: %v", err)
 	}
-	// Mirror workflow.yaml into the legacy root so the Preview lists it.
+	// Build the legacy non-code root explicitly. Move the fixture manifest
+	// from its original Layout 2 destination and create the historical
+	// artifacts directory; Layout 2 writes must never populate that legacy
+	// directory as a side effect.
 	legacyWFYaml := filepath.Join(fx.home, "projects", key, "workflows", string(wf), "workflow.yaml")
 	if err := os.MkdirAll(filepath.Dir(legacyWFYaml), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(legacyWFYaml); os.IsNotExist(err) {
-		if err := os.WriteFile(legacyWFYaml, []byte("schema_version: 1\n"), 0o600); err != nil {
-			t.Fatalf("write legacy manifest: %v", err)
-		}
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(legacyWFYaml), "artifacts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aggregatedWFYaml := filepath.Join(fx.home, "projects", key, string(wf), "workflow.yaml")
+	if err := os.Rename(aggregatedWFYaml, legacyWFYaml); err != nil {
+		t.Fatalf("move fixture manifest to legacy root: %v", err)
 	}
 	return &legacyMigrationFixture{
 		t: t, fx: fx, wf: wf, key: key,
@@ -224,5 +222,3 @@ func openRawDB(t *testing.T, dbPath string) (*sql.DB, error) {
 	}
 	return db, nil
 }
-
-

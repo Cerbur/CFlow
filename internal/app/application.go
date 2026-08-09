@@ -50,12 +50,13 @@ type Application struct {
 	layout     layout.Resolver
 	probe      probe // test seam: protocol-order observation, nil in production
 
-	mu        sync.Mutex
-	locks     *platform.LockSet
-	stores    map[model.WorkflowID]*store.Store // open write Stores, per workflow
-	known     map[model.WorkflowID]struct{}     // workflows opened this session
-	procs     map[model.ProcessID]process.Handle
-	artifacts map[model.WorkflowID]*artifact.Store // open Artifact Stores, per workflow
+	mu              sync.Mutex
+	locks           *platform.LockSet
+	stores          map[model.WorkflowID]*store.Store // open write Stores, per workflow
+	known           map[model.WorkflowID]struct{}     // workflows opened this session
+	procs           map[model.ProcessID]process.Handle
+	artifacts       map[model.WorkflowID]*artifact.Store // open Artifact Stores, per workflow
+	artifactLayouts map[model.WorkflowID]int             // layout version bound by each cached Store
 	// dispatchMu serializes the aggregate transactions of one dispatch
 	// pass (Task 16 live parallelism): the selected Nodes' effect chains
 	// run concurrently — the Provider Sessions overlap in real time —
@@ -155,6 +156,7 @@ func New(opts Options) (*Application, error) {
 		known:              map[model.WorkflowID]struct{}{},
 		procs:              map[model.ProcessID]process.Handle{},
 		artifacts:          map[model.WorkflowID]*artifact.Store{},
+		artifactLayouts:    map[model.WorkflowID]int{},
 		processSessions:    map[model.ProcessID]model.SessionID{},
 		processIdentities:  map[model.ProcessID]process.ProcessIdentity{},
 		stopPolicy:         defaultStopPolicy(opts.StopPolicy),
@@ -249,7 +251,11 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 
 func (a *Application) queryList(ctx context.Context, q ListQuery) (View, error) {
 	var out ListView
-	for _, wf := range a.knownWorkflows() {
+	ids, err := a.knownWorkflows(ctx)
+	if err != nil {
+		return nil, orCtx(ctx, err)
+	}
+	for _, wf := range ids {
 		view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
 		if err != nil {
 			return nil, orCtx(ctx, err)
