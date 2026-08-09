@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
@@ -745,27 +746,58 @@ func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.Workflow
 	if !artifact.IsNotFound(resolveErr) {
 		return base.with(BlockedDrift, "the exact artifact revision is corrupt or carries the wrong identity"), nil
 	}
-	var dir string
+	var dir, managedRoot string
 	switch state.Workflow.LayoutVersion {
 	case 1:
-		dir = filepath.Join(e.legacyArtifactRoot(wf), string(wf), string(intent.Ref.Type), fmt.Sprintf("%d", intent.Ref.Revision))
+		managedRoot = e.legacyArtifactRoot(wf)
+		dir = filepath.Join(managedRoot, string(wf), string(intent.Ref.Type), fmt.Sprintf("%d", intent.Ref.Revision))
 	case 2:
-		dir, err = artifact.WorkflowRevisionDir(e.workflowRoot(wf), intent.Ref.Type, intent.Ref.Revision)
+		managedRoot = e.workflowRoot(wf)
+		dir, err = artifact.WorkflowRevisionDir(managedRoot, intent.Ref.Type, intent.Ref.Revision)
 		if err != nil {
 			return base.with(FatalInvariant, "the aggregate artifact revision path is invalid"), nil
 		}
 	default:
 		return base.with(FatalInvariant, "the workflow layout version cannot select an artifact path"), nil
 	}
-	_, err = os.Lstat(dir)
+	absent, err := managedPathAbsent(managedRoot, dir)
 	switch {
-	case err == nil:
-		return base.with(BlockedDrift, "the artifact revision path exists but cannot resolve valid content"), nil
-	case os.IsNotExist(err):
+	case err != nil:
+		return base.with(BlockedDrift, "the artifact revision path or an ancestor is corrupt or unreadable"), nil
+	case absent:
 		return base.with(SafeToRetry, "the artifact revision is absent"), nil
 	default:
-		return base.with(BlockedDrift, "the artifact revision directory cannot be inspected"), nil
+		return base.with(BlockedDrift, "the artifact revision path exists but cannot resolve valid content"), nil
 	}
+}
+
+// managedPathAbsent distinguishes a genuinely absent descendant from ENOENT
+// caused by an existing corrupt ancestor. Every existing component from the
+// known managed root must be a real directory; symlinks, wrong types, and
+// inspection failures are drift rather than retryable absence.
+func managedPathAbsent(root, target string) (bool, error) {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, fmt.Errorf("managed path is outside its root")
+	}
+	current := root
+	parts := strings.Split(rel, string(filepath.Separator))
+	for index := 0; index <= len(parts); index++ {
+		if index > 0 {
+			current = filepath.Join(current, parts[index-1])
+		}
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return true, nil
+			}
+			return false, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false, fmt.Errorf("managed path component is not a real directory")
+		}
+	}
+	return false, nil
 }
 
 // classifyWorkflowCompile classifies one unfinished WorkflowCompileIntent

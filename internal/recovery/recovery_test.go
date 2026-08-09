@@ -800,6 +800,46 @@ func TestRecoveryFixedRevisionRejectsNonDirectoryRevisionPath(t *testing.T) {
 	})
 }
 
+func TestRecoveryFixedRevisionRejectsCorruptRevisionAncestors(t *testing.T) {
+	setup := func(t *testing.T) (*recoveryFixture, string) {
+		t.Helper()
+		fx := newRecoveryFixture(t)
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		typeDir, err := artifact.WorkflowTypeDir(root, model.ArtifactReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(typeDir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return fx, typeDir
+	}
+	seed := func(fx *recoveryFixture) {
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+	}
+
+	t.Run("dangling type directory symlink", func(t *testing.T) {
+		fx, typeDir := setup(t)
+		if err := os.Symlink("missing-type-target", typeDir); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("regular file type directory", func(t *testing.T) {
+		fx, typeDir := setup(t)
+		if err := os.WriteFile(typeDir, []byte("not a type directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+}
+
 // TestRecoveryProviderSessionDispositions: a ProviderStartIntent whose
 // Session settled terminal is ALREADY_COMPLETED; a still-open Session is
 // SAFE_TO_RETRY.

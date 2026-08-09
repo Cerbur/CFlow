@@ -187,10 +187,18 @@ func (a *Application) verificationManifests(ctx context.Context, wf model.Workfl
 	}
 	var out []model.EvidenceManifest
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		if !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		path := filepath.Join(dir, e.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, model.InvariantFault(fmt.Errorf("verification evidence %s is not a regular file", e.Name()))
+		}
+		body, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
 		}

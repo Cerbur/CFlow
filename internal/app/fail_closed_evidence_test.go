@@ -280,3 +280,54 @@ func TestVerificationManifestIntegrityFailsClosed(t *testing.T) {
 		}
 	})
 }
+
+func TestReportRequiresJSONEvidenceToBeRegularFiles(t *testing.T) {
+	setup := func(t *testing.T, requirement string) (*Application, model.WorkflowID, string) {
+		t.Helper()
+		fx := newPlanningFixture(t)
+		wf, err := fx.create(requirement, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := fx.app()
+		dir := filepath.Join(a.layout.EvidenceDir(wf), "verification")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return a, wf, dir
+	}
+	requireReportFault := func(t *testing.T, a *Application, wf model.WorkflowID) {
+		t.Helper()
+		view, err := a.readAggregate(context.Background(), wf, store.StoreQuery{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.reportInput(context.Background(), observe.BuildInfo{}, view.State, view.NextEventSeq, len(view.Events) == 0); err == nil {
+			t.Fatal("final report accepted a non-regular .json evidence entry")
+		}
+	}
+
+	t.Run("directory", func(t *testing.T) {
+		a, wf, dir := setup(t, "directory verification evidence")
+		if err := os.Mkdir(filepath.Join(dir, "verify-s01.json"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		requireReportFault(t, a, wf)
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		a, wf, dir := setup(t, "symlink verification evidence")
+		m := validVerificationManifest(t, "verify-s01")
+		body, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "target.txt"), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("target.txt", filepath.Join(dir, "verify-s01.json")); err != nil {
+			t.Fatal(err)
+		}
+		requireReportFault(t, a, wf)
+	})
+}
