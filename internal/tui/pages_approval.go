@@ -1,9 +1,11 @@
 package tui
 
-// The Execution Approval page (design §6.2, TUI task 14): the preview
-// tabs (Plan/Spec/DAG/Diff) and the fixed Hash/Scope/Route/Budget/Git
-// Policy Inspector. Every confirmation defaults to NO: Enter alone never
-// approves; the user must explicitly select Yes.
+// The Approval pages (design §6.2, TUI task 14): the Plan Approval and
+// the Execution Approval preview tabs (Plan/Spec/DAG/Diff) with the
+// fixed Hash/Scope/Route/Budget/Git Policy Inspector. Every
+// confirmation defaults to NO: Enter alone never approves; the user must
+// explicitly select Yes. The quit keys belong to the root Model's
+// controlled-stop protocol; a page never quits by itself.
 
 import (
 	"fmt"
@@ -24,12 +26,14 @@ const (
 	TabDiff
 )
 
-// ApprovalModel is the renderable Execution Approval page.
+// ApprovalModel is the renderable Approval page: the Plan Approval when
+// Plan is set, the Execution Approval when Preview is set.
 type ApprovalModel struct {
-	Preview  app.ExecutionPreviewView
-	Tab      ApprovalTab
+	Plan      app.PlanView
+	Preview   app.ExecutionPreviewView
+	Tab       ApprovalTab
 	Confirmed bool // the explicit Yes/No confirmation state
-	Yes      bool   // the selected confirm answer (Enter alone never confirms)
+	Yes       bool // the selected confirm answer (Enter alone never confirms)
 }
 
 // NewApprovalModel maps the execution preview into the page.
@@ -69,17 +73,46 @@ func (m ApprovalModel) Update(msg tea.Msg) (ApprovalModel, tea.Cmd) {
 		case msg.Code == 'n' || msg.Code == 'N':
 			m.Confirmed = true
 			m.Yes = false
-		case IsQuit(msg) || IsCtrlC(msg):
-			return m, tea.Quit
 		}
 	}
 	return m, nil
 }
 
-// RenderApproval renders the Approval page.
+// RenderPlanApproval renders the Plan Approval page.
+func RenderPlanApproval(pv app.PlanView, m ApprovalModel) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "plan approval — workflow %s  %s/%s\n", pv.Workflow, pv.Stage, pv.Runtime)
+	status := string(pv.PlanStatus)
+	if pv.Approved {
+		status = "APPROVED"
+	}
+	fmt.Fprintf(&b, "plan: revision %d  %s\n", pv.Revision, status)
+	if pv.Hash != "" {
+		fmt.Fprintf(&b, "hash: %s\n", pv.Hash)
+	}
+	b.WriteString("\n")
+	if !m.Confirmed {
+		b.WriteString("approve? Enter to choose, y/n (defaults to no)\n")
+	} else {
+		mark := "no"
+		if m.Yes {
+			mark = "yes"
+		}
+		fmt.Fprintf(&b, "confirm: %s (Enter toggles; Enter alone never approves)\n", mark)
+	}
+	return b.String()
+}
+
+// RenderApproval renders the Execution Approval page.
 func RenderApproval(m ApprovalModel) string {
 	var b strings.Builder
 	pv := m.Preview
+	if pv.Workflow == "" {
+		b.WriteString("execution approval — (no preview yet; run the execution dry run first)\n")
+		b.WriteString("\n")
+		b.WriteString("approve? Enter to choose, y/n (defaults to no)\n")
+		return b.String()
+	}
 	fmt.Fprintf(&b, "execution approval — workflow %s\n", pv.Workflow)
 	tabs := []string{"plan", "spec", "dag", "diff"}
 	for i, t := range tabs {
@@ -96,7 +129,7 @@ func RenderApproval(m ApprovalModel) string {
 	b.WriteString(renderApprovalInspector(pv))
 	b.WriteString("\n")
 	if !m.Confirmed {
-		b.WriteString("approve? Enter to choose, y/n, q to quit (defaults to no)\n")
+		b.WriteString("approve? Enter to choose, y/n (defaults to no)\n")
 	} else {
 		mark := "no"
 		if m.Yes {

@@ -885,6 +885,14 @@ func workflowArg(args []string) model.WorkflowID {
 	return ""
 }
 
+// OpenApplication assembles the shared Application for one stateful
+// command from the environment, honoring the injected
+// Dependencies.OpenApplication seam (the TUI uses the same default
+// construction as the headless commands).
+func OpenApplication(ctx context.Context, deps Dependencies) (*app.Application, error) {
+	return openApplication(ctx, deps)
+}
+
 // openApplication assembles the Application for one stateful command from
 // the environment (design 20.1): CFLOW_HOME or the default ~/.cflow, and
 // the current working directory as the project root. The GitFlow seam is

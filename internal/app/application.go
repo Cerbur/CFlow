@@ -148,9 +148,9 @@ func New(opts Options) (*Application, error) {
 		redaction:          opts.Redaction,
 		supervisor:         sup,
 		git:                opts.GitFlow,
-prompts:          opts.Prompts,
-		agent:            opts.Agent,
-		layout:           layout.Resolver{Home: opts.Home, ProjectKey: opts.Project.Key},
+		prompts:            opts.Prompts,
+		agent:              opts.Agent,
+		layout:             layout.Resolver{Home: opts.Home, ProjectKey: opts.Project.Key},
 		stores:             map[model.WorkflowID]*store.Store{},
 		known:              map[model.WorkflowID]struct{}{},
 		procs:              map[model.ProcessID]process.Handle{},
@@ -427,6 +427,15 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 		if merr := a.writeFinalReport(ctx, wf, st); merr != nil {
 			return Outcome{}, orCtx(ctx, merr)
 		}
+	}
+	// A prepared native discussion turn carries the managed Bridge
+	// request facts: the TUI's blocking-exec callback attaches the
+	// terminal streams and runs the supervised interactive process
+	// (design §9.1, TUI task 12). The request is assembled from the
+	// recorded Session binding and the Application's own seams; the TUI
+	// never constructs the process by itself.
+	if _, ok := cmd.(PrepareNativeDiscussionCommand); ok && out.SessionID != "" {
+		out.Native = a.nativeBridgeRequest(ctx, wf, out.SessionID)
 	}
 	// The workflow.yaml artifact manifest follows the Plan Revision it
 	// records (PRD Workflow 元信息: artifacts.active_plan). The read goes

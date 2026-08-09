@@ -267,6 +267,15 @@ func decideApplyReviewRunEnded(state model.State, in model.EffectResultInput, cr
 	verdict, err := parseReviewVerdict(in.Body)
 	b := &builder{state: state}
 	b.mutate(sessionEnd(state, created, in))
+	// The independent Apply Verification Session settled: its managed
+	// process record is stopped so the completed Workflow carries no
+	// active process (the Cleanup gate, design 17.4, requires no managed
+	// processes; the record remains the durable ledger of the run). The
+	// stop runs through the managed stop effect and settles the record
+	// from the typed stopped fact.
+	if p := processBySession(state, created.ID); p != nil && p.Status == model.ProcessStatusRunning {
+		b.effect(model.ManagedProcessStopIntent{Process: p.ID})
+	}
 	if err != nil || !verdict {
 		b.mutate(model.ApplyMutation{ID: att.ID, Status: model.ApplyBlocked, EndedAt: state.Now})
 		b.event(model.EventApplyBlocked, "", model.AttemptKey{}, model.CodeSemanticReviewFailed,
@@ -555,6 +564,17 @@ func findApplyAttempt(state model.State, id model.ApplyAttemptID) *model.ApplyAt
 	for i := range state.ApplyAttempts {
 		if state.ApplyAttempts[i].ID == id {
 			return &state.ApplyAttempts[i]
+		}
+	}
+	return nil
+}
+
+// processBySession returns the managed process record bound to one
+// Session (nil when none exists).
+func processBySession(state model.State, session model.SessionID) *model.ProcessRecord {
+	for i := range state.Processes {
+		if state.Processes[i].Session == session {
+			return &state.Processes[i]
 		}
 	}
 	return nil

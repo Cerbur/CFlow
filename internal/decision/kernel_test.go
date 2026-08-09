@@ -971,17 +971,31 @@ func TestApplyProtocolAndTargetStability(t *testing.T) {
 		t.Fatalf("staging head = %s, want staging-1", got)
 	}
 
-	// the review verdict is judged by the Kernel; PASS -> awaiting delivery
+	// the review verdict is judged by the Kernel; PASS -> awaiting
+	// delivery, and the Apply Verification Session's managed process is
+	// stopped so the completed Workflow carries no active process (the
+	// Cleanup gate requires no managed processes)
 	review := model.EffectResultInput{Kind: model.ProviderRunEnded,
 		Session:      model.Session{ID: "rev-1", ProviderSessionID: "av-1", Purpose: model.PurposeApplyVerification, Status: model.SessionCompleted},
 		Body:         []byte("PASS\n"),
 		ManifestHash: "mh-1"}
 	got3, err := decision.Decide(state, review)
 	requireNoError(t, err)
-	requireNoEffect(t, got3)
+	requireEffect(t, got3, model.ManagedProcessStopIntent{Process: "p-1"})
 	state = apply(t, state, got3)
 	if got := state.ApplyAttempts[0].Status; got != model.ApplyAwaitingConfirmation {
 		t.Fatalf("apply = %s after the review, want AWAITING_CONFIRMATION", got)
+	}
+	// the managed stop settles the process record from the typed fact
+	got4, err := decision.Decide(state, model.EffectResultInput{Kind: model.ProcessStopped, Process: "p-1"})
+	requireNoError(t, err)
+	requireNoEffect(t, got4)
+	state = apply(t, state, got4)
+	_ = got4
+	for _, p := range state.Processes {
+		if p.ID == "p-1" && p.Status != model.ProcessStatusStopped {
+			t.Fatalf("apply verification process = %s, want STOPPED", p.Status)
+		}
 	}
 
 	// a repeated request against the verified attempt is a no-op that
@@ -1014,23 +1028,23 @@ func TestApplyProtocolAndTargetStability(t *testing.T) {
 	// exact confirmation -> the final compare-and-swap fast-forward
 	confirm := model.ApplyCommandInput{Kind: model.ApplyExecute, TargetHead: "main-head",
 		IntegrationHead: "int-9", PreflightHash: "cp-1", Fingerprint: "fp-1"}
-	got4, err := decision.Decide(state, confirm)
+	got5, err := decision.Decide(state, confirm)
 	requireNoError(t, err)
-	requireEffect(t, got4, model.ApplyFastForwardIntent{Apply: "apply-1", TargetHead: "main-head"})
-	state = apply(t, state, got4)
+	requireEffect(t, got5, model.ApplyFastForwardIntent{Apply: "apply-1", TargetHead: "main-head"})
+	state = apply(t, state, got5)
 
 	// fast-forward success settles from the observed ref and never alters
 	// the completed Workflow
-	got5, err := decision.Decide(state, model.EffectResultInput{
+	got6, err := decision.Decide(state, model.EffectResultInput{
 		Kind: model.ApplyFastForwardSucceeded, ApplyAttempt: "apply-1", ObservedHead: "staging-1"})
 	requireNoError(t, err)
-	for _, m := range got5.Mutations {
+	for _, m := range got6.Mutations {
 		if _, ok := m.(model.WorkflowMutation); ok {
 			t.Fatalf("apply success must not alter the Workflow: %+v", m)
 		}
 	}
-	requireEvent(t, got5, model.EventApplySucceeded)
-	state = apply(t, state, got5)
+	requireEvent(t, got6, model.EventApplySucceeded)
+	state = apply(t, state, got6)
 	if got := state.ApplyAttempts[0].Status; got != model.ApplySucceeded {
 		t.Fatalf("apply = %s after the delivery, want SUCCEEDED", got)
 	}

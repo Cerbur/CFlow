@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+
+	"cflow.local/cflow/internal/model"
 )
 
 // TerminalSection is the active section of the Terminal page.
@@ -30,6 +32,9 @@ type TerminalModel struct {
 	ApplyPreview string
 	// CleanupPreview is the cleanup manifest summary.
 	CleanupPreview string
+	// cleanupRef is the exact Manifest Ref of the produced Cleanup Dry
+	// Run the explicit execution binds ("" until a manifest exists).
+	cleanupRef *model.ArtifactRef
 	// Confirmed is the explicit Yes/No confirmation state.
 	Confirmed bool
 	// Yes is the selected confirm answer (Enter alone never confirms).
@@ -42,7 +47,9 @@ func NewTerminalModel() TerminalModel { return TerminalModel{} }
 // Init is the initial command (none).
 func (m TerminalModel) Init() tea.Cmd { return nil }
 
-// Update handles one message on the Terminal page.
+// Update handles one message on the Terminal page. The quit keys belong
+// to the root Model's controlled-stop protocol; the page only
+// navigates its sections and the confirmation state.
 func (m TerminalModel) Update(msg tea.Msg) (TerminalModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -69,8 +76,6 @@ func (m TerminalModel) Update(msg tea.Msg) (TerminalModel, tea.Cmd) {
 		case msg.Code == 'n' || msg.Code == 'N':
 			m.Confirmed = true
 			m.Yes = false
-		case IsQuit(msg) || IsCtrlC(msg):
-			return m, tea.Quit
 		}
 	}
 	return m, nil

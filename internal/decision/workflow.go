@@ -244,10 +244,14 @@ func decidePrepareNativeDiscussion(state model.State, in model.PrepareNativeDisc
 	startIfNeeded(b, state)
 	parent := latestPlanningSession(state)
 	b.mutate(model.SessionAppendMutation{Session: model.Session{
-		ID:         in.Session,
-		Purpose:    model.PurposePlanning,
-		Status:     model.SessionStarting,
-		Supersedes: supersedesOf(parent),
+		ID: in.Session, Purpose: model.PurposePlanning,
+		// The bootstrap identity the native interactive resume targets
+		// (design §9.1): the Provider's own conversation identity the
+		// Bridge attaches to. Real Providers validate the identity when
+		// the resume starts; the Fake accepts any exact identity.
+		ProviderSessionID: string(in.Session),
+		Status:            model.SessionStarting,
+		Supersedes:        supersedesOf(parent),
 	}, Provider: in.Provider})
 	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion session prepared")
 	return b.decision(), nil
@@ -641,10 +645,10 @@ func decideExecutionApproval(state model.State, in model.ExecutionApprovalInput)
 	}
 	b := &builder{state: state}
 	b.mutate(model.ApprovalAppendMutation{Approval: model.Approval{
-		ID:   model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
-		Kind: model.ApprovalExecution,
-		Seq:  state.NextEventSeq,
-		Refs: refs,
+		ID:                model.ApprovalID(fmt.Sprintf("approval-%d", len(state.Approvals)+1)),
+		Kind:              model.ApprovalExecution,
+		Seq:               state.NextEventSeq,
+		Refs:              refs,
 		Fingerprint:       facts.Fingerprint,
 		PreflightRevision: facts.PreflightRevision,
 	}})

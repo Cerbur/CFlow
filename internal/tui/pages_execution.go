@@ -45,6 +45,15 @@ func NewExecutionModel(wf model.WorkflowID) ExecutionModel {
 	}
 }
 
+// WithWorkflow returns the page bound to the given workflow (the first
+// binding wins; the page never switches workflows by itself).
+func (m ExecutionModel) WithWorkflow(wf model.WorkflowID) ExecutionModel {
+	if m.Workflow == "" {
+		m.Workflow = wf
+	}
+	return m
+}
+
 // Init is the initial command (none).
 func (m ExecutionModel) Init() tea.Cmd { return nil }
 
@@ -78,7 +87,9 @@ func nodeStatusForEvent(ev model.Event) model.NodeStatus {
 	return ""
 }
 
-// Update handles one message on the Execution page.
+// Update handles one message on the Execution page. The quit keys
+// belong to the root Model's controlled-stop protocol; the page only
+// navigates its panes.
 func (m ExecutionModel) Update(msg tea.Msg) (ExecutionModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -91,8 +102,6 @@ func (m ExecutionModel) Update(msg tea.Msg) (ExecutionModel, tea.Cmd) {
 			if m.Pane < PaneLog {
 				m.Pane++
 			}
-		case IsQuit(msg) || IsCtrlC(msg):
-			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -158,5 +167,3 @@ func RenderBlocked(m WorkspaceModel) string {
 	b.WriteString("(the workflow stays blocked until the user acts; no automatic retry)\n")
 	return b.String()
 }
-
-

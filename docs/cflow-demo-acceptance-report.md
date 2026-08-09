@@ -259,11 +259,18 @@ Provider.
 - **Candidate:** Internal Candidate (Fake TUI Gate) — NOT a release and
   NOT the Demo Complete Candidate of Gate 3.
 - **Gate script:** `scripts/gate-tui.sh <new-empty-artifact-dir>`.
-- **Fake E2E:** `TestTUIPlanToApplyAndCleanup` drives the complete
-  lifecycle — create → native discussion prepare/finish (strict
+- **Fake E2E:** `TestTUIPlanToApplyAndCleanup` starts the ACTUAL root TUI
+  (the Bubble Tea Program over a Fake terminal — an os.Pipe input the
+  test drives with real key sequences) and the shared Application, and
+  drives the complete lifecycle entirely through the keyboard: create →
+  native discussion (prepare + supervised interactive turn + strict
   `discussion-handoff.json` handoff) → plan approval → execution approval
-  (default-no) → foreground Runner → report → apply → cleanup — through
-  the Fake Adapter with the TUI models exercised at every stage.
+  (default-no; Enter alone never approves) → workspace adoption →
+  foreground Runner → final report → protected apply (the original
+  working tree HEAD/Index/files are re-verified) → explicit cleanup (the
+  exact code directories are deleted; the artifacts, evidence, report,
+  database, and refs are preserved). The test never calls the Application
+  for the lifecycle steps, and no real Provider is ever invoked.
 - **Worktree policy:** the aggregated Workspace is the single delivery
   mainline; tasks branch from the verified workspace head and merge back
   serially; the explicit Cleanup lists the aggregated code directories

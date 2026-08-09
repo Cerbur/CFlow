@@ -192,11 +192,11 @@ func (ProjectWorkspaceQuery) isQuery() {}
 
 // WorkspaceView is the aggregate workspace projection.
 type WorkspaceView struct {
-	Project     ProjectView
-	Workflows   []WorkflowSummary
-	Selected    model.WorkflowID
-	Lifecycle   *WorkflowLifecycleView
-	Health      HealthView
+	Project      ProjectView
+	Workflows    []WorkflowSummary
+	Selected     model.WorkflowID
+	Lifecycle    *WorkflowLifecycleView
+	Health       HealthView
 	LegalActions []LegalAction
 }
 
@@ -211,10 +211,10 @@ type ProjectView struct {
 // workspace main column renders: the status projection plus the active
 // Plan revision and the blocking findings.
 type WorkflowLifecycleView struct {
-	Status     StatusView
-	Plan       *PlanView
-	Blocked    bool
-	Adopted    bool
+	Status  StatusView
+	Plan    *PlanView
+	Blocked bool
+	Adopted bool
 }
 
 // HealthView is the provider/git health of the workspace (read-only
@@ -226,10 +226,10 @@ type HealthView struct {
 
 // ProviderHealth is one enabled Provider's detection summary.
 type ProviderHealth struct {
-	Name          string
-	Compatible    bool
-	Executable    string
-	CLIVersion    string
+	Name       string
+	Compatible bool
+	Executable string
+	CLIVersion string
 }
 
 // LegalAction is one action the selected workflow may legally take right
@@ -304,12 +304,12 @@ type PlanView struct {
 // at the immutable ArtifactChangeSet Revision written by the freeze; the
 // remaining fields mirror the Git facts the Runtime captured.
 type ChangeSetView struct {
-	Ref       model.ArtifactRef
-	Base      string
-	Candidate string
-	Verified  string
+	Ref         model.ArtifactRef
+	Base        string
+	Candidate   string
+	Verified    string
 	Fingerprint string
-	Dirty     bool
+	Dirty       bool
 }
 
 // MigrationPreviewView is the read-only Legacy Layout Migration preview:
@@ -866,37 +866,37 @@ type ConfirmApplyPolicyCommand struct {
 	Workflow model.WorkflowID
 }
 
-func (CreateWorkflowCommand) isCommand()      {}
-func (DiscussRequirementCommand) isCommand()  {}
-func (FreezeDiscussionCommand) isCommand()    {}
-func (GeneratePlanCommand) isCommand()        {}
-func (CheckPlanCommand) isCommand()           {}
-func (ApprovePlanCommand) isCommand()         {}
-func (StartWorkflowCommand) isCommand()       {}
-func (PauseWorkflowCommand) isCommand()       {}
-func (ResumeWorkflowCommand) isCommand()      {}
-func (CancelWorkflowCommand) isCommand()      {}
-func (DryRunCommand) isCommand()              {}
-func (ExecuteCleanupCommand) isCommand()      {}
-func (GenerateSpecsCommand) isCommand()       {}
-func (CompileWorkflowCommand) isCommand()     {}
-func (ExecutionDryRunCommand) isCommand()     {}
-func (ApproveExecutionCommand) isCommand()    {}
-func (DispatchCommand) isCommand()            {}
-func (AdoptWorkspaceCommand) isCommand()      {}
-func (PrepareLayoutMigrationCommand) isCommand()      {}
-func (ExecuteLayoutMigrationCommand) isCommand()      {}
-func (PrepareNativeDiscussionCommand) isCommand()     {}
-func (FinishDiscussionCommand) isCommand()            {}
-func (ReconcileCommand) isCommand()           {}
-func (CommitPolicyConfirmCommand) isCommand() {}
-func (ReplacementPreviewCommand) isCommand()  {}
-func (ApproveReplacementCommand) isCommand()  {}
-func (CompleteWorkflowCommand) isCommand()    {}
-func (RetryCommand) isCommand()               {}
-func (PrepareApplyCommand) isCommand()        {}
-func (ExecuteApplyCommand) isCommand()        {}
-func (ConfirmApplyPolicyCommand) isCommand()  {}
+func (CreateWorkflowCommand) isCommand()          {}
+func (DiscussRequirementCommand) isCommand()      {}
+func (FreezeDiscussionCommand) isCommand()        {}
+func (GeneratePlanCommand) isCommand()            {}
+func (CheckPlanCommand) isCommand()               {}
+func (ApprovePlanCommand) isCommand()             {}
+func (StartWorkflowCommand) isCommand()           {}
+func (PauseWorkflowCommand) isCommand()           {}
+func (ResumeWorkflowCommand) isCommand()          {}
+func (CancelWorkflowCommand) isCommand()          {}
+func (DryRunCommand) isCommand()                  {}
+func (ExecuteCleanupCommand) isCommand()          {}
+func (GenerateSpecsCommand) isCommand()           {}
+func (CompileWorkflowCommand) isCommand()         {}
+func (ExecutionDryRunCommand) isCommand()         {}
+func (ApproveExecutionCommand) isCommand()        {}
+func (DispatchCommand) isCommand()                {}
+func (AdoptWorkspaceCommand) isCommand()          {}
+func (PrepareLayoutMigrationCommand) isCommand()  {}
+func (ExecuteLayoutMigrationCommand) isCommand()  {}
+func (PrepareNativeDiscussionCommand) isCommand() {}
+func (FinishDiscussionCommand) isCommand()        {}
+func (ReconcileCommand) isCommand()               {}
+func (CommitPolicyConfirmCommand) isCommand()     {}
+func (ReplacementPreviewCommand) isCommand()      {}
+func (ApproveReplacementCommand) isCommand()      {}
+func (CompleteWorkflowCommand) isCommand()        {}
+func (RetryCommand) isCommand()                   {}
+func (PrepareApplyCommand) isCommand()            {}
+func (ExecuteApplyCommand) isCommand()            {}
+func (ConfirmApplyPolicyCommand) isCommand()      {}
 
 // ---------------------------------------------------------------------------
 // Outcome
@@ -922,10 +922,36 @@ type Outcome struct {
 	// ChangeSet is the Change Set the freeze command wrote (nil for
 	// commands without one).
 	ChangeSet *ChangeSetView
+	// Native is the managed Native Session Bridge request facts of one
+	// prepared native discussion turn (nil for commands without one,
+	// design §9.1, TUI task 12): everything the TUI's blocking-exec
+	// callback needs except the terminal streams, which the TUI attaches.
+	// The Adapter and Supervisor are seam references; the Bridge alone
+	// starts the supervised interactive process.
+	Native *NativeBridgeRequest
 	// ExportErr reports a failed events.jsonl export. The export is a
 	// rebuildable audit file, never the recovery stream (design 21); the
 	// mutation itself is unaffected.
 	ExportErr error
+}
+
+// NativeBridgeRequest is the managed facts of one prepared native
+// discussion turn: the exact Session, the Provider binding facts, the
+// Workflow Workspace the interactive process runs in, and the Adapter and
+// Supervisor seams the Bridge needs. The TUI only attaches the terminal
+// streams and the user intent; it never constructs the process itself.
+type NativeBridgeRequest struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
+	Provider string
+	// ProviderSession is the Provider's own conversation identity the
+	// interactive resume targets (the bootstrap identity the Session
+	// recorded at prepare).
+	ProviderSession agent.ProviderSessionID
+	// Worktree is the Workflow Workspace the native process runs in.
+	Worktree   string
+	Adapter    agent.Adapter
+	Supervisor process.Supervisor
 }
 
 // ---------------------------------------------------------------------------

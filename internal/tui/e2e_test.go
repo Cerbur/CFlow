@@ -1,346 +1,606 @@
 package tui
 
 // Fake TUI E2E (TUI task 16): the deterministic, fully-Fake-provider
-// lifecycle through the app seam — create → native discussion finish →
-// plan approval → execution approval → foreground runner → report →
-// apply → cleanup — with the TUI model/render mapping exercised at every
-// stage. No real Provider is ever invoked.
+// lifecycle driven through the ACTUAL root TUI — the Bubble Tea Program
+// runs the real root Model over a Fake terminal (an os.Pipe input) and
+// the shared Application. Every key press flows through the TUI; the
+// test never calls the Application for the lifecycle steps. The flow
+// covers create → native discussion → plan/execution approvals →
+// adoption → foreground runner → final report → protected apply →
+// explicit cleanup, and asserts the authoritative Git/DB facts
+// afterwards. No real Provider is ever invoked.
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"cflow.local/cflow/internal/agent"
-	"cflow.local/cflow/internal/agent/fake"
 	tea "charm.land/bubbletea/v2"
 
 	"cflow.local/cflow/internal/app"
-	"cflow.local/cflow/internal/foreground"
-	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/cli"
 	"cflow.local/cflow/internal/model"
-	"cflow.local/cflow/internal/process"
-	"cflow.local/cflow/internal/security"
+	"cflow.local/cflow/internal/observe"
 )
 
-// tuiE2EFixture builds one Fake-driven Application over a real repository.
-type tuiE2EFixture struct {
-	t   *testing.T
-	sup process.Supervisor
-	root string
-	home string
-	ids  model.IDSource
-	now  func() time.Time
-	seq  int
+// syncBuffer is the thread-safe screen capture: the renderer writes
+// frames while the test polls for markers. The Bubble Tea diff renderer
+// writes CHANGED text verbatim, so the E2E waits on the fragments that
+// appear only when the model rendered the projection (new lines and
+// changed values), plus the authoritative app state.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
-func newTUIE2EFixture(t *testing.T) *tuiE2EFixture {
-	t.Helper()
-	root := filepath.Join(t.TempDir(), "repo")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	git := func(args ...string) string {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = root
-		cmd.Env = append(os.Environ(),
-			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
-			"GIT_AUTHOR_NAME=Test User", "GIT_AUTHOR_EMAIL=test@example.com",
-			"GIT_COMMITTER_NAME=Test User", "GIT_COMMITTER_EMAIL=test@example.com",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	git("init", "-b", "main", "-q")
-	if err := os.WriteFile(filepath.Join(root, "init.txt"), []byte("init"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	git("add", "-A")
-	git("commit", "-q", "-m", "init")
-	// verification wrappers
-	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, s := range []string{"verify.sh", "final-verify.sh", "apply-verify.sh"} {
-		if err := os.WriteFile(filepath.Join(root, "scripts", s), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	git("add", "-A")
-	git("commit", "-q", "-m", "wrappers")
-	// The CFLOW_HOME must be canonical (no symlink traversal); the macOS
-	// temp root resolves through /var -> /private/var.
-	home := filepath.Join(t.TempDir(), "home")
-	if canon, err := filepath.EvalSymlinks(filepath.Dir(home)); err == nil {
-		home = filepath.Join(canon, filepath.Base(home))
-	}
-	return &tuiE2EFixture{
-		t: t, sup: process.NewSupervisor(process.NewOSAdapter()), root: root,
-		home: home,
-		ids:  model.SequentialIDSource(),
-		now:  func() time.Time { return time.Unix(1700000000, 0).UTC() },
-	}
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
 }
 
-// app builds a fresh Application with the given Fake scripts loaded.
-func (fx *tuiE2EFixture) app(scripts ...string) *app.Application {
-	fx.t.Helper()
-	reg, err := agent.LoadProviderRegistry()
-	if err != nil {
-		fx.t.Fatalf("provider registry: %v", err)
-	}
-	prompts, err := agent.LoadPromptRegistry()
-	if err != nil {
-		fx.t.Fatalf("prompt registry: %v", err)
-	}
-	ad := fake.New(reg)
-	for _, s := range scripts {
-		if err := ad.LoadScript([]byte(s)); err != nil {
-			fx.t.Fatalf("load fake script: %v", err)
-		}
-	}
-	flow, err := gitflow.NewGitFlow(fx.sup, fx.root)
-	if err != nil {
-		fx.t.Fatal(err)
-	}
-	a, err := app.New(app.Options{
-		Home: fx.home, Project: app.ProjectFor(fx.root),
-		CflowVersion: "0.0.0-dev", Now: fx.now, IDs: fx.ids,
-		Supervisor: fx.sup, GitFlow: flow, Prompts: prompts,
-		Agent: agent.RuntimeOptions{
-			Registry: reg, Redaction: security.Registry{},
-			Adapters: map[string]agent.Adapter{"fake": ad},
-			EvidenceDir: filepath.Join(fx.home, "evidence"),
-		},
-	})
-	if err != nil {
-		fx.t.Fatal(err)
-	}
-	return a
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
-// fakeScript is the deterministic planning script for one purpose.
-func fakeScript(purpose, sessionID, result string) string {
-	return `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"` + purpose +
-		`","session_id":"` + sessionID + `","exit_code":0,"resume":"ok"}
-{"type":"session_started","session_id":"` + sessionID + `","at_ms":0}
-{"type":"assistant_message","session_id":"` + sessionID + `","text":"running","at_ms":10}
-{"type":"session_finished","session_id":"` + sessionID + `","result":` + result + `,"at_ms":20}`
-}
+// fakeTerminal keys: plain text is written verbatim; enter is CR; tab is
+// HT; ctrl+c is 0x03; arrows are the CSI sequences.
+const (
+	keyEnter = "\r"
+	keyTab   = "\t"
+	keyEsc   = "\x1b"
+	keyCtrlC = "\x03"
+	keyRight = "\x1b[C"
+	keyLeft  = "\x1b[D"
+	keyUp    = "\x1b[A"
+	keyDown  = "\x1b[B"
+)
 
-func (fx *tuiE2EFixture) next(prefix string) string {
-	fx.seq++
-	return prefix + string(rune('0'+fx.seq%10)) + string(rune('0'+(fx.seq/10)%10))
-}
-
-// validPlanMarkdown is the full PRD-required plan.
-const validPlanMarkdown = `# Add divide
-
-## 背景
-Division by zero is silent.
-
-## 目标
-Division by zero must error.
-
-## 范围
-The division operator only.
-
-## 非目标
-No other arithmetic changes.
-
-## 约束
-No external dependencies.
-
-## 当前实现分析
-internal/calc/divide.go returns zero.
-
-## 推荐技术方案
-Return a typed error.
-
-## 关键设计决策
-The check lives inside Divide.
-
-## 涉及模块与文件边界
-internal/calc and internal/cli.
-
-## 数据与兼容性影响
-No persisted data.
-
-## 测试与验收方案
-Unit tests plus a CLI assertion.
-
-## 风险与回滚
-Small revert.
-
-## 未决问题
-None.
-`
-
-// TestTUIPlanToApplyAndCleanup is the TUI task 16 failure test: the
-// complete Fake-provider lifecycle through the app seam, with the TUI
-// model/render mapping exercised at every stage.
+// TestTUIPlanToApplyAndCleanup drives the complete lifecycle through the
+// real root TUI keyboard flow and asserts the authoritative Git and DB
+// facts: the Target Working Tree HEAD/Index/files after the Apply, and
+// the exact Cleanup deletion set.
 func TestTUIPlanToApplyAndCleanup(t *testing.T) {
-	fx := newTUIE2EFixture(t)
-	ctx := context.Background()
+	fx := newTUIFixture(t)
+	fx.stubFakeAgentOnPath()
+	ref := &appRef{fx: fx, scripts: fx.fullFlowScripts()}
 
-	// 1. Create the workflow and run one native discussion turn.
-	wf, err := fx.app().Execute(ctx, app.CreateWorkflowCommand{Name: "calculator", Provider: "fake", ConfirmDirty: false})
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	// 2. The native discussion: Prepare records the Session; Finish writes
-	// the strict handoff.
-	prep, err := fx.app().Execute(ctx, app.PrepareNativeDiscussionCommand{Workflow: wf.Workflow, Provider: "fake"})
-	if err != nil {
-		t.Fatalf("prepare native discussion: %v", err)
-	}
-	session := prep.SessionID
-	if session == "" {
-		t.Fatal("no native session")
-	}
-	handoff, _ := json.Marshal(map[string]any{
-		"workflow_id":         string(wf.Workflow),
-		"session_id":          string(session),
-		"targets":             "division by zero must error",
-		"constraints":         "no external dependencies",
-		"non_goals":           "no other arithmetic changes",
-		"acceptance_criteria": "Divide returns a typed error on zero",
-		"open_questions":      "error wording",
-		"change_set":          map[string]any{"revision": 1, "sha256": strings.Repeat("a", 64)},
-		"user_decisions":      []map[string]any{{"topic": "error type", "decision": "typed error"}},
-	})
-	if _, err := fx.app().Execute(ctx, app.FinishDiscussionCommand{Workflow: wf.Workflow, Session: session, Handoff: handoff}); err != nil {
-		t.Fatalf("finish discussion: %v", err)
-	}
-
-	// 3. Plan generation + check + approval.
-	d := fx.next("d")
-	if _, err := fx.app(fakeScript("planning", d, `{"accepted":true}`)).Execute(ctx,
-		app.DiscussRequirementCommand{Workflow: wf.Workflow, Text: "division by zero must error", Provider: "fake"}); err != nil {
-		t.Fatalf("discuss: %v", err)
-	}
-	p := fx.next("p")
-	if _, err := fx.app(fakeScript("planning", p, `{"plan_markdown":`+jsonQuote(validPlanMarkdown)+`}`)).Execute(ctx,
-		app.GeneratePlanCommand{Workflow: wf.Workflow, Provider: "fake"}); err != nil {
-		t.Fatalf("generate plan: %v", err)
-	}
-	c := fx.next("c")
-	if _, err := fx.app(fakeScript("plan-check", c, `{"decision":"pass","summary":"ok","blockingGaps":[],"nonBlockingSuggestions":[],"confidence":0.9}`)).Execute(ctx,
-		app.CheckPlanCommand{Workflow: wf.Workflow, Provider: "fake"}); err != nil {
-		t.Fatalf("check plan: %v", err)
-	}
-	planView, err := fx.app().Query(ctx, app.PlanQuery{Workflow: wf.Workflow})
+	termIn, termOut, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	pv := planView.(app.PlanView)
-	if _, err := fx.app().Execute(ctx, app.ApprovePlanCommand{Workflow: wf.Workflow, Revision: pv.Revision, Hash: pv.Hash}); err != nil {
-		t.Fatalf("approve plan: %v", err)
-	}
+	// The pipe ends are deliberately not closed: the program's input
+	// reader may still be blocked on the read end after Run returns, and
+	// closing it would race the reader (the process cleans up the fds).
+	screen := syncBuffer{}
 
-	// 4. Specs + compile + dry run + execution approval.
-	specJSON := `{"id":"s01","goal":"implement divide","depends_on":[],"write_scope":["src/divide/**"],"read_scope":[],"locks":[],"acceptance":{"verification_command_ids":["verify"]},"route":{"provider":"fake","model":"default","budget":10},"timeout_seconds":1800,"max_retry":2}`
-	s := fx.next("s")
-	if _, err := fx.app(fakeScript("spec-generation", s, `{"specs":[`+specJSON+`],"proposed_commands":[]}`)).Execute(ctx,
-		app.GenerateSpecsCommand{Workflow: wf.Workflow, Provider: "fake"}); err != nil {
-		t.Fatalf("generate specs: %v", err)
-	}
-	w := fx.next("w")
-	patch := `{"schema":"cflow-workflow-patch-1","operations":[{"op":"add_checkpoint","node_id":"merge-s01"}]}`
-	if _, err := fx.app(fakeScript("workflow-optimization", w, patch)).Execute(ctx,
-		app.CompileWorkflowCommand{Workflow: wf.Workflow, Provider: "fake"}); err != nil {
-		t.Fatalf("compile workflow: %v", err)
-	}
-	if _, err := fx.app().Execute(ctx, app.ExecutionDryRunCommand{Workflow: wf.Workflow}); err != nil {
-		t.Fatalf("dry run: %v", err)
-	}
-	qv, err := fx.app().Query(ctx, app.ExecutionPreviewQuery{Workflow: wf.Workflow})
-	if err != nil {
-		t.Fatal(err)
-	}
-	preview := qv.(app.ExecutionPreviewView)
-	// The Approval page: Enter alone never approves.
-	approval := NewApprovalModel(preview)
-	approval, _ = approval.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if approval.Confirmed && approval.Yes {
-		t.Fatal("the approval page approved without selecting yes")
-	}
-	approval, _ = approval.Update(tea.KeyPressMsg{Code: 'y'})
-	if !approval.Confirmed || !approval.Yes {
-		t.Fatal("the approval page did not confirm")
-	}
-	if got := RenderApproval(approval); !strings.Contains(got, "confirm: yes") {
-		t.Fatalf("approval render = %q", got)
-	}
-	if _, err := fx.app().Execute(ctx, app.ApproveExecutionCommand{
-		Workflow: wf.Workflow, PlanHash: preview.PlanHash, SpecHashes: preview.SpecHashes,
-		CatalogHash: preview.CatalogHash, WorkflowHash: preview.WorkflowHash,
-		RoutingHash: preview.RoutingHash, BudgetHash: preview.BudgetHash,
-		CommitPolicyHash: preview.CommitPolicyHash,
-	}); err != nil {
-		t.Fatalf("execution approval: %v", err)
-	}
+	prog := tea.NewProgram(
+		newModel(Dependencies{
+			CLI: cli.Dependencies{
+				Build:           observe.BuildInfo{Version: "0.0.0-e2e", SourceCommit: "e2e"},
+				OpenApplication: ref.open,
+			},
+		}),
+		tea.WithInput(termIn),
+		tea.WithOutput(&screen),
+		tea.WithWindowSize(120, 40),
+	)
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := prog.Run()
+		runDone <- err
+	}()
 
-	// 5. The foreground Runner drives the dispatch chain to completion.
-	implScript := `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"implementation","session_id":"i1","exit_code":0,"resume":"ok","tasks":{"task-s01":{"writes":[{"path":"src/divide/divide.go","content":"package divide\n\n// Divide returns a/b.\nfunc Divide(a, b int) (int, error) {\n\treturn a / b, nil\n}\n"}],"commit":"implement divide"}}}
-{"type":"session_started","session_id":"i1","at_ms":0}
-{"type":"assistant_message","session_id":"i1","text":"implemented","at_ms":10}
-{"type":"session_finished","session_id":"i1","result":{"summary":"implemented"},"at_ms":20}`
-	review := fakeScript("review", "r1", `{"decision":"PASS","report":"PASS\n\nFindings:\n- none\n"}`)
-	final := fakeScript("final-verification", "fr1", `{"decision":"PASS","report":"PASS\n\nFindings:\n- none\n"}`)
-	a := fx.app(implScript, review, final)
-	runner := foreground.Runner{Driver: a}
-	execModel := NewExecutionModel(wf.Workflow)
-	// Drive passes; the runner stops at a terminal or a user decision.
-	for i := 0; i < 6; i++ {
-		out, err := a.DriveOnce(ctx, wf.Workflow)
-		if err != nil {
-			if code, ok := model.CodeOf(err); ok && code == model.CodeWorkspaceAdoptionRequired {
-				break
+	// waitOutput blocks until the rendered screen contains the marker.
+	waitOutput := func(marker string) {
+		t.Helper()
+		deadline := time.Now().Add(120 * time.Second)
+		for !strings.Contains(screen.String(), marker) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for screen %q\n--- screen ---\n%s", marker, screen.String())
 			}
-			t.Fatalf("drive pass %d: %v", i, err)
+			time.Sleep(20 * time.Millisecond)
 		}
-		for _, ev := range out.Outcome.Events {
-			execModel = execModel.OnEvent(ev)
+	}
+	// waitApp blocks until the app predicate holds.
+	waitApp := func(label string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(120 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for app %q\n--- screen ---\n%s", label, screen.String())
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		if out.Kind == app.DriveTerminal {
+	}
+	// waitBuffer blocks until the screen buffer satisfies the predicate.
+	// The Bubble Tea diff renderer writes changed content verbatim, so
+	// the predicates target final-frame content that is never
+	// overwritten (new pages, loaded projections, changed values).
+	waitBuffer := func(label string, pred func(string) bool) {
+		t.Helper()
+		deadline := time.Now().Add(120 * time.Second)
+		for !pred(screen.String()) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for screen %q\n--- screen ---\n%s", label, screen.String())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	keys := func(s string) {
+		if _, err := termOut.Write([]byte(s)); err != nil {
+			t.Fatalf("write keys: %v", err)
+		}
+	}
+
+	// The initial workspace: the read-only load rendered the project.
+	waitOutput("no workflows yet")
+
+	// ---- create the workflow through the TUI form ----
+	keys("n")
+	waitOutput("create workflow")
+	keys("calculator" + keyEnter)
+	// The TUI processed the create (the workspace renders the workflow
+	// with the status line).
+	waitOutput("workflow created")
+	waitOutput("REQUIREMENT_DISCUSSION")
+	wf := ref.list()[0]
+
+	// ---- native discussion ----
+	keys(keyRight) // → discussion (the workspace arrows navigate)
+	waitOutput("Start Native Discussion")
+	keys(keyEnter) // Start Native Discussion (prepare + bridge turn)
+	waitOutput("Continue Same Session")
+	keys(keyDown)  // select Finish (Continue is the default selection)
+	keys(keyEnter) // freeze the change set → handoff editor
+	waitOutput("handoff content (JSON)")
+	keys(handoffContentJSON)
+	keys(keyEnter) // finish the discussion
+	waitApp("discussion finished", func() bool {
+		return sessionCompleted(t, ref.a, wf)
+	})
+
+	// ---- plan approval ----
+	keys(keyTab) // → plan approval
+	waitOutput("plan approval")
+	keys("g") // generate the plan
+	waitApp("plan generated", func() bool { return planRevision(t, ref.a, wf) >= 1 })
+	waitBuffer("plan hash rendered", func(s string) bool { return hexHash(s, "hash:") })
+	keys("k") // independent check
+	waitApp("plan checked", func() bool {
+		return planStatus(t, ref.a, wf) == model.PlanChecked
+	})
+	keys("y") // approve (explicit confirmation)
+	waitApp("plan approved", func() bool { return planStatus(t, ref.a, wf) == model.PlanApproved })
+
+	// ---- execution approval ----
+	keys(keyTab) // → execution approval
+	waitOutput("execution approval")
+	keys("s") // generate the specs
+	waitApp("specs generated", func() bool { return workflowStage(t, ref.a, wf) == model.StageWorkflowGeneration })
+	keys("w") // compile the workflow
+	// The dry run requires the compiled workflow: wait until the
+	// workflow hash is recorded in the execution facts (the partial
+	// preview query succeeds once the compile committed) before pressing
+	// 'd' — a too-early dry run would fail and burn its preflight
+	// artifact revision.
+	waitApp("workflow compiled", func() bool {
+		return executionPreview(t, ref.a, wf).WorkflowHash != ""
+	})
+	keys("d") // execution dry run
+	waitApp("dry run ready", func() bool {
+		return executionPreview(t, ref.a, wf).CommitPolicyHash != ""
+	})
+	// The Approval binds the exact displayed hashes; pressing 'y'
+	// before the reloaded preview rendered is refused harmlessly, so
+	// retry until the workflow opens into execution.
+	deadline := time.Now().Add(120 * time.Second)
+	for {
+		keys("y") // approve the execution (binds the frozen change set)
+		ready := false
+		sub := time.Now().Add(5 * time.Second)
+		for !ready && time.Now().Before(sub) {
+			st := statusOf(t, ref.a, wf)
+			ready = st.Runtime == model.RuntimeRunning && st.Stage == model.StageExecution
+			if !ready {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		if ready {
 			break
 		}
-	}
-	// Drive to completion through dispatch passes.
-	for i := 0; i < 24; i++ {
-		out, err := a.DriveOnce(ctx, wf.Workflow)
-		if err != nil {
-			t.Fatalf("dispatch pass %d: %v", i, err)
+		if time.Now().After(deadline) {
+			t.Fatalf("the execution approval never opened dispatch\n--- screen ---\n%s", screen.String())
 		}
-		iv, _ := a.Query(ctx, app.InspectQuery{Workflow: wf.Workflow})
-		if iv.(app.InspectView).Status.Stage == model.StageCompleted {
+	}
+	waitApp("execution approved", func() bool {
+		return workflowRuntime(t, ref.a, wf) == model.RuntimeRunning &&
+			workflowStage(t, ref.a, wf) == model.StageExecution
+	})
+
+	// ---- execution + workspace adoption + foreground runner ----
+	waitOutput("r resume & run")
+	keys("r") // resume & run
+	// The runner stops at the Workspace Adoption Gate (the execution
+	// approval bound the frozen Change Set).
+	waitBuffer("decision panel rendered", func(s string) bool {
+		return strings.Contains(s, "decision required:")
+	})
+	// The adoption needs the decision panel state; pressing 'a' early
+	// is a no-op, so retry until the workspace is adopted.
+	adoptDeadline := time.Now().Add(120 * time.Second)
+	for {
+		keys("a") // adopt the workspace
+		ready := false
+		sub := time.Now().Add(5 * time.Second)
+		for !ready && time.Now().Before(sub) {
+			ready = workspaceAdopted(t, ref.a, wf)
+			if !ready {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		if ready {
 			break
 		}
-		_ = out
+		if time.Now().After(adoptDeadline) {
+			t.Fatalf("the workspace adoption never completed\n--- screen ---\n%s", screen.String())
+		}
 	}
-	iv, err := a.Query(ctx, app.InspectQuery{Workflow: wf.Workflow})
-	if err != nil {
-		t.Fatal(err)
+	keys("r") // run again
+	waitApp("workflow completed", func() bool { return workflowStage(t, ref.a, wf) == model.StageCompleted })
+
+	// ---- final report ----
+	keys(keyTab) // → blocked
+	keys(keyTab) // → terminal
+	waitOutput("terminal")
+	keys("r") // render the final report
+	waitBuffer("final report rendered", func(s string) bool {
+		return strings.Contains(s, "# CFlow Execution Report")
+	})
+
+	// ---- protected apply ----
+	keys(keyRight) // → apply section
+	keys("p")      // stage the apply
+	waitBuffer("apply preview rendered", func(s string) bool {
+		return strings.Contains(s, "AWAITING_CONFIRMATION")
+	})
+	// The explicit delivery: Enter alone must not deliver; y delivers.
+	keys(keyEnter)
+	waitApp("apply not delivered by enter", func() bool {
+		return applyStatus(t, ref.a, wf) == model.ApplyAwaitingConfirmation
+	})
+	keys("y")
+	waitApp("apply delivered", func() bool { return applyStatus(t, ref.a, wf) == model.ApplySucceeded })
+
+	// The Target Working Tree: HEAD, Index, and files are synchronized
+	// with the delivered Apply head.
+	requireAppliedWorkingTree(t, fx, ref.a, wf)
+
+	// Snapshot the preserved workflow directories (everything except the
+	// code directories the Cleanup may delete) before the Cleanup.
+	preserved := snapshotWorkflowEntries(t, fx, wf)
+
+	// ---- explicit cleanup ----
+	keys(keyRight) // → cleanup section
+	keys("c")      // cleanup dry run
+	waitOutput("cleanup dry run manifest ready")
+	waitApp("cleanup manifest", func() bool { return cleanupStatus(t, ref.a, wf) != "" })
+	keys("y") // execute the bound manifest
+	waitApp("cleanup executed", func() bool { return cleanupStatus(t, ref.a, wf) == model.CleanupStatusSucceeded })
+
+	// The Cleanup deleted exactly the code directories and preserved the
+	// artifacts, evidence, report, database, and refs.
+	requireCleanupPreservation(t, fx, wf, preserved)
+
+	// quit through the normal key (no runner is active anymore).
+	keys("q")
+	if err := <-runDone; err != nil {
+		t.Fatalf("tui run: %v", err)
 	}
-	if iv.(app.InspectView).Status.Stage != model.StageCompleted {
-		t.Fatalf("workflow did not complete: %+v", iv.(app.InspectView).Status)
-	}
-	if got := RenderExecution(execModel); !strings.Contains(got, "workflow") {
-		t.Fatalf("execution render = %q", got)
-	}
-	_ = runner
 }
 
-func jsonQuote(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
+// handoffContentJSON is the strict handoff content the user types in the
+// handoff editor (the Runtime fills the workflow/session/change-set
+// facts).
+const handoffContentJSON = `{"targets":"division by zero must error","constraints":"no external dependencies","non_goals":"no other arithmetic changes","acceptance_criteria":"Divide returns a typed error on zero","open_questions":"error wording","user_decisions":[{"topic":"error type","decision":"typed error"}]}`
+
+// hexHash reports whether s contains the prefix followed by at least 12
+// lowercase hex digits (the rendered plan/preview hash lines).
+func hexHash(s, prefix string) bool {
+	idx := strings.Index(s, prefix)
+	if idx < 0 {
+		return false
+	}
+	rest := strings.TrimLeft(s[idx+len(prefix):], " ")
+	n := 0
+	for _, c := range rest {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			break
+		}
+		n++
+	}
+	return n >= 12
+}
+
+// ---------------------------------------------------------------------------
+// authoritative app facts the test waits on
+// ---------------------------------------------------------------------------
+
+func (r *appRef) list() []model.WorkflowID {
+	view, err := r.a.Query(context.Background(), app.ListQuery{})
+	if err != nil {
+		return nil
+	}
+	var ids []model.WorkflowID
+	for _, w := range view.(app.ListView).Workflows {
+		ids = append(ids, w.ID)
+	}
+	return ids
+}
+
+func statusOf(t *testing.T, a *app.Application, wf model.WorkflowID) app.StatusView {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.StatusQuery{Workflow: wf})
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	return view.(app.StatusView)
+}
+
+func workflowStage(t *testing.T, a *app.Application, wf model.WorkflowID) model.WorkflowStage {
+	t.Helper()
+	return statusOf(t, a, wf).Stage
+}
+
+func workflowRuntime(t *testing.T, a *app.Application, wf model.WorkflowID) model.RuntimeStatus {
+	t.Helper()
+	return statusOf(t, a, wf).Runtime
+}
+
+func sessionCompleted(t *testing.T, a *app.Application, wf model.WorkflowID) bool {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	if err != nil {
+		return false
+	}
+	sessions := view.(app.InspectView).Sessions
+	if len(sessions) == 0 {
+		return false
+	}
+	return sessions[len(sessions)-1].Status == model.SessionCompleted
+}
+
+func planRevision(t *testing.T, a *app.Application, wf model.WorkflowID) int {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.PlanQuery{Workflow: wf})
+	if err != nil {
+		return 0
+	}
+	return view.(app.PlanView).Revision
+}
+
+func planStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.PlanStatus {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.PlanQuery{Workflow: wf})
+	if err != nil {
+		return ""
+	}
+	return view.(app.PlanView).PlanStatus
+}
+
+func executionPreview(t *testing.T, a *app.Application, wf model.WorkflowID) app.ExecutionPreviewView {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.ExecutionPreviewQuery{Workflow: wf})
+	if err != nil {
+		return app.ExecutionPreviewView{}
+	}
+	return view.(app.ExecutionPreviewView)
+}
+
+func workspaceAdopted(t *testing.T, a *app.Application, wf model.WorkflowID) bool {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.ProjectWorkspaceQuery{Selected: wf})
+	if err != nil {
+		return false
+	}
+	lc := view.(app.WorkspaceView).Lifecycle
+	return lc != nil && lc.Adopted
+}
+
+func applyStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.ApplyStatus {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	if err != nil {
+		return ""
+	}
+	attempts := view.(app.InspectView).ApplyAttempts
+	if len(attempts) == 0 {
+		return ""
+	}
+	return attempts[len(attempts)-1].Status
+}
+
+func cleanupStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.CleanupStatus {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	if err != nil {
+		return ""
+	}
+	attempts := view.(app.InspectView).CleanupAttempts
+	if len(attempts) == 0 {
+		return ""
+	}
+	return attempts[len(attempts)-1].Status
+}
+
+// ---------------------------------------------------------------------------
+// authoritative Git facts
+// ---------------------------------------------------------------------------
+
+// requireAppliedWorkingTree asserts the Apply updated the original
+// working tree: HEAD equals the reviewed Apply head the Workflow
+// recorded, the index and the worktree are clean, the delivered file
+// content is on disk, and the cflow audit refs exist.
+func requireAppliedWorkingTree(t *testing.T, fx *tuiFixture, a *app.Application, wf model.WorkflowID) {
+	t.Helper()
+	head, err := fx.gitOK("rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("target head: %v", err)
+	}
+	if head == "" {
+		t.Fatal("target working tree has no HEAD after the apply")
+	}
+	// The delivered head is the exact staging head the Apply recorded.
+	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := view.(app.InspectView).ApplyAttempts
+	if len(attempts) == 0 || attempts[len(attempts)-1].StagingHead == "" {
+		t.Fatalf("the apply recorded no delivered head: %+v", attempts)
+	}
+	if head != attempts[len(attempts)-1].StagingHead {
+		t.Fatalf("target head %s != the delivered apply head %s", head, attempts[len(attempts)-1].StagingHead)
+	}
+	// The index and worktree are clean (no staged, unstaged, or
+	// untracked residue).
+	if out, err := fx.gitOK("status", "--porcelain"); err != nil || strings.TrimSpace(out) != "" {
+		t.Fatalf("target working tree not clean after the apply: %q (%v)", out, err)
+	}
+	// The delivered file is present with the verified content.
+	content, err := os.ReadFile(filepath.Join(fx.root, "src", "divide", "divide.go"))
+	if err != nil {
+		t.Fatalf("delivered file: %v", err)
+	}
+	if !strings.Contains(string(content), "func Divide(a, b int) (int, error)") {
+		t.Fatalf("delivered file content = %q", content)
+	}
+	// The cflow audit refs exist (the branch mainline and the audits).
+	refs, err := fx.gitOK("for-each-ref", "--format=%(refname)", "refs/cflow/")
+	if err != nil || strings.TrimSpace(refs) == "" {
+		t.Fatalf("no cflow refs after the apply: %q (%v)", refs, err)
+	}
+}
+
+// snapshotWorkflowEntries records the workflow directories that must
+// survive the Cleanup: the aggregated root's non-code entries (the
+// Cleanup may delete only the workspace and the tmp worktrees) and the
+// legacy workflow directory that holds the artifacts (plans, specs,
+// reports, evidence, sessions, logs, state).
+func snapshotWorkflowEntries(t *testing.T, fx *tuiFixture, wf model.WorkflowID) []string {
+	t.Helper()
+	wfRoot := workflowRoot(t, fx, wf)
+	entries, err := os.ReadDir(wfRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Name() == "workspace" || e.Name() == "tmp" {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// workflowRoot resolves the aggregated root of one workflow.
+func workflowRoot(t *testing.T, fx *tuiFixture, wf model.WorkflowID) string {
+	t.Helper()
+	root := filepath.Join(fx.home, "projects")
+	projectDirs, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projectDirs) != 1 {
+		t.Fatalf("project dirs = %v", projectDirs)
+	}
+	return filepath.Join(root, projectDirs[0].Name(), string(wf))
+}
+
+// legacyWorkflowRoot resolves the legacy artifacts root of one workflow
+// (the aggregated code directories are new; the artifacts still live at
+// the legacy path, which the Cleanup must never touch).
+func legacyWorkflowRoot(t *testing.T, fx *tuiFixture, wf model.WorkflowID) string {
+	t.Helper()
+	root := filepath.Join(fx.home, "projects")
+	projectDirs, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projectDirs) != 1 {
+		t.Fatalf("project dirs = %v", projectDirs)
+	}
+	return filepath.Join(root, projectDirs[0].Name(), "workflows", string(wf))
+}
+
+// requireCleanupPreservation asserts the Cleanup deleted exactly the
+// aggregated code directories (workspace, tmp/tasks/*, tmp/apply-*) and
+// preserved every other workflow directory, the artifacts, the
+// database, and the refs.
+func requireCleanupPreservation(t *testing.T, fx *tuiFixture, wf model.WorkflowID, preserved []string) {
+	t.Helper()
+	wfRoot := workflowRoot(t, fx, wf)
+
+	// Deleted: the aggregated code directories — the Workspace and
+	// every Task/Apply worktree (the empty tmp parent may remain).
+	if _, err := os.Stat(filepath.Join(wfRoot, "workspace")); err == nil {
+		t.Fatalf("cleanup left the workspace behind")
+	}
+	tmp := filepath.Join(wfRoot, "tmp")
+	if entries, err := os.ReadDir(tmp); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && e.Name() == "tasks" {
+				sub, err2 := os.ReadDir(filepath.Join(tmp, "tasks"))
+				if err2 == nil && len(sub) > 0 {
+					t.Fatalf("cleanup left tmp/tasks entries behind: %v", sub)
+				}
+				continue
+			}
+			t.Fatalf("cleanup left tmp/%s behind", e.Name())
+		}
+	}
+	// Preserved: every non-code aggregated-root entry that existed
+	// before the Cleanup.
+	for _, name := range preserved {
+		if _, err := os.Stat(filepath.Join(wfRoot, name)); err != nil {
+			t.Fatalf("cleanup deleted the preserved %s directory: %v", name, err)
+		}
+	}
+	// Preserved: the artifacts (the plans, specs, workflows, reviews,
+	// reports, evidence, sessions, logs, and state at the legacy
+	// workflow path).
+	legacy := legacyWorkflowRoot(t, fx, wf)
+	artifactsRoot := filepath.Join(legacy, "artifacts", string(wf))
+	legacyEntries, err := os.ReadDir(artifactsRoot)
+	if err != nil {
+		t.Fatalf("cleanup deleted the artifacts: %v", err)
+	}
+	found := map[string]bool{}
+	for _, e := range legacyEntries {
+		found[e.Name()] = true
+	}
+	// The legacy layout names the artifact directories by their raw
+	// type; every artifact the flow produced must survive the Cleanup.
+	for _, want := range []string{"plan", "plan-check", "spec", "catalog", "workflow",
+		"discussion-handoff", "change-set", "report", "routing-policy", "budget-policy"} {
+		if !found[want] {
+			t.Fatalf("cleanup deleted the %s artifacts: %v", want, legacyEntries)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(fx.home, "cflow.db")); err != nil {
+		t.Fatalf("cleanup deleted the authoritative database: %v", err)
+	}
+	// Preserved: the git refs.
+	refs, err := fx.gitOK("for-each-ref", "--format=%(refname)", "refs/cflow/")
+	if err != nil || strings.TrimSpace(refs) == "" {
+		t.Fatalf("cleanup removed the cflow refs: %q (%v)", refs, err)
+	}
 }

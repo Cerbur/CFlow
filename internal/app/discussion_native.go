@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/store"
@@ -126,6 +127,38 @@ func findSessionState(state model.State, id model.SessionID) *model.Session {
 		}
 	}
 	return nil
+}
+
+// nativeBridgeRequest assembles the managed Native Session Bridge
+// request facts of one prepared native discussion Session (design §9.1,
+// TUI task 12): the recorded Session binding (Provider and the
+// bootstrap Provider Session identity), the Workflow Workspace the
+// interactive process runs in, and the Adapter/Supervisor seams. The
+// Bridge request is Application-owned state; the TUI only attaches the
+// terminal streams and the user intent inside its blocking-exec
+// callback.
+func (a *Application) nativeBridgeRequest(ctx context.Context, wf model.WorkflowID, session model.SessionID) *NativeBridgeRequest {
+	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
+	if err != nil {
+		return nil
+	}
+	s := findSessionState(view.State, session)
+	if s == nil || s.Provider == "" {
+		return nil
+	}
+	ad := a.agent.Adapters[s.Provider]
+	if ad == nil {
+		return nil
+	}
+	return &NativeBridgeRequest{
+		Workflow:        wf,
+		Session:         s.ID,
+		Provider:        s.Provider,
+		ProviderSession: agent.ProviderSessionID(s.ProviderSessionID),
+		Worktree:        a.layout.Workspace(wf),
+		Adapter:         ad,
+		Supervisor:      a.supervisor,
+	}
 }
 
 var _ = fmt.Sprintf
