@@ -146,7 +146,13 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// ---- create the workflow through the TUI form ----
 	keys("n")
 	waitOutput("create workflow")
-	keys("calculator" + keyEnter)
+	keys("calculator")
+	// The Create page surfaces the target's dirty facts before the
+	// confirmation; the E2E target is clean.
+	waitOutput("target working tree: clean")
+	waitOutput("will not touch your files")
+	keys(keyEnter) // Enter only submits the name for the confirmation
+	keys("y")      // only an explicit y creates (the clean target carries no dirty flag)
 	// The TUI processed the create (the workspace renders the workflow
 	// with the status line).
 	waitOutput("workflow created")

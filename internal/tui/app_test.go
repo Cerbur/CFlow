@@ -160,6 +160,332 @@ func TestModelMigrationRenderShowsCompleteEvidence(t *testing.T) {
 	}
 }
 
+// blockedController returns a BLOCKED workspace whose LegalActions the
+// test controls: resumeLegal decides whether the Runtime permits Resume.
+type blockedController struct {
+	executed    []app.Command
+	resumeLegal bool
+}
+
+func (c *blockedController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (c *blockedController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	actions := []app.LegalAction{{Label: "Inspect", Hint: "blocked"}}
+	if c.resumeLegal {
+		actions = append(actions, app.LegalAction{Label: "Resume", Kind: model.ResumeWorkflow})
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeBlocked}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status:  app.StatusView{Workflow: "wf-1", Stage: model.StageExecution, Runtime: model.RuntimeBlocked},
+			Blocked: true,
+		},
+		LegalActions: actions,
+		Health:       app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{{Name: "fake", Compatible: true}}},
+	}, nil
+}
+func (*blockedController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*blockedController) EscalateStop() {}
+
+// TestModelBlockedPageIssuesNoResumeWithoutLegalAction: the Blocked page
+// issues a Resume command ONLY when the Runtime LegalActions include it.
+// A blocked workflow whose LegalActions contain NO Resume renders no
+// resume key/hint and pressing r issues no Resume command.
+func TestModelBlockedPageIssuesNoResumeWithoutLegalAction(t *testing.T) {
+	ctrl := &blockedController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m.page = PageBlocked
+	if got := render(m); strings.Contains(got, "r resume") {
+		t.Fatalf("blocked page hard-codes the resume hint:\n%s", got)
+	}
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("blocked page without a resume legal action executed %v", ctrl.executed)
+	}
+}
+
+// TestModelBlockedPageKeepsResumeWhenLegal: when the Runtime LegalActions
+// DO contain Resume the Blocked page renders the hint and pressing r
+// issues the typed ResumeWorkflowCommand.
+func TestModelBlockedPageKeepsResumeWhenLegal(t *testing.T) {
+	ctrl := &blockedController{resumeLegal: true}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m.page = PageBlocked
+	if got := render(m); !strings.Contains(got, "r resume") {
+		t.Fatalf("blocked page lost the runtime resume hint:\n%s", got)
+	}
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("blocked page with a resume legal action executed %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("blocked resume command type = %T", ctrl.executed[0])
+	}
+}
+
+// workspaceActionsController returns one workspace whose LegalActions the
+// test controls (a PAUSED workflow for the resume tests).
+type workspaceActionsController struct {
+	executed    []app.Command
+	resumeLegal bool
+}
+
+func (c *workspaceActionsController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (c *workspaceActionsController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	var actions []app.LegalAction
+	if c.resumeLegal {
+		actions = append(actions, app.LegalAction{Label: "Resume", Kind: model.ResumeWorkflow})
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePaused}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{Workflow: "wf-1", Stage: model.StageWorkflowGeneration, Runtime: model.RuntimePaused},
+		},
+		LegalActions: actions,
+		Health:       app.HealthView{GitAvailable: true},
+	}, nil
+}
+func (*workspaceActionsController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*workspaceActionsController) EscalateStop() {}
+
+// TestModelWorkspaceResumeRequiresLegalAction: the Workspace r key is not
+// an unconditional Resume; it executes ResumeWorkflowCommand only when the
+// Runtime LegalActions include it.
+func TestModelWorkspaceResumeRequiresLegalAction(t *testing.T) {
+	// Without the resume legal action the key is a no-op.
+	ctrl := &workspaceActionsController{}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("workspace r without a resume legal action executed %v", ctrl.executed)
+	}
+	// With the resume legal action the key issues the typed command.
+	ctrl2 := &workspaceActionsController{resumeLegal: true}
+	m2 := load(t, testModel(&recordingController{ctrl: ctrl2}))
+	m2 = press(t, m2, 'r', 0)
+	if len(ctrl2.executed) != 1 {
+		t.Fatalf("workspace r with a resume legal action executed %v", ctrl2.executed)
+	}
+	if _, ok := ctrl2.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("workspace resume command type = %T", ctrl2.executed[0])
+	}
+}
+
+// executionController is the Execution page seam: the workspace projection
+// and the DriveOnce result the test controls.
+type executionController struct {
+	executed   []app.Command
+	driveCalls int
+	actions    []app.LegalAction
+	runtime    model.RuntimeStatus
+}
+
+func (c *executionController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (c *executionController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: c.runtime}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{Workflow: "wf-1", Stage: model.StageExecution, Runtime: c.runtime},
+		},
+		LegalActions: c.actions,
+		Health:       app.HealthView{GitAvailable: true},
+	}, nil
+}
+func (c *executionController) DriveOnce(_ context.Context, _ model.WorkflowID) (app.DriveOutcome, error) {
+	c.driveCalls++
+	return app.DriveOutcome{Kind: app.DriveTerminal, Reason: "terminal"}, nil
+}
+func (*executionController) EscalateStop() {}
+
+// TestModelExecutionResumeDrivenByLegalActions: the Execution page issues
+// the Resume command ONLY when the Runtime LegalActions include it; a
+// workflow without the resume legal action starts the Foreground Runner
+// directly and never sends ResumeWorkflowCommand.
+func TestModelExecutionResumeDrivenByLegalActions(t *testing.T) {
+	// A PAUSED workflow whose LegalActions include Resume: r resumes first.
+	paused := &executionController{
+		actions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		runtime: model.RuntimePaused,
+	}
+	m := load(t, testModel(&recordingController{ctrl: paused}))
+	m.page = PageExecution
+	m = press(t, m, 'r', 0)
+	if len(paused.executed) != 1 {
+		t.Fatalf("execution r with a resume legal action executed %v", paused.executed)
+	}
+	if _, ok := paused.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("execution resume command type = %T", paused.executed[0])
+	}
+
+	// A RUNNING workflow whose LegalActions contain NO Resume: r starts the
+	// runner directly and never issues ResumeWorkflowCommand.
+	running := &executionController{
+		actions: []app.LegalAction{{Label: "Pause", Kind: model.PauseWorkflow}},
+		runtime: model.RuntimeRunning,
+	}
+	m2 := load(t, testModel(&recordingController{ctrl: running}))
+	m2.page = PageExecution
+	m2 = press(t, m2, 'r', 0)
+	if len(running.executed) != 0 {
+		t.Fatalf("execution r without a resume legal action executed %v", running.executed)
+	}
+	if running.driveCalls != 1 {
+		t.Fatalf("the runner was not started (drive calls = %d)", running.driveCalls)
+	}
+}
+
+// createController is the Create page seam: it answers the workspace load
+// and the DiscoveryQuery with the target Git facts the test controls, and
+// records every CreateWorkflowCommand.
+type createController struct {
+	executed []app.Command
+	dirty    bool
+}
+
+func (c *createController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-new"}, nil
+}
+func (c *createController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Project: app.ProjectView{Name: "repo", Root: "/repo"},
+			Health:  app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{{Name: "fake", Compatible: true}}},
+		}, nil
+	case app.DiscoveryQuery:
+		return app.DiscoveryView{
+			Branch: "main", Head: "0123456789abcdef",
+			Dirty: c.dirty, DirtyFingerprint: "sha256:deadbeef",
+			StagedCount: 1, UnstagedCount: 0, UntrackedCount: 1,
+		}, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+func (*createController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*createController) EscalateStop() {}
+
+// createPage opens the Create page and types the workflow name.
+func createPage(t *testing.T, m Model, name string) Model {
+	t.Helper()
+	m = press(t, m, 'n', 0)
+	return typeText(t, m, name)
+}
+
+// typeText types one string through the Model as individual text key
+// presses (the create name and handoff inputs use KeyPressMsg.Text).
+func typeText(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	for _, r := range s {
+		m = step(t, m, tea.KeyPressMsg{Code: r, Text: string(r), Mod: 0})
+	}
+	return m
+}
+
+// TestCreateDirtyTargetEnterDoesNotCreate: a dirty target is queried and
+// displayed before creation; the confirmation defaults to No, so Enter
+// (both to submit the name and on the confirmation) never creates.
+func TestCreateDirtyTargetEnterDoesNotCreate(t *testing.T) {
+	ctrl := &createController{dirty: true}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	got := render(m)
+	for _, want := range []string{"DIRTY", "dirty fingerprint: sha256:deadbeef", "will not touch your files"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("create page misses %q:\n%s", want, got)
+		}
+	}
+	// Enter submits the name for the confirmation; it never creates.
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("Enter created the workflow: %v", ctrl.executed)
+	}
+	// Enter on the confirmation is No too.
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("Enter confirmed the workflow: %v", ctrl.executed)
+	}
+}
+
+// TestCreateDirtyTargetYConfirmsDirty: only an explicit y sends the create
+// command with ConfirmDirty: true on a dirty target.
+func TestCreateDirtyTargetYConfirmsDirty(t *testing.T) {
+	ctrl := &createController{dirty: true}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
+	m = press(t, m, 'y', 0)          // the explicit confirmation
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("explicit y did not create: %v", ctrl.executed)
+	}
+	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
+	if !ok {
+		t.Fatalf("create command type = %T", ctrl.executed[0])
+	}
+	if cc.Name != "calculator" || !cc.ConfirmDirty {
+		t.Fatalf("create = %+v, want Name calculator and ConfirmDirty:true", cc)
+	}
+}
+
+// TestCreateCleanTargetCreatesWithoutDirtyFlag: a clean target creates
+// with an explicit y and carries no dirty flag.
+func TestCreateCleanTargetCreatesWithoutDirtyFlag(t *testing.T) {
+	ctrl := &createController{dirty: false}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	if got := render(m); !strings.Contains(got, "clean") {
+		t.Fatalf("clean target create page misses the clean state:\n%s", got)
+	}
+	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
+	m = press(t, m, 'y', 0)          // the explicit confirmation
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("explicit y did not create: %v", ctrl.executed)
+	}
+	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
+	if !ok {
+		t.Fatalf("create command type = %T", ctrl.executed[0])
+	}
+	if cc.ConfirmDirty {
+		t.Fatalf("clean target create carried a dirty flag: %+v", cc)
+	}
+}
+
 func (r *recordingController) Execute(ctx context.Context, cmd app.Command) (app.Outcome, error) {
 	r.executed = append(r.executed, cmd)
 	return r.ctrl.Execute(ctx, cmd)
