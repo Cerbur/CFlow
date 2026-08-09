@@ -245,19 +245,27 @@ No push, tag, PR, or remote publication has occurred.
 - [x] The user authorized the real Cross-Provider E2E and self-Dogfood runs.
 - [ ] The user performs the final release sign-off and records it here.
 
-## 11. Fake TUI Gate candidate (TUI task 16)
+## 11. Fake TUI Gate (TUI task 16)
 
-The TUI workflow (Tasks 4–16) introduces a NEW Internal Candidate evidence
+The TUI workflow (Tasks 4–16) introduces a NEW Candidate Gate evidence
 chain, clearly separated from the historical Gate 3 candidate above: the
-deterministic Fake TUI Gate (`scripts/gate-tui.sh`) runs the
-fully-Fake-provider suites — `internal/tui`, `internal/foreground`,
-`internal/native`, and the complete `go test ./...` — and binds the Source
-Commit, Binary SHA-256, Go Version, the test logs, and the redacted
-Manifest into a new empty artifact directory. It NEVER invokes a real
+deterministic Fake TUI Gate (`scripts/gate-tui.sh`) is the Candidate Gate
+for the interactive TUI lifecycle. It runs the fully-Fake-provider suites —
+`internal/tui`, `internal/foreground`, `internal/native`, the complete
+`go test ./...`, and the cross-platform build proof
+(`scripts/check-cross-build.sh`) — and binds the Source Commit, Binary
+SHA-256, the full Go Version, the cross-build result, the test logs, and
+the redacted Manifest into a new empty artifact directory. A pre-populated
+artifact directory is refused (fail closed). It NEVER invokes a real
 Provider.
 
-- **Candidate:** Internal Candidate (Fake TUI Gate) — NOT a release and
-  NOT the Demo Complete Candidate of Gate 3.
+**Candidate status: pending.** The gate is being hardened (it now refuses
+a pre-populated artifact directory and runs the cross-platform build
+proof), and its evidence must be regenerated on the exact candidate Commit.
+The TUI is therefore **not yet an Internal Candidate**; the `Internal
+Candidate (Fake TUI Gate)` label applies only after the repaired gate
+passes on that exact Commit.
+
 - **Gate script:** `scripts/gate-tui.sh <new-empty-artifact-dir>`.
 - **Fake E2E:** `TestTUIPlanToApplyAndCleanup` starts the ACTUAL root TUI
   (the Bubble Tea Program over a Fake terminal — an os.Pipe input the

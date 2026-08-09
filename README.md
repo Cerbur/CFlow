@@ -17,8 +17,11 @@ evidence—not from an agent saying that the work is complete.
 > approvals, foreground Runner, protected Apply, and explicit Cleanup through
 > the shared Application, and implements the controlled-stop protocol. The
 > deterministic Fake TUI Gate (`TestTUIPlanToApplyAndCleanup` through the
-> real root TUI and a Fake terminal) is the current **Internal Candidate**;
-> see the [acceptance report](docs/cflow-demo-acceptance-report.md), the
+> real root TUI and a Fake terminal) is being hardened as the Candidate
+> Gate; the gate evidence is pending, so the TUI is **not yet an Internal
+> Candidate** — that label applies only after the repaired gate passes on
+> the exact candidate Commit. See the
+> [acceptance report](docs/cflow-demo-acceptance-report.md), the
 > [TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md),
 > and the [implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
 > The real Codex/Claude Native + Headless E2E and the self-Dogfood are
@@ -148,8 +151,8 @@ Codex/Claude Native + Headless E2E and self-Dogfood have not been rerun for
 this branch; they require separate approval on an exact candidate commit.
 
 The aggregated layout, Workspace adoption, native discussion bridge, and
-Foreground Runner exist behind typed Application APIs, but the root TUI does
-not yet make them operable. The current headless discussion path remains the
+Foreground Runner are wired into the root TUI and exercised by the Fake TUI
+E2E through the shared Application; the headless discussion path remains the
 line-oriented `discuss` command shown above.
 
 ## Command map
@@ -205,11 +208,13 @@ the Dogfood flow performs protected Apply.
 Historical evidence is evidence for its exact binary and source commit only;
 it does not automatically attest later commits.
 
-The current `TestTUIPlanToApplyAndCleanup` exercises Application methods and
-standalone TUI models directly; it does not launch the root TUI through fake
-terminal input and currently stops before Report, Apply, and Cleanup. Until
-that gap is closed, a passing Fake TUI Gate must not be treated as evidence of
-the complete interactive lifecycle.
+The current `TestTUIPlanToApplyAndCleanup` starts the actual root TUI (the
+Bubble Tea Program over a Fake terminal driven with real key sequences) and
+drives the complete interactive lifecycle — native discussion, approvals,
+workspace adoption, foreground Runner, the final report, the protected
+Apply, and the explicit Cleanup. A passing repaired Fake TUI Gate is the
+evidence chain for that interactive lifecycle; it does not by itself assert
+an Internal Candidate until the gate passes on the exact candidate Commit.
 
 ## Documentation
 
