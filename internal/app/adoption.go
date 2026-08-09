@@ -55,6 +55,14 @@ func (a *Application) latestChangeSetRef(ctx context.Context, wf model.WorkflowI
 //
 // Every failure is a typed fault with no mutation: the Workspace, the
 // Change Set, and the Target Branch stay untouched.
+//
+// When the Workspace is NOT Git-clean (Task 4, design 8.4 step 2), the
+// gate first runs a managed adoption/coding Session that organizes and
+// commits the dirty native changes inside the Workspace; the full gate
+// chain then runs against the NEW post-adoption candidate Head and the
+// independent Review follows. The dirty case does not reject: it returns
+// the managed adoption input, and a failed adoption Session Blocks the
+// Workflow through the Kernel.
 func (a *Application) prepareAdoption(ctx context.Context, c AdoptWorkspaceCommand) (model.Input, model.WorkflowID, error) {
 	wf, err := a.resolveMutationWorkflow(c.Workflow)
 	if err != nil {
@@ -92,13 +100,46 @@ func (a *Application) prepareAdoption(ctx context.Context, c AdoptWorkspaceComma
 		return nil, "", err
 	}
 	// The frozen Change Set Revision the approval bound: it must resolve
-	// and its candidate facts must match the re-observed Workspace exactly
-	// (Approval 后漂移 closes the gate before any Session starts).
+	// (the adoption Session and the gate chain read it; a missing body is a
+	// closed fault before any Session starts).
 	changeSet, err := a.readChangeSetBody(ctx, wf, facts.ChangeSetRevision, facts.ChangeSetHash)
 	if err != nil {
 		return nil, "", model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the frozen change set no longer resolves; the workspace drifted after the approval")
 	}
+	routing, err := a.approvedRoutingPolicy(ctx, wf)
+	if err != nil {
+		return nil, "", err
+	}
+	review, ok := routingPrimaryBinding(routing, model.PurposeReview)
+	if !ok || review.Provider == "" {
+		return nil, "", model.NewFault(model.CodeApprovalInputChanged,
+			"the execution approval bound no independent review route for the adoption")
+	}
+	if !status.Clean() {
+		// DIRTY native Workspace (Task 4, design 8.4 step 2): a managed
+		// adoption/coding Session organizes and commits the changes; the
+		// gate chain runs afterwards against the NEW candidate Head. The
+		// candidate facts recorded here are the observed dirty facts; the
+		// Kernel replaces them with the post-adoption evidence.
+		adoption, ok := routingPrimaryBinding(routing, model.PurposeImplementation)
+		if !ok || adoption.Provider == "" {
+			return nil, "", model.NewFault(model.CodeApprovalInputChanged,
+				"the execution approval bound no coding route for the adoption session")
+		}
+		return model.AdoptWorkspaceInput{
+			Session:          model.SessionID(a.ids(model.IDSession)),
+			Route:            review.Provider,
+			AdoptionSession:  model.SessionID(a.ids(model.IDSession)),
+			AdoptionRoute:    adoption.Provider,
+			ChangeSetHash:    facts.ChangeSetHash,
+			CandidateHead:    status.Head,
+			DirtyFingerprint: status.Dirty.Combined,
+		}, wf, nil
+	}
+	// The frozen Change Set Revision the approval bound: it must resolve
+	// and its candidate facts must match the re-observed Workspace exactly
+	// (Approval 后漂移 closes the gate before any Session starts).
 	if changeSet.BaseCommit != view.State.Workflow.BaseCommit ||
 		changeSet.CandidateHead != status.Head ||
 		changeSet.DirtyFingerprint != status.Dirty.Combined {
@@ -115,10 +156,6 @@ func (a *Application) prepareAdoption(ctx context.Context, c AdoptWorkspaceComma
 	}
 	// Clean/Scope: the Workspace must be Git-clean (every native change
 	// committed) and within the approved write scope.
-	if !status.Clean() {
-		return nil, "", model.NewFault(model.CodeDirtyWorktreeDrifted,
-			"the workspace is not git-clean; commit or discard the native changes before adopting")
-	}
 	if err := a.verifyAdoptionScope(ctx, wf, changeSet); err != nil {
 		return nil, "", err
 	}
@@ -126,15 +163,6 @@ func (a *Application) prepareAdoption(ctx context.Context, c AdoptWorkspaceComma
 	// base..candidate inside the Workspace.
 	if err := a.verifyAdoptionCatalog(ctx, wf, facts, view.State.Workflow.BaseCommit, status.Head); err != nil {
 		return nil, "", err
-	}
-	routing, err := a.approvedRoutingPolicy(ctx, wf)
-	if err != nil {
-		return nil, "", err
-	}
-	review, ok := routingPrimaryBinding(routing, model.PurposeReview)
-	if !ok || review.Provider == "" {
-		return nil, "", model.NewFault(model.CodeApprovalInputChanged,
-			"the execution approval bound no independent review route for the adoption")
 	}
 	return model.AdoptWorkspaceInput{
 		Session:          model.SessionID(a.ids(model.IDSession)),
@@ -226,7 +254,12 @@ func (a *Application) verifyAdoptionScope(ctx context.Context, wf model.Workflow
 	}
 	check := func(path string) error {
 		for _, scope := range scopes {
-			if path == scope || strings.HasPrefix(path, strings.TrimSuffix(scope, "/")+"/") {
+			// The approved Spec write scope may carry a `/**` glob marker
+			// (the same normalization the scheduler's static conflict
+			// judgment uses): `src/divide/**` covers every path below
+			// `src/divide/`.
+			base := normalizeScope(scope)
+			if path == base || strings.HasPrefix(path, strings.TrimSuffix(base, "/")+"/") {
 				return nil
 			}
 		}
@@ -369,6 +402,181 @@ func (a *Application) adoptionReviewProviderStart(ctx context.Context, wf model.
 	return out, nil
 }
 
+// adoptionCodingProviderStart runs the managed adoption/coding Session
+// (Task 4, design 8.4 step 2): a coding Session inside the Workspace that
+// organizes and commits the dirty native changes to the Workspace Branch.
+// The adoption output is judged by evidence, never by a claim: the result
+// carries the Runtime-observed Workspace facts (EndHead and the Dirty
+// Fingerprint), the Kernel re-judges them, and the gate chain (Change Set
+// re-freeze against the NEW candidate Head, Identity/Signing, Clean/Scope,
+// the fixed Verification Catalog over base..new-candidate) runs right here
+// after the Session. Any gate failure is reported as a failed Session with
+// the typed code; the Kernel Blocks the Workflow and preserves the
+// Workspace, the Change Set, and the Target Branch.
+func (a *Application) adoptionCodingProviderStart(ctx context.Context, wf model.WorkflowID, intent model.ProviderStartIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.promptForPurpose(model.PurposeAdoption)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the adoption purpose")
+	}
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.adoptionCodingSessionInput(ctx, wf, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := rt.Start(ctx, agent.StartRequest{
+		Purpose:   intent.Purpose,
+		Provider:  intent.Route,
+		Prompt:    renderPrompt(prompt.Body, input),
+		Input:     a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, input),
+		CWD:       cwd,
+		SessionID: intent.Session,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	// The Workspace facts after the adoption Session are the evidence the
+	// gate judges (a new Commit, a clean Workspace, the candidate HEAD
+	// advanced). EndDirtyFingerprint follows the AttemptEnded convention:
+	// "" when the Workspace is clean, the fingerprint when dirty (gitflow's
+	// DirtyFingerprint.Combined is a deterministic hash of the state and is
+	// non-empty even for a clean tree, so the clean signal is the empty
+	// string, never the combined hash).
+	post, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out, err := a.runOutcome(cmd, res)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out.EndHead = post.Head
+	if !post.Clean() {
+		out.EndDirtyFingerprint = dirtyFingerprint(post.Dirty)
+	}
+	// A crashed or failed adoption Session: report the observed facts; the
+	// Kernel Blocks the gate.
+	if res.Terminal != nil && res.Terminal.Type == agent.EventFailed {
+		return out, nil
+	}
+	// The adoption evidence (design 8.4 step 2): a new Commit exists (the
+	// candidate HEAD advanced) and the Workspace is clean. The Kernel
+	// re-judges the same facts from this Result; the executor only stops
+	// here to avoid re-freezing a Change Set the gate will reject.
+	if !post.Clean() || post.Head == "" || post.Head == pre.Head {
+		return out, nil
+	}
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	base := view.State.Workflow.BaseCommit
+	facts := view.State.Workflow.ExecutionFacts
+	if facts == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("the adoption gate lost the execution facts"))
+	}
+	// Re-freeze the Change Set against the NEW candidate Head: the frozen
+	// facts the approval bound are re-bound to the post-adoption revision
+	// (the committed native changes now form the candidate).
+	rangeFacts, err := a.observeCommitRange(ctx, base, post.Head)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	body, err := assembleChangeSet(base, cwd, post, rangeFacts, string(intent.Session))
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	ref, err := a.freezeChangeSet(ctx, wf, intent.Session, body)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	out.Artifact = ref
+	reFrozen, err := a.readChangeSetBody(ctx, wf, ref.Revision, ref.Hash)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	failAdoption := func(code model.Code) model.EffectResultInput {
+		out.Session.Status = model.SessionFailed
+		out.FailureCode = code
+		return out
+	}
+	// The post-adoption gate chain (design 8.4 steps 3-4): the Workspace
+	// Branch, the Commit Policy Identity/Signing preflight, the Clean/Scope
+	// check over the re-frozen Change Set, and the fixed Verification
+	// Catalog over base..new-candidate.
+	if err := a.verifyWorkspaceBranch(ctx, cwd, view.State.Workflow.WorkspaceBranch); err != nil {
+		if code, ok := model.CodeOf(err); ok {
+			return failAdoption(code), nil
+		}
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifyAdoptionPreflight(ctx, wf, facts); err != nil {
+		if code, ok := model.CodeOf(err); ok {
+			return failAdoption(code), nil
+		}
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifyAdoptionScope(ctx, wf, reFrozen); err != nil {
+		if code, ok := model.CodeOf(err); ok {
+			return failAdoption(code), nil
+		}
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifyAdoptionCatalog(ctx, wf, facts, base, post.Head); err != nil {
+		if code, ok := model.CodeOf(err); ok {
+			return failAdoption(code), nil
+		}
+		return model.EffectResultInput{}, err
+	}
+	return out, nil
+}
+
+// adoptionCodingSessionInput builds the managed adoption Session's typed
+// input block: the frozen Change Set body the approval bound (the candidate
+// facts the adoption Session organizes and commits) and the Workspace
+// facts.
+func (a *Application) adoptionCodingSessionInput(ctx context.Context, wf model.WorkflowID, cwd string) (any, error) {
+	store, err := a.artifactStore(wf)
+	if err != nil {
+		return nil, err
+	}
+	view, err := a.writeStoreView(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
+	changeSetBody, err := readRequiredArtifact(ctx, store, wf, model.ArtifactChangeSet)
+	if err != nil {
+		return nil, err
+	}
+	var changeSet model.ChangeSet
+	if err := jsonUnmarshal(changeSetBody, &changeSet); err != nil {
+		return nil, model.InvariantFault(fmt.Errorf("the frozen change set body is not canonical"))
+	}
+	base := view.State.Workflow.BaseCommit
+	return struct {
+		ChangeSet     string `json:"change_set"`
+		Workspace     string `json:"workspace"`
+		CommitRange   string `json:"commit_range"`
+		Diff          string `json:"diff"`
+		CandidateHead string `json:"candidate_head"`
+	}{
+		ChangeSet:     string(changeSetBody),
+		Workspace:     cwd,
+		CommitRange:   base + ".." + changeSet.CandidateHead,
+		Diff:          a.gitDiff(ctx, cwd, base+".."+changeSet.CandidateHead),
+		CandidateHead: changeSet.CandidateHead,
+	}, nil
+}
+
 // adoptionReviewSessionInput builds the Adoption Reviewer's typed input
 // block: the frozen Change Set body, the approved Plan/Spec/Catalog, the
 // Workspace facts, and the candidate Diff.
@@ -381,14 +589,17 @@ func (a *Application) adoptionReviewSessionInput(ctx context.Context, wf model.W
 	if err != nil {
 		return nil, err
 	}
-	facts := view.State.Workflow.ExecutionFacts
-	changeSet, err := a.readChangeSetBody(ctx, wf, facts.ChangeSetRevision, facts.ChangeSetHash)
-	if err != nil {
-		return nil, err
-	}
+	// The ACTIVE Change Set Revision: after a managed adoption the Runtime
+	// re-froze the Change Set against the post-adoption candidate Head, so
+	// the review judges the latest frozen Revision (the re-bound facts),
+	// never the stale revision the approval bound before the adoption ran.
 	changeSetBody, err := readRequiredArtifact(ctx, store, wf, model.ArtifactChangeSet)
 	if err != nil {
 		return nil, err
+	}
+	var changeSet model.ChangeSet
+	if err := jsonUnmarshal(changeSetBody, &changeSet); err != nil {
+		return nil, model.InvariantFault(fmt.Errorf("the change set body is not canonical"))
 	}
 	plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
 	if err != nil {

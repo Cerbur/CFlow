@@ -132,10 +132,12 @@ func TestAdoptWorkspaceAdvancesVerifiedHead(t *testing.T) {
 	}
 }
 
-// TestAdoptWorkspaceRejectsDirtyWorkspace covers the native-session
-// uncommitted case: an uncommitted Workspace can never be adopted; the
-// failure preserves the Workspace and the Target Branch.
-func TestAdoptWorkspaceRejectsDirtyWorkspace(t *testing.T) {
+// TestAdoptWorkspaceOutOfScopeDirtyBlocks covers the out-of-scope native
+// uncommitted case (Task 4, design 8.4 step 3): the managed adoption
+// Session commits the dirty change, the re-frozen Change Set then exposes
+// the out-of-scope path to the Scope gate, and the gate Blocks the Workflow
+// while preserving the Workspace, the Change Set, and the Target Branch.
+func TestAdoptWorkspaceOutOfScopeDirtyBlocks(t *testing.T) {
 	fx := newExecutionFixture(t)
 	wf, err := fx.create("add divide", false)
 	if err != nil {
@@ -144,24 +146,26 @@ func TestAdoptWorkspaceRejectsDirtyWorkspace(t *testing.T) {
 	pv, _ := freezeAndDriveToGate(t, fx, wf)
 	approveExecution(t, fx, wf, pv)
 
-	// The native session left an uncommitted file in the Workspace after
-	// the freeze (the approval-bound Change Set no longer matches).
+	// A native session leaves an out-of-scope uncommitted file in the
+	// Workspace after the freeze.
 	ws := fx.workspacePath(wf)
 	if err := os.WriteFile(filepath.Join(ws, "wip.txt"), []byte("wip"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = fx.app(reviewPassScript()).Execute(context.Background(),
-		AdoptWorkspaceCommand{Workflow: wf})
-	requireFaultCode(t, err, model.CodeEvidenceSubjectChanged)
-
-	// The Workspace is preserved (the drift is still there), the verified
-	// head is empty, and the Target Branch never moved.
+	if _, err := fx.app(adoptionCommitScript()).Execute(context.Background(),
+		AdoptWorkspaceCommand{Workflow: wf}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	st := fx.status(wf)
+	if st.VerifiedWorkspaceHead != "" {
+		t.Fatalf("verified head was set despite the scope violation: %+v", st)
+	}
+	if st.Runtime != model.RuntimeBlocked {
+		t.Fatalf("out-of-scope adoption left the workflow %s, want BLOCKED", st.Runtime)
+	}
 	if !pathExists(filepath.Join(ws, "wip.txt")) {
 		t.Fatal("the workspace drift was discarded by the failed adoption")
-	}
-	if st := fx.status(wf); st.VerifiedWorkspaceHead != "" {
-		t.Fatalf("verified head was set despite the drift: %+v", st)
 	}
 	requireFaultCode(t, mustDispatchAdopt(t, fx, wf), model.CodeWorkspaceAdoptionRequired)
 }
@@ -299,4 +303,182 @@ func mustDispatchAdopt(t *testing.T, fx *planningFixture, wf model.WorkflowID) e
 	t.Helper()
 	_, err := fx.app().Execute(context.Background(), DispatchCommand{Workflow: wf})
 	return err
+}
+
+// adoptionCommitScript is the deterministic managed adoption Session output
+// (Task 4, design 8.4 step 2): the adoption/coding Session runs inside the
+// Workspace and creates the real implementation Commit that organizes the
+// dirty native changes (`commits` makes the Fake Provider run git add -A and
+// git commit in its working directory — CFlow itself never does).
+func adoptionCommitScript() string {
+	return `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"adoption","session_id":"ad1","exit_code":0,"resume":"ok","commits":["adopt native changes"]}
+{"type":"session_started","session_id":"ad1","at_ms":0}
+{"type":"assistant_message","session_id":"ad1","text":"Organizing and committing the native workspace changes.","at_ms":10}
+{"type":"session_finished","session_id":"ad1","result":{"summary":"adopted"},"at_ms":20}`
+}
+
+// adoptionNoopScript is the deterministic managed adoption Session output
+// that settles WITHOUT creating any Commit: the Workspace stays dirty at the
+// same HEAD, so the adoption evidence (no new commit, dirty fingerprint)
+// must Block the Workflow.
+func adoptionNoopScript() string {
+	return `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"adoption","session_id":"ad2","exit_code":0,"resume":"ok"}
+{"type":"session_started","session_id":"ad2","at_ms":0}
+{"type":"assistant_message","session_id":"ad2","text":"Nothing to commit.","at_ms":10}
+{"type":"session_finished","session_id":"ad2","result":{"summary":"no commit"},"at_ms":20}`
+}
+
+// freezeAndDriveDirtyToGate drives the execution lifecycle for a Workspace
+// whose native session left an uncommitted change BEFORE the freeze: the
+// frozen Change Set captures the dirty candidate facts, the Execution
+// Approval binds the frozen hash, and the Workspace stays dirty at the
+// adoption gate.
+func freezeAndDriveDirtyToGate(t *testing.T, fx *planningFixture, wf model.WorkflowID) string {
+	t.Helper()
+	out, err := fx.app(discussionScript("d1", "division by zero must error")).Execute(context.Background(),
+		DiscussRequirementCommand{Workflow: wf, Text: "division by zero must error", Provider: "fake"})
+	if err != nil {
+		t.Fatalf("discuss: %v", err)
+	}
+	ws := fx.workspacePath(wf)
+	if err := os.MkdirAll(filepath.Join(ws, "src", "divide"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "src", "divide", "divide.go"),
+		[]byte("package divide\n\n// Divide returns a/b.\nfunc Divide(a, b int) (int, error) {\n\treturn a / b, nil\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freeze, err := fx.app().Execute(context.Background(),
+		FreezeDiscussionCommand{Workflow: wf, Session: out.SessionID})
+	if err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	if freeze.ChangeSet == nil || !freeze.ChangeSet.Dirty {
+		t.Fatalf("freeze captured no dirty candidate: %+v", freeze.ChangeSet)
+	}
+	changeSetHash := freeze.ChangeSet.Ref.Hash
+	fx.discussSeq++
+	if _, err := fx.app(planScript("p1", validPlan())).Execute(context.Background(),
+		GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	fx.checkSeq++
+	if _, err := fx.app(checkScript("c1", "pass")).Execute(context.Background(),
+		CheckPlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	approveCheckedPlan(t, fx, wf)
+	pv := driveToExecutionGate(t, fx, wf)
+	if pv.ChangeSetHash != changeSetHash {
+		t.Fatalf("preview change set hash = %q, want the frozen %q", pv.ChangeSetHash, changeSetHash)
+	}
+	approveExecution(t, fx, wf, pv)
+	return changeSetHash
+}
+
+// TestAdoptWorkspaceAdoptsDirtyNativeChanges is the Task 4 adoption PASS
+// test (design 8.4 step 2): an uncommitted native Workspace is not rejected;
+// the Adoption flow starts a managed adoption/coding Session that organizes
+// and commits the native changes, then the gate chain (Change Set
+// re-observation, Commit Policy, Clean/Scope, Catalog, independent Review)
+// runs against the NEW candidate Head, and verified_workspace_head advances
+// to the exact post-adoption HEAD.
+func TestAdoptWorkspaceAdoptsDirtyNativeChanges(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf, err := fx.create("add divide", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freezeAndDriveDirtyToGate(t, fx, wf)
+	ws := fx.workspacePath(wf)
+	preHead := gitOut(t, ws, "rev-parse", "HEAD")
+
+	// Dispatch still waits: the candidate Head is unverified.
+	_, err = fx.app().Execute(context.Background(), DispatchCommand{Workflow: wf})
+	requireFaultCode(t, err, model.CodeWorkspaceAdoptionRequired)
+
+	// The managed adoption Session commits the native changes; the gate
+	// chain passes and the verified head advances to the post-adoption HEAD.
+	if _, err := fx.app(adoptionCommitScript(), reviewPassScript()).Execute(context.Background(),
+		AdoptWorkspaceCommand{Workflow: wf}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	postHead := gitOut(t, ws, "rev-parse", "HEAD")
+	if postHead == preHead {
+		t.Fatal("the adoption session did not advance the workspace head")
+	}
+	st := fx.status(wf)
+	if st.VerifiedWorkspaceHead != postHead {
+		t.Fatalf("verified workspace head = %q, want the post-adoption head %q", st.VerifiedWorkspaceHead, postHead)
+	}
+	if st.CandidateWorkspaceHead != postHead {
+		t.Fatalf("candidate workspace head = %q, want %q", st.CandidateWorkspaceHead, postHead)
+	}
+	// The verified workspace fingerprint is the clean-state fingerprint at
+	// the adopted Head (the existing convention records the deterministic
+	// clean fingerprint, never an empty string).
+	if st.WorkspaceDirtyFingerprint == "" {
+		t.Fatalf("the adopted workspace recorded no dirty fingerprint")
+	}
+	if !pathExists(filepath.Join(ws, "src", "divide", "divide.go")) {
+		t.Fatal("the native change was lost by the adoption")
+	}
+	if out := gitOut(t, ws, "status", "--porcelain"); out != "" {
+		t.Fatalf("the workspace is not clean after the adoption:\n%s", out)
+	}
+
+	// Dispatch now schedules from the verified workspace head.
+	a := fx.app(implementationScript("i1"))
+	fx.probe = &callProbe{}
+	a.probe = fx.probe
+	if _, err := a.Execute(context.Background(), DispatchCommand{Workflow: wf}); err != nil {
+		t.Fatalf("dispatch after adoption: %v", err)
+	}
+}
+
+// TestAdoptWorkspaceAdoptionFailureBlocks covers the adoption-session
+// failure case (Task 4, design 8.4 step 7): the managed adoption Session
+// settles without creating any Commit, so the evidence (a new Commit must
+// exist, the Workspace must be clean, the candidate HEAD must advance)
+// Blocks the Workflow and preserves the Workspace, the Change Set, and the
+// Target Branch.
+func TestAdoptWorkspaceAdoptionFailureBlocks(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf, err := fx.create("add divide", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freezeAndDriveDirtyToGate(t, fx, wf)
+	ws := fx.workspacePath(wf)
+	preHead := gitOut(t, ws, "rev-parse", "HEAD")
+
+	if _, err := fx.app(adoptionNoopScript()).Execute(context.Background(),
+		AdoptWorkspaceCommand{Workflow: wf}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if out := gitOut(t, ws, "rev-parse", "HEAD"); out != preHead {
+		t.Fatalf("the workspace head moved despite the failed adoption: %s -> %s", preHead, out)
+	}
+	st := fx.status(wf)
+	if st.VerifiedWorkspaceHead != "" {
+		t.Fatalf("verified head was set despite the failed adoption: %+v", st)
+	}
+	if st.Runtime != model.RuntimeBlocked {
+		t.Fatalf("failed adoption left the workflow %s, want BLOCKED", st.Runtime)
+	}
+	blocked := false
+	for _, f := range st.Findings {
+		if f.Blocking {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("failed adoption left no blocking finding: %+v", st.Findings)
+	}
+	if !pathExists(filepath.Join(ws, "src", "divide", "divide.go")) {
+		t.Fatal("the workspace was not preserved by the failed adoption")
+	}
+	if out := gitOut(t, ws, "status", "--porcelain"); out == "" {
+		t.Fatal("the native change was discarded by the failed adoption")
+	}
 }

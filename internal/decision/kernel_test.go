@@ -2052,6 +2052,102 @@ func TestDispatchCommitsRunningAttemptBeforeEffects(t *testing.T) {
 	}
 }
 
+// TestDispatchWaitsForAdoptionWhenCandidateUnverified is the Task 4
+// scheduler gate (design 8.2: any automatic Task may only be created from
+// verified_workspace_head): when the Execution Approval bound a frozen
+// Change Set and verified_workspace_head is unset, the Kernel refuses to
+// allocate a normal Task from the unverified candidate Head with
+// WORKSPACE_ADOPTION_REQUIRED and mutates nothing.
+func TestDispatchWaitsForAdoptionWhenCandidateUnverified(t *testing.T) {
+	state := fixtureExecutionStage()
+	state.Workflow.ExecutionFacts = &model.ExecutionFacts{ChangeSetHash: "cs-1", ChangeSetRevision: 1}
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodePending, 2)
+	got, err := decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	assertFaultCode(t, err, model.CodeWorkspaceAdoptionRequired)
+
+	// No mutation happened: no Attempt, no Session, no Effect.
+	if len(got.Mutations) != 0 || len(got.Events) != 0 || got.Effect != nil {
+		t.Fatalf("dispatch for an unadopted workspace emitted a mutation/effect: %+v", got)
+	}
+}
+
+// adoptionGateState builds the aggregated EXECUTION state right after
+// decideAdoptWorkspace recorded the managed adoption/coding Session and the
+// independent Adoption Review Session (Task 4, design 8.4 step 2).
+func adoptionGateState() model.State {
+	st := workflowState(model.StageExecution, model.RuntimeRunning)
+	st.Workflow.LayoutVersion = 2
+	st.Workflow.WorkspacePath = "/ws"
+	st.Workflow.WorkspaceBranch = "cflow/wf-1/workspace"
+	st.Workflow.ExecutionFacts = &model.ExecutionFacts{ChangeSetHash: "cs-1"}
+	st.Workflow.CandidateWorkspaceHead = "pre-head"
+	st.Sessions = append(st.Sessions,
+		model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionStarting, Provider: "fake"},
+		model.Session{ID: "review-1", Purpose: model.PurposeReview, Status: model.SessionStarting, Provider: "fake"})
+	return st
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidencePass: the adoption evidence (a
+// new Commit, a clean Workspace, the candidate HEAD advanced) PASSes, the
+// Kernel re-binds the Change Set facts to the re-frozen revision and starts
+// the independent Adoption Review Session (Task 4, design 8.4 step 2/5).
+func TestAdoptionCodingRunEndedJudgesEvidencePass(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "post-head",
+		EndDirtyFingerprint: "",
+		Artifact:            model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 2, Hash: "cs-2"},
+	})
+	requireNoError(t, err)
+	effect, ok := got.Effect.(model.ProviderStartIntent)
+	if !ok || effect.Session != "review-1" || effect.Purpose != model.PurposeReview {
+		t.Fatalf("adoption pass effect = %#v, want the review start for review-1", got.Effect)
+	}
+	foundRef := false
+	for _, m := range got.Mutations {
+		switch mm := m.(type) {
+		case model.ArtifactRefMutation:
+			if mm.Type == model.ArtifactChangeSet && mm.Revision == 2 && mm.Hash == "cs-2" {
+				foundRef = true
+			}
+		case model.WorkflowMutation:
+			if mm.CandidateWorkspaceHead != "post-head" || mm.VerifiedWorkspaceHead != "" {
+				t.Fatalf("workflow mutation = %+v", mm)
+			}
+		}
+	}
+	if !foundRef {
+		t.Fatalf("adoption pass did not re-bind the change set ref: %+v", got.Mutations)
+	}
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidenceDirtyBlocks: the adoption Session
+// settled but the evidence shows the Workspace is still dirty — the
+// evidence never yields to a claim, and the Kernel Blocks the Workflow
+// (Task 4, design 8.4 step 7).
+func TestAdoptionCodingRunEndedJudgesEvidenceDirtyBlocks(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "pre-head",
+		EndDirtyFingerprint: "sha256:dirty",
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("dirty adoption emitted an effect: %+v", got.Effect)
+	}
+	blocked := false
+	for _, m := range got.Mutations {
+		if mm, ok := m.(model.WorkflowMutation); ok && mm.Runtime == model.RuntimeBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("dirty adoption did not block the workflow: %+v", got.Mutations)
+	}
+}
+
 // TestDispatchGateClosureRejectsQueuedAllocation: an allocation whose gate
 // closed between candidate computation and commit is refused with
 // DISPATCH_GATE_CLOSED and mutates nothing (PRD 已确认：并行失败后的

@@ -302,6 +302,11 @@ func (a *Application) promptForPurpose(purpose model.AgentPurpose) (agent.Prompt
 		name = "WORKFLOW_OPTIMIZATION"
 	case model.PurposeImplementation:
 		name = "TASK_IMPLEMENTATION"
+	case model.PurposeAdoption:
+		// The managed adoption/coding Session (Task 4, design 8.4 step 2) is
+		// a coding Session: it receives the same implementation prompt the
+		// coding Sessions use.
+		name = "TASK_IMPLEMENTATION"
 	case model.PurposeReview:
 		name = "TASK_REVIEW"
 	case model.PurposeRepair:

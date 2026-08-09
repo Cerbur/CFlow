@@ -242,7 +242,7 @@ type ExecutionApprovalInput struct {
 func (ExecutionApprovalInput) isInput() {}
 
 // AdoptWorkspaceInput is the Runtime-verified input of the Workspace
-// Adoption Gate (TUI task 6, design 8.4): the Execution Approval bound a
+// Adoption Gate (TUI task 6, design 8.4; Task 4): the Execution Approval bound a
 // frozen Change Set, and the Application re-verified the Workspace's
 // Change Set, Commit Policy, Identity/Signing, Clean/Scope, Catalog
 // Verification, and review route before the Kernel records the independent
@@ -267,6 +267,13 @@ type AdoptWorkspaceInput struct {
 	// at the verified Candidate Head (the frozen Change Set's
 	// fingerprint, re-observed unchanged).
 	DirtyFingerprint string
+	// AdoptionSession is the fresh managed adoption/coding Session identity
+	// allocated when the Workspace carries uncommitted native changes
+	// (Task 4, design 8.4 step 2; "" when the Workspace is already clean and
+	// no adoption Session runs). AdoptionRoute is the approved coding route
+	// the adoption Session runs on.
+	AdoptionSession SessionID
+	AdoptionRoute   string
 }
 
 func (AdoptWorkspaceInput) isInput() {}

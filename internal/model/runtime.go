@@ -351,6 +351,13 @@ const (
 	PurposeRepair               AgentPurpose = "repair"
 	PurposeReview               AgentPurpose = "review"
 	PurposeFinalVerification    AgentPurpose = "final-verification"
+	// PurposeAdoption is the managed adoption/coding Session of the
+	// Workspace Adoption Gate (Task 4, design 8.4 step 2): when the
+	// Workspace carries uncommitted native changes, a managed Session runs
+	// inside the Workspace and organizes and commits them. Its output is
+	// judged by Git evidence (a new Commit, a clean Workspace, the candidate
+	// HEAD advanced), never by a claim.
+	PurposeAdoption AgentPurpose = "adoption"
 	// PurposeApplyVerification is the independent Apply Verification
 	// Session (PRD 已确认：显式受保护 Apply step 4): a fresh Session that
 	// performs the semantic Review of the combined Target + Integration
@@ -364,7 +371,8 @@ func (p AgentPurpose) Valid() bool {
 	switch p {
 	case PurposePlanning, PurposePlanCheck, PurposeSpecGeneration,
 		PurposeWorkflowOptimization, PurposeImplementation, PurposeRepair,
-		PurposeReview, PurposeFinalVerification, PurposeApplyVerification:
+		PurposeReview, PurposeFinalVerification, PurposeApplyVerification,
+		PurposeAdoption:
 		return true
 	}
 	return false

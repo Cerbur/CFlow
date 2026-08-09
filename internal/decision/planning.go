@@ -94,6 +94,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageExecution {
 				return decideImplementationRunEnded(state, in, created)
 			}
+		case model.PurposeAdoption:
+			// A settled managed adoption/coding Session (Task 4, design 8.4
+			// step 2): the adoption evidence (a new Commit, a clean
+			// Workspace, the candidate HEAD advanced) is judged inside the
+			// Workspace Adoption Gate, never from a claim.
+			if state.Workflow.Stage == model.StageExecution {
+				return decideAdoptionCodingRunEnded(state, in, created)
+			}
 		case model.PurposeReview:
 			// The independent Reviewer Session's verdict is evidence; the
 			// Kernel judges it (design 16.2: review never replaces
@@ -147,6 +155,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 	case model.PurposeImplementation, model.PurposeReview, model.PurposeRepair:
 		if state.Workflow.Stage == model.StageExecution {
 			return settleExecutionSessionFailure(state, in, created, code)
+		}
+	case model.PurposeAdoption:
+		// A failed or cancelled managed adoption/coding Session (Task 4,
+		// design 8.4 step 7): the adoption evidence is absent, so the
+		// adoption gate Blocks the Workflow and preserves the Workspace,
+		// the Change Set, and the Target Branch.
+		if state.Workflow.Stage == model.StageExecution {
+			return decideAdoptionCodingRunEnded(state, in, created)
 		}
 	case model.PurposeFinalVerification:
 		// A failed or cancelled Final Reviewer Session settles its

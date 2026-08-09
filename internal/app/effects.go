@@ -381,6 +381,12 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if intent.Purpose == model.PurposeImplementation {
 		return a.codingProviderStart(ctx, wf, intent, cmd, rt)
 	}
+	if intent.Purpose == model.PurposeAdoption {
+		// The managed adoption/coding Session (Task 4, design 8.4 step 2):
+		// a coding Session inside the Workspace that organizes and commits
+		// the dirty native changes; its output is judged by Git evidence.
+		return a.adoptionCodingProviderStart(ctx, wf, intent, cmd, rt)
+	}
 	if intent.Purpose == model.PurposeReview {
 		if intent.Node == "" {
 			// The Workspace Adoption Review (TUI task 6, design 8.4): the

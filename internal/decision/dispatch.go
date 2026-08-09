@@ -118,8 +118,19 @@ func sameDependencies(a, b []model.NodeID) bool {
 // decideDispatch is one serialized allocation routed by Node kind
 // (design 12): agent-task Nodes run the coding chain, verify Nodes the
 // deterministic Verification and the independent Review, and merge Nodes
-// the serial --no-ff Integration merge (Task 13).
+// the serial --no-ff Integration merge (Task 13). The Workspace Adoption
+// Gate closes the scheduler before any Node starts (Task 4, design 8.2):
+// when the Execution Approval bound a frozen Change Set and the Workspace
+// has not been adopted yet, no normal Task may be created from an
+// unverified candidate Head (verified_workspace_head is the only legal
+// Task base), and the Kernel refuses with WORKSPACE_ADOPTION_REQUIRED
+// without mutating anything.
 func decideDispatch(state model.State, in model.DispatchInput) (model.Decision, error) {
+	if state.Workflow.ExecutionFacts != nil && state.Workflow.ExecutionFacts.ChangeSetHash != "" &&
+		state.Workflow.VerifiedWorkspaceHead == "" {
+		return model.Decision{}, model.NewFault(model.CodeWorkspaceAdoptionRequired,
+			"the workspace has not been adopted; no task may start from an unverified candidate head")
+	}
 	node := state.Nodes[in.Node]
 	if node == nil {
 		return model.Decision{}, model.InvalidInputFault("unknown node " + string(in.Node))
