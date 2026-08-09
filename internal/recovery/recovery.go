@@ -757,11 +757,10 @@ func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.Workflow
 	default:
 		return base.with(FatalInvariant, "the workflow layout version cannot select an artifact path"), nil
 	}
-	entries, err := os.ReadDir(dir)
+	_, err = os.Lstat(dir)
 	switch {
 	case err == nil:
-		_ = entries
-		return base.with(BlockedDrift, "the artifact revision directory exists but cannot resolve valid content"), nil
+		return base.with(BlockedDrift, "the artifact revision path exists but cannot resolve valid content"), nil
 	case os.IsNotExist(err):
 		return base.with(SafeToRetry, "the artifact revision is absent"), nil
 	default:

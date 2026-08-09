@@ -760,6 +760,46 @@ func TestRecoveryFixedRevisionRejectsInvalidArtifactEvidence(t *testing.T) {
 	})
 }
 
+func TestRecoveryFixedRevisionRejectsNonDirectoryRevisionPath(t *testing.T) {
+	setup := func(t *testing.T) (*recoveryFixture, string) {
+		t.Helper()
+		fx := newRecoveryFixture(t)
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		dir, err := artifact.WorkflowRevisionDir(root, model.ArtifactReport, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return fx, dir
+	}
+	seed := func(fx *recoveryFixture) {
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+	}
+
+	t.Run("dangling symlink", func(t *testing.T) {
+		fx, dir := setup(t)
+		if err := os.Symlink("missing-revision-target", dir); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("regular file", func(t *testing.T) {
+		fx, dir := setup(t)
+		if err := os.WriteFile(dir, []byte("not a revision directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+}
+
 // TestRecoveryProviderSessionDispositions: a ProviderStartIntent whose
 // Session settled terminal is ALREADY_COMPLETED; a still-open Session is
 // SAFE_TO_RETRY.

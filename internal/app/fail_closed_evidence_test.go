@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,31 @@ import (
 	"cflow.local/cflow/internal/store"
 	"cflow.local/cflow/internal/verify"
 )
+
+func validVerificationManifest(t *testing.T, node model.NodeID) model.EvidenceManifest {
+	t.Helper()
+	m := model.EvidenceManifest{
+		SchemaVersion: "1.0.0", Node: node, Output: "verified output",
+		OutputHash: verificationTestHash([]byte("verified output")),
+	}
+	m.Hash = verificationManifestTestHash(t, m)
+	return m
+}
+
+func verificationManifestTestHash(t *testing.T, m model.EvidenceManifest) string {
+	t.Helper()
+	m.Hash = ""
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verificationTestHash(body)
+}
+
+func verificationTestHash(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
 
 func putRequiredSpec(t *testing.T, a *Application, wf model.WorkflowID, id string) {
 	t.Helper()
@@ -211,4 +239,44 @@ func TestReportRejectsCorruptVerificationEvidence(t *testing.T) {
 	if _, err := a.reportInput(context.Background(), observe.BuildInfo{}, view.State, view.NextEventSeq, len(view.Events) == 0); err == nil {
 		t.Fatal("report silently omitted corrupt verification evidence")
 	}
+}
+
+func TestVerificationManifestIntegrityFailsClosed(t *testing.T) {
+	t.Run("parseable output tampering at review gate", func(t *testing.T) {
+		fx := newPlanningFixture(t)
+		wf, err := fx.create("tampered verification output", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := fx.app()
+		m := validVerificationManifest(t, "verify-s01")
+		m.Output = "tampered but parseable output"
+		if err := a.writeVerificationManifest(context.Background(), wf, m.Node, m); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.readRequiredVerificationManifest(context.Background(), wf, m.Node); err == nil {
+			t.Fatal("review evidence accepted an Output value that does not match OutputHash")
+		}
+	})
+
+	t.Run("parseable self hash tampering in final report", func(t *testing.T) {
+		fx := newPlanningFixture(t)
+		wf, err := fx.create("tampered verification self hash", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := fx.app()
+		m := validVerificationManifest(t, "verify-s01")
+		m.Hash = strings.Repeat("f", 64)
+		if err := a.writeVerificationManifest(context.Background(), wf, m.Node, m); err != nil {
+			t.Fatal(err)
+		}
+		view, err := a.readAggregate(context.Background(), wf, store.StoreQuery{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.reportInput(context.Background(), observe.BuildInfo{}, view.State, view.NextEventSeq, len(view.Events) == 0); err == nil {
+			t.Fatal("final report accepted a verification manifest with a forged self-hash")
+		}
+	})
 }

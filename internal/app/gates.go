@@ -1054,12 +1054,8 @@ func (a *Application) readRequiredVerificationManifest(ctx context.Context, wf m
 	if len(body) == 0 {
 		return nil, model.InvariantFault(fmt.Errorf("required verification manifest for %s is missing", node))
 	}
-	var manifest model.EvidenceManifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return nil, model.InvariantFault(fmt.Errorf("verification manifest for %s cannot be parsed: %w", node, err))
-	}
-	if manifest.Node != node || manifest.Hash == "" {
-		return nil, model.InvariantFault(fmt.Errorf("verification manifest for %s does not match its required identity", node))
+	if _, err := validateVerificationManifest(body, node); err != nil {
+		return nil, err
 	}
 	return body, nil
 }

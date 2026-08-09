@@ -11,7 +11,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -195,12 +194,10 @@ func (a *Application) verificationManifests(ctx context.Context, wf model.Workfl
 		if err != nil {
 			return nil, err
 		}
-		var m model.EvidenceManifest
-		if err := json.Unmarshal(body, &m); err != nil {
-			return nil, model.InvariantFault(fmt.Errorf("verification evidence %s cannot be parsed: %w", e.Name(), err))
-		}
-		if m.Hash == "" {
-			return nil, model.InvariantFault(fmt.Errorf("verification evidence %s has no identity hash", e.Name()))
+		node := model.NodeID(strings.TrimSuffix(e.Name(), ".json"))
+		m, err := validateVerificationManifest(body, node)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, m)
 	}
