@@ -165,10 +165,20 @@ func fakeScript(purpose, sessionID, result string) string {
 {"type":"session_finished","session_id":"` + sessionID + `","result":` + result + `,"at_ms":20}`
 }
 
-// planScript is the deterministic Plan Revision output.
+// planScript is the deterministic Plan Revision output. Its terminal result
+// also carries the strict handoff content fields so the SAME planning
+// fixture serves the managed discussion finish resume (the Application
+// binds the runtime facts; the plan generation extracts plan_markdown).
 func planScript(sessionID string) string {
-	return fakeScript("planning", sessionID, `{"plan_markdown":`+jsonQuote(validPlanMarkdown)+`}`)
+	return fakeScript("planning", sessionID,
+		`{"plan_markdown":`+jsonQuote(validPlanMarkdown)+`,`+handoffContentFields+`}`)
 }
+
+// handoffContentFields is the strict handoff content fields the user types
+// in the discussion handoff editor (content fields only; the runtime facts
+// — workflow_id, session_id, change_set — are bound by CFlow's managed
+// resume). It is also the content the managed resume fixture produces.
+const handoffContentFields = `"targets":"division by zero must error","constraints":"no external dependencies","non_goals":"no other arithmetic changes","acceptance_criteria":"Divide returns a typed error on zero","open_questions":"error wording","user_decisions":[{"topic":"error type","decision":"typed error"}]`
 
 // checkPlanPassScript is the independent Plan Check PASS verdict.
 func checkPlanPassScript(sessionID string) string {

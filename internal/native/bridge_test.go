@@ -57,6 +57,11 @@ func TestBridgeRestoresAndReconciles(t *testing.T) {
 	if result.Session != session || !result.Reconciled {
 		t.Fatalf("%+v", result)
 	}
+	// The result echoes the exact Provider Session the turn resumed, so the
+	// Application can revalidate the binding on return (design §9.2).
+	if result.ProviderSession != providerSession || result.Provider != "fake" {
+		t.Fatalf("bridge result binding = %+v, want %q/%q", result, providerSession, "fake")
+	}
 }
 
 // TestBridgeRefusesWithoutCapability: a provider without the native

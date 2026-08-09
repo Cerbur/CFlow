@@ -53,6 +53,21 @@ type ProviderResumeIntent struct {
 
 func (ProviderResumeIntent) isEffectIntent() {}
 
+// NativeBootstrapIntent runs the managed Provider start/bootstrap of one
+// native interactive discussion Session (design §9.1, TUI task 12): the
+// Runtime starts the Provider and captures the Provider's own session
+// identity from the validated session_started event. The bootstrap only
+// establishes the context and the Provider Session — it never represents
+// the discussion as complete; the interactive terminal continues the
+// exact Session later through the Native Session Bridge.
+type NativeBootstrapIntent struct {
+	Session SessionID
+	Purpose AgentPurpose
+	Route   string
+}
+
+func (NativeBootstrapIntent) isEffectIntent() {}
+
 // ProviderCancelIntent cancels a Provider Session.
 type ProviderCancelIntent struct {
 	Session SessionID

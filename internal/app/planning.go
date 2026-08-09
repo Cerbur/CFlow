@@ -264,6 +264,8 @@ func (a *Application) planningPrompt(cmd model.Input) (agent.Prompt, bool) {
 	switch cmd.(type) {
 	case model.DiscussRequirementInput:
 		purpose = "REQUIREMENT_DISCUSSION"
+	case model.PrepareNativeDiscussionInput, model.ContinueNativeDiscussionInput, model.SwitchAgentInput:
+		purpose = "REQUIREMENT_DISCUSSION"
 	case model.GeneratePlanInput:
 		purpose = "PLAN_GENERATION"
 	case model.CheckPlanInput:

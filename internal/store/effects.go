@@ -99,6 +99,8 @@ func effectKindOf(i model.EffectIntent) (string, error) {
 		return "provider-start", nil
 	case model.ProviderResumeIntent:
 		return "provider-resume", nil
+	case model.NativeBootstrapIntent:
+		return "native-bootstrap", nil
 	case model.ProviderCancelIntent:
 		return "provider-cancel", nil
 	case model.PlanningWorktreeCreateIntent:
@@ -155,6 +157,10 @@ func effectFromKind(kind string, payload []byte) (model.EffectIntent, error) {
 		return v, err
 	case "provider-resume":
 		var v model.ProviderResumeIntent
+		err = json.Unmarshal(payload, &v)
+		return v, err
+	case "native-bootstrap":
+		var v model.NativeBootstrapIntent
 		err = json.Unmarshal(payload, &v)
 		return v, err
 	case "provider-cancel":

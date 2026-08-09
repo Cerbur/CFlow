@@ -39,8 +39,11 @@ type Request struct {
 type Result struct {
 	Session    model.SessionID
 	Provider   string
-	Exit       process.Exit
-	Reconciled bool
+	// ProviderSession is the Provider's own session identity the turn
+	// resumed (echoed for the Application's binding revalidation).
+	ProviderSession agent.ProviderSessionID
+	Exit            process.Exit
+	Reconciled      bool
 }
 
 // Bridge is the native interactive session runner.
@@ -89,9 +92,10 @@ func (Bridge) Run(ctx context.Context, req Request) (Result, error) {
 		return Result{Session: req.Session, Provider: req.Provider, Exit: exit, Reconciled: false}, err
 	}
 	return Result{
-		Session:     req.Session,
-		Provider:    req.Provider,
-		Exit:        exit,
-		Reconciled:  exit.Fact == process.FactProcessExit && exit.Code == 0,
+		Session:         req.Session,
+		Provider:        req.Provider,
+		ProviderSession: req.ProviderSession,
+		Exit:            exit,
+		Reconciled:      exit.Fact == process.FactProcessExit && exit.Code == 0,
 	}, nil
 }

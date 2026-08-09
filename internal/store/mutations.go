@@ -70,6 +70,18 @@ func applyMutation(st *model.State, m model.Mutation) error {
 		}
 		se.ProviderSessionID = m.ProviderSessionID
 		se.Status = m.Status
+	case model.SessionBindMutation:
+		se := findSession(st, m.ID)
+		if se == nil {
+			return fmt.Errorf("session %s does not exist", m.ID)
+		}
+		se.ProviderSessionID = m.ProviderSessionID
+	case model.SessionStatusMutation:
+		se := findSession(st, m.ID)
+		if se == nil {
+			return fmt.Errorf("session %s does not exist", m.ID)
+		}
+		se.Status = m.Status
 	case model.NodeStatusMutation:
 		n := st.Nodes[m.Node]
 		if n == nil {
@@ -541,6 +553,24 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 			nullIfEmpty(m.ProviderSessionID), string(m.Status),
 			m.EndedAt.UTC().Format(time.RFC3339Nano), m.ID, st.Workflow.ID); err != nil {
 			return fmt.Errorf("end session: %w", err)
+		}
+		return nil
+
+	case model.SessionBindMutation:
+		if _, err := q.ExecContext(ctx, `UPDATE sessions
+			SET provider_session_id = ?
+			WHERE id = ? AND workflow_id = ?`,
+			nullIfEmpty(m.ProviderSessionID), m.ID, st.Workflow.ID); err != nil {
+			return fmt.Errorf("bind session: %w", err)
+		}
+		return nil
+
+	case model.SessionStatusMutation:
+		if _, err := q.ExecContext(ctx, `UPDATE sessions
+			SET status = ?
+			WHERE id = ? AND workflow_id = ?`,
+			string(m.Status), m.ID, st.Workflow.ID); err != nil {
+			return fmt.Errorf("set session status: %w", err)
 		}
 		return nil
 

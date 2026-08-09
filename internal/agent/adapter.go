@@ -126,6 +126,29 @@ type ResumeRequest struct {
 	Context           ContextInput
 }
 
+// BootstrapRequest starts the managed Provider bootstrap of one native
+// interactive discussion Session (design §9.1, TUI task 12): the Runtime
+// starts the Provider and captures the Provider's own session identity
+// from the validated session_started event, then stops the start run — the
+// interactive terminal continues the exact Session later. SessionID is the
+// Application-allocated CFlow Session identity the established Provider
+// Session binds to.
+type BootstrapRequest struct {
+	Purpose   model.AgentPurpose
+	Provider  string
+	Prompt    string
+	Input     any
+	CWD       string
+	SessionID model.SessionID
+}
+
+// BootstrapResult is the established Session fact of one managed
+// bootstrap: the CFlow Session bound to the Provider's own session id.
+type BootstrapResult struct {
+	Session  model.Session
+	Provider string
+}
+
 // RunHandle names one live run for Cancel and Inspect. The Runtime
 // allocates it; providers never synthesize handles.
 type RunHandle struct {

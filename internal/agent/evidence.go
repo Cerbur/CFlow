@@ -190,6 +190,29 @@ func ensureSensitiveDir(path string) error {
 	return security.CreateSensitiveDir(path)
 }
 
+// openEventFile opens one Session's redacted events file for append. A
+// brand-new file is born 0600 through the guard (O_CREATE|O_EXCL); an
+// existing file — e.g. the managed bootstrap or a prior interactive turn
+// created it — is verified as a safe owner-only regular file and opened
+// for append, so a native Session's evidence accumulates across Runtime
+// instances (design §9, TUI task 12).
+func openEventFile(path string) (*os.File, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return security.CreateSensitiveFile(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, model.InvalidInputFault("evidence event path is not a regular file")
+	}
+	if _, err := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+}
+
 // appendEvent persists one redacted complete event line for a Session,
 // creating the events file 0600 on first use.
 func (w *evidenceWriter) appendEvent(ctx context.Context, session model.SessionID, line persistedEvent) error {
@@ -212,7 +235,7 @@ func (w *evidenceWriter) appendEvent(ctx context.Context, session model.SessionI
 			return err
 		}
 		path := filepath.Join(w.dir, "events", string(session)+".jsonl")
-		f, err = security.CreateSensitiveFile(path)
+		f, err = openEventFile(path)
 		if err != nil {
 			return err
 		}

@@ -8,7 +8,6 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -16,6 +15,7 @@ import (
 
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/process"
 )
 
 // recordingController wraps the shared Application and records every
@@ -752,8 +752,11 @@ func TestModelQShowsPauseAndExit(t *testing.T) {
 }
 
 // createWithDiscussion drives the requirement discussion setup through
-// the Application: create, prepare the native session, freeze the Change
-// Set, and finish with the strict handoff. Returns the workflow id.
+// the Application: create, prepare the native session (managed bootstrap
+// binds the Provider's own session id), the Bridge return persists the
+// process exit facts and moves the Session to INTERACTIVE_IDLE, freeze the
+// Change Set, and finish with the managed structured resume producing the
+// strict handoff. Returns the workflow id.
 func (fx *tuiFixture) createWithDiscussion(ctx context.Context, a *app.Application) model.WorkflowID {
 	fx.t.Helper()
 	out, err := a.Execute(ctx, app.CreateWorkflowCommand{Name: "calculator", Provider: "fake", ConfirmDirty: true})
@@ -765,26 +768,30 @@ func (fx *tuiFixture) createWithDiscussion(ctx context.Context, a *app.Applicati
 	if err != nil {
 		fx.t.Fatalf("prepare native discussion: %v", err)
 	}
+	if prep.Native == nil {
+		fx.t.Fatal("prepare carried no native bridge request")
+	}
+	// The Bridge return revalidates the binding and moves the Session to
+	// INTERACTIVE_IDLE.
+	if _, err := a.Execute(ctx, app.NativeDiscussionReturnCommand{
+		Workflow: wf, Session: prep.SessionID,
+		Exit:            process.Exit{Code: 0, Fact: process.FactProcessExit},
+		Provider:        "fake",
+		ProviderSession: prep.Native.ProviderSession,
+	}); err != nil {
+		fx.t.Fatalf("native discussion return: %v", err)
+	}
 	frozen, err := a.Execute(ctx, app.FreezeDiscussionCommand{Workflow: wf, Session: prep.SessionID})
 	if err != nil {
 		fx.t.Fatalf("freeze: %v", err)
 	}
-	ref := frozen.ChangeSet.Ref
-	handoff, err := json.Marshal(map[string]any{
-		"workflow_id":         string(wf),
-		"session_id":          string(prep.SessionID),
-		"targets":             "division by zero must error",
-		"constraints":         "no external dependencies",
-		"non_goals":           "no other arithmetic changes",
-		"acceptance_criteria": "Divide returns a typed error on zero",
-		"open_questions":      "error wording",
-		"change_set":          map[string]any{"revision": ref.Revision, "sha256": ref.Hash},
-		"user_decisions":      []map[string]any{{"topic": "error type", "decision": "typed error"}},
-	})
-	if err != nil {
-		fx.t.Fatal(err)
-	}
-	if _, err := a.Execute(ctx, app.FinishDiscussionCommand{Workflow: wf, Session: prep.SessionID, Handoff: handoff}); err != nil {
+	_ = frozen.ChangeSet.Ref
+	// Finish drives the managed structured resume on the same provider
+	// session that produces the strict handoff from the user's decisions.
+	if _, err := a.Execute(ctx, app.FinishDiscussionCommand{
+		Workflow: wf, Session: prep.SessionID,
+		Decisions: []byte(`{` + handoffContentFields + `}`),
+	}); err != nil {
 		fx.t.Fatalf("finish: %v", err)
 	}
 	return wf

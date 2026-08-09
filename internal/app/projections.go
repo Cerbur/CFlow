@@ -245,6 +245,7 @@ func inspectView(st model.State, pending []string) InspectView {
 		Attempts:        attemptSlice(st.Attempts),
 		Approvals:       st.Approvals,
 		Sessions:        st.Sessions,
+		Processes:       st.Processes,
 		Runs:            st.Runs,
 		Quarantines:     st.Quarantines,
 		ApplyAttempts:   st.ApplyAttempts,

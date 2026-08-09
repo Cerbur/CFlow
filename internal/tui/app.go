@@ -17,6 +17,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/cli"
 	"cflow.local/cflow/internal/foreground"
@@ -310,10 +311,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case nativeDoneMsg:
 		if msg.err != nil {
 			m.status = "native session: " + msg.err.Error()
-		} else {
-			m.status = fmt.Sprintf("native session %s returned (exit %d)", msg.result.Session, msg.result.Exit.Code)
+			return m, m.reloadCmd()
 		}
-		return m, m.reloadCmd()
+		// The Bridge return persists the process exit facts and moves the
+		// Session to INTERACTIVE_IDLE; the Return actions are legal only
+		// per the revalidated facts (design §9.2, TUI task 12).
+		m.status = fmt.Sprintf("native session %s returned (exit %d)", msg.result.Session, msg.result.Exit.Code)
+		return m, m.executeCmd(app.NativeDiscussionReturnCommand{
+			Workflow:        m.selected,
+			Session:         msg.result.Session,
+			Exit:            msg.result.Exit,
+			Provider:        msg.result.Provider,
+			ProviderSession: agent.ProviderSessionID(msg.result.ProviderSession),
+		})
 	case reportLoadedMsg:
 		if msg.err != nil {
 			m.status = "report: " + msg.err.Error()
@@ -965,15 +975,19 @@ func (m Model) activateDiscussionAction() (Model, tea.Cmd) {
 	}
 	action := m.discussion.Actions[m.discussion.Selected]
 	switch action {
-	case ReturnStart, ReturnContinue:
+	case ReturnStart:
 		m.status = "preparing the native discussion…"
 		return m, m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+	case ReturnContinue:
+		// Continue resumes the SAME Provider Session on the SAME provider.
+		m.status = "continuing the native discussion…"
+		return m, m.executeCmd(app.ContinueNativeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
 	case ReturnFinish:
 		m.status = "freezing the change set…"
 		return m, m.executeCmd(app.FreezeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
 	case ReturnSwitch:
 		m.status = "switching the discussion session…"
-		return m, m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		return m, m.switchAgentCmd()
 	case ReturnPause:
 		m.page = PageWorkspace
 		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
@@ -995,6 +1009,33 @@ func (m Model) discussionProvider() string {
 	return "fake"
 }
 
+// switchAgentCmd issues the switch-agent command: a DIFFERENT provider than
+// the bound Session's and the user-supplied reason. Without a different
+// healthy provider the switch fails closed without a mutation.
+func (m Model) switchAgentCmd() tea.Cmd {
+	current := m.discussion.Provider
+	alt := ""
+	for _, p := range m.workspace.Health.Providers {
+		if p.Compatible && p.Name != current {
+			alt = p.Name
+			break
+		}
+	}
+	if alt == "" {
+		return func() tea.Msg { return commandDoneMsg{err: fmt.Errorf("no different provider is available to switch to")} }
+	}
+	reason := m.discussion.SwitchReason
+	if strings.TrimSpace(reason) == "" {
+		reason = "user switched the discussion agent"
+	}
+	return m.executeCmd(app.SwitchAgentCommand{
+		Workflow: m.selected,
+		Session:  model.SessionID(m.discussion.Session),
+		Provider: alt,
+		Reason:   reason,
+	})
+}
+
 // handleHandoffKey handles the handoff content editor.
 func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
@@ -1003,7 +1044,7 @@ func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.discussion.Handoff = ""
 		return m, nil
 	case msg.Code == tea.KeyEnter:
-		body, err := buildHandoff(m.discussion.Handoff, m.selected, model.SessionID(m.discussion.Session), m.discussion.ChangeSetRef)
+		content, err := handoffDecisions(m.discussion.Handoff, m.selected, model.SessionID(m.discussion.Session), m.discussion.ChangeSetRef)
 		if err != nil {
 			m.discussion.Status = err.Error()
 			return m, nil
@@ -1012,7 +1053,7 @@ func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.discussion.Editing = false
 		m.status = "finishing the discussion…"
 		return m, m.executeCmd(app.FinishDiscussionCommand{
-			Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Handoff: body,
+			Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Decisions: content,
 		})
 	case msg.Code == tea.KeyBackspace || msg.Code == tea.KeyDelete:
 		if len(m.discussion.Handoff) > 0 {

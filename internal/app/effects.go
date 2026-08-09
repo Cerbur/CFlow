@@ -59,6 +59,8 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return a.providerStart(ctx, wf, e, input, rt)
 	case model.ProviderResumeIntent:
 		return a.providerResume(ctx, wf, e, input, rt)
+	case model.NativeBootstrapIntent:
+		return a.nativeBootstrap(ctx, wf, e, input, rt)
 	case model.ProviderCancelIntent:
 		// STUB (Task 17): the two-phase Provider stop protocol.
 		return model.EffectResultInput{}, stubEffect(e)
@@ -198,6 +200,13 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 		}
 		if r.Kind != model.ProviderRunEnded || r.Session.ID != e.Session || r.Session.Purpose != e.Purpose {
 			return model.InvariantFault(fmt.Errorf("provider resume result does not match intent for session %s", e.Session))
+		}
+	case model.NativeBootstrapIntent:
+		if r.Kind != model.NativeBootstrapEstablished || r.Session.ID != e.Session {
+			return model.InvariantFault(fmt.Errorf("native bootstrap result does not match intent for session %s", e.Session))
+		}
+		if r.Session.ProviderSessionID == "" {
+			return model.InvariantFault(fmt.Errorf("native bootstrap result carries no provider session id"))
 		}
 	case model.ArtifactWriteIntent:
 		if r.Kind != model.ArtifactWritten ||
@@ -446,6 +455,50 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 		out.CatalogRef = ref
 	}
 	return out, nil
+}
+
+// nativeBootstrap runs the managed Provider start/bootstrap of one native
+// interactive discussion Session (design §9.1, TUI task 12): the Runtime
+// establishes the Provider's own session identity from the validated
+// session_started event, and the Result carries that exact identity for the
+// Kernel to bind. The bootstrap never uses a CFlow Session id as the
+// Provider identity, and it fails closed when the Provider returns no
+// session id or the binding drifts.
+func (a *Application) nativeBootstrap(ctx context.Context, wf model.WorkflowID, intent model.NativeBootstrapIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.planningPrompt(cmd)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the discussion bootstrap")
+	}
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.sessionInput(ctx, wf, cmd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	res, err := rt.Bootstrap(ctx, agent.BootstrapRequest{
+		Purpose: intent.Purpose, Provider: intent.Route,
+		Prompt: renderPrompt(prompt.Body, input), Input: input,
+		CWD: cwd, SessionID: intent.Session,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return model.EffectResultInput{
+		Kind:    model.NativeBootstrapEstablished,
+		Session: res.Session,
+	}, nil
 }
 
 // providerResume re-establishes an existing Provider Session (design
@@ -933,6 +986,19 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 		if _, ok := cmd.(model.CheckPlanInput); !ok {
 			return nil, nil
 		}
+	}
+	// Plan generation reads the immutable Discussion Handoff (the native
+	// discussion path) — never a terminal transcript. The legacy headless
+	// discussion (no handoff) falls back to the discussion turn body for
+	// backward compatibility.
+	handoff, err := readOptionalArtifact(ctx, store, wf, model.ArtifactDiscussionHandoff)
+	if err != nil {
+		return nil, err
+	}
+	if handoff != nil {
+		return struct {
+			Requirement string `json:"requirement"`
+		}{Requirement: string(handoff)}, nil
 	}
 	body, err := readOptionalArtifact(ctx, store, wf, model.ArtifactDiscussionTurn)
 	if err != nil {

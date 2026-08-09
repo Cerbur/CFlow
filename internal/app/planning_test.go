@@ -136,6 +136,82 @@ func (fx *planningFixture) app(scripts ...string) *Application {
 	return a
 }
 
+// appWithAdapters builds an Application over the given named Fake Adapters
+// (a second provider instance) plus the deterministic "fake" binding. Each
+// script is loaded into the adapter(s) whose binding dialect matches the
+// script's declared dialect, so a codex-dialect bootstrap fixture lands on
+// the codex adapter only.
+func (fx *planningFixture) appWithAdapters(extra map[string]agent.Adapter, scripts ...string) *Application {
+	fx.t.Helper()
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		fx.t.Fatalf("provider registry: %v", err)
+	}
+	prompts, err := agent.LoadPromptRegistry()
+	if err != nil {
+		fx.t.Fatalf("prompt registry: %v", err)
+	}
+	ad := fake.New(reg)
+	adapters := map[string]agent.Adapter{"fake": ad}
+	for name, extraAd := range extra {
+		adapters[name] = extraAd
+	}
+	for _, s := range scripts {
+		sc, err := fake.ParseScript([]byte(s))
+		if err != nil {
+			fx.t.Fatalf("parse script: %v", err)
+		}
+		if sc.Dialect == "" || sc.Dialect == "cflow.dialect.fake.v1" {
+			if err := ad.LoadScript([]byte(s)); err != nil {
+				fx.t.Fatalf("load fake script: %v", err)
+			}
+		}
+		for name, extraAd := range extra {
+			fa, ok := extraAd.(*fake.Adapter)
+			if !ok {
+				continue
+			}
+			binding, _ := reg.Select(name)
+			if sc.Dialect == binding.Dialect.ID {
+				if err := fa.LoadScript([]byte(s)); err != nil {
+					fx.t.Fatalf("load script for %s: %v", name, err)
+				}
+			}
+		}
+	}
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.root)
+	if err != nil {
+		fx.t.Fatalf("new gitflow: %v", err)
+	}
+	a, err := New(Options{
+		Home:         fx.home,
+		Project:      ProjectFor(fx.root),
+		CflowVersion: "0.0.0-dev",
+		Now:          fx.now,
+		IDs:          fx.ids,
+		Supervisor:   fx.sup,
+		GitFlow:      flow,
+		Prompts:      prompts,
+		Agent: agent.RuntimeOptions{
+			Registry:    reg,
+			Redaction:   security.Registry{},
+			Adapters:    adapters,
+			EvidenceDir: filepath.Join(fx.home, "evidence"),
+		},
+	})
+	if err != nil {
+		fx.t.Fatalf("new application: %v", err)
+	}
+	return a
+}
+
+// namedFake builds a deterministic Fake Adapter bound to one named registry
+// Provider (a different-provider seam for switch tests; nil when the
+// provider is not in the registry).
+func namedFake(reg *agent.ProviderRegistry, name string) *fake.Adapter {
+	return fake.NewNamed(reg, name)
+}
+
 func (fx *planningFixture) create(name string, confirm bool) (model.WorkflowID, error) {
 	fx.t.Helper()
 	out, err := fx.app().Execute(context.Background(),

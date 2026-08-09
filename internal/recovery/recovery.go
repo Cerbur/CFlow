@@ -259,12 +259,14 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 			intent.BaseHead, intent.Branch)
 	case model.VerificationRunIntent:
 		return e.classifyVerification(ctx, wf, state, base, intent)
-	case model.ProviderStartIntent, model.ProviderResumeIntent:
+	case model.ProviderStartIntent, model.ProviderResumeIntent, model.NativeBootstrapIntent:
 		var session model.SessionID
 		switch t := intent.(type) {
 		case model.ProviderStartIntent:
 			session = t.Session
 		case model.ProviderResumeIntent:
+			session = t.Session
+		case model.NativeBootstrapIntent:
 			session = t.Session
 		}
 		return e.classifyProviderSession(base, state, session)

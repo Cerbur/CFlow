@@ -882,6 +882,40 @@ func TestPlanApprovalBindsExactRevision(t *testing.T) {
 	}
 }
 
+// TestPlanGenerationRequiresHandoffAndChangeSet (remediation plan
+// requirement 5): Plan generation is gated on the immutable Discussion
+// Handoff AND the frozen Change Set. An input that claims a native handoff
+// without the frozen Change Set (or vice versa) is refused — a workflow
+// cannot generate a Plan from discussion turns alone.
+func TestPlanGenerationRequiresHandoffAndChangeSet(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	handoff := model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactDiscussionHandoff, Revision: 1, Hash: "handoff-h"}
+	cs := model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 1, Hash: "change-set-h"}
+
+	// A handoff without the frozen Change Set is refused.
+	if _, err := decision.Decide(st, model.GeneratePlanInput{
+		Provider: "fake", Session: "s-1", HandoffRef: handoff,
+	}); err == nil {
+		t.Fatal("plan generation with a handoff but no change set was accepted")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
+		t.Fatalf("handoff-only fault = %v, want APPROVAL_INPUT_CHANGED", err)
+	}
+	// A Change Set without the handoff is refused.
+	if _, err := decision.Decide(st, model.GeneratePlanInput{
+		Provider: "fake", Session: "s-2", ChangeSetRef: cs,
+	}); err == nil {
+		t.Fatal("plan generation with a change set but no handoff was accepted")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
+		t.Fatalf("change-set-only fault = %v, want APPROVAL_INPUT_CHANGED", err)
+	}
+	// With BOTH immutable refs the plan generation proceeds.
+	if _, err := decision.Decide(st, model.GeneratePlanInput{
+		Provider: "fake", Session: "s-3", HandoffRef: handoff, ChangeSetRef: cs,
+	}); err != nil {
+		t.Fatalf("plan generation with both refs: %v", err)
+	}
+}
+
 func TestExecutionApprovalAdvancesToExecution(t *testing.T) {
 	state := fixtureAwaitingExecutionApproval("workflow-a")
 	got, err := decision.Decide(state, model.ExecutionApprovalInput{WorkflowHash: "workflow-a",
