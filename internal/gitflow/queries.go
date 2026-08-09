@@ -141,6 +141,73 @@ func hasGpgsig(raw []byte) bool {
 	return false
 }
 
+// ancestryCheck reports whether one commit is an ancestor of another with
+// `git merge-base --is-ancestor <ancestor> <descendant>` (the adoption's
+// new-commit closure). Exit 0 means ancestor, exit 1 means not; any other
+// exit or a non-resolvable commit fails closed.
+func (g *GitFlow) ancestryCheck(ctx context.Context, q AncestryCheck) (AncestryFacts, error) {
+	if err := validateHead(q.Ancestor); err != nil {
+		return AncestryFacts{}, err
+	}
+	if err := validateHead(q.Descendant); err != nil {
+		return AncestryFacts{}, err
+	}
+	_, _, exit, err := g.run(ctx, g.dir, childEnv(), defaultGitTimeout, "merge-base", "--is-ancestor", q.Ancestor, q.Descendant)
+	if err != nil {
+		return AncestryFacts{}, err
+	}
+	facts := AncestryFacts{Ancestor: q.Ancestor, Descendant: q.Descendant}
+	switch {
+	case exit.Fact == process.FactProcessExit && exit.Code == 0:
+		facts.AncestorOf = true
+		return facts, nil
+	case exit.Fact == process.FactProcessExit && exit.Code == 1:
+		facts.AncestorOf = false
+		return facts, nil
+	default:
+		return AncestryFacts{}, model.InvalidInputFault("gitflow: cannot resolve the ancestry check")
+	}
+}
+
+// branchInspect observes one working tree's attached Branch and HEAD:
+// `git symbolic-ref --quiet HEAD` for the attached local branch (only
+// refs/heads counts as attached) and `git rev-parse --verify HEAD` for the
+// full HEAD hash. A detached or unborn working tree reports the detached
+// Branch/HEAD facts, never an error.
+func (g *GitFlow) branchInspect(ctx context.Context, q BranchInspect) (BranchFacts, error) {
+	dir := g.dir
+	if q.Dir != "" {
+		canon, err := canonicalDir(q.Dir)
+		if err != nil {
+			return BranchFacts{}, err
+		}
+		dir = canon
+	}
+	env := childEnv()
+	branch := ""
+	out, _, exit, err := g.run(ctx, dir, env, defaultGitTimeout, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return BranchFacts{}, err
+	}
+	if exit.Fact == process.FactProcessExit && exit.Code == 0 {
+		sym := strings.TrimSpace(string(out))
+		if strings.HasPrefix(sym, "refs/heads/") {
+			branch = strings.TrimPrefix(sym, "refs/heads/")
+		}
+	}
+	head, err := g.revParseHead(ctx, dir, env)
+	if err != nil {
+		return BranchFacts{}, err
+	}
+	return BranchFacts{
+		Dir:      dir,
+		Branch:   branch,
+		Head:     head,
+		Detached: branch == "" && head != "",
+		Exists:   branch != "" || head != "",
+	}, nil
+}
+
 // refLookup reports one ref's existence and expected value (design 15.3:
 // ref existence and expected value).
 func (g *GitFlow) refLookup(ctx context.Context, q RefLookup) (RefFacts, error) {

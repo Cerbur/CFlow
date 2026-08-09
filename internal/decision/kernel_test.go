@@ -2088,7 +2088,8 @@ func adoptionGateState() model.State {
 }
 
 // TestAdoptionCodingRunEndedJudgesEvidencePass: the adoption evidence (a
-// new Commit, a clean Workspace, the candidate HEAD advanced) PASSes, the
+// new Commit, a clean Workspace, the candidate HEAD advanced, and a
+// re-frozen Change Set that carries at least one real Commit) PASSes, the
 // Kernel re-binds the Change Set facts to the re-frozen revision and starts
 // the independent Adoption Review Session (Task 4, design 8.4 step 2/5).
 func TestAdoptionCodingRunEndedJudgesEvidencePass(t *testing.T) {
@@ -2097,6 +2098,7 @@ func TestAdoptionCodingRunEndedJudgesEvidencePass(t *testing.T) {
 		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
 		EndHead:             "post-head",
 		EndDirtyFingerprint: "",
+		Body:                []byte(`{"base_commit":"base","candidate_head":"post-head","verified_head":"post-head","commits":["c1"],"tracked_diff":[{"path":"src/divide/divide.go"}],"untracked":[],"dirty_fingerprint":"","session_id":"adopt-1","content_hash":""}`),
 		Artifact:            model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 2, Hash: "cs-2"},
 	})
 	requireNoError(t, err)
@@ -2145,6 +2147,61 @@ func TestAdoptionCodingRunEndedJudgesEvidenceDirtyBlocks(t *testing.T) {
 	}
 	if !blocked {
 		t.Fatalf("dirty adoption did not block the workflow: %+v", got.Mutations)
+	}
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidenceNoCommitBlocks: the adoption
+// Session settled clean but the candidate HEAD did NOT advance — the
+// adoption produced no Commit and the Kernel Blocks with
+// MISSING_IMPLEMENTATION_COMMIT (Task 4, design 8.4 step 7).
+func TestAdoptionCodingRunEndedJudgesEvidenceNoCommitBlocks(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "pre-head", // == CandidateWorkspaceHead
+		EndDirtyFingerprint: "",
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("no-commit adoption emitted an effect: %+v", got.Effect)
+	}
+	blocked := false
+	for _, m := range got.Mutations {
+		if mm, ok := m.(model.WorkflowMutation); ok && mm.Runtime == model.RuntimeBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("no-commit adoption did not block the workflow: %+v", got.Mutations)
+	}
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidenceEmptyCommitRangeBlocks: the
+// adoption Session settled clean at a CHANGED head, but the re-frozen
+// Change Set the Runtime produced carries NO Commit — a head-string
+// inequality without a real commit range is not adoption evidence, and the
+// Kernel Blocks with MISSING_IMPLEMENTATION_COMMIT (F2, design 8.4 step 2).
+func TestAdoptionCodingRunEndedJudgesEvidenceEmptyCommitRangeBlocks(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "post-head",
+		EndDirtyFingerprint: "",
+		Body:                []byte(`{"base_commit":"base","candidate_head":"post-head","verified_head":"post-head","commits":[],"tracked_diff":[{"path":"src/divide/divide.go"}],"untracked":[],"dirty_fingerprint":"","session_id":"adopt-1","content_hash":""}`),
+		Artifact:            model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 2, Hash: "cs-2"},
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("empty-commit-range adoption emitted an effect: %+v", got.Effect)
+	}
+	blocked := false
+	for _, m := range got.Mutations {
+		if mm, ok := m.(model.WorkflowMutation); ok && mm.Runtime == model.RuntimeBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("empty-commit-range adoption did not block the workflow: %+v", got.Mutations)
 	}
 }
 

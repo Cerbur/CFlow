@@ -174,6 +174,14 @@ func decideAdoptionCodingRunEnded(state model.State, in model.EffectResultInput,
 	if in.EndHead == "" || in.EndHead == state.Workflow.CandidateWorkspaceHead {
 		return adoptionFailure(b, state, created, model.CodeMissingImplementationCommit), nil
 	}
+	// The adoption evidence requires the re-frozen Change Set to carry at
+	// least one real Commit (design 8.4 step 2): a session that moved the
+	// workspace to a head with an empty commit range (e.g. `git reset
+	// --hard` to a foreign or past head) produced no adoption Commit and
+	// Blocks the gate.
+	if !adoptionChangeSetCarriesCommit(in.Body) {
+		return adoptionFailure(b, state, created, model.CodeMissingImplementationCommit), nil
+	}
 	// The adoption evidence passed: the Workspace is clean at the NEW
 	// candidate Head, and the Runtime re-froze the Change Set against it.
 	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
@@ -213,6 +221,21 @@ func adoptionReviewSessionOf(state model.State) (model.Session, bool) {
 		}
 	}
 	return model.Session{}, false
+}
+
+// adoptionChangeSetCarriesCommit re-judges the adoption evidence (design
+// 8.4 step 2): the re-frozen Change Set body the Runtime produced must
+// carry at least one real Commit (a non-empty commit range). An empty or
+// unparsable body fails closed — the evidence never yields to a claim.
+func adoptionChangeSetCarriesCommit(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var cs model.ChangeSet
+	if err := json.Unmarshal(body, &cs); err != nil {
+		return false
+	}
+	return len(cs.Commits) > 0
 }
 
 // decideAdoptionReviewRunEnded settles one Workspace Adoption Review

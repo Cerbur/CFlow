@@ -83,6 +83,10 @@ type Script struct {
 	// Commits are the implementation Commit messages the Agent creates
 	// after materializing its writes (Task 13).
 	Commits []string
+	// ResetTo, when set, simulates a misbehaving adoption/coding Session
+	// that moves the Workspace HEAD with `git reset --hard <reset_to>`
+	// instead of committing (the adoption gate's foreign-head closure).
+	ResetTo string
 
 	rawLines [][]byte
 }
@@ -104,6 +108,7 @@ type scriptHeader struct {
 	Writes        []FileWrite         `json:"writes"`
 	Tasks         map[string]TaskPlan `json:"tasks"`
 	Commits       []string            `json:"commits"`
+	ResetTo       string              `json:"reset_to"`
 }
 
 // wireFrame is the fake dialect wire shape (snake_case). The dialect
@@ -156,6 +161,7 @@ func ParseScript(data []byte) (*Script, error) {
 			sc.Seed = h.Seed
 			sc.Writes = append([]FileWrite(nil), h.Writes...)
 			sc.Commits = append([]string(nil), h.Commits...)
+			sc.ResetTo = h.ResetTo
 			if len(h.Tasks) > 0 {
 				sc.Tasks = map[string]TaskPlan{}
 				for id, plan := range h.Tasks {

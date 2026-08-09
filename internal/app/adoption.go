@@ -122,6 +122,16 @@ func (a *Application) prepareAdoption(ctx context.Context, c AdoptWorkspaceComma
 		// gate chain runs afterwards against the NEW candidate Head. The
 		// candidate facts recorded here are the observed dirty facts; the
 		// Kernel replaces them with the post-adoption evidence.
+		//
+		// The BASE-COMMIT invariant still holds on the dirty path: for a
+		// dirty Workspace the candidate Head/fingerprint mismatch is
+		// expected, but a frozen Change Set whose BaseCommit differs from
+		// the recorded Workflow BaseCommit is an approval drift that must
+		// block BEFORE any adoption Session starts.
+		if changeSet.BaseCommit != view.State.Workflow.BaseCommit {
+			return nil, "", model.NewFault(model.CodeEvidenceSubjectChanged,
+				"the workspace drifted after the execution approval; re-freeze before adopting")
+		}
 		adoption, ok := routingPrimaryBinding(routing, model.PurposeImplementation)
 		if !ok || adoption.Provider == "" {
 			return nil, "", model.NewFault(model.CodeApprovalInputChanged,
@@ -195,7 +205,9 @@ func (a *Application) readChangeSetBody(ctx context.Context, wf model.WorkflowID
 }
 
 // verifyWorkspaceBranch asserts the workspace worktree is attached to the
-// recorded CFlow-owned Workspace Branch (design 8.2).
+// recorded CFlow-owned Workspace Branch (design 8.2): the branch ref must
+// exist AND the worktree's observed HEAD must be attached to that exact
+// branch. An adoption Session that switched branches fails closed.
 func (a *Application) verifyWorkspaceBranch(ctx context.Context, cwd, want string) error {
 	if a.git == nil {
 		return model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
@@ -211,6 +223,45 @@ func (a *Application) verifyWorkspaceBranch(ctx context.Context, cwd, want strin
 	if !ref.Exists || ref.Value == "" {
 		return model.NewFault(model.CodeEvidenceSubjectChanged,
 			"the workspace branch no longer exists")
+	}
+	// The Worktree must be attached to the recorded Workspace Branch
+	// (design 8.2): a Session that switched branches fails closed.
+	bf, err := a.git.Observe(ctx, gitflow.BranchInspect{Dir: cwd})
+	if err != nil {
+		return err
+	}
+	branch, ok := bf.(gitflow.BranchFacts)
+	if !ok {
+		return model.InvariantFault(fmt.Errorf("branch inspection observation has an unexpected type"))
+	}
+	if branch.Detached || branch.Branch != want || branch.Head == "" || branch.Head != ref.Value {
+		return model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the workspace worktree is not attached to the workspace branch")
+	}
+	return nil
+}
+
+// verifyAdoptionAncestry asserts the pre-adoption HEAD is an ancestor of
+// the post-adoption HEAD (the adoption's new-commit closure, design 8.4
+// step 2): the adoption may only append commits on top of the recorded
+// candidate. A misbehaving session that moved the Workspace to a foreign
+// head (e.g. `git reset --hard` to an unrelated or past commit) fails
+// closed with EVIDENCE_SUBJECT_CHANGED before any gate runs.
+func (a *Application) verifyAdoptionAncestry(ctx context.Context, pre, post string) error {
+	if a.git == nil {
+		return model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
+	}
+	facts, err := a.git.Observe(ctx, gitflow.AncestryCheck{Ancestor: pre, Descendant: post})
+	if err != nil {
+		return err
+	}
+	ac, ok := facts.(gitflow.AncestryFacts)
+	if !ok {
+		return model.InvariantFault(fmt.Errorf("ancestry observation has an unexpected type"))
+	}
+	if !ac.AncestorOf {
+		return model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the adoption session moved the workspace to a head that does not descend from the recorded candidate")
 	}
 	return nil
 }
@@ -475,6 +526,18 @@ func (a *Application) adoptionCodingProviderStart(ctx context.Context, wf model.
 	if !post.Clean() || post.Head == "" || post.Head == pre.Head {
 		return out, nil
 	}
+	// The adoption evidence is an ancestry closure, never a bare head-string
+	// inequality: the pre-adoption HEAD must be an ancestor of the
+	// post-adoption HEAD (the adoption may only append commits on top of the
+	// recorded candidate). A session that moved the workspace to a foreign
+	// head (e.g. `git reset --hard` to an unrelated or past commit) fails
+	// closed with EVIDENCE_SUBJECT_CHANGED and the Kernel Blocks the
+	// Workflow before any gate runs.
+	if err := a.verifyAdoptionAncestry(ctx, pre.Head, post.Head); err != nil {
+		out.Session.Status = model.SessionFailed
+		out.FailureCode = model.CodeEvidenceSubjectChanged
+		return out, nil
+	}
 	view, err := a.writeStoreView(ctx, wf)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -508,6 +571,16 @@ func (a *Application) adoptionCodingProviderStart(ctx context.Context, wf model.
 		out.Session.Status = model.SessionFailed
 		out.FailureCode = code
 		return out
+	}
+	// The re-frozen Change Set body is the adoption evidence the Kernel
+	// re-judges: the Kernel requires it to carry at least one real Commit.
+	out.Body = body
+	// The adoption evidence requires the re-frozen Change Set to carry at
+	// least one real Commit (design 8.4 step 2): a session that moved the
+	// workspace to a head with an empty commit range (a reset to a foreign
+	// or past head) produces no adoption Commit and Blocks the gate.
+	if len(reFrozen.Commits) == 0 {
+		return failAdoption(model.CodeMissingImplementationCommit), nil
 	}
 	// The post-adoption gate chain (design 8.4 steps 3-4): the Workspace
 	// Branch, the Commit Policy Identity/Signing preflight, the Clean/Scope
@@ -553,7 +626,18 @@ func (a *Application) adoptionCodingSessionInput(ctx context.Context, wf model.W
 	if err != nil {
 		return nil, err
 	}
-	changeSetBody, err := readRequiredArtifact(ctx, store, wf, model.ArtifactChangeSet)
+	facts := view.State.Workflow.ExecutionFacts
+	if facts == nil || facts.ChangeSetRevision < 1 || facts.ChangeSetHash == "" {
+		return nil, model.InvariantFault(fmt.Errorf("the adoption gate lost the bound change set facts"))
+	}
+	// The BOUND Change Set Revision the Execution Approval referenced, never
+	// the ACTIVE revision (the adoption re-freeze may already have advanced
+	// the active reference): the adoption Session organizes the exact
+	// approved diff.
+	changeSetBody, err := store.Get(ctx, model.ArtifactRef{
+		Workflow: wf, Type: model.ArtifactChangeSet,
+		Revision: facts.ChangeSetRevision, Hash: facts.ChangeSetHash,
+	})
 	if err != nil {
 		return nil, err
 	}
