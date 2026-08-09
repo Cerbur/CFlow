@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,9 @@ func TestCodingSessionInputOwnSpec(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("put spec artifact: %v", err)
 	}
+	putRequiredCatalog(t, a, wf)
+	seedNodeRow(t, filepath.Join(a.home, "cflow.db"), wf,
+		"task-s02", "s02", string(model.NodeAgentTask), string(model.NodeRunning), "cflow/task-s02")
 	in, err := a.sessionInput(ctx, wf, model.DispatchInput{Node: "task-s02"})
 	if err != nil {
 		t.Fatalf("session input: %v", err)

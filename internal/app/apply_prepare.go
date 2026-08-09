@@ -12,6 +12,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 
 	"cflow.local/cflow/internal/artifact"
@@ -397,11 +398,17 @@ func (a *Application) applyResolutionNeeded(ctx context.Context, wf model.Workfl
 	if err != nil {
 		return false, err
 	}
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
 	unmerged, err := a.unmergedPathsOf(ctx, path)
-	if err != nil || len(unmerged) == 0 {
-		// A blocked policy attempt may not have created its Apply Worktree
-		// yet. Path-selection errors have already been propagated above; an
-		// absent/unreadable worktree means no resolution session is owed.
+	if err != nil {
+		return false, err
+	}
+	if len(unmerged) == 0 {
 		return false, nil
 	}
 	return true, nil

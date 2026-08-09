@@ -128,8 +128,14 @@ func (a *Application) applyIdentityDrifted(ctx context.Context, wf model.Workflo
 	if err != nil {
 		return false, err
 	}
-	if _, err := os.Stat(path); err != nil {
-		return false, nil
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := a.observeWorktree(ctx, path, ""); err != nil {
+		return false, err
 	}
 	engine, err := verify.NewEngine(verify.EngineOptions{
 		Supervisor: a.supervisor, GitFlow: a.git, Redaction: a.redaction,
@@ -310,9 +316,11 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 	var verifications []string
 	for id, n := range st.Nodes {
 		if n.Kind == model.NodeVerify || n.Kind == model.NodeFinalVerify {
-			if b, err := a.readVerificationManifestFile(ctx, wf, id); err == nil && len(b) > 0 {
-				verifications = append(verifications, string(b))
+			b, err := a.readRequiredVerificationManifest(ctx, wf, id)
+			if err != nil {
+				return nil, err
 			}
+			verifications = append(verifications, string(b))
 		}
 	}
 	sort.Strings(verifications)
@@ -330,11 +338,27 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 	if err != nil {
 		return nil, err
 	}
+	plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalogBody, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
-		"plan":               string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-		"spec":               string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		"catalog":            string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		"workflow":           string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		"plan":               string(plan),
+		"spec":               string(spec),
+		"catalog":            string(catalogBody),
+		"workflow":           string(workflow),
 		"integration_branch": st.Workflow.IntegrationBranch,
 		"integration_head":   st.Workflow.IntegrationHead,
 		"target_branch":      st.Workflow.TargetBranch,
@@ -356,7 +380,7 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 // apply verification manifest and returns its self-hash ("" when
 // absent).
 func (a *Application) applyVerificationManifestHash(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt) (string, error) {
-	body, err := a.readVerificationManifestFile(ctx, wf, model.NodeID(string(att.ID)))
+	body, err := a.readRequiredVerificationManifest(ctx, wf, model.NodeID(string(att.ID)))
 	if err != nil || len(body) == 0 {
 		return "", err
 	}

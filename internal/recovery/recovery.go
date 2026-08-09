@@ -34,7 +34,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
@@ -726,14 +725,25 @@ func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.Workflow
 		if err == nil && ref.Revision >= 1 {
 			return base.with(AlreadyCompleted, "the artifact type carries a written revision"), nil
 		}
-		return base.with(SafeToRetry, "no artifact revision of the type exists"), nil
-	}
-	if intent.Ref.Hash != "" {
-		// The intent pinned an exact content identity: the file must read
-		// back with it.
-		if _, err := store.Get(ctx, intent.Ref); err == nil {
-			return base.with(AlreadyCompleted, "the artifact revision reads back with the exact identity"), nil
+		if artifact.IsNotFound(err) {
+			return base.with(SafeToRetry, "no artifact revision of the type exists"), nil
 		}
+		return base.with(BlockedDrift, "the artifact type contains unreadable or invalid revision evidence"), nil
+	}
+	// Resolve the exact Revision through the immutable Store reader. A raw
+	// filename is never completion evidence: canonical form, schema,
+	// envelope identity, and content hash must all validate first.
+	resolved, resolveErr := store.Resolve(ctx, artifact.ResolveRequest{
+		WorkflowID: wf, Type: intent.Ref.Type, Revision: intent.Ref.Revision,
+	})
+	if resolveErr == nil {
+		if intent.Ref.Hash != "" && resolved.Hash != intent.Ref.Hash {
+			return base.with(BlockedDrift, "the artifact revision has a different content identity"), nil
+		}
+		return base.with(AlreadyCompleted, "the exact artifact revision validates through the Store"), nil
+	}
+	if !artifact.IsNotFound(resolveErr) {
+		return base.with(BlockedDrift, "the exact artifact revision is corrupt or carries the wrong identity"), nil
 	}
 	var dir string
 	switch state.Workflow.LayoutVersion {
@@ -750,23 +760,13 @@ func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.Workflow
 	entries, err := os.ReadDir(dir)
 	switch {
 	case err == nil:
-		for _, entry := range entries {
-			if isArtifactContent(entry) {
-				return base.with(AlreadyCompleted, "the artifact revision directory carries its content file"), nil
-			}
-		}
-		return base.with(BlockedDrift, "the artifact revision directory exists without its content file"), nil
+		_ = entries
+		return base.with(BlockedDrift, "the artifact revision directory exists but cannot resolve valid content"), nil
 	case os.IsNotExist(err):
 		return base.with(SafeToRetry, "the artifact revision is absent"), nil
 	default:
 		return base.with(BlockedDrift, "the artifact revision directory cannot be inspected"), nil
 	}
-}
-
-// isArtifactContent reports whether one directory entry is an Artifact
-// content file (not the atomic-write temp or a subdirectory).
-func isArtifactContent(entry os.DirEntry) bool {
-	return !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".")
 }
 
 // classifyWorkflowCompile classifies one unfinished WorkflowCompileIntent

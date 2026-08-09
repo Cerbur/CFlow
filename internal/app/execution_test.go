@@ -10,6 +10,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -726,6 +727,9 @@ func (fx *planningFixture) executionReady(scripts ...string) (*Application, mode
 func (fx *planningFixture) dispatchPlanFor(a *Application, wf model.WorkflowID, plan *dispatchPlan) error {
 	fx.t.Helper()
 	ctx := context.Background()
+	if err := seedDispatchPlanSpecs(ctx, fx.t, a, wf, plan); err != nil {
+		return err
+	}
 	st, err := a.ensureWriteStore(ctx, wf)
 	if err != nil {
 		return err
@@ -736,6 +740,64 @@ func (fx *planningFixture) dispatchPlanFor(a *Application, wf model.WorkflowID, 
 	}
 	defer releaseHolds(holds)
 	_, err = a.dispatchPass(ctx, st, wf, plan, false, nil)
+	return err
+}
+
+// seedDispatchPlanSpecs gives manually constructed dispatch plans the same
+// required Spec evidence the real compiler path persists. These scheduler
+// fixtures deliberately replace the compiled plan, so they must also seed
+// the matching immutable Spec revision instead of relying on a nil prompt.
+func seedDispatchPlanSpecs(ctx context.Context, t *testing.T, a *Application, wf model.WorkflowID, plan *dispatchPlan) error {
+	t.Helper()
+	var specs []map[string]any
+	seen := map[string]struct{}{}
+	for _, node := range plan.nodes {
+		if node.kind != model.NodeAgentTask || node.specID == "" {
+			continue
+		}
+		if _, ok := seen[node.specID]; ok {
+			continue
+		}
+		seen[node.specID] = struct{}{}
+		writeScope := node.writeScope
+		if len(writeScope) == 0 {
+			writeScope = []string{"src/**"}
+		}
+		locks := node.locks
+		if locks == nil {
+			locks = []string{}
+		}
+		specs = append(specs, map[string]any{
+			"id": node.specID, "goal": "scheduler fixture " + node.specID,
+			"depends_on": []string{}, "write_scope": writeScope,
+			"read_scope": []string{}, "locks": locks,
+			"acceptance":      map[string]any{"verification_command_ids": []string{"verify"}},
+			"route":           map[string]any{"provider": "fake", "model": "default", "budget": 1},
+			"timeout_seconds": 60, "max_retry": 0,
+		})
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(specs)
+	if err != nil {
+		return err
+	}
+	artifacts, err := a.artifactStore(wf)
+	if err != nil {
+		return err
+	}
+	revision := 1
+	if ref, err := artifacts.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactSpec}); err == nil {
+		revision = ref.Revision + 1
+	} else if !artifact.IsNotFound(err) {
+		return err
+	}
+	_, err = artifacts.Put(ctx, artifact.PutRequest{
+		WorkflowID: wf, Type: model.ArtifactSpec, Revision: revision, SchemaVersion: "1.0.0",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Producer: artifact.ProducerRef{Purpose: "scheduler-fixture"},
+		Body: body,
+	})
 	return err
 }
 
@@ -831,7 +893,7 @@ func (fx *planningFixture) RequireOrder(first, second string) {
 // node "S01" (the brief's fixture identity) on the fake route.
 func fixturePlan() *dispatchPlan {
 	return &dispatchPlan{nodes: []dispatchNode{{
-		id: "S01", kind: model.NodeAgentTask, specID: "S01",
+		id: "S01", kind: model.NodeAgentTask, specID: "s01",
 		retry: 2, timeout: 1800, route: "fake",
 		writeScope: []string{"src/divide/**"},
 	}}}
@@ -865,9 +927,9 @@ func TestDispatchDefersSharedLockConflict(t *testing.T) {
 	}
 	a, wf := fx.executionReady(implementationScript("i1"))
 	plan := &dispatchPlan{nodes: []dispatchNode{
-		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+		{id: "S01", kind: model.NodeAgentTask, specID: "s01", retry: 0, timeout: 1800,
 			route: "fake", locks: []string{"db-shard-1"}},
-		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+		{id: "S02", kind: model.NodeAgentTask, specID: "s02", retry: 0, timeout: 1800,
 			route: "fake", locks: []string{"db-shard-1"}},
 	}}
 	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {
@@ -938,9 +1000,9 @@ func TestDispatchDefersAgainstRunningNodeLocks(t *testing.T) {
 	}
 	a, wf := fx.executionReady(implementationScript("i1"))
 	plan := &dispatchPlan{nodes: []dispatchNode{
-		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+		{id: "S01", kind: model.NodeAgentTask, specID: "s01", retry: 0, timeout: 1800,
 			route: "fake", locks: []string{"db-shard-1"}},
-		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+		{id: "S02", kind: model.NodeAgentTask, specID: "s02", retry: 0, timeout: 1800,
 			route: "fake", locks: []string{"db-shard-1"}},
 	}}
 	// The crashed-runtime state: S01 RUNNING with its Attempt never
@@ -976,9 +1038,9 @@ func TestDispatchDefersAgainstRunningNodeScopes(t *testing.T) {
 	}
 	a, wf := fx.executionReady(implementationScript("i1"))
 	plan := &dispatchPlan{nodes: []dispatchNode{
-		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+		{id: "S01", kind: model.NodeAgentTask, specID: "s01", retry: 0, timeout: 1800,
 			route: "fake", writeScope: []string{"src/calc/**"}},
-		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+		{id: "S02", kind: model.NodeAgentTask, specID: "s02", retry: 0, timeout: 1800,
 			route: "fake", writeScope: []string{"src/calc/sub/**"}},
 	}}
 	seedNodeRow(t, a.dbPath, wf, "S01", "S01", "agent-task", "RUNNING", "cflow/"+string(wf)+"/task-S01")
@@ -1009,9 +1071,9 @@ func TestDispatchHonorsConcurrencyCap(t *testing.T) {
 	}
 	a := fx.executionGate(wf, implementationScript("i1"))
 	plan := &dispatchPlan{nodes: []dispatchNode{
-		{id: "S01", kind: model.NodeAgentTask, specID: "S01", retry: 0, timeout: 1800,
+		{id: "S01", kind: model.NodeAgentTask, specID: "s01", retry: 0, timeout: 1800,
 			route: "fake", writeScope: []string{"src/a/**"}},
-		{id: "S02", kind: model.NodeAgentTask, specID: "S02", retry: 0, timeout: 1800,
+		{id: "S02", kind: model.NodeAgentTask, specID: "s02", retry: 0, timeout: 1800,
 			route: "fake", writeScope: []string{"src/b/**"}},
 	}}
 	if err := fx.dispatchPlanFor(a, wf, plan); err != nil {

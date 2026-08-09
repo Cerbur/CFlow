@@ -386,6 +386,26 @@ func (a *Application) adoptionReviewSessionInput(ctx context.Context, wf model.W
 	if err != nil {
 		return nil, err
 	}
+	changeSetBody, err := readRequiredArtifact(ctx, store, wf, model.ArtifactChangeSet)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return nil, err
+	}
 	base := view.State.Workflow.BaseCommit
 	return struct {
 		ChangeSet     string `json:"change_set"`
@@ -398,11 +418,11 @@ func (a *Application) adoptionReviewSessionInput(ctx context.Context, wf model.W
 		Diff          string `json:"diff"`
 		CandidateHead string `json:"candidate_head"`
 	}{
-		ChangeSet:     string(readArtifact(ctx, store, wf, model.ArtifactChangeSet)),
-		Plan:          string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-		Spec:          string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		Catalog:       string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		Workflow:      string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		ChangeSet:     string(changeSetBody),
+		Plan:          string(plan),
+		Spec:          string(spec),
+		Catalog:       string(catalog),
+		Workflow:      string(workflow),
 		Workspace:     cwd,
 		CommitRange:   base + ".." + changeSet.CandidateHead,
 		Diff:          a.gitDiff(ctx, cwd, base+".."+changeSet.CandidateHead),

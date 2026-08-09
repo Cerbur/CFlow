@@ -513,7 +513,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	if err != nil {
 		return nil, err
 	}
-	manifestBody, err := a.readVerificationManifestFile(ctx, wf, verifyNode)
+	manifestBody, err := a.readRequiredVerificationManifest(ctx, wf, verifyNode)
 	if err != nil {
 		return nil, err
 	}
@@ -543,9 +543,11 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	var verifications []string
 	for id, n := range st.Nodes {
 		if n.Kind == model.NodeVerify || n.Kind == model.NodeFinalVerify {
-			if b, err := a.readVerificationManifestFile(ctx, wf, id); err == nil && len(b) > 0 {
-				verifications = append(verifications, string(b))
+			b, err := a.readRequiredVerificationManifest(ctx, wf, id)
+			if err != nil {
+				return nil, err
 			}
+			verifications = append(verifications, string(b))
 		}
 	}
 	sort.Strings(verifications)
@@ -570,6 +572,22 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		nodeAcceptance = append(nodeAcceptance, fmt.Sprintf("%s/%s=%s", id, n.Kind, n.Status))
 	}
 	sort.Strings(nodeAcceptance)
+	plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return nil, err
+	}
 	return struct {
 		Plan              string `json:"plan"`
 		Spec              string `json:"spec"`
@@ -583,10 +601,10 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		Commits           string `json:"commits"`
 		Nodes             string `json:"nodes"`
 	}{
-		Plan:              string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		Catalog:           string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		Workflow:          string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		Plan:              string(plan),
+		Spec:              string(spec),
+		Catalog:           string(catalog),
+		Workflow:          string(workflow),
 		IntegrationBranch: deliveryBranch,
 		IntegrationHead:   deliveryHead,
 		TargetBranch:      st.Workflow.TargetBranch,
@@ -623,11 +641,19 @@ func (a *Application) reviewSessionInput(ctx context.Context, wf model.WorkflowI
 	if err != nil {
 		return nil, err
 	}
-	manifestBody, err := a.readVerificationManifestFile(ctx, wf, verifyNode)
+	manifestBody, err := a.readRequiredVerificationManifest(ctx, wf, verifyNode)
 	if err != nil {
 		return nil, err
 	}
 	worktree, err := a.taskWorktreePath(ctx, wf, taskNode)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
 	if err != nil {
 		return nil, err
 	}
@@ -639,8 +665,8 @@ func (a *Application) reviewSessionInput(ctx context.Context, wf model.WorkflowI
 		Verification string `json:"verification"`
 		Diff         string `json:"diff"`
 	}{
-		Spec:         string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		Catalog:      string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		Spec:         string(spec),
+		Catalog:      string(catalog),
 		CommitRange:  manifestRange(manifestBody),
 		Worktree:     worktree,
 		Verification: string(manifestBody),
@@ -849,7 +875,10 @@ func (a *Application) verificationNodeFacts(ctx context.Context, wf model.Workfl
 	if err != nil {
 		return "", "", "", "", err
 	}
-	body := readArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	body, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return "", "", "", "", err
+	}
 	wfIR, err := compile.ParseWorkflow(body)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("the compiled workflow cannot be parsed")
@@ -1017,10 +1046,28 @@ func (a *Application) readVerificationManifestFile(ctx context.Context, wf model
 	return data, nil
 }
 
+func (a *Application) readRequiredVerificationManifest(ctx context.Context, wf model.WorkflowID, node model.NodeID) ([]byte, error) {
+	body, err := a.readVerificationManifestFile(ctx, wf, node)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, model.InvariantFault(fmt.Errorf("required verification manifest for %s is missing", node))
+	}
+	var manifest model.EvidenceManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return nil, model.InvariantFault(fmt.Errorf("verification manifest for %s cannot be parsed: %w", node, err))
+	}
+	if manifest.Node != node || manifest.Hash == "" {
+		return nil, model.InvariantFault(fmt.Errorf("verification manifest for %s does not match its required identity", node))
+	}
+	return body, nil
+}
+
 // verificationManifestHash is the persisted manifest's self-hash ("" when
 // absent).
 func (a *Application) verificationManifestHash(ctx context.Context, wf model.WorkflowID, node model.NodeID) (string, error) {
-	body, err := a.readVerificationManifestFile(ctx, wf, node)
+	body, err := a.readRequiredVerificationManifest(ctx, wf, node)
 	if err != nil || body == nil {
 		return "", err
 	}

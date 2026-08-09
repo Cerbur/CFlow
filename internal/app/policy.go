@@ -39,6 +39,7 @@ type policyWorktree struct {
 	Head   string
 	Branch string
 	Node   model.NodeID
+	Err    error
 }
 
 // policyInterval is the monitor's recompute period (PRD step 5: no slower
@@ -188,6 +189,7 @@ func (a *Application) activeWorktreeHeads(ctx context.Context, wf model.Workflow
 	out := map[string]policyWorktree{}
 	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
 	if err != nil {
+		out["unresolved-workflow:"+string(wf)] = policyWorktree{Err: err}
 		return out
 	}
 	st := view.State
@@ -197,19 +199,35 @@ func (a *Application) activeWorktreeHeads(ctx context.Context, wf model.Workflow
 		}
 		path, err := a.taskWorktreePath(ctx, wf, n.ID)
 		if err != nil {
+			out["unresolved-task:"+string(n.ID)] = policyWorktree{Branch: n.Branch, Node: n.ID, Err: err}
 			continue
 		}
 		status, err := a.observeWorktree(ctx, path, "")
-		if err != nil || status.Head == "" {
+		if err != nil {
+			out[path] = policyWorktree{Branch: n.Branch, Node: n.ID, Err: err}
+			continue
+		}
+		if status.Head == "" {
+			out[path] = policyWorktree{Branch: n.Branch, Node: n.ID,
+				Err: model.InvariantFault(fmt.Errorf("active task worktree %s has no observable HEAD", n.ID))}
 			continue
 		}
 		out[path] = policyWorktree{Head: status.Head, Branch: n.Branch, Node: n.ID}
 	}
-	// The Integration Worktree: its HEAD is the delivery chain's current
-	// baseline; a window Commit here quarantines the Integration Branch.
-	path := a.integrationWorktreePath(wf)
-	if status, err := a.observeWorktree(ctx, path, ""); err == nil && status.Head != "" {
-		out[path] = policyWorktree{Head: status.Head, Branch: st.Workflow.IntegrationBranch}
+	// The layout-aware delivery worktree: Workspace on Layout 2, Integration
+	// on Layout 1. A layout failure is retained as blocking snapshot evidence.
+	deliveryBranch, _, path, pathErr := a.deliveryFacts(ctx, wf, st)
+	if pathErr != nil {
+		out["unresolved-delivery:"+string(wf)] = policyWorktree{Err: pathErr}
+		return out
+	}
+	if status, err := a.observeWorktree(ctx, path, ""); err != nil {
+		out[path] = policyWorktree{Branch: deliveryBranch, Err: err}
+	} else if status.Head == "" {
+		out[path] = policyWorktree{Branch: deliveryBranch,
+			Err: model.InvariantFault(fmt.Errorf("delivery worktree has no observable HEAD"))}
+	} else {
+		out[path] = policyWorktree{Head: status.Head, Branch: deliveryBranch}
 	}
 	return out
 }
@@ -230,13 +248,26 @@ func (a *Application) settlePolicyDrift(ctx context.Context, st *store.Store, wf
 	settleCtx := context.WithoutCancel(ctx)
 	var window []model.WindowCommit
 	for path, pre := range heads {
+		if pre.Err != nil {
+			return pre.Err
+		}
 		final, err := a.observeWorktree(settleCtx, path, "")
-		if err != nil || final.Head == "" || final.Head == pre.Head {
+		if err != nil {
+			return err
+		}
+		if final.Head == "" {
+			return model.InvariantFault(fmt.Errorf("safety-stop worktree %s has no observable HEAD", path))
+		}
+		if final.Head == pre.Head {
 			continue
 		}
 		// Scan the drift window (pre, final]: commits the stop request
 		// could not observe atomically.
-		if !a.windowHasCommits(settleCtx, pre.Head, final.Head) {
+		hasCommits, err := a.windowHasCommits(settleCtx, pre.Head, final.Head)
+		if err != nil {
+			return err
+		}
+		if !hasCommits {
 			continue
 		}
 		window = append(window, model.WindowCommit{
@@ -254,16 +285,19 @@ func (a *Application) settlePolicyDrift(ctx context.Context, st *store.Store, wf
 
 // windowHasCommits reports whether the half-open commit range (from, to]
 // is non-empty.
-func (a *Application) windowHasCommits(ctx context.Context, from, to string) bool {
+func (a *Application) windowHasCommits(ctx context.Context, from, to string) (bool, error) {
 	if a.git == nil {
-		return false
+		return false, model.InvariantFault(fmt.Errorf("git seam is not configured for policy-window inspection"))
 	}
 	facts, err := a.git.Observe(ctx, gitflow.HistoryRange{From: from, To: to})
 	if err != nil {
-		return false
+		return false, err
 	}
 	rf, ok := facts.(gitflow.RangeFacts)
-	return ok && len(rf.Commits) > 0
+	if !ok {
+		return false, model.InvariantFault(fmt.Errorf("policy-window history observation has an unexpected type"))
+	}
+	return len(rf.Commits) > 0, nil
 }
 
 // settleDriftWindowQuarantine creates the unique audit Refs before the

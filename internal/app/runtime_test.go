@@ -450,6 +450,10 @@ func TestResumeFallbackReportsLostFactsForKernelCharge(t *testing.T) {
 	sess := rt.Sessions()[0].Session
 
 	a := fx.app()
+	putRequiredSpec(t, a, wf, "s01")
+	putRequiredCatalog(t, a, wf)
+	seedNodeRow(t, filepath.Join(fx.home, "cflow.db"), wf,
+		"S01", "s01", string(model.NodeAgentTask), string(model.NodeRunning), "cflow/"+string(wf)+"/task-S01")
 	input := model.DispatchInput{Node: "S01", Session: sess.ID, Route: "fake", BaseHead: "base"}
 	result, err := a.executeEffect(context.Background(), model.ProviderResumeIntent{
 		Session: sess.ID, Purpose: model.PurposeImplementation,

@@ -69,19 +69,31 @@ func (a *Application) reportInput(ctx context.Context, build observe.BuildInfo, 
 		TrustBoundary: reportTrustBoundary,
 	}
 	store, err := a.artifactStore(wfOf(st))
-	if err == nil {
-		for _, typ := range []model.ArtifactType{
-			model.ArtifactPlan, model.ArtifactSpec, model.ArtifactCatalog,
-			model.ArtifactWorkflow, model.ArtifactRoutingPolicy, model.ArtifactBudgetPolicy,
-			model.ArtifactReport,
-		} {
-			if ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wfOf(st), Type: typ}); err == nil {
-				in.ActiveArtifacts = append(in.ActiveArtifacts, ref)
-			}
-		}
+	if err != nil {
+		return observe.ReportInput{}, err
 	}
-	in.VerificationManifests = a.verificationManifests(ctx, wfOf(st))
-	in.Migration.Applied, in.Migration.SchemaVersion = a.appliedMigrations(ctx, wfOf(st))
+	for _, typ := range []model.ArtifactType{
+		model.ArtifactPlan, model.ArtifactSpec, model.ArtifactCatalog,
+		model.ArtifactWorkflow, model.ArtifactRoutingPolicy, model.ArtifactBudgetPolicy,
+		model.ArtifactReport,
+	} {
+		ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wfOf(st), Type: typ})
+		if err != nil {
+			if artifact.IsNotFound(err) {
+				continue
+			}
+			return observe.ReportInput{}, err
+		}
+		in.ActiveArtifacts = append(in.ActiveArtifacts, ref)
+	}
+	in.VerificationManifests, err = a.verificationManifests(ctx, wfOf(st))
+	if err != nil {
+		return observe.ReportInput{}, err
+	}
+	in.Migration.Applied, in.Migration.SchemaVersion, err = a.appliedMigrations(ctx, wfOf(st))
+	if err != nil {
+		return observe.ReportInput{}, err
+	}
 	wfDir, err := a.workflowDir(ctx, wfOf(st))
 	if err != nil {
 		return observe.ReportInput{}, err
@@ -121,29 +133,29 @@ func (a *Application) reportSecurity() observe.ReportSecurity {
 
 // appliedMigrations reads the applied schema_migrations posture through a
 // read-only Store open (never migrating, design 6.1).
-func (a *Application) appliedMigrations(ctx context.Context, wf model.WorkflowID) ([]observe.AppliedMigration, int) {
+func (a *Application) appliedMigrations(ctx context.Context, wf model.WorkflowID) ([]observe.AppliedMigration, int, error) {
 	if _, err := os.Stat(a.dbPath); err != nil {
-		return nil, 0
+		return nil, 0, err
 	}
 	ls, err := a.lockSet()
 	if err != nil {
-		return nil, 0
+		return nil, 0, err
 	}
 	hold, err := ls.SchemaShared(ctx)
 	if err != nil {
-		return nil, 0
+		return nil, 0, err
 	}
 	defer hold.Release()
 	st, err := store.Open(ctx, store.OpenOptions{
 		Path: a.dbPath, Workflow: wf, ReadOnly: true, CflowVersion: a.cflowVer, Now: a.now,
 	})
 	if err != nil {
-		return nil, 0
+		return nil, 0, err
 	}
 	defer st.Close()
 	rows, err := st.AppliedMigrations(ctx)
 	if err != nil {
-		return nil, 0
+		return nil, 0, err
 	}
 	out := make([]observe.AppliedMigration, 0, len(rows))
 	version := 0
@@ -153,20 +165,26 @@ func (a *Application) appliedMigrations(ctx context.Context, wf model.WorkflowID
 			version = r.Version
 		}
 	}
-	return out, version
+	return out, version, nil
 }
 
 // verificationManifests reads every persisted Evidence Manifest of one
 // workflow from the managed evidence root (design 16.2).
-func (a *Application) verificationManifests(ctx context.Context, wf model.WorkflowID) []model.EvidenceManifest {
+func (a *Application) verificationManifests(ctx context.Context, wf model.WorkflowID) ([]model.EvidenceManifest, error) {
 	root, err := a.workflowEvidenceDir(ctx, wf)
-	if err != nil || root == "" {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if root == "" {
+		return nil, nil
 	}
 	dir := filepath.Join(root, "verification")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var out []model.EvidenceManifest
 	for _, e := range entries {
@@ -175,16 +193,19 @@ func (a *Application) verificationManifests(ctx context.Context, wf model.Workfl
 		}
 		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
-			continue
+			return nil, err
 		}
 		var m model.EvidenceManifest
-		if json.Unmarshal(body, &m) != nil || m.Hash == "" {
-			continue
+		if err := json.Unmarshal(body, &m); err != nil {
+			return nil, model.InvariantFault(fmt.Errorf("verification evidence %s cannot be parsed: %w", e.Name(), err))
+		}
+		if m.Hash == "" {
+			return nil, model.InvariantFault(fmt.Errorf("verification evidence %s has no identity hash", e.Name()))
 		}
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })
-	return out
+	return out, nil
 }
 
 // writeFinalReportIfCompleted writes the immutable Final Report Artifact

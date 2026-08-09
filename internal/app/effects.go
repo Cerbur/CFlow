@@ -896,19 +896,31 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 	}
 	switch cmd.(type) {
 	case model.SpecGenerationInput:
+		plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+		if err != nil {
+			return nil, err
+		}
+		catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+		if err != nil {
+			return nil, err
+		}
 		return struct {
 			Plan    string `json:"plan"`
 			Catalog string `json:"catalog"`
 		}{
-			Plan:    string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-			Catalog: string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+			Plan:    string(plan),
+			Catalog: string(catalog),
 		}, nil
 	case model.WorkflowCompilationInput:
+		spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+		if err != nil {
+			return nil, err
+		}
 		return struct {
 			Spec           string   `json:"spec"`
 			EligibleRoutes []string `json:"eligible_routes"`
 		}{
-			Spec:           string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+			Spec:           string(spec),
 			EligibleRoutes: eligibleRouteNames(),
 		}, nil
 	case model.DispatchInput:
@@ -922,31 +934,50 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 			return nil, nil
 		}
 	}
-	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactDiscussionTurn})
-	if err != nil {
-		return nil, nil
-	}
-	body, err := store.Get(ctx, ref)
+	body, err := readOptionalArtifact(ctx, store, wf, model.ArtifactDiscussionTurn)
 	if err != nil {
 		return nil, err
+	}
+	if body == nil {
+		return nil, nil
 	}
 	return struct {
 		Requirement string `json:"requirement"`
 	}{Requirement: string(body)}, nil
 }
 
-// readArtifact reads the active Revision body of one Artifact Type
-// ("" when none exists).
-func readArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) []byte {
+// readRequiredArtifact reads and validates the active Revision of one
+// approval-bound Artifact. Absence and every validation failure propagate.
+func readRequiredArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) ([]byte, error) {
 	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: typ})
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	body, err := store.Get(ctx, ref)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return body
+	if len(body) == 0 {
+		return nil, model.InvariantFault(fmt.Errorf("required %s artifact body is empty", typ))
+	}
+	return body, nil
+}
+
+// readOptionalArtifact differs only in allowing the Store's exact not-found
+// result. Corrupt or unsafe optional evidence still fails closed.
+func readOptionalArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) ([]byte, error) {
+	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: typ})
+	if err != nil {
+		if artifact.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	body, err := store.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 // eligibleRouteNames is the deterministic eligible route list for the

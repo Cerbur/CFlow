@@ -1104,30 +1104,58 @@ func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowI
 	if err != nil {
 		return nil, err
 	}
-	body := readArtifact(ctx, store, wf, model.ArtifactSpec)
+	body, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
 	bodies, err := splitSpecSetBody(body)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
-	// The Compiler names each Task node "task-<spec-id>"; hand the coding
-	// Session ONLY its own Spec so a multi-Spec workflow (Task 12) can
+	// Compiler nodes use task-<spec-id>. The lower-case normalization keeps
+	// legacy scheduler fixtures compatible with the closed lower-case Spec
+	// ID form; real compiled Node IDs are already lower-case.
+	specID := strings.ToLower(strings.TrimPrefix(string(node), "task-"))
+	if specID == "" {
+		return nil, model.InvariantFault(fmt.Errorf("dispatched node %s has no Spec identity", node))
+	}
+	// Hand the coding Session ONLY its own Spec identity so a multi-Spec
+	// workflow (Task 12) can
 	// never be implemented under the wrong Spec — a provider agent that
 	// receives the whole Spec set may attribute a sibling Spec to its
 	// Task.
-	specID := strings.TrimPrefix(string(node), "task-")
 	nodeSpec := ""
+	var selectedSpec compile.Spec
 	for _, b := range bodies {
 		s, err := compile.ParseSpec(b)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		if s.ID == specID {
 			nodeSpec = string(b)
+			selectedSpec = s
 			break
 		}
 	}
 	if nodeSpec == "" {
-		return nil, nil
+		return nil, model.InvariantFault(fmt.Errorf("approved Spec set does not contain dispatched node %s", node))
+	}
+	catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
+	catalogIR, err := compile.ParseCatalog(catalog)
+	if err != nil {
+		return nil, err
+	}
+	commands := make(map[string]struct{}, len(catalogIR.Entries))
+	for _, entry := range catalogIR.Entries {
+		commands[entry.CommandID] = struct{}{}
+	}
+	for _, commandID := range selectedSpec.Acceptance.VerificationCommandIDs {
+		if _, ok := commands[commandID]; !ok {
+			return nil, model.InvariantFault(fmt.Errorf("approved Catalog does not contain Spec %s command %s", selectedSpec.ID, commandID))
+		}
 	}
 	worktree, err := a.taskWorktreePath(ctx, wf, node)
 	if err != nil {
@@ -1135,7 +1163,7 @@ func (a *Application) codingSessionInput(ctx context.Context, wf model.WorkflowI
 	}
 	return &codingSessionInput{
 		Spec:     nodeSpec,
-		Catalog:  string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		Catalog:  string(catalog),
 		Worktree: worktree,
 	}, nil
 }

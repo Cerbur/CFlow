@@ -330,7 +330,10 @@ func (a *Application) runApplyResolution(ctx context.Context, wf model.WorkflowI
 	if provider == "" {
 		return model.InvariantFault(fmt.Errorf("the resolution session has no recorded provider"))
 	}
-	writeScope := a.applyResolutionWriteScope(ctx, wf, conflictFiles)
+	writeScope, err := a.applyResolutionWriteScope(ctx, wf, conflictFiles)
+	if err != nil {
+		return err
+	}
 	input := map[string]any{
 		"conflict_files": conflictFiles,
 		"write_scope":    writeScope,
@@ -391,15 +394,18 @@ func (a *Application) sessionProviderOf(wf model.WorkflowID, session model.Sessi
 // applyResolutionWriteScope is the restricted write scope of the ONE
 // resolution attempt: the conflict files plus the union of the approved
 // Specs' write scopes.
-func (a *Application) applyResolutionWriteScope(ctx context.Context, wf model.WorkflowID, conflictFiles []string) []string {
+func (a *Application) applyResolutionWriteScope(ctx context.Context, wf model.WorkflowID, conflictFiles []string) ([]string, error) {
 	store, err := a.artifactStore(wf)
 	if err != nil {
-		return conflictFiles
+		return nil, err
 	}
-	body := readArtifact(ctx, store, wf, model.ArtifactSpec)
+	body, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
 	specs, err := a.parseSpecSet(body)
 	if err != nil {
-		return conflictFiles
+		return nil, err
 	}
 	seen := map[string]struct{}{}
 	for _, c := range conflictFiles {
@@ -415,7 +421,7 @@ func (a *Application) applyResolutionWriteScope(ctx context.Context, wf model.Wo
 		out = append(out, p)
 	}
 	sort.Strings(out)
-	return out
+	return out, nil
 }
 
 // verifyApplyCommit verifies the Apply Merge Commit's actual author,

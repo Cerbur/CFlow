@@ -682,6 +682,84 @@ func TestRecoveryLayout2FixedRevisionCrashWindows(t *testing.T) {
 	})
 }
 
+// TestRecoveryFixedRevisionRejectsInvalidArtifactEvidence proves a content
+// filename is never completion evidence by itself: the exact revision must
+// resolve and validate through the immutable Store reader.
+func TestRecoveryFixedRevisionRejectsInvalidArtifactEvidence(t *testing.T) {
+	setup := func(t *testing.T) (*recoveryFixture, *artifact.Store, model.ArtifactRef, string) {
+		t.Helper()
+		fx := newRecoveryFixture(t)
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		st, err := artifact.NewWorkflow(root, testWF, security.Registry{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, err := st.Put(context.Background(), artifact.PutRequest{
+			WorkflowID: testWF, Type: model.ArtifactReport, Revision: 3,
+			SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+			Body: []byte("validated report"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(root, "reports", "report", "3")
+		return fx, st, ref, dir
+	}
+	seed := func(fx *recoveryFixture) {
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+	}
+
+	t.Run("corrupt content", func(t *testing.T) {
+		fx, _, ref, dir := setup(t)
+		if err := os.WriteFile(filepath.Join(dir, ref.Hash), []byte("not an artifact envelope"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("foreign extra content", func(t *testing.T) {
+		fx, _, _, dir := setup(t)
+		if err := os.WriteFile(filepath.Join(dir, strings.Repeat("f", 64)), []byte("foreign"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("wrong envelope", func(t *testing.T) {
+		fx, st, reportRef, dir := setup(t)
+		planRef, err := st.Put(context.Background(), artifact.PutRequest{
+			WorkflowID: testWF, Type: model.ArtifactPlan, Revision: 3,
+			SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+			Body: []byte("---\nrevision: 3\ntitle: Wrong envelope\nworkflow_id: wf-1\n---\n\n# Wrong envelope\n"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		planPath := filepath.Join(fx.home, "projects", fx.projectKey, testWF,
+			"plans", "plan", "3", planRef.Hash)
+		body, err := os.ReadFile(planPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(dir, reportRef.Hash)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, planRef.Hash), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+}
+
 // TestRecoveryProviderSessionDispositions: a ProviderStartIntent whose
 // Session settled terminal is ALREADY_COMPLETED; a still-open Session is
 // SAFE_TO_RETRY.

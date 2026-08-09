@@ -707,6 +707,18 @@ func storeFault(reason string) error {
 	return model.NewFault(model.CodeInsecureCFLOWHomePermissions, reason)
 }
 
+// IsNotFound reports whether err is the Store's exact absence result. It is
+// intentionally narrower than CodeInvalidInput: corrupt content, a wrong
+// envelope, an unsupported schema, and unsafe filesystem posture must never
+// be mistaken for an absent optional Artifact.
+func IsNotFound(err error) bool {
+	var fault *model.Fault
+	if !errors.As(err, &fault) || fault.Code != model.CodeInvalidInput {
+		return false
+	}
+	return fault.SafeText == "artifact revision not found" || fault.SafeText == "artifact not found"
+}
+
 // stringEqual avoids an allocation for the canonical-form byte check.
 func stringEqual(a, b []byte) bool {
 	return string(a) == string(b)
