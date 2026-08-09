@@ -1469,6 +1469,81 @@ func TestRunnerRendererErrorClearsOwnership(t *testing.T) {
 	}
 }
 
+// TestPumpEventsNilChannel is the nil-channel regression test: after a
+// terminal path clears eventCh (applyRunnerDone, clearRunner), a pump
+// command that is still in flight must terminate with eventsClosedMsg
+// instead of blocking forever on a nil channel (a leaked goroutine). The
+// timeout guard turns the pre-fix hang into a test failure rather than
+// freezing the suite.
+func TestPumpEventsNilChannel(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := testModel(&recordingController{ctrl: ctrl})
+	m.eventCh = nil
+
+	cmd := m.pumpEvents()
+	if cmd == nil {
+		t.Fatal("pumpEvents returned a nil command")
+	}
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+	select {
+	case msg := <-done:
+		if _, ok := msg.(eventsClosedMsg); !ok {
+			t.Fatalf("pumpEvents on a nil channel yielded %T, want eventsClosedMsg", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pumpEvents on a nil channel hung (blocked on the nil channel)")
+	}
+}
+
+// TestRunnerEventInactiveNoRepump is the stale-event regression test: a
+// runnerEventMsg arriving after the runner is no longer active (the
+// renderer-error and the runner's event send come from different
+// goroutines, so an in-flight event can arrive after clearRunner) must be
+// applied to the Execution page but MUST NOT re-pump — re-pumping there
+// captures the cleared nil channel and leaks the pump goroutine.
+func TestRunnerEventInactiveNoRepump(t *testing.T) {
+	m := testModel(&recordingController{ctrl: &executionController{runtime: model.RuntimeRunning}})
+	m.running = false
+	m.eventCh = nil
+
+	upd, cmd := m.Update(runnerEventMsg{ev: model.Event{Seq: 1, Kind: model.EventRunStarted, Workflow: "wf-1", Text: "run started"}})
+	if cmd != nil {
+		t.Fatalf("runnerEventMsg while the runner is inactive re-pumped: cmd = %v", cmd)
+	}
+	mm := upd.(Model)
+	if mm.running {
+		t.Fatal("runnerEventMsg while inactive set the running flag")
+	}
+	if len(mm.execution.Log) != 1 {
+		t.Fatalf("inactive runnerEventMsg was not applied to the Execution page: log = %v", mm.execution.Log)
+	}
+}
+
+// TestRunnerEventActiveRepumps guards the normal-flow counterpart: while
+// the runner IS active, a runnerEventMsg still re-pumps (the Execution
+// page keeps consuming committed events until the runner terminal path).
+func TestRunnerEventActiveRepumps(t *testing.T) {
+	ch := make(chan model.Event, 1)
+	ch <- model.Event{Seq: 2, Kind: model.EventNodeSucceeded, Workflow: "wf-1", Node: "n1"}
+	m := testModel(&recordingController{ctrl: &executionController{runtime: model.RuntimeRunning}})
+	m.running = true
+	m.eventCh = ch
+
+	upd, cmd := m.Update(runnerEventMsg{ev: model.Event{Seq: 1, Kind: model.EventRunStarted, Workflow: "wf-1", Text: "run started"}})
+	if cmd == nil {
+		t.Fatal("runnerEventMsg while active did not re-pump")
+	}
+	mm := upd.(Model)
+	if !mm.running {
+		t.Fatal("runnerEventMsg while active cleared the running flag")
+	}
+	// The re-pump command reads the next committed event.
+	if msg := cmd(); msg == nil {
+		t.Fatal("the re-pump command produced no message")
+	}
+}
+
 // createWithDiscussion drives the requirement discussion setup through
 // the Application: create, prepare the native session (managed bootstrap
 // binds the Provider's own session id), the Bridge return persists the

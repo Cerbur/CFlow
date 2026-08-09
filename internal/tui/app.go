@@ -310,7 +310,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyCommand(msg)
 	case runnerEventMsg:
 		m.execution = m.execution.OnEvent(msg.ev)
-		return m, m.pumpEvents()
+		if m.running {
+			return m, m.pumpEvents()
+		}
+		// The runner is no longer active (a terminal path already cleared
+		// running/eventCh): apply the in-flight event but never re-pump —
+		// re-pumping would capture the cleared nil eventCh and leak a
+		// goroutine blocked on a nil channel forever.
+		return m, nil
 	case eventsClosedMsg:
 		return m, nil
 	case runnerDoneMsg:
@@ -1460,9 +1467,17 @@ func (m Model) startRunner() (Model, tea.Cmd) {
 }
 
 // pumpEvents forwards one committed Runner event to the Execution page.
+// A terminal path can clear eventCh while a pump command is still in
+// flight (the renderer-error and the runner's event send come from
+// different goroutines with no happens-before edge): a cleared channel
+// must end the pump with eventsClosedMsg instead of blocking forever on
+// a nil channel (a leaked goroutine).
 func (m Model) pumpEvents() tea.Cmd {
 	ch := m.eventCh
 	return func() tea.Msg {
+		if ch == nil {
+			return eventsClosedMsg{}
+		}
 		ev, ok := <-ch
 		if !ok {
 			return eventsClosedMsg{}
