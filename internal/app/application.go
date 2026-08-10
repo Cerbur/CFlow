@@ -189,6 +189,36 @@ func New(opts Options) (*Application, error) {
 	return a, nil
 }
 
+// EnsureSchema upgrades an existing project database before a read-only
+// surface such as the TUI starts querying it. Read projections deliberately
+// never migrate; the application bootstrap owns this explicit startup step.
+// A missing database is left untouched so merely opening the TUI does not
+// create CFLOW_HOME state.
+func (a *Application) EnsureSchema(ctx context.Context) error {
+	if _, err := os.Stat(a.dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	locks, err := a.lockSet()
+	if err != nil {
+		return err
+	}
+	hold, err := locks.SchemaExclusive(ctx)
+	if err != nil {
+		return err
+	}
+	defer hold.Release()
+	st, err := store.Open(ctx, store.OpenOptions{
+		Path: a.dbPath, CflowVersion: a.cflowVer, Now: a.now,
+	})
+	if err != nil {
+		return err
+	}
+	return st.Close()
+}
+
 // lockSet opens the process LockSet lazily: reads on a database that does
 // not exist never create CFLOW_HOME.
 func (a *Application) lockSet() (*platform.LockSet, error) {
@@ -791,9 +821,9 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 			return nil, "", err
 		}
 		return model.GeneratePlanInput{
-			Provider:    c.Provider,
-			Session:     model.SessionID(a.ids(model.IDSession)),
-			HandoffRef:  handoffRef,
+			Provider:     c.Provider,
+			Session:      model.SessionID(a.ids(model.IDSession)),
+			HandoffRef:   handoffRef,
 			ChangeSetRef: csRef,
 		}, wf, nil
 	case CheckPlanCommand:

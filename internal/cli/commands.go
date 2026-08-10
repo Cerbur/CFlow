@@ -1032,7 +1032,7 @@ func openApplication(ctx context.Context, deps Dependencies) (*app.Application, 
 		return nil, err
 	}
 	adapters["fake"] = ad
-	return app.New(app.Options{
+	application, err := app.New(app.Options{
 		Home:         home,
 		Project:      app.ProjectFor(root),
 		CflowVersion: observe.Version,
@@ -1047,6 +1047,13 @@ func openApplication(ctx context.Context, deps Dependencies) (*app.Application, 
 			EvidenceDir: filepath.Join(home, "evidence"),
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	if err := application.EnsureSchema(ctx); err != nil {
+		return nil, err
+	}
+	return application, nil
 }
 
 // openAdapters registers the optional real Provider Adapters the
