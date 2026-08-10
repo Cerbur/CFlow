@@ -8,18 +8,222 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/foreground"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 )
+
+func TestWorkspaceQueryRetriesWithoutStaleSelection(t *testing.T) {
+	ctrl := &staleWorkspaceQueryController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	msg := m.queryProjectionMsg(PageWorkspace, app.ProjectWorkspaceQuery{Selected: "wf-removed"})
+	projection, ok := msg.(projectionMsg)
+	if !ok || projection.err != nil {
+		t.Fatalf("workspace query fallback = %#v", msg)
+	}
+	if len(ctrl.queries) != 2 {
+		t.Fatalf("workspace queries = %d, want stale selection plus fallback", len(ctrl.queries))
+	}
+	if got := ctrl.queries[1].(app.ProjectWorkspaceQuery).Selected; got != "" {
+		t.Fatalf("fallback selected = %q, want empty", got)
+	}
+	if _, ok := projection.view.(app.WorkspaceView); !ok {
+		t.Fatalf("fallback view = %T, want app.WorkspaceView", projection.view)
+	}
+}
+
+type staleWorkspaceQueryController struct {
+	queries []app.Query
+}
+
+func (c *staleWorkspaceQueryController) Execute(context.Context, app.Command) (app.Outcome, error) {
+	return app.Outcome{}, nil
+}
+
+func (c *staleWorkspaceQueryController) Query(_ context.Context, q app.Query) (app.View, error) {
+	c.queries = append(c.queries, q)
+	workspaceQ, ok := q.(app.ProjectWorkspaceQuery)
+	if !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	if workspaceQ.Selected != "" {
+		return nil, model.InvalidInputFault("no such workflow: " + string(workspaceQ.Selected))
+	}
+	return app.WorkspaceView{Workflows: []app.WorkflowSummary{{ID: "wf-1"}}}, nil
+}
+
+func (*staleWorkspaceQueryController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*staleWorkspaceQueryController) EscalateStop() {}
+
+func TestApplyProjectionNormalizesStaleWorkspaceSelection(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-removed"
+	m, _ = m.applyProjection(projectionMsg{
+		page: PageWorkspace,
+		view: app.WorkspaceView{
+			Selected:     "wf-removed",
+			Workflows:    []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePaused}},
+			Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimePaused}},
+			LegalActions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		},
+	})
+	if m.selected != "wf-1" || m.workspace.Selected.ID != "wf-1" {
+		t.Fatalf("root selection = %q, workspace selection = %q; want wf-1", m.selected, m.workspace.Selected.ID)
+	}
+}
+
+func TestWorkspaceStatusStaysInsideViewport(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ready = true
+	m.page = PageWorkspace
+	m.width = 120
+	m.height = 30
+	m.status = "workflow created"
+
+	out := render(m)
+	if !strings.Contains(out, "status: workflow created") {
+		t.Fatalf("workspace status is not rendered:\n%s", out)
+	}
+	if got := lipgloss.Height(out); got > m.height {
+		t.Fatalf("workspace render has %d content rows for a %d-row viewport", got, m.height)
+	}
+	if strings.Count(out, "status:") != 1 {
+		t.Fatalf("workspace status/footer should be a single row, got %q", out)
+	}
+}
+
+func TestNonWorkspaceStatusPreservesDiagnosticText(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ready = true
+	m.page = PagePauseExit
+	m.width = 80
+	m.height = 24
+	m.status = "first diagnostic line\nsecond diagnostic line"
+
+	out := render(m)
+	if !strings.Contains(out, "status: first diagnostic line\nsecond diagnostic line\n") {
+		t.Fatalf("non-Workspace status was normalized or truncated: %q", out)
+	}
+}
+
+func TestWorkspaceStatusIsSingleLineAndBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		width  int
+		height int
+		status string
+	}{
+		{name: "narrow wrapped status", width: 20, height: 2, status: "第一行\n第二行 with a very long suffix"},
+		{name: "single row viewport", width: 12, height: 1, status: "状态 with a very long message"},
+		{name: "two row viewport", width: 16, height: 2, status: "two\nrows with a long suffix"},
+		{name: "three row viewport", width: 18, height: 3, status: "three\nrows with a long suffix"},
+		{name: "ansi and cjk", width: 24, height: 4, status: "\033[31m错误\033[0m: 发生了一个很长的问题"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(Dependencies{})
+			m.ready = true
+			m.page = PageWorkspace
+			m.width = tc.width
+			m.height = tc.height
+			m.status = tc.status
+			out := render(m)
+			if got := lipgloss.Height(out); got > tc.height {
+				t.Fatalf("render has %d rows for %d-row viewport: %q", got, tc.height, out)
+			}
+			rows := strings.Split(out, "\n")
+			for i, row := range rows {
+				if got := lipgloss.Width(row); got > tc.width {
+					t.Fatalf("row %d width %d > %d: %q", i, got, tc.width, row)
+				}
+			}
+			if tc.height == 1 {
+				if !strings.Contains(out, "quit") {
+					t.Fatalf("minimal Workspace footer disappeared: %q", out)
+				}
+			} else if !strings.Contains(out, "status:") {
+				t.Fatalf("status disappeared: %q", out)
+			}
+			if strings.Count(out, "status:") > 1 {
+				t.Fatalf("status was rendered more than once: %q", out)
+			}
+		})
+	}
+}
+
+func TestWorkspaceMinimalViewportKeepsFooterVisible(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+	}{
+		{width: 20, height: 1},
+		{width: 20, height: 2},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", tc.width, tc.height), func(t *testing.T) {
+			m := newModel(Dependencies{})
+			m.ready = true
+			m.page = PageWorkspace
+			m.width = tc.width
+			m.height = tc.height
+			m.status = "status that must not hide the footer"
+			out := render(m)
+			if got := lipgloss.Height(out); got > tc.height {
+				t.Fatalf("render height %d > %d: %q", got, tc.height, out)
+			}
+			if !strings.Contains(out, "quit") {
+				t.Fatalf("minimal Workspace footer is missing: %q", out)
+			}
+		})
+	}
+}
+
+func TestWorkspaceRootCompactFooterPreservesProjectedActions(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+	}{
+		{width: 60, height: 18},
+		{width: 80, height: 24},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", tc.width, tc.height), func(t *testing.T) {
+			m := newModel(Dependencies{})
+			m.ready = true
+			m.page = PageWorkspace
+			m.width = tc.width
+			m.height = tc.height
+			m.workspace = longWorkspaceViewModel()
+			m.workspace.Actions = []Action{ActionResume, ActionPause, ActionCancel, ActionMigrate}
+			m.status = "a long provider/status message that is optional footer detail"
+			out := render(m)
+			if got := lipgloss.Height(out); got > tc.height {
+				t.Fatalf("render height %d > %d: %q", got, tc.height, out)
+			}
+			for i, line := range strings.Split(out, "\n") {
+				if got := lipgloss.Width(line); got > tc.width {
+					t.Fatalf("row %d width %d > %d: %q", i, got, tc.width, line)
+				}
+			}
+			for _, want := range []string{"r resume", "p pause", "x cancel", "m migrate"} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("compact root render misses %q: %q", want, out)
+				}
+			}
+		})
+	}
+}
 
 // recordingController wraps the shared Application and records every
 // typed Command the TUI issues and every EscalateStop call.

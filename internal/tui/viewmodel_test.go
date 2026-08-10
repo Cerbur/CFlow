@@ -67,6 +67,50 @@ func TestMapWorkspaceSelectsFirstWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestMapWorkspaceNormalizesStaleSelectionBeforeMappingActions(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Selected: "wf-removed",
+		Workflows: []app.WorkflowSummary{
+			{ID: "wf-1", Runtime: model.RuntimePaused},
+			{ID: "wf-2", Runtime: model.RuntimeRunning},
+		},
+		Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimePaused}},
+		LegalActions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+	})
+	if vm.Selected.ID != "wf-1" || vm.Selected.Action != ActionResume {
+		t.Fatalf("stale selection did not normalize before action mapping: selected=%+v", vm.Selected)
+	}
+	if vm.Workflows[0].Action != ActionResume || vm.Workflows[1].Action != ActionNone {
+		t.Fatalf("row actions after stale selection = %+v", vm.Workflows)
+	}
+}
+
+func TestMapWorkspaceClearsSelectionWhenNoWorkflowsRemain(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Selected:     "wf-removed",
+		Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-removed", Runtime: model.RuntimePaused}},
+		LegalActions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+	})
+	if vm.Selected.ID != "" || vm.Lifecycle != nil || len(vm.Actions) != 0 {
+		t.Fatalf("empty workspace retained stale facts: selected=%+v lifecycle=%+v actions=%v", vm.Selected, vm.Lifecycle, vm.Actions)
+	}
+}
+
+func TestMapWorkspaceDropsFactsForASelectionMismatchedLifecycle(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Selected:     "wf-removed",
+		Workflows:    []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePaused}},
+		Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-removed", Runtime: model.RuntimePaused}},
+		LegalActions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+	})
+	if vm.Selected.ID != "wf-1" {
+		t.Fatalf("selected workflow = %s, want wf-1", vm.Selected.ID)
+	}
+	if vm.Lifecycle != nil || len(vm.Actions) != 0 || vm.Selected.Action != ActionNone {
+		t.Fatalf("mismatched lifecycle facts leaked into selected workflow: lifecycle=%+v actions=%v selected=%+v", vm.Lifecycle, vm.Actions, vm.Selected)
+	}
+}
+
 // TestMapWorkspaceBlockedWithoutResume: a blocked workflow whose Runtime
 // LegalActions contain NO Resume maps to no resume action, no resume key
 // hint, and no resume text on the blocked page.

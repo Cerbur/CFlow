@@ -116,7 +116,7 @@ type Model struct {
 	// selected is the workflow the workspace focuses.
 	selected model.WorkflowID
 	// workspace is the renderable workspace projection.
-	workspace WorkspaceModel
+	workspace WorkspaceViewModel
 	// provider is the discussion provider route of the selected
 	// workflow ("" until a session exists; the create page falls back
 	// to the first healthy provider).
@@ -291,7 +291,20 @@ func (m Model) Init() tea.Cmd {
 // returns the projection message.
 func (m Model) queryProjectionMsg(page Page, q app.Query) tea.Msg {
 	view, err := m.ctrl.Query(context.Background(), q)
+	if err != nil && page == PageWorkspace {
+		// A workflow can disappear between two read-only projections. Retry the
+		// aggregate query without the stale selection so the Application can
+		// choose the first remaining workflow; this changes no Runtime state.
+		if workspaceQ, ok := q.(app.ProjectWorkspaceQuery); ok && workspaceQ.Selected != "" && isMissingWorkflowError(err) {
+			view, err = m.ctrl.Query(context.Background(), app.ProjectWorkspaceQuery{})
+		}
+	}
 	return projectionMsg{page: page, view: view, err: err}
+}
+
+func isMissingWorkflowError(err error) bool {
+	code, ok := model.CodeOf(err)
+	return ok && code == model.CodeInvalidInput && strings.Contains(err.Error(), "no such workflow:")
 }
 
 // Update handles one message.
@@ -383,7 +396,9 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
 		if v, ok := msg.view.(app.WorkspaceView); ok {
 			m.workspace = MapWorkspace(v)
-			m.selected = v.Selected
+			// Keep command routing aligned with the normalized ViewModel
+			// selection when a projection refers to a workflow that disappeared.
+			m.selected = m.workspace.Selected.ID
 			if m.provider == "" {
 				m.provider = preferredProvider(v.Health.Providers)
 			}
@@ -1684,7 +1699,10 @@ func render(m Model) string {
 	var b strings.Builder
 	switch m.page {
 	case PageWorkspace:
-		b.WriteString(RenderWorkspace(m.workspace, m.width))
+		// Workspace owns a single footer row that combines projected key hints
+		// with the root's transient status. Other pages retain their existing
+		// status rendering below.
+		b.WriteString(renderWorkspaceWithStatus(m.workspace, m.status, m.width, m.height))
 	case PageDiscussion:
 		b.WriteString(RenderDiscussionReturn(m.discussion))
 		b.WriteString(m.hints())
@@ -1718,7 +1736,9 @@ func render(m Model) string {
 		b.WriteString(renderMigration(m))
 		b.WriteString(m.hints())
 	}
-	if m.status != "" {
+	if m.status != "" && m.page != PageWorkspace {
+		// Preserve the established diagnostic/status rendering on all
+		// non-Workspace pages; this visual refresh is Workspace-only.
 		fmt.Fprintf(&b, "\nstatus: %s\n", m.status)
 	}
 	return b.String()
@@ -1730,8 +1750,6 @@ func render(m Model) string {
 // currently permit.
 func (m Model) hints() string {
 	switch m.page {
-	case PageWorkspace:
-		return workspaceHints(m.workspace)
 	case PageDiscussion:
 		return "\n↑/↓ action  Enter run  b workspace\n"
 	case PagePlanApproval:
@@ -1764,28 +1782,9 @@ func (m Model) hints() string {
 	return ""
 }
 
-// workspaceHints renders the Workspace page hint from the selected
-// workflow's Runtime LegalActions only.
-func workspaceHints(m WorkspaceModel) string {
-	parts := []string{"↑/↓ select workflow", "←/→ lifecycle", "n create", "q quit"}
-	if hasAction(m.Actions, ActionResume) {
-		parts = append(parts, "r resume")
-	}
-	if hasAction(m.Actions, ActionPause) {
-		parts = append(parts, "p pause")
-	}
-	if hasAction(m.Actions, ActionCancel) {
-		parts = append(parts, "x cancel")
-	}
-	if hasAction(m.Actions, ActionMigrate) {
-		parts = append(parts, "m migrate")
-	}
-	return "\n" + strings.Join(parts, "  ") + "\n"
-}
-
 // blockedHints renders the Blocked page hint from the Runtime LegalActions
 // only: Resume appears solely when the Runtime permits it.
-func blockedHints(m WorkspaceModel) string {
+func blockedHints(m WorkspaceViewModel) string {
 	parts := []string{"b workspace"}
 	if hasAction(m.Actions, ActionResume) {
 		parts = append(parts, "r resume")

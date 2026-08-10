@@ -5,32 +5,34 @@ package tui
 // narrow terminal collapses the inspector below the main column.
 
 import (
+	"fmt"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/model"
+
+	"charm.land/lipgloss/v2"
 )
 
 // TestRenderWorkspaceWide: the wide layout shows all three columns.
 func TestRenderWorkspaceWide(t *testing.T) {
-	m := sampleWorkspaceModel()
-	got := RenderWorkspace(m, 120)
+	m := sampleWorkspaceViewModel()
+	got := RenderWorkspace(m, 120, 45)
 	for _, want := range []string{"project:", "workflows:", "calculator", "workflow calculator (wf-1)", "actions:", "inspector:"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("wide render misses %q:\n%s", want, got)
 		}
 	}
 	for _, line := range strings.Split(got, "\n") {
-		if width := utf8.RuneCountInString(stripANSI(line)); width > 120 {
+		if width := lipgloss.Width(line); width > 120 {
 			t.Fatalf("wide render line has width %d > 120: %q", width, line)
 		}
 	}
 }
 
 func TestRenderWorkspaceUsesWorkbenchFrame(t *testing.T) {
-	got := RenderWorkspace(sampleWorkspaceModel(), 120)
+	got := RenderWorkspace(sampleWorkspaceViewModel(), 120, 45)
 	for _, want := range []string{
 		"CFlow",
 		"WORKFLOWS",
@@ -38,7 +40,7 @@ func TestRenderWorkspaceUsesWorkbenchFrame(t *testing.T) {
 		"INSPECTOR",
 		"Provider:",
 		"Navigate",
-		"|",
+		"│",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("workbench render misses %q:\n%s", want, got)
@@ -46,26 +48,268 @@ func TestRenderWorkspaceUsesWorkbenchFrame(t *testing.T) {
 	}
 }
 
-// TestRenderWorkspaceNarrow: below the narrow width the inspector still
-// renders (as a detail page below the main column).
+// TestRenderWorkspaceNarrow: Compact below the narrow width keeps the
+// inspector facts as an inline read-only summary rather than a full panel.
 func TestRenderWorkspaceNarrow(t *testing.T) {
-	m := sampleWorkspaceModel()
-	got := RenderWorkspace(m, 80)
-	if !strings.Contains(got, "inspector:") {
-		t.Fatalf("narrow render misses the inspector detail page:\n%s", got)
+	m := sampleWorkspaceViewModel()
+	got := RenderWorkspace(m, 80, 24)
+	if !strings.Contains(got, "inspector: summary") {
+		t.Fatalf("compact render misses the inline inspector summary:\n%s", got)
+	}
+	if strings.Contains(got, "INSPECTOR") {
+		t.Fatalf("compact render unexpectedly contains the full inspector panel:\n%s", got)
 	}
 	for _, line := range strings.Split(got, "\n") {
-		if width := utf8.RuneCountInString(stripANSI(line)); width > 80 {
+		if width := lipgloss.Width(line); width > 80 {
 			t.Fatalf("narrow render line has width %d > 80: %q", width, line)
 		}
 	}
+}
+
+func TestRenderWorkspaceResponsiveBoundsAndStructure(t *testing.T) {
+	cases := []struct {
+		name   string
+		width  int
+		height int
+		want   []string
+		avoid  []string
+	}{
+		{name: "wide-large", width: 160, height: 45, want: []string{"WORKFLOWS", "LIFECYCLE", "INSPECTOR"}},
+		{name: "wide-threshold", width: 120, height: 30, want: []string{"WORKFLOWS", "LIFECYCLE", "INSPECTOR"}},
+		{name: "medium", width: 100, height: 24, want: []string{"WORKFLOWS", "WORKSPACE", "SUMMARY", "TARGET", "WORKSPACE"}},
+		{name: "compact", width: 80, height: 24, want: []string{"WORKSPACE", "STAGE", "RUNTIME", "LEGAL ACTIONS"}, avoid: []string{"INSPECTOR"}},
+		{name: "compact-small", width: 60, height: 18, want: []string{"WORKSPACE", "STAGE", "RUNTIME", "LEGAL ACTIONS"}, avoid: []string{"INSPECTOR"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderWorkspace(longWorkspaceViewModel(), tc.width, tc.height)
+			assertWorkspaceBounds(t, got, tc.width, tc.height)
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("render misses %q at %dx%d:\n%s", want, tc.width, tc.height, got)
+				}
+			}
+			for _, avoid := range tc.avoid {
+				if strings.Contains(got, avoid) {
+					t.Fatalf("render unexpectedly contains %q at %dx%d:\n%s", avoid, tc.width, tc.height, got)
+				}
+			}
+			assertCompletePanelBorders(t, got)
+		})
+	}
+}
+
+func TestRenderWorkspaceUsesAuthoritativeStageForLifecycleProgress(t *testing.T) {
+	m := longWorkspaceViewModel()
+	wide := RenderWorkspace(m, 120, 30)
+	if !strings.Contains(wide, "● Define") {
+		t.Fatalf("workflow-generation stage did not activate Define: %s", wide)
+	}
+	compact := RenderWorkspace(m, 80, 24)
+	if !strings.Contains(compact, "LIFECYCLE  3/7 · Define") {
+		t.Fatalf("workflow-generation stage did not map to compact Define progress: %s", compact)
+	}
+
+	m.Lifecycle.Stage = model.StageCompleted
+	completed := RenderWorkspace(m, 80, 24)
+	if !strings.Contains(completed, "LIFECYCLE  6/7 · Apply") {
+		t.Fatalf("completed stage did not map to Apply progress: %s", completed)
+	}
+}
+
+func TestRenderWorkspaceFallsBackToMinimalBeforePanelsLosePrimaryContext(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+	}{
+		{width: 88, height: 7},
+		{width: 60, height: 12},
+	} {
+		got := RenderWorkspace(longWorkspaceViewModel(), tc.width, tc.height)
+		assertWorkspaceBounds(t, got, tc.width, tc.height)
+		if strings.ContainsAny(got, "╭╮├┤╰╯") {
+			t.Fatalf("unsafe threshold rendered a panel at %dx%d:\n%s", tc.width, tc.height, got)
+		}
+		if !strings.Contains(got, "q") {
+			t.Fatalf("minimal threshold lost footer at %dx%d:\n%s", tc.width, tc.height, got)
+		}
+	}
+}
+
+func TestRenderWorkspaceFooterKeepsQuitHintAtTinyWidths(t *testing.T) {
+	m := sampleWorkspaceViewModel()
+	for _, width := range []int{1, 4, 5, 6} {
+		got := renderWorkspaceFooter(m, "", width)
+		if !strings.Contains(got, "q") {
+			t.Fatalf("footer at width %d lost quit affordance: %q", width, got)
+		}
+		if gotWidth := lipgloss.Width(got); gotWidth > width {
+			t.Fatalf("footer width %d > %d: %q", gotWidth, width, got)
+		}
+	}
+}
+
+func TestRenderWorkspaceSmallPanelViewportsStayMinimal(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+	}{
+		{width: 88, height: 6},
+		{width: 100, height: 6},
+		{width: 120, height: 6},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", tc.width, tc.height), func(t *testing.T) {
+			got := RenderWorkspace(longWorkspaceViewModel(), tc.width, tc.height)
+			assertWorkspaceBounds(t, got, tc.width, tc.height)
+			if strings.ContainsAny(got, "╭╮├┤╰╯") {
+				t.Fatalf("small viewport contains a partial panel at %dx%d:\n%s", tc.width, tc.height, got)
+			}
+		})
+	}
+}
+
+func TestWorkspaceFitStyledLineIsANSIUnicodeAndNewlineAware(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		width int
+	}{
+		{name: "under", input: "abc", width: 8},
+		{name: "exact", input: "abc", width: 3},
+		{name: "over", input: "abcdefgh", width: 5},
+		{name: "cjk", input: "项目状态", width: 8},
+		{name: "cjk-truncated-boundary", input: "项目状态", width: 4},
+		{name: "emoji", input: "👩‍💻 ready", width: 8},
+		{name: "emoji-truncated", input: "👩‍💻 ready", width: 4},
+		{name: "tab", input: "a\tb", width: 8},
+		{name: "ansi", input: workspaceTheme.Selected.Render("selected"), width: 12},
+		{name: "ansi-truncated", input: workspaceTheme.Selected.Render("selected content"), width: 8},
+		{name: "newline", input: "first\nsecond", width: 12},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := workspaceFitStyledLine(tc.input, tc.width)
+			if strings.ContainsAny(got, "\r\n") {
+				t.Fatalf("helper returned multiple rows: %q", got)
+			}
+			if gotWidth := lipgloss.Width(got); gotWidth != tc.width {
+				t.Fatalf("width = %d, want %d: %q", gotWidth, tc.width, got)
+			}
+		})
+	}
+	if got := workspaceTruncateText("first\nsecond", 8); strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("truncate helper returned multiple rows: %q", got)
+	}
+}
+
+func TestWorkspacePanelKeepsBorderColumnsAlignedAfterUnicodeTruncation(t *testing.T) {
+	got := workspacePanelWithHeight("标题", []string{"项目状态"}, 12, 7)
+	for i, line := range strings.Split(got, "\n") {
+		if gotWidth := lipgloss.Width(line); gotWidth != 12 {
+			t.Fatalf("panel row %d width = %d, want 12: %q", i, gotWidth, line)
+		}
+	}
+}
+
+func TestWorkspaceFooterPreservesProjectedActionHints(t *testing.T) {
+	m := longWorkspaceViewModel()
+	m.Actions = []Action{ActionResume, ActionPause, ActionCancel, ActionMigrate}
+	for _, width := range []int{60, 80} {
+		got := renderWorkspaceFooter(m, "", width)
+		for _, want := range []string{"q quit", "r resume", "p pause", "x cancel", "m migrate"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("footer at width %d misses projected hint %q: %q", width, want, got)
+			}
+		}
+		if gotWidth := lipgloss.Width(got); gotWidth > width {
+			t.Fatalf("footer width %d > %d: %q", gotWidth, width, got)
+		}
+	}
+}
+
+func TestRenderWorkspaceMinimalViewportHasNoPartialPanel(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+	}{
+		{width: 59, height: 11},
+		{width: 40, height: 5},
+	} {
+		got := RenderWorkspace(longWorkspaceViewModel(), tc.width, tc.height)
+		assertWorkspaceBounds(t, got, tc.width, tc.height)
+		if strings.ContainsAny(got, "╭╮├┤╰╯") {
+			t.Fatalf("minimal render contains a partial panel at %dx%d:\n%s", tc.width, tc.height, got)
+		}
+	}
+}
+
+func TestRenderWorkspaceDoesNotInventLegalActions(t *testing.T) {
+	got := RenderWorkspace(sampleWorkspaceViewModel(), 160, 45)
+	if !strings.Contains(got, "r resume") {
+		t.Fatalf("projected resume action missing:\n%s", got)
+	}
+	for _, forbidden := range []string{"p pause", "x cancel", "m migrate"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("unprojected action %q rendered:\n%s", forbidden, got)
+		}
+	}
+}
+
+func assertWorkspaceBounds(t *testing.T, output string, width, height int) {
+	t.Helper()
+	if gotHeight := lipgloss.Height(output); gotHeight > height {
+		t.Fatalf("render height %d > %d:\n%s", gotHeight, height, output)
+	}
+	for i, line := range strings.Split(output, "\n") {
+		if gotWidth := lipgloss.Width(line); gotWidth > width {
+			t.Fatalf("line %d width %d > %d: %q", i, gotWidth, width, line)
+		}
+	}
+}
+
+func assertCompletePanelBorders(t *testing.T, output string) {
+	t.Helper()
+	for i, line := range strings.Split(output, "\n") {
+		switch {
+		case strings.Contains(line, "╭") && !strings.Contains(line, "╮"):
+			t.Fatalf("opening panel border is incomplete on line %d: %q", i, line)
+		case strings.Contains(line, "├") && !strings.Contains(line, "┤"):
+			t.Fatalf("separator panel border is incomplete on line %d: %q", i, line)
+		case strings.Contains(line, "╰") && !strings.Contains(line, "╯"):
+			t.Fatalf("closing panel border is incomplete on line %d: %q", i, line)
+		}
+	}
+}
+
+func longWorkspaceViewModel() WorkspaceViewModel {
+	return MapWorkspace(app.WorkspaceView{
+		Project:  app.ProjectView{Key: "项目-这是一个非常长的项目标识", Root: "/Users/example/非常/长/的/项目/路径/with/a/long/segment", Name: "仓库工作区"},
+		Selected: "wf-长名称",
+		Workflows: []app.WorkflowSummary{
+			{ID: "wf-长名称", Name: "这是一个非常长的 Workflow 名称", Stage: model.StageWorkflowGeneration, Runtime: model.RuntimeRunning},
+			{ID: "wf-blocked", Name: "blocked workflow", Stage: model.StageExecution, Runtime: model.RuntimeBlocked},
+		},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{
+				Workflow: "wf-长名称", Name: "这是一个非常长的 Workflow 名称", Stage: model.StageWorkflowGeneration,
+				Runtime: model.RuntimeRunning, TargetBranch: "feature/这是一条很长的目标分支名称", VerifiedWorkspaceHead: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+			Plan: &app.PlanView{PlanStatus: model.PlanApproved, Revision: 42, Approved: true, Hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		},
+		Health: app.HealthView{
+			GitAvailable: true,
+			Providers:    []app.ProviderHealth{{Name: "非常长的 Provider 名称", Compatible: true, Executable: "/usr/local/bin/provider-with-a-very-long-name", CLIVersion: "v2026.08.11"}},
+		},
+		LegalActions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+	})
 }
 
 // TestRenderWorkspaceEmpty: the empty workspace renders a hint without
 // panicking.
 func TestRenderWorkspaceEmpty(t *testing.T) {
 	m := MapWorkspace(app.WorkspaceView{})
-	got := RenderWorkspace(m, 120)
+	got := RenderWorkspace(m, 120, 45)
 	if !strings.Contains(got, "no workflows") {
 		t.Fatalf("empty render = %q", got)
 	}
@@ -93,7 +337,7 @@ func TestMapWorkspaceIncludesLayoutMigrationLegalAction(t *testing.T) {
 // TestWorkspaceNavigationOnlyUpdatesSelection: navigation keys update
 // only the UI selection; no Execute is ever called (the mapping is pure).
 func TestWorkspaceNavigationOnlyUpdatesSelection(t *testing.T) {
-	m := sampleWorkspaceModel()
+	m := sampleWorkspaceViewModel()
 	if m.Selected.ID != "wf-1" {
 		t.Fatalf("selection = %s", m.Selected.ID)
 	}
@@ -113,7 +357,7 @@ func TestWorkspaceNavigationOnlyUpdatesSelection(t *testing.T) {
 	}
 }
 
-func sampleWorkspaceModel() WorkspaceModel {
+func sampleWorkspaceViewModel() WorkspaceViewModel {
 	return MapWorkspace(app.WorkspaceView{
 		Project:  app.ProjectView{Key: "k", Root: "/r", Name: "repo"},
 		Selected: "wf-1",
