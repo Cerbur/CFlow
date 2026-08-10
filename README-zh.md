@@ -6,7 +6,7 @@ CFlow 是一个面向 Coding Agent 的 local-first 工作流 Runtime。它把一
 
 CFlow 不是 `codex` 或 `claude` 的薄封装。它负责可恢复的 Plan-to-Done 生命周期，并且只依据持久化证据推进状态，而不会因为 Agent 声称“已经完成”就判定成功。
 
-> **项目状态：**2026-08-07 的 TUI 方向已确认，可运行的 TUI 根 Model 现已真正接通：它加载只读项目工作台，导航各生命周期页面，并通过共享 Application 驱动原生讨论、Plan/Execution 批准、Foreground Runner、受保护 Apply 与显式 Cleanup，同时实现受控停止协议。确定性 Fake TUI Gate（`TestTUIPlanToApplyAndCleanup` 通过真实根 TUI 与 Fake 终端）正在被加固为 Candidate Gate；Gate 证据尚未生成，因此在修复后的 Gate 于精确 Candidate Commit 上通过之前，TUI **还不是 Internal Candidate**。详见[验收报告](docs/cflow-demo-acceptance-report.md)、[TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与[实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood **尚未运行**，需要在新精确 Candidate Commit 上单独明确授权。
+> **项目状态：**全屏 TUI 已确认作为交互式终端中的默认入口。根 TUI 已通过共享 Application 接通 Fake Provider 的完整主链路，包括 Workflow 创建、Native Discussion、Plan 与 Execution Approval、Workspace Adoption、Foreground Runner、最终报告、受保护 Apply、显式 Cleanup 和受控停止。这仍是实现阶段构建，不是 Release；真实 Codex/Claude E2E 与 Self-Dogfood 需要在精确 Candidate Commit 上单独明确授权。详见 [TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与[实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。
 
 ## 为什么需要 CFlow
 
@@ -78,9 +78,26 @@ CGO_ENABLED=0 go build -trimpath -o cflow ./cmd/cflow
 
 Release 风格构建还会写入源码 Commit 与内嵌 Registry Hash。详见 [`scripts/check-cross-build.sh`](scripts/check-cross-build.sh) 和[验收报告](docs/cflow-demo-acceptance-report.md)。
 
-## 当前用法
+## 快速开始
 
-在交互式终端中，裸 `cflow` 进入全屏 TUI：加载项目工作台，导航生命周期（讨论、Plan/Execution 批准、执行/Runner、阻塞决策、报告、Apply、Cleanup），所有状态修改都通过共享 Application 驱动。行式子命令仍作为 headless CLI 保留，供脚本与无 TTY 环境使用。
+在目标 Git 仓库中，或该仓库的任意子目录运行：
+
+```sh
+./cflow
+```
+
+在交互式终端中，这会打开全屏工作台。启动时加载当前项目与最近活动的 Workflow，但不会自动 Resume、Dispatch、Apply 或 Cleanup。TUI 中的标准流程是：
+
+1. 创建或选择 Workflow，检查 Target Branch 与隔离事实。
+2. 启动 Codex 或 Claude 原生需求讨论。CFlow 会暂挂自己的界面，在 Workflow Workspace 中运行 Provider，Session 返回后恢复 TUI。
+3. 生成并独立检查 Plan，然后明确批准精确的 Plan Revision。
+4. 生成 Specs 与受限 Workflow，检查 Execution Dry Run，并明确批准精确执行输入。
+5. 由 Foreground Runner 持续推进就绪任务；只有需要用户决策、安全停止、终态或无法安全推进时才暂停。
+6. 查看最终报告，暂存并明确确认受保护 Apply，再生成 Cleanup Dry Run 并确认精确 Cleanup Manifest。
+
+导航和选择都是只读操作。Approval、Apply、Cancel 与 Cleanup 都需要明确确认，默认选择“否”。Runner 空闲时按 `q` 退出；Runner 运行时按 `q` 会打开 Pause and Exit。`Ctrl-C` 第一次请求受控暂停，第二次才进入强制停止。
+
+行式子命令仍是正式的 headless CLI，可用于脚本、诊断、自动化和无 TTY 环境。
 
 没有 TTY 时，裸 `cflow` 只输出稳定诊断，不修改任何状态。
 
@@ -103,11 +120,11 @@ printf '%s\n' '描述需要完成的修改及其约束。' | \
 ./cflow execution-approve
 ```
 
-Approval 命令需要交互确认，并且默认选择“否”。Provider 执行可能访问网络并产生模型费用；批准前应检查精确 Route、预算、命令、Git Identity/Signing 事实和权限边界。
+Headless 命令与 TUI 使用同一个 Application 和 Runtime，不会绕过两道批准门。Approval 命令需要交互确认，并且默认选择“否”。Provider 执行可能访问网络并产生模型费用；批准前应检查精确 Route、预算、命令、Git Identity/Signing 事实和权限边界。
 
 `doctor` 中部分有状态检查仍会显示 `NOT_YET_AVAILABLE`。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood 尚未针对该分支重跑；它们需要在精确 Candidate Commit 上单独授权。
 
-聚合布局、Workspace Adoption、Native Discussion Bridge 和 Foreground Runner 已接入根 TUI，并由 Fake TUI E2E 通过共享 Application 驱动；headless 需求讨论仍使用上文所示的行式 `discuss` 命令。
+新 Workflow 使用 `$CFLOW_HOME/projects/<project-key>/<workflow-id>/` 下的聚合布局。Workflow 包含唯一长期 `workspace/` Worktree，以及位于 `tmp/` 下的临时 Task 和 Apply Worktree；Plan、Session、Review、Evidence、Log、Report 和状态投影均位于目标代码库之外。Legacy Layout 在显式迁移前只读，可从 TUI 或 `layout-migration` 命令发起迁移。
 
 ## 命令概览
 
@@ -133,6 +150,8 @@ CFlow 提供严格的工作流与仓库证据门禁，但它不是 OS Sandbox。
 - CFlow 管理的敏感路径按 Owner-only 权限设计；持久化的 Provider/Tool 内容会经过统一脱敏流程。
 - CFlow 不对本地证据提供应用层加密，操作系统备份可能包含这些数据。
 - Cancel 会保留 Artifact、Session、Commit、Worktree 与证据；Cleanup 是独立的精确目标操作，并且不会删除审计历史。
+
+`$CFLOW_HOME/cflow.db` 是权威状态库。Workflow-local 的 `state/` 文件只是状态投影与恢复证据，不构成第二个权威来源。TUI 不直接写 SQLite、Git、Artifact 或最终状态；所有变更都通过共享 Application 与 Runtime 执行。
 
 ## 验收与发布证据
 

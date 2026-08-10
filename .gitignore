@@ -4,3 +4,6 @@ test-artifacts/
 
 # macOS desktop metadata.
 .DS_Store
+
+# Local build artifact.
+/cflow

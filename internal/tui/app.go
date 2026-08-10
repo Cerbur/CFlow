@@ -1572,7 +1572,6 @@ func render(m Model) string {
 	switch m.page {
 	case PageWorkspace:
 		b.WriteString(RenderWorkspace(m.workspace, m.width))
-		b.WriteString(m.hints())
 	case PageDiscussion:
 		b.WriteString(RenderDiscussionReturn(m.discussion))
 		b.WriteString(m.hints())
@@ -1583,7 +1582,7 @@ func render(m Model) string {
 		b.WriteString(RenderApproval(m.approval))
 		b.WriteString(m.hints())
 	case PageExecution:
-		b.WriteString(RenderExecution(m.execution))
+		b.WriteString(RenderExecutionAt(m.execution, m.width))
 		if m.pendingDecision != "" {
 			b.WriteString(renderDecisionPanel(m.pendingDecision))
 		}

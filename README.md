@@ -11,22 +11,15 @@ CFlow is not another thin wrapper around `codex` or `claude`. It owns the
 recoverable Plan-to-Done lifecycle and advances state only from persisted
 evidence—not from an agent saying that the work is complete.
 
-> **Project status:** the 2026-08-07 TUI direction is confirmed and the
-> runnable root TUI is now wired end to end: it loads the read-only project
-> workspace, navigates the lifecycle pages, drives the native discussion,
-> approvals, foreground Runner, protected Apply, and explicit Cleanup through
-> the shared Application, and implements the controlled-stop protocol. The
-> deterministic Fake TUI Gate (`TestTUIPlanToApplyAndCleanup` through the
-> real root TUI and a Fake terminal) is being hardened as the Candidate
-> Gate; the gate evidence is pending, so the TUI is **not yet an Internal
-> Candidate** — that label applies only after the repaired gate passes on
-> the exact candidate Commit. See the
-> [acceptance report](docs/cflow-demo-acceptance-report.md), the
-> [TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md),
-> and the [implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
-> The real Codex/Claude Native + Headless E2E and the self-Dogfood are
-> **not yet run** — they require separate explicit user approval on a new
-> exact candidate Commit.
+> **Project status:** the full-screen TUI is the confirmed default entry point
+> on interactive terminals. The root TUI is wired through the shared
+> Application and covers the complete Fake-provider lifecycle: Workflow
+> creation, native discussion, Plan and Execution Approval, Workspace
+> adoption, Foreground Runner, final report, protected Apply, explicit Cleanup,
+> and controlled stopping. This is an implementation-stage build, not a
+> release; real Codex/Claude E2E and self-Dogfood require separate explicit
+> approval on an exact candidate Commit. See the [TUI design](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md)
+> and [implementation plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md).
 
 ## Why CFlow
 
@@ -111,15 +104,40 @@ Release-style builds additionally stamp the source commit and embedded
 registry hashes. See [`scripts/check-cross-build.sh`](scripts/check-cross-build.sh)
 and the [acceptance report](docs/cflow-demo-acceptance-report.md).
 
-## Current usage
+## Quick start
 
-On an interactive terminal, bare `cflow` enters the full-screen TUI: it loads
-the project workspace, navigates the lifecycle (discussion, plan and execution
-approvals, execution/runner, blocked decisions, report, apply, cleanup), and
-drives every state change through the shared Application. The line-oriented
-subcommands remain as the headless CLI for scripts and non-TTY environments.
-Without a TTY, bare `cflow` prints a stable diagnostic and does not mutate
-state.
+Run `cflow` from the target Git repository, or from any directory below its
+Git root:
+
+```sh
+./cflow
+```
+
+On an interactive terminal this opens the full-screen workspace. It loads the
+current project and recently active Workflows without automatically resuming,
+dispatching, applying, or cleaning anything. From the TUI, the normal path is:
+
+1. Create or select a Workflow and review the target branch and isolation facts.
+2. Start the native Codex or Claude discussion. CFlow suspends its screen,
+   runs the provider in the Workflow Workspace, and restores the TUI when the
+   session returns.
+3. Generate and independently check the Plan, then explicitly approve the
+   exact Plan revision.
+4. Generate Specs and the restricted Workflow, inspect the Execution Dry Run,
+   and explicitly approve its exact inputs.
+5. Let the Foreground Runner drive ready tasks. It stops only for a user
+   decision, a safety stop, a terminal state, or no safe progress.
+6. Review the final report, stage and explicitly confirm protected Apply, then
+   produce a Cleanup Dry Run and explicitly confirm the exact cleanup manifest.
+
+Navigation and selection are read-only. Approval, Apply, Cancel, and Cleanup
+require an explicit confirmation and default to “no”. Press `q` to leave when
+the Runner is idle; while it is active, `q` opens Pause and Exit. `Ctrl-C`
+requests a controlled pause, with a second `Ctrl-C` reserved for force stop.
+
+The line-oriented commands remain a first-class headless CLI for scripts,
+diagnostics, automation, and non-TTY environments. Bare `cflow` without an
+interactive terminal prints a stable diagnostic and does not mutate state.
 
 Real providers are currently registered in the post-candidate CLI through
 `CFLOW_PROVIDERS`. Without it, the deterministic Fake Adapter remains the
@@ -142,18 +160,23 @@ printf '%s\n' 'Describe the change and its constraints.' | \
 ./cflow execution-approve
 ```
 
-Approval commands are interactive and default to “no.” Provider execution may
-use the network and incur model cost. Review the exact routes, budgets,
-commands, Git identity/signing facts, and permission boundary before approval.
+The headless commands drive the same Application and Runtime as the TUI. They
+are useful when you need stable text output, but do not bypass either approval
+gate. Approval commands are interactive and default to “no”. Provider
+execution may use the network and incur model cost. Review the exact routes,
+budgets, commands, Git identity/signing facts, and permission boundary before
+approval.
 
 Several `doctor` stateful checks still report `NOT_YET_AVAILABLE`. Real
 Codex/Claude Native + Headless E2E and self-Dogfood have not been rerun for
 this branch; they require separate approval on an exact candidate commit.
 
-The aggregated layout, Workspace adoption, native discussion bridge, and
-Foreground Runner are wired into the root TUI and exercised by the Fake TUI
-E2E through the shared Application; the headless discussion path remains the
-line-oriented `discuss` command shown above.
+New Workflows use the aggregated layout under `$CFLOW_HOME/projects/<project-key>/<workflow-id>/`.
+The Workflow contains one long-lived `workspace/` Worktree plus temporary Task
+and Apply Worktrees under `tmp/`; Plans, Sessions, Reviews, Evidence, Logs,
+Reports, and state projections stay outside the target codebase. Legacy layouts
+are read-only until an explicit migration is requested from the TUI or the
+`layout-migration` command.
 
 ## Command map
 
@@ -187,6 +210,11 @@ OS sandbox.
 - Cancel preserves artifacts, sessions, commits, worktrees, and evidence.
   Cleanup is a separate, exact-target operation and never deletes audit
   history.
+
+`$CFLOW_HOME/cflow.db` is the authoritative state store. Workflow-local
+`state/` files are projections and recovery evidence, not a second authority.
+The TUI never writes SQLite, Git, artifacts, or final state directly; every
+mutation goes through the shared Application and Runtime.
 
 ## Verification and release evidence
 

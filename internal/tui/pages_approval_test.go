@@ -114,3 +114,15 @@ func TestExecutionOnlyNeedsUserBreaks(t *testing.T) {
 		t.Fatalf("an ordinary event switched the page away")
 	}
 }
+
+func TestRenderExecutionUsesWorkbenchLayout(t *testing.T) {
+	m := NewExecutionModel("wf-1")
+	m.NodeStates["S06"] = model.NodeRunning
+	m.Log = []string{"12 Agent session resumed"}
+	got := RenderExecution(m)
+	for _, want := range []string{"CFlow", "EXECUTION", "TASK GRAPH", "INSPECTOR", "S06", "Provider:"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("execution render misses %q:\n%s", want, got)
+		}
+	}
+}

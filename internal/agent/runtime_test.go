@@ -9,6 +9,7 @@ package agent_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -840,4 +841,66 @@ func TestBootstrapPropagatesControlledStopError(t *testing.T) {
 	if err == nil {
 		t.Fatal("bootstrap swallowed the controlled-stop error")
 	}
+}
+
+// TestBootstrapPreservesPreSessionProtocolErrors ensures a Provider's real
+// protocol or process failure is not rewritten as a misleading missing
+// session id before the first session_started event.
+func TestBootstrapPreservesPreSessionProtocolErrors(t *testing.T) {
+	reg, err := agent.LoadProviderRegistry()
+	requireNoError(t, err)
+	inner := fake.New(reg)
+	ad := &preSessionErrorAdapter{
+		Adapter: inner,
+		err: &agent.ProcessCrash{
+			ExitCode: 1,
+			Message:  "fake: provider exited before session_started (sk-abcdefghijklmnop)",
+		},
+	}
+	rt, err := agent.NewRuntime(agent.RuntimeOptions{
+		Now:         fixedClock,
+		IDs:         model.SequentialIDSource(),
+		Registry:    reg,
+		Redaction:   testRedactionRegistry(),
+		EvidenceDir: tempRoot(t),
+		Adapters:    map[string]agent.Adapter{"fake": ad},
+	})
+	requireNoError(t, err)
+	defer func() { _ = rt.Close() }()
+
+	_, err = rt.Bootstrap(context.Background(), agent.BootstrapRequest{
+		Purpose:   model.PurposePlanning,
+		Provider:  "fake",
+		Prompt:    "discuss the requirement",
+		SessionID: "cflow-sess-1",
+	})
+	var crash *agent.ProcessCrash
+	if !errors.As(err, &crash) {
+		t.Fatalf("expected original ProcessCrash, got %v", err)
+	}
+	if crash.ExitCode != 1 ||
+		!strings.Contains(crash.Message, "fake: provider exited before session_started") ||
+		!strings.Contains(crash.Message, "[REDACTED:provider_token]") {
+		t.Fatalf("unexpected crash detail: %+v", crash)
+	}
+	if strings.Contains(crash.Message, "sk-abcdefghijklmnop") {
+		t.Fatalf("crash detail leaked provider token: %q", crash.Message)
+	}
+}
+
+type preSessionErrorAdapter struct {
+	agent.Adapter
+	err error
+}
+
+func (a *preSessionErrorAdapter) Start(context.Context, agent.StartRequest) (agent.Run, error) {
+	return preSessionErrorRun{err: a.err}, nil
+}
+
+type preSessionErrorRun struct {
+	err error
+}
+
+func (r preSessionErrorRun) Next(context.Context) (agent.Event, error) {
+	return agent.Event{}, r.err
 }

@@ -141,11 +141,13 @@ func wfMutStatus(state model.State, rt model.RuntimeStatus) model.WorkflowMutati
 }
 
 // newRun allocates the next Run identity deterministically from the
-// aggregate (design 7.2: opaque, locally generated, never from display
+// aggregate. The Workflow identity is part of the ID because runs.id is
+// globally unique in SQLite while the Run sequence is local to one
+// Workflow (design 7.2: opaque, locally generated, never from display
 // names; design 6.2 rule 6: fixed before any Effect).
 func newRun(state model.State, status model.RunStatus, gate bool) model.Run {
 	return model.Run{
-		ID:           model.RunID(fmt.Sprintf("run-%d", len(state.Runs)+1)),
+		ID:           model.RunID(fmt.Sprintf("run-%s-%d", state.Workflow.ID, len(state.Runs)+1)),
 		Status:       status,
 		DispatchGate: gate,
 		StartedAt:    state.Now,

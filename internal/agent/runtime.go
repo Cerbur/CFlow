@@ -9,6 +9,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -488,8 +489,20 @@ func (r *Runtime) Bootstrap(ctx context.Context, req BootstrapRequest) (*Bootstr
 		ev, err := arun.Next(ctx)
 		if err != nil {
 			if session == nil {
-				// The stream ended before any validated session_started
-				// established an identity: fail closed, no vague Session.
+				// Only a clean stream end means the Provider supplied no
+				// session identity. Preserve process, protocol, auth, and
+				// context errors so the caller can act on the real cause.
+				if !errors.Is(err, io.EOF) {
+					var crash *ProcessCrash
+					if errors.As(err, &crash) {
+						message, redErr := r.redactCrashMessage(crash.Message)
+						if redErr != nil {
+							return nil, redErr
+						}
+						return nil, &ProcessCrash{ExitCode: crash.ExitCode, Message: message}
+					}
+					return nil, err
+				}
 				return nil, model.NewFault(model.CodeProviderSessionIDMissing,
 					"the discussion bootstrap ended before establishing the provider session id")
 			}
@@ -546,6 +559,13 @@ func (r *Runtime) Bootstrap(ctx context.Context, req BootstrapRequest) (*Bootstr
 			"the discussion bootstrap established no provider session")
 	}
 	return &BootstrapResult{Session: session.session, Provider: req.Provider}, nil
+}
+
+// redactCrashMessage applies the Runtime's authoritative redaction policy
+// before a Provider diagnostic can be persisted or shown to a user.
+func (r *Runtime) redactCrashMessage(message string) (string, error) {
+	red := security.NewRedactor(r.redaction)
+	return redactText(red, message)
 }
 
 // ---------------------------------------------------------------------------

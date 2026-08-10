@@ -502,9 +502,10 @@ func (a *Application) nativeBootstrap(ctx context.Context, wf model.WorkflowID, 
 		}
 		input = attachBundleInput(input, &bundle)
 	}
+	typedInput := a.providerTypedInput(ctx, rt, intent.Purpose, intent.Route, input)
 	res, err := rt.Bootstrap(ctx, agent.BootstrapRequest{
 		Purpose: intent.Purpose, Provider: intent.Route,
-		Prompt: renderPrompt(prompt.Body, input), Input: input,
+		Prompt: renderPrompt(prompt.Body, input), Input: typedInput,
 		CWD: cwd, SessionID: intent.Session,
 	})
 	if err != nil {

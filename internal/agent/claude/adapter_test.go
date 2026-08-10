@@ -968,6 +968,27 @@ func TestDialectExitWithoutTerminalFailsClosed(t *testing.T) {
 	}
 }
 
+// TestProcessCrashIncludesBoundedStderr makes a provider launch failure
+// diagnosable: stdout may contain no terminal event, but stderr explains
+// why the CLI exited. The adapter must carry that bounded diagnostic into
+// the crash fact instead of dropping it.
+func TestProcessCrashIncludesBoundedStderr(t *testing.T) {
+	h := newHarness(t, claudeBinding(t))
+	r := h.startRun(t, agent.PurposePlanner, claude.Input{SchemaJSON: h.schema, MaxBudgetUSD: h.budget})
+	hnd := h.waitStarts(t, 1)
+	h.fake.EmitOutput(hnd, process.Stderr, []byte("invalid value for --max-budget-usd: expected a positive number\n"))
+	h.fake.ExitGroup(hnd, 1)
+
+	_, err := collectErr(r)
+	var crash *agent.ProcessCrash
+	if !errors.As(err, &crash) {
+		t.Fatalf("expected ProcessCrash, got %v", err)
+	}
+	if !strings.Contains(crash.Message, "invalid value for --max-budget-usd") {
+		t.Fatalf("crash message dropped stderr diagnostic: %q", crash.Message)
+	}
+}
+
 // TestStderrRedaction: stderr frames are bounded and dropped by the
 // adapter; a secret on stderr never surfaces in any event, error, or
 // completion, and does not poison the stdout protocol stream.

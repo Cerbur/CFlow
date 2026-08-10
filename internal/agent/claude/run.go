@@ -13,11 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 )
+
+const maxCrashStderrBytes = 8 << 10
 
 // run is one supervised claude process event stream. established and
 // terminalSeen are written only by the draining goroutine; stopped and
@@ -30,6 +33,9 @@ type run struct {
 
 	parser       streamParser
 	terminalSeen bool
+	stderr       strings.Builder
+	stderrBytes  int
+	stderrCut    bool
 	stopped      bool
 	reaped       bool
 }
@@ -63,9 +69,12 @@ func (r *run) Next(ctx context.Context) (agent.Event, error) {
 					Code:    model.CodeProviderProtocolViolation,
 					Message: "claude stdout exceeded the bounded stream budget",
 				}
+			case process.EventFrameErr:
+				r.appendStderr(ev.Frame)
+			case process.EventOverflowErr:
+				r.stderrCut = true
 			default:
-				// EventStarted, stderr frames, EOF facts, and overflow
-				// facts of the dropped stderr stream never surface.
+				// EventStarted and stream EOF facts do not surface.
 			}
 		case <-ctx.Done():
 			return agent.Event{}, ctx.Err()
@@ -126,8 +135,34 @@ func (r *run) afterReap(ctx context.Context) (agent.Event, error) {
 	}
 	return agent.Event{}, &agent.ProcessCrash{
 		ExitCode: exit.Code,
-		Message:  fmt.Sprintf("claude %s (code %d) without a terminal structured event", factText(exit.Fact), exit.Code),
+		Message:  r.crashMessage(exit),
 	}
+}
+
+func (r *run) appendStderr(frame []byte) {
+	if r.stderrCut || r.stderrBytes >= maxCrashStderrBytes {
+		r.stderrCut = true
+		return
+	}
+	remaining := maxCrashStderrBytes - r.stderrBytes
+	if len(frame) > remaining {
+		frame = frame[:remaining]
+		r.stderrCut = true
+	}
+	r.stderr.Write(frame)
+	r.stderrBytes += len(frame)
+}
+
+func (r *run) crashMessage(exit process.Exit) string {
+	msg := fmt.Sprintf("claude %s (code %d) without a terminal structured event", factText(exit.Fact), exit.Code)
+	diagnostic := strings.TrimSpace(r.stderr.String())
+	if diagnostic == "" {
+		return msg
+	}
+	if r.stderrCut {
+		diagnostic += " [truncated]"
+	}
+	return msg + "; stderr: " + diagnostic
 }
 
 // stop marks the controlled stop: after the process is reaped, Next

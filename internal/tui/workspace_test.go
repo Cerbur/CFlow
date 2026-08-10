@@ -23,6 +23,23 @@ func TestRenderWorkspaceWide(t *testing.T) {
 	}
 }
 
+func TestRenderWorkspaceUsesWorkbenchFrame(t *testing.T) {
+	got := RenderWorkspace(sampleWorkspaceModel(), 120)
+	for _, want := range []string{
+		"CFlow",
+		"WORKFLOWS",
+		"LIFECYCLE",
+		"INSPECTOR",
+		"Provider:",
+		"Navigate",
+		"|",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("workbench render misses %q:\n%s", want, got)
+		}
+	}
+}
+
 // TestRenderWorkspaceNarrow: below the narrow width the inspector still
 // renders (as a detail page below the main column).
 func TestRenderWorkspaceNarrow(t *testing.T) {

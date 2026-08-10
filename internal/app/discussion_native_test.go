@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/agent/claude"
+	"cflow.local/cflow/internal/agent/codex"
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
@@ -128,6 +130,62 @@ func TestNativeDiscussionPrepareBindsRealProviderSession(t *testing.T) {
 		t.Fatalf("session status = %s, want STARTING", s.Status)
 	}
 	_ = a
+}
+
+// TestNativeDiscussionClaudeBootstrapUsesTypedInput guards the real Claude
+// adapter contract: Native Discussion bootstrap must pass the managed
+// claude.Input, not the generic discussion input.
+func TestNativeDiscussionClaudeBootstrapUsesTypedInput(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("native-claude-discussion", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad := namedFake(reg, "claude")
+	if err := ad.LoadScript([]byte(bootstrapScriptDialect("cflow.dialect.claude-stream-json.v1", "claude-sess-1"))); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingAdapter{Adapter: ad}
+	a := fx.appWithAdapters(map[string]agent.Adapter{"claude": rec})
+	if _, err := a.Execute(context.Background(), PrepareNativeDiscussionCommand{
+		Workflow: wf,
+		Provider: "claude",
+	}); err != nil {
+		t.Fatalf("prepare claude native discussion: %v", err)
+	}
+
+	rec.mu.Lock()
+	gotInput := rec.input
+	rec.mu.Unlock()
+	if _, ok := gotInput.(claude.Input); !ok {
+		t.Fatalf("claude bootstrap input type = %T, want claude.Input", gotInput)
+	}
+}
+
+// TestNativeDiscussionAllocatesRunIDsAcrossWorkflows verifies that the
+// globally unique runs.id identity is not restarted at run-1 for every
+// Workflow. A second Workflow must be able to start its first native
+// discussion even after another Workflow already opened a Run.
+func TestNativeDiscussionAllocatesRunIDsAcrossWorkflows(t *testing.T) {
+	fx := newPlanningFixture(t)
+	first, err := fx.create("first-native-discussion", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.prepareNative(t, first, "provider-sess-1")
+
+	second, err := fx.create("second-native-discussion", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := fx.prepareNative(t, second, "provider-sess-2")
+	if out.SessionID == "" {
+		t.Fatal("second native discussion did not start")
+	}
 }
 
 // TestNativeDiscussionReturnPersistsFactsAndIdles (remediation plan
@@ -327,19 +385,16 @@ func TestNativeDiscussionSwitchRequiresDifferentProvider(t *testing.T) {
 	if gotInput == nil {
 		t.Fatal("the switch bootstrap carried no managed start input")
 	}
-	nb, ok := gotInput.(*nativeBootstrapInput)
+	nb, ok := gotInput.(codex.Input)
 	if !ok {
-		t.Fatalf("switch bootstrap input type = %T, want *nativeBootstrapInput", gotInput)
+		t.Fatalf("switch bootstrap input type = %T, want codex.Input", gotInput)
 	}
-	if nb.ContextBundle == nil {
-		t.Fatal("the switch bootstrap input did not carry the context bundle")
+	if nb.ContextBundleRef == "" {
+		t.Fatal("the switch bootstrap input did not carry the context bundle reference")
 	}
-	if nb.ContextBundle.Path != news.ContextBundlePath ||
-		nb.ContextBundle.Revision != news.ContextBundleRevision ||
-		nb.ContextBundle.Hash != news.ContextBundleSha256 {
-		t.Fatalf("bootstrap input bundle = rev %d %s @ %s, want rev %d %s @ %s",
-			nb.ContextBundle.Revision, nb.ContextBundle.Hash, nb.ContextBundle.Path,
-			news.ContextBundleRevision, news.ContextBundleSha256, news.ContextBundlePath)
+	if nb.ContextBundleRef != news.ContextBundlePath {
+		t.Fatalf("bootstrap input bundle ref = %q, want %q",
+			nb.ContextBundleRef, news.ContextBundlePath)
 	}
 }
 

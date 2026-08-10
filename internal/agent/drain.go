@@ -89,11 +89,15 @@ func (r *Runtime) drain(ctx context.Context, arun Run, cfg drainConfig) (*RunRes
 			var crash *ProcessCrash
 			if errors.As(err, &crash) {
 				exitCode = crash.ExitCode
-				findings := []persistedFinding{{Code: model.CodeAgentProcessCrashed, Text: crash.Message}}
+				message, redErr := r.redactCrashMessage(crash.Message)
+				if redErr != nil {
+					return nil, redErr
+				}
+				findings := []persistedFinding{{Code: model.CodeAgentProcessCrashed, Text: message}}
 				if _, serr := settle(model.SessionFailed, crash.ExitCode, findings, nil); serr != nil {
 					return nil, serr
 				}
-				return nil, model.NewFault(model.CodeAgentProcessCrashed, crash.Message)
+				return nil, model.NewFault(model.CodeAgentProcessCrashed, message)
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
