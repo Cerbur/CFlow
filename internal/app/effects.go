@@ -922,12 +922,19 @@ func planningBody(cmd model.Input, res *agent.RunResult) []byte {
 			if plan := extractPlanMarkdown([]byte(res.Terminal.Result)); plan != "" {
 				return []byte(plan)
 			}
-			return nil
+		}
+		if plan := extractAssistantPlanMarkdown(res.Events); plan != "" {
+			return []byte(plan)
 		}
 		return nil
 	case model.CheckPlanInput:
 		if res.Terminal != nil {
-			return []byte(res.Terminal.Result)
+			if result := extractCheckResultJSON([]byte(res.Terminal.Result)); result != "" {
+				return []byte(result)
+			}
+		}
+		if result := extractAssistantCheckResultJSON(res.Events); result != "" {
+			return []byte(result)
 		}
 		return nil
 	case model.SpecGenerationInput, model.WorkflowCompilationInput:
@@ -954,48 +961,184 @@ func extractPlanMarkdown(raw []byte) string {
 		}
 		var object map[string]json.RawMessage
 		if json.Unmarshal(value, &object) == nil {
-			for _, key := range []string{"plan_markdown", "plan_document"} {
+			for _, key := range []string{"plan_markdown", "plan_document", "document", "plan"} {
 				if rawText, ok := object[key]; ok {
 					var text string
-					if json.Unmarshal(rawText, &text) == nil && isPlanMarkdown(text) {
+					if json.Unmarshal(rawText, &text) == nil {
+						if text = normalizePlanMarkdown(text); text != "" {
+							return text
+						}
+					}
+				}
+			}
+			for _, key := range []string{"value", "type"} {
+				if nested, ok := object[key]; ok {
+					if text := walk(nested, depth+1); text != "" {
 						return text
 					}
 				}
 			}
-			if rawText, ok := object["plan"]; ok {
-				var text string
-				if json.Unmarshal(rawText, &text) == nil && isPlanMarkdown(text) {
+			var content string
+			if nested, ok := object["content"]; ok && json.Unmarshal(nested, &content) == nil {
+				if text := walk(json.RawMessage(content), depth+1); text != "" {
 					return text
-				}
-			}
-			if nested, ok := object["type"]; ok {
-				if text := walk(nested, depth+1); text != "" {
-					return text
-				}
-			}
-			if nested, ok := object["content"]; ok {
-				if text := walk(nested, depth+1); text != "" {
-					return text
-				}
-				var content string
-				if json.Unmarshal(nested, &content) == nil && isPlanMarkdown(content) {
-					return content
-				}
-				if json.Unmarshal(nested, &content) == nil {
-					if text := walk(json.RawMessage(content), depth+1); text != "" {
-						return text
-					}
 				}
 			}
 			return ""
 		}
 		var text string
-		if json.Unmarshal(value, &text) == nil && isPlanMarkdown(text) {
-			return text
+		if json.Unmarshal(value, &text) == nil {
+			return normalizePlanMarkdown(text)
 		}
 		return ""
 	}
 	return walk(json.RawMessage(raw), 0)
+}
+
+func normalizePlanMarkdown(text string) string {
+	if plan := normalizePlanCandidate(text); plan != "" {
+		return plan
+	}
+	return extractEmbeddedPlanMarkdown(text)
+}
+
+func normalizePlanCandidate(text string) string {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "```") {
+		lines := strings.Split(text, "\n")
+		for i := 1; i < len(lines); i++ {
+			if strings.TrimSpace(lines[i]) == "```" {
+				text = strings.Join(lines[1:i], "\n")
+				break
+			}
+		}
+	}
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "---") {
+		lines := strings.Split(text, "\n")
+		if strings.TrimSpace(lines[0]) == "---" {
+			for i := 1; i < len(lines); i++ {
+				if strings.TrimSpace(lines[i]) == "---" {
+					text = strings.Join(lines[i+1:], "\n")
+					break
+				}
+			}
+		}
+	}
+	text = strings.TrimSpace(text)
+	if isPlanMarkdown(text) {
+		return text
+	}
+	return ""
+}
+
+func extractAssistantPlanMarkdown(events []agent.Event) string {
+	var assistant strings.Builder
+	for _, ev := range events {
+		if ev.Type != agent.EventAssistantMessage || ev.Text == "" {
+			continue
+		}
+		if assistant.Len() > 0 {
+			assistant.WriteByte('\n')
+		}
+		assistant.WriteString(ev.Text)
+	}
+	if plan := extractEmbeddedPlanMarkdown(assistant.String()); plan != "" {
+		return plan
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type != agent.EventAssistantMessage || events[i].Text == "" {
+			continue
+		}
+		if plan := normalizePlanCandidate(events[i].Text); plan != "" {
+			return plan
+		}
+	}
+	return ""
+}
+
+// extractCheckResultJSON accepts only a direct structured JSON object or a
+// JSON object inside a Markdown code fence. It deliberately does not scan
+// arbitrary prose for JSON so a human-readable Checker report cannot be
+// mistaken for a Kernel decision.
+func extractCheckResultJSON(raw []byte) string {
+	text := strings.TrimSpace(string(raw))
+	if isStructuredCheckResultJSON(text) {
+		return text
+	}
+	return ""
+}
+
+func extractAssistantCheckResultJSON(events []agent.Event) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type != agent.EventAssistantMessage || events[i].Text == "" {
+			continue
+		}
+		if result := extractCheckResultJSON([]byte(events[i].Text)); result != "" {
+			return result
+		}
+		text := events[i].Text
+		for offset := 0; offset < len(text); {
+			relativeOpen := strings.Index(text[offset:], "```")
+			if relativeOpen < 0 {
+				break
+			}
+			open := offset + relativeOpen
+			relativeBody := strings.IndexByte(text[open+3:], '\n')
+			if relativeBody < 0 {
+				break
+			}
+			bodyStart := open + 3 + relativeBody + 1
+			relativeClose := strings.Index(text[bodyStart:], "```")
+			if relativeClose < 0 {
+				break
+			}
+			bodyEnd := bodyStart + relativeClose
+			if result := extractCheckResultJSON([]byte(text[bodyStart:bodyEnd])); result != "" {
+				return result
+			}
+			offset = bodyEnd + 3
+		}
+	}
+	return ""
+}
+
+func isStructuredCheckResultJSON(text string) bool {
+	var object map[string]json.RawMessage
+	if text == "" || json.Unmarshal([]byte(text), &object) != nil {
+		return false
+	}
+	rawDecision, ok := object["decision"]
+	if !ok {
+		return false
+	}
+	var decision string
+	return json.Unmarshal(rawDecision, &decision) == nil && strings.TrimSpace(decision) != ""
+}
+
+func extractEmbeddedPlanMarkdown(text string) string {
+	for offset := 0; offset < len(text); {
+		relativeOpen := strings.Index(text[offset:], "```")
+		if relativeOpen < 0 {
+			return ""
+		}
+		open := offset + relativeOpen
+		relativeBody := strings.IndexByte(text[open+3:], '\n')
+		if relativeBody < 0 {
+			return ""
+		}
+		bodyStart := open + 3 + relativeBody + 1
+		relativeClose := strings.Index(text[bodyStart:], "```")
+		if relativeClose < 0 {
+			return ""
+		}
+		bodyEnd := bodyStart + relativeClose
+		if plan := normalizePlanCandidate(text[bodyStart:bodyEnd]); plan != "" {
+			return plan
+		}
+		offset = bodyEnd + 3
+	}
+	return ""
 }
 
 func isPlanMarkdown(text string) bool {
@@ -1048,6 +1191,14 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 		return nil, err
 	}
 	switch cmd.(type) {
+	case model.CheckPlanInput:
+		plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+		if err != nil {
+			return nil, err
+		}
+		return struct {
+			Plan string `json:"plan"`
+		}{Plan: string(plan)}, nil
 	case model.SpecGenerationInput:
 		plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
 		if err != nil {
@@ -1083,9 +1234,7 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 		return a.codingSessionInput(ctx, wf, cmd.(model.DispatchInput).Node)
 	}
 	if _, ok := cmd.(model.GeneratePlanInput); !ok {
-		if _, ok := cmd.(model.CheckPlanInput); !ok {
-			return nil, nil
-		}
+		return nil, nil
 	}
 	// Plan generation reads the immutable Discussion Handoff (the native
 	// discussion path) — never a terminal transcript. The legacy headless

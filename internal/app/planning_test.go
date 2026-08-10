@@ -345,6 +345,31 @@ func TestPlanningBodyAcceptsClaudeStructuredPlanShapes(t *testing.T) {
 			result: `{"type":{"plan":"# Plan\n\nbody"}}`,
 			want:   "# Plan\n\nbody",
 		},
+		{
+			name:   "observed root plan envelope with front matter",
+			result: `{"plan":"---\nworkflow_id: wf-1\nrevision: 5\ntitle: Plan\n---\n\n# Plan\n\nbody"}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "observed nested plan document envelope with front matter",
+			result: `{"type":{"plan_document":"---\nworkflow_id: wf-1\nrevision: 5\ntitle: Plan\n---\n\n# Plan\n\nbody"}}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "observed content envelope with front matter",
+			result: `{"content":"{\"plan_document\":\"---\\nworkflow_id: wf-1\\nrevision: 5\\ntitle: Plan\\n---\\n\\n# Plan\\n\\nbody\"}"}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "claude document envelope with front matter",
+			result: `{"value":{"document":"---\nworkflow_id: wf-1\nrevision: 5\ntitle: Plan\n---\n\n# Plan\n\nbody"}}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "claude document envelope with fenced front matter",
+			result: `{"value":{"document":"` + "```markdown" + `\n---\nworkflow_id: wf-1\nrevision: 5\ntitle: Plan\n---\n\n# Plan\n\nbody\n` + "```" + `"}}`,
+			want:   "# Plan\n\nbody",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -361,6 +386,47 @@ func TestPlanningBodyAcceptsClaudeStructuredPlanShapes(t *testing.T) {
 func TestPlanningBodyDoesNotPassThroughUnrecognizedJSON(t *testing.T) {
 	got := planningBody(model.GeneratePlanInput{}, &agent.RunResult{
 		Terminal: &agent.Event{Result: `{"unexpected":"value"}`},
+	})
+	if got != nil {
+		t.Fatalf("planning body = %q, want nil", got)
+	}
+}
+
+func TestPlanningBodyAcceptsFencedPlanInAssistantMessage(t *testing.T) {
+	markdown := strings.TrimSpace(validPlan())
+	text := "Here is the immutable Plan document:\n\n```markdown\n---\nworkflow_id: workflow-1\nrevision: 5\ntitle: Add divide\n---\n\n" + markdown + "\n```"
+	got := planningBody(model.GeneratePlanInput{}, &agent.RunResult{
+		Events: []agent.Event{{Type: agent.EventAssistantMessage, Text: text}},
+	})
+	if string(got) != markdown {
+		t.Fatalf("planning body = %q, want fenced plan body %q", got, markdown)
+	}
+}
+
+func TestPlanningBodyAcceptsCheckJSONFromTerminal(t *testing.T) {
+	result := checkResultJSON("pass")
+	got := planningBody(model.CheckPlanInput{}, &agent.RunResult{
+		Terminal: &agent.Event{Result: result},
+	})
+	if string(got) != result {
+		t.Fatalf("planning body = %q, want %q", got, result)
+	}
+}
+
+func TestPlanningBodyAcceptsFencedCheckJSONInAssistantMessage(t *testing.T) {
+	result := checkResultJSON("needs_revision")
+	text := "Checker result:\n\n```json\n" + result + "\n```"
+	got := planningBody(model.CheckPlanInput{}, &agent.RunResult{
+		Events: []agent.Event{{Type: agent.EventAssistantMessage, Text: text}},
+	})
+	if string(got) != result {
+		t.Fatalf("planning body = %q, want %q", got, result)
+	}
+}
+
+func TestPlanningBodyRejectsMarkdownCheckReport(t *testing.T) {
+	got := planningBody(model.CheckPlanInput{}, &agent.RunResult{
+		Events: []agent.Event{{Type: agent.EventAssistantMessage, Text: "PASS\n\nExecution readiness: ready."}},
 	})
 	if got != nil {
 		t.Fatalf("planning body = %q, want nil", got)
@@ -567,6 +633,60 @@ func TestPlanGenerationRejectsMissingSection(t *testing.T) {
 	pv := fx.planView(wf)
 	if pv.Revision != 1 || pv.PlanStatus != model.PlanDraft || pv.Hash == "" {
 		t.Fatalf("plan after generation = %+v", pv)
+	}
+}
+
+func TestPlanGenerationReportsEmptyOutputSeparately(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("add divide", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.app(planScript("p-empty", "")).Execute(context.Background(),
+		GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("generate with empty plan: %v", err)
+	}
+	view, err := fx.app().Query(context.Background(), InspectQuery{Workflow: wf})
+	if err != nil {
+		t.Fatalf("inspect query: %v", err)
+	}
+	inspect := view.(InspectView)
+	if len(inspect.Status.Findings) == 0 {
+		t.Fatal("empty plan produced no finding")
+	}
+	if got := inspect.Status.Findings[len(inspect.Status.Findings)-1].Text; got != "plan output is empty" {
+		t.Fatalf("empty plan finding = %q, want %q", got, "plan output is empty")
+	}
+}
+
+func TestPlanCheckSessionInputIncludesActivePlan(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("add divide", false)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := fx.app(planScript("p1", validPlan())).Execute(context.Background(),
+		GeneratePlanCommand{Workflow: wf, Provider: "fake"}); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	input, err := fx.app().sessionInput(context.Background(), wf, model.CheckPlanInput{})
+	if err != nil {
+		t.Fatalf("plan check session input: %v", err)
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("marshal plan check session input: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("decode plan check session input: %v", err)
+	}
+	if !strings.Contains(got["plan"], "# ") || !strings.Contains(got["plan"], "## 背景") {
+		t.Fatalf("plan check input does not contain the active plan: %q", got["plan"])
+	}
+	if _, ok := got["requirement"]; ok {
+		t.Fatalf("plan check input unexpectedly contains requirement-only context: %+v", got)
 	}
 }
 

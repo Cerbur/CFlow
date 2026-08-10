@@ -417,9 +417,18 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 			}
 			m.plan = v
 			m.approval = ApprovalModel{Plan: v}
-			if m.page == PagePlanApproval && planProjectionReached(v, m.pendingPlanStatus) {
-				m.status = m.pendingPlanStatus
-				m.pendingPlanStatus = ""
+			if m.page == PagePlanApproval {
+				if status, reached := planProjectionStatus(v, m.pendingPlanStatus); reached {
+					m.status = status
+					pending := m.pendingPlanStatus
+					m.pendingPlanStatus = ""
+					if pending == "plan checked" {
+						m.planCheckInFlight = false
+						if v.PlanStatus != model.PlanChecked {
+							m.pendingPlanApproval = false
+						}
+					}
+				}
 			}
 			if m.pendingPlanApproval && v.PlanStatus == model.PlanChecked &&
 				v.Revision >= 1 && v.Hash != "" {
@@ -1021,16 +1030,27 @@ func latestFinding(findings []model.Finding, code model.Code) *model.Finding {
 	return nil
 }
 
-func planProjectionReached(v app.PlanView, pending string) bool {
+func planProjectionStatus(v app.PlanView, pending string) (string, bool) {
 	switch pending {
 	case "plan generated":
-		return v.Stage == model.StagePlanCheck && v.Revision >= 1 && v.Hash != ""
+		return "plan generated", v.Stage == model.StagePlanCheck && v.Revision >= 1 && v.Hash != ""
 	case "plan checked":
-		return v.PlanStatus == model.PlanChecked
+		switch {
+		case v.PlanStatus == model.PlanChecked:
+			return "plan checked", true
+		case v.Stage == model.StageRequirementDiscussion && v.PlanStatus == model.PlanDraft:
+			return "plan check needs discussion", true
+		case v.Stage == model.StagePlanGeneration && v.PlanStatus == model.PlanDraft:
+			return "plan check needs revision", true
+		case v.PlanStatus == model.PlanRejected:
+			return "plan rejected", true
+		default:
+			return "", false
+		}
 	case "plan approved":
-		return v.PlanStatus == model.PlanApproved
+		return "plan approved", v.PlanStatus == model.PlanApproved
 	default:
-		return false
+		return "", false
 	}
 }
 

@@ -1114,6 +1114,75 @@ func TestModelPlanProjectionIgnoresOutOfOrderOlderState(t *testing.T) {
 	}
 }
 
+func TestModelPlanCheckTerminalProjectionSettlesStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		view   app.PlanView
+		status string
+	}{
+		{
+			name: "needs discussion",
+			view: app.PlanView{
+				Stage:      model.StageRequirementDiscussion,
+				Runtime:    model.RuntimeRunning,
+				PlanStatus: model.PlanDraft,
+			},
+			status: "plan check needs discussion",
+		},
+		{
+			name: "needs revision",
+			view: app.PlanView{
+				Stage:      model.StagePlanGeneration,
+				Runtime:    model.RuntimeRunning,
+				PlanStatus: model.PlanDraft,
+			},
+			status: "plan check needs revision",
+		},
+		{
+			name: "rejected",
+			view: app.PlanView{
+				Stage:      model.StagePlanCheck,
+				Runtime:    model.RuntimePaused,
+				PlanStatus: model.PlanRejected,
+			},
+			status: "plan rejected",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newModel(Dependencies{})
+			m.page = PagePlanApproval
+			m.selected = "wf-1"
+			m.plan = app.PlanView{
+				Workflow:   "wf-1",
+				Stage:      model.StagePlanCheck,
+				PlanStatus: model.PlanDraft,
+			}
+			m.planCheckInFlight = true
+			m.pendingPlanStatus = "plan checked"
+			m.pendingPlanApproval = true
+			m.status = "plan check finished; refreshing plan projection…"
+
+			tt.view.Workflow = "wf-1"
+			m, _ = m.applyProjection(projectionMsg{page: PagePlanApproval, view: tt.view})
+
+			if m.status != tt.status {
+				t.Fatalf("status = %q, want %q", m.status, tt.status)
+			}
+			if m.pendingPlanStatus != "" {
+				t.Fatalf("pending plan status = %q, want empty", m.pendingPlanStatus)
+			}
+			if m.planCheckInFlight {
+				t.Fatal("plan check remained in flight after terminal projection")
+			}
+			if m.pendingPlanApproval {
+				t.Fatal("approval remained queued after non-checked terminal projection")
+			}
+		})
+	}
+}
+
 // TestModelPlanGeneratedStatusFollowsProjection prevents the command
 // callback from claiming success before the refreshed PlanView is visible.
 func TestModelPlanGeneratedStatusFollowsProjection(t *testing.T) {

@@ -760,8 +760,11 @@ func artifactRefPath(ref model.ArtifactRef) string {
 // the agent's Markdown: a "# <title>" heading followed by every required
 // "## <section>" heading. It returns the title.
 func validatePlanMarkdown(body []byte) (string, error) {
-	if len(body) == 0 || len(body) > maxPlanBody {
-		return "", fmt.Errorf("plan output is empty or exceeds the bounded size")
+	if len(body) == 0 {
+		return "", fmt.Errorf("plan output is empty")
+	}
+	if len(body) > maxPlanBody {
+		return "", fmt.Errorf("plan output exceeds the bounded size: %d bytes > %d", len(body), maxPlanBody)
 	}
 	if !utf8.Valid(body) {
 		return "", fmt.Errorf("plan output is not valid UTF-8")
