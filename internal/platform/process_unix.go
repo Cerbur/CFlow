@@ -9,6 +9,7 @@ package platform
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -34,6 +35,25 @@ func KillGroup(pgid int, sig syscall.Signal) error {
 	} else {
 		return err
 	}
+}
+
+// TerminalProcessGroup returns the foreground process group attached to fd.
+func TerminalProcessGroup(fd int) (int, error) {
+	return unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+}
+
+// SetTerminalProcessGroup transfers foreground terminal ownership to pgid.
+func SetTerminalProcessGroup(fd, pgid int) error {
+	if pgid <= 0 {
+		return fmt.Errorf("platform: invalid foreground process group %d", pgid)
+	}
+	// The caller is normally in the background after the child exits.
+	// POSIX terminals otherwise deliver SIGTTOU to a background process
+	// that changes the foreground process group. CFlow owns this terminal
+	// handoff, so keep SIGTTOU ignored for the process lifetime just as an
+	// interactive shell does.
+	signal.Ignore(syscall.SIGTTOU)
+	return unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, pgid)
 }
 
 // SelfIdentity returns the current process PID and its start token.

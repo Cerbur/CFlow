@@ -40,10 +40,23 @@ type osProcess struct {
 	pgid     int
 	outR     *os.File
 	errR     *os.File
+	terminal *terminalHandoff
 
 	waitOnce sync.Once
 	exit     Exit
 	waitErr  error
+}
+
+type terminalHandoff struct {
+	fd           int
+	previousPgid int
+}
+
+func (h *terminalHandoff) restore() error {
+	if h == nil {
+		return nil
+	}
+	return platform.SetTerminalProcessGroup(h.fd, h.previousPgid)
 }
 
 func (p *osProcess) Identity() ProcessIdentity { return p.identity }
@@ -162,17 +175,35 @@ func envSlice(env map[string]string) []string {
 // StartInteractive launches one native interactive process (a provider
 // terminal, TUI task 11): the child inherits the terminal streams
 // directly (cmd.Stdin/Stdout/Stderr attached to the Terminal triple), so
-// no frame parser runs. The process is isolated in its own process group
-// and its PID + start token identity is captured exactly like a framed
-// process; the Supervisor still supports Stop/Wait/Inspect.
+// no frame parser runs. The process is isolated in its own process group;
+// when the inherited input is a real terminal, foreground ownership is
+// transferred to the child for the duration of the turn and restored after
+// Wait. The Supervisor still supports Stop/Wait/Inspect.
 func (a *OSAdapter) StartInteractive(ctx context.Context, h Handle, spec InteractiveSpec) (Process, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	var handoff *terminalHandoff
+	var terminalFD int
+	if f, ok := spec.Terminal.In.(*os.File); ok {
+		previousPgid, ioctlErr := platform.TerminalProcessGroup(int(f.Fd()))
+		if ioctlErr == nil {
+			terminalFD = int(f.Fd())
+			handoff = &terminalHandoff{fd: terminalFD, previousPgid: previousPgid}
+		}
 	}
 	cmd := exec.Command(spec.Executable, spec.Args...)
 	cmd.Dir = spec.Dir
 	cmd.Env = envSlice(spec.Env)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if handoff != nil {
+		// Foreground asks os.StartProcess to create the isolated process
+		// group and assign it the controlling terminal during child
+		// startup. Doing this in the child avoids the parent/child race
+		// where an interactive provider can read before the handoff.
+		cmd.SysProcAttr.Foreground = true
+		cmd.SysProcAttr.Ctty = terminalFD
+	}
 	if spec.Terminal.In != nil {
 		cmd.Stdin = spec.Terminal.In
 	}
@@ -190,12 +221,14 @@ func (a *OSAdapter) StartInteractive(ctx context.Context, h Handle, spec Interac
 	if err != nil {
 		_ = platform.KillGroup(pid, syscall.SIGKILL)
 		_ = cmd.Wait()
+		_ = handoff.restore()
 		return nil, fmt.Errorf("process: read start token for pid %d: %w", pid, err)
 	}
 	return &osProcess{
 		cmd:      cmd,
 		identity: ProcessIdentity{PID: pid, StartToken: token},
 		pgid:     pid,
+		terminal: handoff,
 	}, nil
 }
 
@@ -225,13 +258,17 @@ func signalOf(sig Signal) syscall.Signal {
 func (a *OSAdapter) Wait(ctx context.Context, p Process) (Exit, error) {
 	op := p.(*osProcess)
 	op.waitOnce.Do(func() {
-		op.waitErr = op.cmd.Wait()
-		op.exit = mapExit(op.waitErr)
-		if op.waitErr != nil {
+		waitErr := op.cmd.Wait()
+		op.exit = mapExit(waitErr)
+		restoreErr := op.terminal.restore()
+		if waitErr != nil {
 			var ee *exec.ExitError
-			if errors.As(op.waitErr, &ee) {
-				op.waitErr = nil
+			if !errors.As(waitErr, &ee) {
+				op.waitErr = waitErr
 			}
+		}
+		if restoreErr != nil && op.waitErr == nil {
+			op.waitErr = fmt.Errorf("process: restore terminal foreground process group: %w", restoreErr)
 		}
 	})
 	return op.exit, op.waitErr
