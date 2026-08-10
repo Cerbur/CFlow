@@ -242,7 +242,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// contiguous "r start the runner" is not guaranteed to be written.
 	// Waiting on the fragment guards the reload — pressing r before it would
 	// hit the stale Resume projection.
-	waitOutput("start the runner")
+	waitOutput("start the run")
 	keys("r") // start the runner
 	// The runner stops at the Workspace Adoption Gate (the execution
 	// approval bound the frozen Change Set).
