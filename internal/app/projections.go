@@ -258,9 +258,10 @@ func (a *Application) queryPlan(ctx context.Context, q PlanQuery) (View, error) 
 		return nil, model.InvalidInputFault("no such workflow: " + string(wf))
 	}
 	pv := PlanView{
-		Workflow: view.State.Workflow.ID,
-		Stage:    view.State.Workflow.Stage,
-		Runtime:  view.State.Workflow.Runtime,
+		Workflow:         view.State.Workflow.ID,
+		AggregateVersion: view.AggregateVersion,
+		Stage:            view.State.Workflow.Stage,
+		Runtime:          view.State.Workflow.Runtime,
 	}
 	if view.State.Plan != nil {
 		pv.PlanStatus = view.State.Plan.Status

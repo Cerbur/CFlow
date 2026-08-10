@@ -919,13 +919,10 @@ func planningBody(cmd model.Input, res *agent.RunResult) []byte {
 		return nil
 	case model.GeneratePlanInput:
 		if res.Terminal != nil {
-			var result struct {
-				PlanMarkdown string `json:"plan_markdown"`
+			if plan := extractPlanMarkdown([]byte(res.Terminal.Result)); plan != "" {
+				return []byte(plan)
 			}
-			if json.Unmarshal([]byte(res.Terminal.Result), &result) == nil && result.PlanMarkdown != "" {
-				return []byte(result.PlanMarkdown)
-			}
-			return []byte(res.Terminal.Result)
+			return nil
 		}
 		return nil
 	case model.CheckPlanInput:
@@ -942,6 +939,67 @@ func planningBody(cmd model.Input, res *agent.RunResult) []byte {
 		return nil
 	}
 	return nil
+}
+
+// extractPlanMarkdown accepts the bounded result shapes observed across
+// Claude CLI versions and fixtures. It never treats an arbitrary JSON
+// object as Markdown: the extracted value must be a string beginning with
+// a Markdown H1, which is the Kernel's first Plan schema requirement.
+func extractPlanMarkdown(raw []byte) string {
+	const maxDepth = 3
+	var walk func(json.RawMessage, int) string
+	walk = func(value json.RawMessage, depth int) string {
+		if depth > maxDepth {
+			return ""
+		}
+		var object map[string]json.RawMessage
+		if json.Unmarshal(value, &object) == nil {
+			for _, key := range []string{"plan_markdown", "plan_document"} {
+				if rawText, ok := object[key]; ok {
+					var text string
+					if json.Unmarshal(rawText, &text) == nil && isPlanMarkdown(text) {
+						return text
+					}
+				}
+			}
+			if rawText, ok := object["plan"]; ok {
+				var text string
+				if json.Unmarshal(rawText, &text) == nil && isPlanMarkdown(text) {
+					return text
+				}
+			}
+			if nested, ok := object["type"]; ok {
+				if text := walk(nested, depth+1); text != "" {
+					return text
+				}
+			}
+			if nested, ok := object["content"]; ok {
+				if text := walk(nested, depth+1); text != "" {
+					return text
+				}
+				var content string
+				if json.Unmarshal(nested, &content) == nil && isPlanMarkdown(content) {
+					return content
+				}
+				if json.Unmarshal(nested, &content) == nil {
+					if text := walk(json.RawMessage(content), depth+1); text != "" {
+						return text
+					}
+				}
+			}
+			return ""
+		}
+		var text string
+		if json.Unmarshal(value, &text) == nil && isPlanMarkdown(text) {
+			return text
+		}
+		return ""
+	}
+	return walk(json.RawMessage(raw), 0)
+}
+
+func isPlanMarkdown(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "# ")
 }
 
 // renderPrompt fills a prompt's <CFLOW_INPUT> block with the structured

@@ -430,6 +430,9 @@ type CommittedDecision struct {
 	Decision   Decision
 	Version    AggregateVersion
 	EventRange EventRange
+	// EffectID is the persisted identity of Decision.Effect, when one was
+	// committed. Result transactions use it to settle that exact ledger row.
+	EffectID string
 }
 
 // EventRange is the half-open Event sequence range [From, To) a Decision

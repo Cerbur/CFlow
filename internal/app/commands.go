@@ -294,13 +294,14 @@ type DiscoveryView struct {
 
 // PlanView is the active Plan Revision's review projection.
 type PlanView struct {
-	Workflow   model.WorkflowID
-	Stage      model.WorkflowStage
-	Runtime    model.RuntimeStatus
-	PlanStatus model.PlanStatus
-	Revision   int
-	Hash       string
-	Approved   bool
+	Workflow         model.WorkflowID
+	AggregateVersion model.AggregateVersion
+	Stage            model.WorkflowStage
+	Runtime          model.RuntimeStatus
+	PlanStatus       model.PlanStatus
+	Revision         int
+	Hash             string
+	Approved         bool
 }
 
 // ChangeSetView is the frozen candidate Change Set projection. Ref points

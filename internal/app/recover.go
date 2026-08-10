@@ -172,6 +172,15 @@ func effectBudget(st model.State, pending int, cmd model.Input) int {
 		n += 3
 	case model.ExecutionApprovalInput:
 		n += 2
+	case model.ApplyCommandInput:
+		// Prepare Apply can chain staging and the independent review
+		// Session before the final settlement Decision.
+		n += 2
+	case model.ApplyPolicyConfirmationInput:
+		// Policy/catalog confirmation re-opens staging and can chain the
+		// independent review plus its managed-process stop before the final
+		// settlement Decision.
+		n += 2
 	case model.DispatchInput:
 		// One allocation chains the Task Worktree creation and the coding
 		// Session run (two Effects) before the settle Decision.

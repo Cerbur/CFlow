@@ -319,6 +319,54 @@ func planScript(sessionID, markdown string) string {
 		strconv.Quote(sessionID), strconv.Quote(sessionID), strconv.Quote(sessionID), strconv.Quote(sessionID), strconv.Quote(markdown))
 }
 
+func TestPlanningBodyAcceptsClaudeStructuredPlanShapes(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+		want   string
+	}{
+		{
+			name:   "plan markdown",
+			result: `{"plan_markdown":"# Plan\n\nbody"}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "plan document",
+			result: `{"plan_document":"# Plan\n\nbody"}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "content wraps plan document",
+			result: `{"content":"{\"plan_document\":\"# Plan\\n\\nbody\"}"}`,
+			want:   "# Plan\n\nbody",
+		},
+		{
+			name:   "legacy nested plan",
+			result: `{"type":{"plan":"# Plan\n\nbody"}}`,
+			want:   "# Plan\n\nbody",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := planningBody(model.GeneratePlanInput{}, &agent.RunResult{
+				Terminal: &agent.Event{Result: tt.result},
+			})
+			if string(got) != tt.want {
+				t.Fatalf("planning body = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPlanningBodyDoesNotPassThroughUnrecognizedJSON(t *testing.T) {
+	got := planningBody(model.GeneratePlanInput{}, &agent.RunResult{
+		Terminal: &agent.Event{Result: `{"unexpected":"value"}`},
+	})
+	if got != nil {
+		t.Fatalf("planning body = %q, want nil", got)
+	}
+}
+
 func checkScript(sessionID, decision string) string {
 	return fmt.Sprintf(`{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"plan-check","session_id":%s,"exit_code":0,"resume":"ok"}
 {"type":"session_started","session_id":%s,"at_ms":0}

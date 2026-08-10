@@ -588,15 +588,23 @@ func (a *Application) acquireMutationLocks(ctx context.Context, wf model.Workflo
 // live parallelism) never observe a stale aggregate (design 12:
 // serialized allocation, concurrent Provider runs).
 func (a *Application) transactPass(ctx context.Context, st *store.Store, input model.Input) (model.CommittedDecision, error) {
+	return a.transactPassWithEffect(ctx, st, input, "")
+}
+
+func (a *Application) transactPassWithEffect(ctx context.Context, st *store.Store, input model.Input, effectID string) (model.CommittedDecision, error) {
 	a.dispatchMu.Lock()
 	defer a.dispatchMu.Unlock()
 	view, err := st.View(ctx, store.StoreQuery{})
 	if err != nil {
 		return model.CommittedDecision{}, err
 	}
-	return st.Transact(ctx, view.AggregateVersion, func(state model.State) (model.Decision, error) {
+	decide := func(state model.State) (model.Decision, error) {
 		return decision.Decide(state, input)
-	})
+	}
+	if effectID != "" {
+		return st.TransactResult(ctx, view.AggregateVersion, effectID, decide)
+	}
+	return st.Transact(ctx, view.AggregateVersion, decide)
 }
 
 // runDecisionLoop applies Decisions until the Kernel requests no Effect,
@@ -626,8 +634,17 @@ func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf m
 	executed := map[string]struct{}{}
 	var committed []model.CommittedDecision
 	resultFed := false
+	pendingEffectID := ""
 	for iter := 0; iter < budget; iter++ {
-		cd, err := st.Transact(ctx, version, func(state model.State) (model.Decision, error) {
+		transact := st.Transact
+		if pendingEffectID != "" {
+			effectID := pendingEffectID
+			transact = func(ctx context.Context, expected model.AggregateVersion, fn func(model.State) (model.Decision, error)) (model.CommittedDecision, error) {
+				return st.TransactResult(ctx, expected, effectID, fn)
+			}
+			pendingEffectID = ""
+		}
+		cd, err := transact(ctx, version, func(state model.State) (model.Decision, error) {
 			d, err := decision.Decide(state, input)
 			if err != nil {
 				return model.Decision{}, err
@@ -651,6 +668,7 @@ func (a *Application) runDecisionLoop(ctx context.Context, st *store.Store, wf m
 			return Outcome{}, model.InvariantFault(fmt.Errorf("repeated identical uncompleted effect intent %s", id))
 		}
 		executed[id] = struct{}{}
+		pendingEffectID = cd.EffectID
 		a.probeStep("intent-commit")
 		a.probeStep("effect")
 		result, err := a.executeEffect(ctx, cd.Decision.Effect, restricted, wf, cmd, cmdInput, rt)

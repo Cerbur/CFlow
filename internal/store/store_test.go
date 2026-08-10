@@ -679,6 +679,69 @@ func TestEffectIntentCommitsWithDecisionAndSurfacesAsPending(t *testing.T) {
 	}
 }
 
+func TestTransactResultSettlesEffectAndCommitsSuccessorAtomically(t *testing.T) {
+	s := openTestStore(t)
+	first := mustTransact(t, s, 0, func(state model.State) (model.Decision, error) {
+		d, err := fixtureDecision(state)
+		if err != nil {
+			return model.Decision{}, err
+		}
+		d.Effect = model.ArtifactWriteIntent{
+			Ref: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactPlan, Revision: 1},
+		}
+		return d, nil
+	})
+	if first.EffectID == "" {
+		t.Fatal("first decision did not return its effect identity")
+	}
+
+	second, err := s.TransactResult(context.Background(), first.Version, first.EffectID,
+		func(state model.State) (model.Decision, error) {
+			return model.Decision{
+				Effect: model.ArtifactWriteIntent{
+					Ref: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactPlan, Revision: 2},
+				},
+			}, nil
+		})
+	if err != nil {
+		t.Fatalf("transact result: %v", err)
+	}
+	if second.EffectID == "" || second.EffectID == first.EffectID {
+		t.Fatalf("successor effect identity = %q, first = %q", second.EffectID, first.EffectID)
+	}
+	view := mustView(t, s)
+	if len(view.PendingEffects) != 1 {
+		t.Fatalf("pending effects = %d, want successor only", len(view.PendingEffects))
+	}
+	if view.PendingEffects[0].ID != second.EffectID {
+		t.Fatalf("pending effect = %q, want %q", view.PendingEffects[0].ID, second.EffectID)
+	}
+}
+
+func TestTransactResultRejectsAlreadySettledEffect(t *testing.T) {
+	s := openTestStore(t)
+	first := mustTransact(t, s, 0, func(state model.State) (model.Decision, error) {
+		d, err := fixtureDecision(state)
+		if err != nil {
+			return model.Decision{}, err
+		}
+		d.Effect = model.ArtifactWriteIntent{
+			Ref: model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactPlan, Revision: 1},
+		}
+		return d, nil
+	})
+	if _, err := s.TransactResult(context.Background(), first.Version, first.EffectID,
+		func(model.State) (model.Decision, error) { return model.Decision{}, nil }); err != nil {
+		t.Fatalf("first result transaction: %v", err)
+	}
+	view := mustView(t, s)
+	_, err := s.TransactResult(context.Background(), view.AggregateVersion, first.EffectID,
+		func(model.State) (model.Decision, error) { return model.Decision{}, nil })
+	if err == nil {
+		t.Fatal("expected already-settled effect to be rejected")
+	}
+}
+
 func TestFailedEffectIntentCommitLeavesNoPendingEffect(t *testing.T) {
 	s := openTestStore(t)
 	injectFailure(t, s, FailBeforeCommit)

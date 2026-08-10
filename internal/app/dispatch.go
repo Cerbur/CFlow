@@ -797,6 +797,7 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 	dispatchCmd := input
 	executed := map[string]struct{}{}
 	gateFed := false
+	pendingEffectID := ""
 	// The pass may be cancelled mid-chain (user Ctrl+C or a detected
 	// Commit Policy drift): the RUNNING Attempt then settles INTERRUPTED
 	// without Retry charge and the stop converges through the Kernel. The
@@ -805,7 +806,9 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 	// the two-phase stop complete.
 	settleCtx := ctx
 	for iter := 0; iter < nodeDispatchBudget; iter++ {
-		cd, err := a.transactPass(ctx, st, input)
+		effectID := pendingEffectID
+		pendingEffectID = ""
+		cd, err := a.transactPassWithEffect(ctx, st, input, effectID)
 		if err != nil {
 			if ctx.Err() != nil {
 				// The pass was interrupted between Effects: settle the
@@ -859,6 +862,7 @@ func (a *Application) runNodeDispatch(ctx context.Context, st *store.Store, wf m
 			return model.InvariantFault(fmt.Errorf("repeated identical uncompleted effect intent %s", id))
 		}
 		executed[id] = struct{}{}
+		pendingEffectID = cd.EffectID
 		// The Commit Policy monitor runs while the commit-capable Session
 		// is active (PRD step 5: no slower than once per second). It
 		// starts at the chain's first Effect — before the Worktree
@@ -942,8 +946,11 @@ func (a *Application) interruptChain(settleCtx context.Context, st *store.Store,
 		EndDirtyFingerprint: dirty,
 	}
 	executed := map[string]struct{}{}
+	pendingEffectID := ""
 	for iter := 0; iter < nodeDispatchBudget; iter++ {
-		cd, err := a.transactPass(settleCtx, st, input)
+		effectID := pendingEffectID
+		pendingEffectID = ""
+		cd, err := a.transactPassWithEffect(settleCtx, st, input, effectID)
 		if err != nil {
 			return false
 		}
@@ -955,6 +962,7 @@ func (a *Application) interruptChain(settleCtx context.Context, st *store.Store,
 			return false
 		}
 		executed[id] = struct{}{}
+		pendingEffectID = cd.EffectID
 		result, err := a.executeEffect(settleCtx, cd.Decision.Effect, false, wf, DispatchCommand{Workflow: wf}, input, rt)
 		if err != nil {
 			return false

@@ -244,7 +244,8 @@ func seedProcessRow(t *testing.T, dbPath string, wf model.WorkflowID, id string,
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := db.Exec(`INSERT INTO managed_processes
 		(id, run_id, process_type, status, exit_code, started_at)
-		VALUES (?, 'run-1', 'implementation', ?, 0, ?)`, id, string(status), now); err != nil {
+		VALUES (?, (SELECT id FROM runs WHERE workflow_id = ? ORDER BY id LIMIT 1),
+			'implementation', ?, 0, ?)`, id, wf, string(status), now); err != nil {
 		t.Fatalf("seed process: %v", err)
 	}
 }
@@ -281,6 +282,17 @@ func TestEffectIntentCommitsBeforeExecutorRuns(t *testing.T) {
 	want := []string{"recover", "lock", "lock", "intent-commit", "effect", "result-commit"}
 	if got := probe.Calls(); !slices.Equal(want, got) {
 		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+func TestEffectBudgetIncludesApplyStagingReviewChain(t *testing.T) {
+	got := effectBudget(model.State{}, 0, model.ApplyCommandInput{Kind: model.ApplyRequest})
+	if got < 3 {
+		t.Fatalf("apply request budget = %d, want at least 3 iterations for staging, review, and settlement", got)
+	}
+	confirm := effectBudget(model.State{}, 0, model.ApplyPolicyConfirmationInput{})
+	if confirm < 3 {
+		t.Fatalf("apply confirmation budget = %d, want at least 3 iterations for staging, review, and settlement", confirm)
 	}
 }
 

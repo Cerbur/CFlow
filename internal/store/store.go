@@ -395,13 +395,24 @@ func (s *Store) View(ctx context.Context, q StoreQuery) (StoreView, error) {
 // Transact
 // ---------------------------------------------------------------------------
 
-// Transact applies one Decision to the bound aggregate atomically: the
-// state mutations, the authoritative Events, and the at most one Effect
-// Intent commit in one transaction (design 9.2). expected must equal the
-// current aggregate version; a stale writer is rejected. Event sequences
-// are assigned by the database transaction, strictly increasing, and
-// returned as the half-open EventRange [From, To).
+// Transact applies one Decision to the bound aggregate atomically.
 func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, fn func(model.State) (model.Decision, error)) (model.CommittedDecision, error) {
+	return s.transact(ctx, expected, "", fn)
+}
+
+// TransactResult applies the Result Decision for one previously committed
+// Effect atomically. The effect must still be pending and belong to this
+// workflow; otherwise the transaction fails closed.
+func (s *Store) TransactResult(ctx context.Context, expected model.AggregateVersion, effectID string, fn func(model.State) (model.Decision, error)) (model.CommittedDecision, error) {
+	if effectID == "" {
+		return model.CommittedDecision{}, model.InvalidInputFault("result transaction requires an effect identity")
+	}
+	return s.transact(ctx, expected, effectID, fn)
+}
+
+// transact applies one Decision and, when effectID is non-empty, settles the
+// matching pending Effect in the same SQLite transaction.
+func (s *Store) transact(ctx context.Context, expected model.AggregateVersion, effectID string, fn func(model.State) (model.Decision, error)) (model.CommittedDecision, error) {
 	if s.readOnly || !s.exists {
 		return model.CommittedDecision{}, model.InvalidInputFault("store is read-only")
 	}
@@ -505,6 +516,7 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 	// without Events must still receive a unique intent identity (the
 	// planning chain requests a Provider run and then the Artifact write
 	// it produced, and the result Decisions carry no Events).
+	effectIDCommitted := ""
 	if decision.Effect != nil {
 		kind, err := effectKindOf(decision.Effect)
 		if err != nil {
@@ -518,12 +530,27 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM effects`).Scan(&effectID); err != nil {
 			return model.CommittedDecision{}, fmt.Errorf("effect ledger count: %w", err)
 		}
+		effectIDCommitted = fmt.Sprintf("effect-%d", effectID+1)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO effects
 			(id, workflow_id, kind, payload_json, status, decision_version, created_at)
 			VALUES (?, ?, ?, ?, 'PENDING', ?, ?)`,
-			fmt.Sprintf("effect-%d", effectID+1), workflow, kind, string(payload),
+			effectIDCommitted, workflow, kind, string(payload),
 			expected+1, now.Format(time.RFC3339Nano)); err != nil {
 			return model.CommittedDecision{}, s.mapSQLError(err)
+		}
+	}
+	if effectID != "" {
+		res, err := tx.ExecContext(ctx, `UPDATE effects SET status = 'RESULTED'
+			WHERE id = ? AND workflow_id = ? AND status = 'PENDING'`,
+			effectID, workflow)
+		if err != nil {
+			return model.CommittedDecision{}, s.mapSQLError(err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return model.CommittedDecision{}, fmt.Errorf("settle effect: %w", err)
+		} else if n != 1 {
+			return model.CommittedDecision{}, model.InvariantFault(
+				fmt.Errorf("pending effect %s was not found for workflow %s", effectID, workflow))
 		}
 	}
 
@@ -553,6 +580,7 @@ func (s *Store) Transact(ctx context.Context, expected model.AggregateVersion, f
 		Decision:   decision,
 		Version:    expected + 1,
 		EventRange: model.EventRange{From: next, To: next + uint64(len(decision.Events))},
+		EffectID:   effectIDCommitted,
 	}, nil
 }
 

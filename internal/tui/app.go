@@ -149,6 +149,12 @@ type Model struct {
 	// status is the transient status line.
 	status            string
 	pendingPlanStatus string
+	// pendingPlanApproval preserves an explicit user approval while the
+	// CheckPlan command's authoritative projection is still in flight.
+	// The approval is issued only after the refreshed revision/hash is
+	// visible, so this never bypasses the stale-plan guard.
+	pendingPlanApproval bool
+	planCheckInFlight   bool
 
 	// Runner state: running is true while the Foreground Runner is
 	// active; runCancel is the runner's context; eventCh is the
@@ -402,11 +408,30 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 		}
 	case PagePlanApproval:
 		if v, ok := msg.view.(app.PlanView); ok {
+			// Page queries run asynchronously. A slower query started
+			// before CheckPlan may arrive after the fresh CHECKED
+			// projection and must not roll the local approval state back.
+			if v.Workflow == m.plan.Workflow &&
+				v.AggregateVersion < m.plan.AggregateVersion {
+				return m, nil
+			}
 			m.plan = v
 			m.approval = ApprovalModel{Plan: v}
 			if m.page == PagePlanApproval && planProjectionReached(v, m.pendingPlanStatus) {
 				m.status = m.pendingPlanStatus
 				m.pendingPlanStatus = ""
+			}
+			if m.pendingPlanApproval && v.PlanStatus == model.PlanChecked &&
+				v.Revision >= 1 && v.Hash != "" {
+				m.pendingPlanApproval = false
+				m.planCheckInFlight = false
+				m.status = "approving the refreshed plan revision…"
+				return m, m.executeCmd(app.ApprovePlanCommand{
+					Workflow: m.selected, Revision: v.Revision, Hash: v.Hash,
+				})
+			}
+			if v.PlanStatus == model.PlanChecked {
+				m.planCheckInFlight = false
 			}
 		}
 	case PageExecutionApproval:
@@ -468,6 +493,10 @@ func (m Model) reloadCmd() tea.Cmd {
 // applyCommand handles one finished typed Application Command.
 func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 	if msg.err != nil {
+		if _, ok := msg.cmd.(app.CheckPlanCommand); ok {
+			m.planCheckInFlight = false
+			m.pendingPlanApproval = false
+		}
 		m.status = fmt.Sprintf("%v", msg.err)
 		if m.stop == stopPauseAndExit {
 			// The pause failed; the user still asked to exit. Never
@@ -564,10 +593,18 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.status = "discussion finished"
 		return m, m.reloadCmd()
 	case app.GeneratePlanCommand:
+		m.planCheckInFlight = false
+		m.pendingPlanApproval = false
+		if finding := latestFinding(msg.out.Findings, model.CodeSchemaInvalid); finding != nil {
+			m.pendingPlanStatus = ""
+			m.status = "plan output rejected: " + finding.Text
+			return m, m.reloadCmd()
+		}
 		m.pendingPlanStatus = "plan generated"
 		m.status = "plan generation finished; refreshing plan projection…"
 		return m, m.reloadCmd()
 	case app.CheckPlanCommand:
+		m.planCheckInFlight = true
 		m.pendingPlanStatus = "plan checked"
 		m.status = "plan check finished; refreshing plan projection…"
 		return m, m.reloadCmd()
@@ -975,6 +1012,15 @@ func hasAction(actions []Action, want Action) bool {
 	return false
 }
 
+func latestFinding(findings []model.Finding, code model.Code) *model.Finding {
+	for i := len(findings) - 1; i >= 0; i-- {
+		if findings[i].Code == code {
+			return &findings[i]
+		}
+	}
+	return nil
+}
+
 func planProjectionReached(v app.PlanView, pending string) bool {
 	switch pending {
 	case "plan generated":
@@ -1231,6 +1277,8 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	}
 	switch {
 	case msg.Code == 'g' || msg.Code == 'G':
+		m.planCheckInFlight = false
+		m.pendingPlanApproval = false
 		m.status = "generating a plan revision…"
 		return m, m.executeCmd(app.GeneratePlanCommand{Workflow: m.selected, Provider: m.discussionProvider()})
 	case msg.Code == 'k' || msg.Code == 'K':
@@ -1251,7 +1299,14 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	upd, cmd := m.approval.Update(msg)
 	m.approval = upd
 	if m.approval.Confirmed && m.approval.Yes {
-		if m.plan.Revision < 1 || m.plan.Hash == "" {
+		if m.plan.PlanStatus != model.PlanChecked || m.plan.Revision < 1 || m.plan.Hash == "" {
+			if m.planCheckInFlight || m.pendingPlanStatus == "plan checked" {
+				m.pendingPlanApproval = true
+				m.approval.Confirmed = false
+				m.approval.Yes = false
+				m.status = "plan approval queued; waiting for refreshed PLAN_CHECK"
+				return m, nil
+			}
 			m.status = "no plan revision to approve"
 			m.approval.Confirmed = false
 			m.approval.Yes = false

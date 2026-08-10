@@ -1012,6 +1012,108 @@ func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
 	}
 }
 
+// TestModelPlanApprovalWaitsForCheckedProjection preserves an explicit y
+// pressed after the CheckPlan command settled but before the refreshed
+// PlanView arrived. The approval must bind the revision/hash from that
+// fresh projection instead of dropping the user's action or using stale
+// local data.
+func TestModelPlanApprovalWaitsForCheckedProjection(t *testing.T) {
+	rec := &recordingController{ctrl: &migrationController{}}
+	m := newModel(Dependencies{})
+	m.ctrl = rec
+	m.page = PagePlanApproval
+	m.selected = "wf-1"
+	m.plan = app.PlanView{
+		Workflow:   "wf-1",
+		Stage:      model.StagePlanGeneration,
+		Runtime:    model.RuntimePaused,
+		PlanStatus: model.PlanDraft,
+	}
+
+	m, _ = m.applyCommand(commandDoneMsg{cmd: app.CheckPlanCommand{}})
+	m = press(t, m, 'y', 0)
+	if rec.hasExecuted(app.ApprovePlanCommand{}) {
+		t.Fatal("stale projection issued ApprovePlanCommand")
+	}
+	if !m.pendingPlanApproval {
+		t.Fatal("explicit approval was not queued while projection was stale")
+	}
+
+	m, cmd := m.applyProjection(projectionMsg{
+		page: PagePlanApproval,
+		view: app.PlanView{
+			Workflow:   "wf-1",
+			Stage:      model.StagePlanCheck,
+			Runtime:    model.RuntimePaused,
+			PlanStatus: model.PlanChecked,
+			Revision:   1,
+			Hash:       "fresh-plan-hash",
+		},
+	})
+	if cmd == nil {
+		t.Fatal("fresh checked projection did not resume the queued approval")
+	}
+	if msg := cmd(); msg == nil {
+		t.Fatal("queued approval command returned no completion message")
+	}
+	var approved app.ApprovePlanCommand
+	for _, executed := range rec.executed {
+		if got, ok := executed.(app.ApprovePlanCommand); ok {
+			approved = got
+		}
+	}
+	if approved.Revision != 1 || approved.Hash != "fresh-plan-hash" {
+		t.Fatalf("approval = %+v, want fresh revision/hash", approved)
+	}
+}
+
+func TestModelPlanProjectionIgnoresOutOfOrderOlderState(t *testing.T) {
+	rec := &recordingController{ctrl: &migrationController{}}
+	m := newModel(Dependencies{})
+	m.ctrl = rec
+	m.page = PagePlanApproval
+	m.selected = "wf-1"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page: PagePlanApproval,
+		view: app.PlanView{
+			Workflow:         "wf-1",
+			AggregateVersion: 10,
+			Stage:            model.StagePlanCheck,
+			Runtime:          model.RuntimePaused,
+			PlanStatus:       model.PlanChecked,
+			Revision:         1,
+			Hash:             "fresh-plan-hash",
+		},
+	})
+	m, _ = m.applyProjection(projectionMsg{
+		page: PagePlanApproval,
+		view: app.PlanView{
+			Workflow:         "wf-1",
+			AggregateVersion: 9,
+			Stage:            model.StagePlanCheck,
+			Runtime:          model.RuntimePaused,
+			PlanStatus:       model.PlanChecking,
+			Revision:         1,
+			Hash:             "fresh-plan-hash",
+		},
+	})
+	if m.plan.PlanStatus != model.PlanChecked || m.plan.AggregateVersion != 10 {
+		t.Fatalf("older projection replaced fresh state: %+v", m.plan)
+	}
+
+	m = press(t, m, 'y', 0)
+	var approved app.ApprovePlanCommand
+	for _, executed := range rec.executed {
+		if got, ok := executed.(app.ApprovePlanCommand); ok {
+			approved = got
+		}
+	}
+	if approved.Revision != 1 || approved.Hash != "fresh-plan-hash" {
+		t.Fatalf("approval = %+v, want fresh revision/hash", approved)
+	}
+}
+
 // TestModelPlanGeneratedStatusFollowsProjection prevents the command
 // callback from claiming success before the refreshed PlanView is visible.
 func TestModelPlanGeneratedStatusFollowsProjection(t *testing.T) {
