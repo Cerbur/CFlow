@@ -449,8 +449,8 @@ func TestClaudeArgvPreservesProviderPermissionDefaults(t *testing.T) {
 
 // TestStartArgvExactShape: the exact Start argv is --print
 // --input-format stream-json --output-format stream-json --json-schema
-// <json> --max-budget-usd <amount>; the approved optional --model appears
-// only when the typed request carries one.
+// <json> with --max-budget-usd only for a finite budget; the approved
+// optional --model appears only when the typed request carries one.
 func TestStartArgvExactShape(t *testing.T) {
 	req := fixtureClaudeStart()
 	argv := claude.StartArgv(req)
@@ -467,6 +467,14 @@ func TestStartArgvExactShape(t *testing.T) {
 		"--json-schema", req.SchemaJSON, "--max-budget-usd", req.MaxBudgetUSD, "--model", "claude-sonnet-4-5")
 	requireAbsentArgs(t, argv, "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
 		"--permission-mode", "--allowedTools", "--disallowedTools")
+}
+
+func TestStartArgvOmitsUnlimitedBudgetFlag(t *testing.T) {
+	req := fixtureClaudeStart()
+	req.MaxBudgetUSD = ""
+	requireExactArgs(t, claude.StartArgv(req),
+		"--print", "--input-format", "stream-json", "--output-format", "stream-json",
+		"--verbose", "--json-schema", req.SchemaJSON)
 }
 
 // TestResumeArgvAddsResumeFlag: Resume argv is the Start argv plus
@@ -1020,8 +1028,7 @@ func TestStderrRedaction(t *testing.T) {
 
 // TestAdapterStartRequiresValidSchemaAndBudget: the adapter fails closed
 // before any process launch when the request carries no typed claude
-// input, an invalid schema JSON, or an unusable budget (the argv contract
-// always passes --json-schema <json> --max-budget-usd <amount>).
+// input, an invalid schema JSON, or an unusable finite budget.
 func TestAdapterStartRequiresValidSchemaAndBudget(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1030,7 +1037,6 @@ func TestAdapterStartRequiresValidSchemaAndBudget(t *testing.T) {
 		{"untyped input", map[string]any{"requirement": "search"}},
 		{"schema is not json", claude.Input{SchemaJSON: "not json", MaxBudgetUSD: "0.50"}},
 		{"schema empty", claude.Input{SchemaJSON: "", MaxBudgetUSD: "0.50"}},
-		{"budget empty", claude.Input{SchemaJSON: schemaJSON, MaxBudgetUSD: ""}},
 		{"budget not a number", claude.Input{SchemaJSON: schemaJSON, MaxBudgetUSD: "abc"}},
 		{"budget negative", claude.Input{SchemaJSON: schemaJSON, MaxBudgetUSD: "-1"}},
 	}

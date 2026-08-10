@@ -97,9 +97,11 @@ type Input struct {
 
 // StartArgv builds the exact Start argv (brief acceptance): noninteractive
 // `claude --print --input-format stream-json --output-format stream-json
-// --verbose --json-schema <json> --max-budget-usd <amount>` with the
-// approved optional --model. Existing Provider permission defaults remain
-// in force: no permission-bypass or allowlist flag is ever added.
+// --verbose --json-schema <json> [--max-budget-usd <amount>]` with the
+// approved optional --model. An empty budget means CFlow's unlimited budget
+// policy and must omit the provider flag; Claude rejects a zero amount.
+// Existing Provider permission defaults remain in force: no
+// permission-bypass or allowlist flag is ever added.
 //
 // --verbose is required by the installed Claude CLI (>= 2.1.221) when
 // --print is combined with --output-format stream-json; without it the
@@ -114,7 +116,9 @@ func StartArgv(req StartRequest) []string {
 		"--output-format", "stream-json",
 		"--verbose",
 		"--json-schema", req.SchemaJSON,
-		"--max-budget-usd", req.MaxBudgetUSD,
+	}
+	if req.MaxBudgetUSD != "" {
+		argv = append(argv, "--max-budget-usd", req.MaxBudgetUSD)
 	}
 	if req.Model != "" {
 		argv = append(argv, "--model", req.Model)
@@ -470,11 +474,11 @@ func validateSchemaJSON(schema string) error {
 }
 
 // validateBudget verifies the approved hard budget is a non-negative
-// decimal amount: the argv contract always carries --max-budget-usd and
-// an unusable amount can never reach argv.
+// decimal amount. An empty value means no cap; it is omitted from argv
+// because Claude rejects --max-budget-usd 0.
 func validateBudget(amount string) error {
 	if amount == "" {
-		return model.InvalidInputFault("claude requires the approved budget amount")
+		return nil
 	}
 	v, err := strconv.ParseFloat(amount, 64)
 	if err != nil || v < 0 {

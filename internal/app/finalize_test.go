@@ -362,7 +362,7 @@ func TestProviderTypedInputPlanningFallback(t *testing.T) {
 	if !ok {
 		t.Fatalf("planning claude typed input has unexpected type %T", a.providerTypedInput(ctx, rt, model.PurposePlanCheck, "claude", base))
 	}
-	if claudeIn.SchemaJSON == "" || claudeIn.MaxBudgetUSD != "0" {
+	if claudeIn.SchemaJSON == "" || claudeIn.MaxBudgetUSD != "" {
 		t.Fatalf("planning claude typed input lost the schema or budget facts: %+v", claudeIn)
 	}
 

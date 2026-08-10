@@ -461,12 +461,15 @@ func (a *Application) providerTypedInput(ctx context.Context, rt *agent.Runtime,
 			// parseReviewVerdict could not find the decision.
 			schema = codexReviewSchema
 		}
-		return claude.Input{
+		input := claude.Input{
 			SchemaJSON:       schema,
-			MaxBudgetUSD:     strconv.FormatFloat(routeBudget, 'f', -1, 64),
 			Model:            routeModel,
 			ContextBundleRef: bundleRef,
 		}
+		if routeBudget > 0 {
+			input.MaxBudgetUSD = strconv.FormatFloat(routeBudget, 'f', -1, 64)
+		}
+		return input
 	}
 	return base
 }
