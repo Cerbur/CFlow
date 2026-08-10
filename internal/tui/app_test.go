@@ -999,7 +999,7 @@ func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
 
 	// The command has completed, but its asynchronous projection reload has
 	// not been applied yet: this is the timing shown in the user report.
-	_, _ = m.applyCommand(commandDoneMsg{cmd: app.GeneratePlanCommand{}})
+	m, _ = m.applyCommand(commandDoneMsg{cmd: app.GeneratePlanCommand{}})
 	m = press(t, m, 'k', 0)
 
 	for _, cmd := range rec.executed {
@@ -1009,6 +1009,53 @@ func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
 	}
 	if !strings.Contains(m.status, "wait") {
 		t.Fatalf("status = %q, want a wait message", m.status)
+	}
+}
+
+// TestModelPlanGeneratedStatusFollowsProjection prevents the command
+// callback from claiming success before the refreshed PlanView is visible.
+func TestModelPlanGeneratedStatusFollowsProjection(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PagePlanApproval
+	m.selected = "wf-1"
+	m.plan = app.PlanView{
+		Workflow: "wf-1",
+		Stage:    model.StagePlanGeneration,
+		Runtime:  model.RuntimeRunning,
+	}
+
+	m, _ = m.applyCommand(commandDoneMsg{cmd: app.GeneratePlanCommand{}})
+	if strings.Contains(m.status, "plan generated") {
+		t.Fatalf("command callback claimed generated before projection: %q", m.status)
+	}
+
+	m, _ = m.applyProjection(projectionMsg{
+		page: PagePlanApproval,
+		view: app.PlanView{
+			Workflow:   "wf-1",
+			Stage:      model.StagePlanGeneration,
+			Runtime:    model.RuntimeRunning,
+			Revision:   0,
+			PlanStatus: model.PlanDraft,
+		},
+	})
+	if strings.Contains(m.status, "plan generated") {
+		t.Fatalf("stale projection claimed generated: %q", m.status)
+	}
+
+	m, _ = m.applyProjection(projectionMsg{
+		page: PagePlanApproval,
+		view: app.PlanView{
+			Workflow:   "wf-1",
+			Stage:      model.StagePlanCheck,
+			Runtime:    model.RuntimePaused,
+			Revision:   1,
+			Hash:       "plan-hash",
+			PlanStatus: model.PlanDraft,
+		},
+	})
+	if m.status != "plan generated" {
+		t.Fatalf("fresh projection status = %q, want plan generated", m.status)
 	}
 }
 

@@ -147,7 +147,8 @@ type Model struct {
 	// DiscoveryQuery projection loads.
 	createDirty *app.DiscoveryView
 	// status is the transient status line.
-	status string
+	status            string
+	pendingPlanStatus string
 
 	// Runner state: running is true while the Foreground Runner is
 	// active; runCancel is the runner's context; eventCh is the
@@ -403,6 +404,10 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 		if v, ok := msg.view.(app.PlanView); ok {
 			m.plan = v
 			m.approval = ApprovalModel{Plan: v}
+			if m.page == PagePlanApproval && planProjectionReached(v, m.pendingPlanStatus) {
+				m.status = m.pendingPlanStatus
+				m.pendingPlanStatus = ""
+			}
 		}
 	case PageExecutionApproval:
 		if v, ok := msg.view.(app.ExecutionPreviewView); ok {
@@ -559,13 +564,16 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.status = "discussion finished"
 		return m, m.reloadCmd()
 	case app.GeneratePlanCommand:
-		m.status = "plan generated"
+		m.pendingPlanStatus = "plan generated"
+		m.status = "plan generation finished; refreshing plan projection…"
 		return m, m.reloadCmd()
 	case app.CheckPlanCommand:
-		m.status = "plan checked"
+		m.pendingPlanStatus = "plan checked"
+		m.status = "plan check finished; refreshing plan projection…"
 		return m, m.reloadCmd()
 	case app.ApprovePlanCommand:
-		m.status = "plan approved"
+		m.pendingPlanStatus = "plan approved"
+		m.status = "plan approval finished; refreshing plan projection…"
 		return m, m.reloadCmd()
 	case app.GenerateSpecsCommand:
 		m.status = "specs generated"
@@ -965,6 +973,19 @@ func hasAction(actions []Action, want Action) bool {
 		}
 	}
 	return false
+}
+
+func planProjectionReached(v app.PlanView, pending string) bool {
+	switch pending {
+	case "plan generated":
+		return v.Stage == model.StagePlanCheck && v.Revision >= 1 && v.Hash != ""
+	case "plan checked":
+		return v.PlanStatus == model.PlanChecked
+	case "plan approved":
+		return v.PlanStatus == model.PlanApproved
+	default:
+		return false
+	}
 }
 
 // handleMigrationKey owns the explicit TUI Preview -> Prepare -> Execute
