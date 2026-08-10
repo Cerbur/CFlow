@@ -321,6 +321,7 @@ func ValidateState(st State) error {
 type Workflow struct {
 	ID      WorkflowID
 	Project ProjectID
+	Name    string
 
 	Stage   WorkflowStage
 	Runtime RuntimeStatus

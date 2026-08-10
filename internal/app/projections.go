@@ -10,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
 	"cflow.local/cflow/internal/security"
 	"cflow.local/cflow/internal/store"
+	yaml "go.yaml.in/yaml/v3"
 )
 
 // resolveQueryWorkflow resolves the optional workflow of a Query: an
@@ -172,14 +174,45 @@ func (a *Application) workflowEvidenceDir(ctx context.Context, wf model.Workflow
 
 func workflowSummary(st model.State) WorkflowSummary {
 	return WorkflowSummary{
-		ID: st.Workflow.ID, Stage: st.Workflow.Stage, Runtime: st.Workflow.Runtime,
+		ID: st.Workflow.ID, Name: st.Workflow.Name, Stage: st.Workflow.Stage, Runtime: st.Workflow.Runtime,
 		TargetBranch: st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
 	}
 }
 
+// workflowDisplayName preserves the static identity of pre-name-persistence
+// workflows. Newer rows use SQLite as the source of truth; an empty name is
+// the compatibility case where the immutable workflow.yaml still carries
+// the user-provided name.
+func (a *Application) workflowDisplayName(st model.State) string {
+	if st.Workflow.Name != "" {
+		return st.Workflow.Name
+	}
+	var path string
+	switch st.Workflow.LayoutVersion {
+	case 1:
+		path = filepath.Join(a.legacyWorkflowDir(st.Workflow.ID), "workflow.yaml")
+	case 2:
+		path = filepath.Join(a.layout.WorkflowRoot(st.Workflow.ID), "workflow.yaml")
+	default:
+		return ""
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var manifest workflowManifest
+	if err := yaml.Unmarshal(body, &manifest); err != nil {
+		return ""
+	}
+	if manifest.WorkflowID != "" && manifest.WorkflowID != string(st.Workflow.ID) {
+		return ""
+	}
+	return strings.TrimSpace(manifest.Name)
+}
+
 func statusView(st model.State) StatusView {
 	v := StatusView{
-		Workflow: st.Workflow.ID, Stage: st.Workflow.Stage, Runtime: st.Workflow.Runtime,
+		Workflow: st.Workflow.ID, Name: st.Workflow.Name, Stage: st.Workflow.Stage, Runtime: st.Workflow.Runtime,
 		LayoutVersion: st.Workflow.LayoutVersion,
 		TargetBranch:  st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
 		IntegrationBranch:         st.Workflow.IntegrationBranch,

@@ -119,6 +119,7 @@ func wfMut(state model.State, stage model.WorkflowStage, rt model.RuntimeStatus,
 	return model.WorkflowMutation{
 		ID:                        state.Workflow.ID,
 		Project:                   state.Workflow.Project,
+		Name:                      state.Workflow.Name,
 		Stage:                     stage,
 		Runtime:                   rt,
 		TargetBranch:              state.Workflow.TargetBranch,

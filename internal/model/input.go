@@ -47,6 +47,7 @@ type WorkflowCommandInput struct {
 
 	Workflow     WorkflowID
 	Project      ProjectID
+	Name         string
 	TargetBranch string
 	BaseCommit   string
 	Reason       string
@@ -114,7 +115,7 @@ type NativeDiscussionReturnInput struct {
 	ProviderSession string
 	// WorkspaceHead and WorkspaceDirtyFingerprint are the revalidated
 	// Workspace facts observed on the return.
-	WorkspaceHead            string
+	WorkspaceHead             string
 	WorkspaceDirtyFingerprint string
 }
 

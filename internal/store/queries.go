@@ -49,7 +49,7 @@ func forEachRow(ctx context.Context, q querier, query string, args []any, fn fun
 // ---------------------------------------------------------------------------
 
 const queryWorkflowRow = `
-	SELECT id, project_id, stage, runtime_status, plan_status, aggregate_version,
+	SELECT id, project_id, COALESCE(name, ''), stage, runtime_status, plan_status, aggregate_version,
 	       COALESCE(target_branch, ''), COALESCE(base_commit, ''),
 	       COALESCE(integration_branch, ''), COALESCE(integration_head, ''),
 	       COALESCE(layout_version, 1),
@@ -202,22 +202,22 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 	}
 
 	var (
-		id, project, stage, runtime string
-		planStatus                  sql.NullString
-		version                     uint64
-		targetBranch, baseCommit    string
-		integrationBranch           string
-		integrationHead             string
-		cancelAt, cancelReason      sql.NullString
-		layoutVersion               int
-		workspacePath               string
-		workspaceBranch             string
-		candidateHead               string
-		verifiedHead                string
-		dirtyFingerprint            string
+		id, project, name, stage, runtime string
+		planStatus                        sql.NullString
+		version                           uint64
+		targetBranch, baseCommit          string
+		integrationBranch                 string
+		integrationHead                   string
+		cancelAt, cancelReason            sql.NullString
+		layoutVersion                     int
+		workspacePath                     string
+		workspaceBranch                   string
+		candidateHead                     string
+		verifiedHead                      string
+		dirtyFingerprint                  string
 	)
 	err := q.QueryRowContext(ctx, queryWorkflowRow, workflow).Scan(
-		&id, &project, &stage, &runtime, &planStatus, &version,
+		&id, &project, &name, &stage, &runtime, &planStatus, &version,
 		&targetBranch, &baseCommit, &integrationBranch, &integrationHead,
 		&layoutVersion, &workspacePath, &workspaceBranch,
 		&candidateHead, &verifiedHead, &dirtyFingerprint,
@@ -230,7 +230,7 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 	}
 	st.Version = model.AggregateVersion(version)
 	st.Workflow = model.Workflow{
-		ID: model.WorkflowID(id), Project: model.ProjectID(project),
+		ID: model.WorkflowID(id), Project: model.ProjectID(project), Name: name,
 		Stage: model.WorkflowStage(stage), Runtime: model.RuntimeStatus(runtime),
 		TargetBranch: targetBranch, BaseCommit: baseCommit,
 		IntegrationBranch: integrationBranch, IntegrationHead: integrationHead,

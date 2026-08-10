@@ -512,6 +512,7 @@ func (a *Application) executeMigration(ctx context.Context, st *store.Store, wf 
 		b := &decisionBuilder{}
 		m := model.WorkflowMutation{
 			ID: s.Workflow.ID, Project: s.Workflow.Project,
+			Name:  s.Workflow.Name,
 			Stage: s.Workflow.Stage, Runtime: s.Workflow.Runtime,
 			TargetBranch: s.Workflow.TargetBranch, BaseCommit: s.Workflow.BaseCommit,
 			IntegrationBranch:      s.Workflow.IntegrationBranch,

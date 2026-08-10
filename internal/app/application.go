@@ -767,6 +767,7 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		return model.WorkflowCommandInput{
 			Kind: model.CreateWorkflow, Workflow: wf,
 			Project:         model.ProjectID(a.project.Key),
+			Name:            c.Name,
 			TargetBranch:    facts.Branch,
 			BaseCommit:      facts.Head,
 			WorkspacePath:   ws,

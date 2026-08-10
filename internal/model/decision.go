@@ -28,6 +28,7 @@ type Mutation interface{ isMutation() }
 type WorkflowMutation struct {
 	ID                WorkflowID
 	Project           ProjectID
+	Name              string
 	Stage             WorkflowStage
 	Runtime           RuntimeStatus
 	TargetBranch      string

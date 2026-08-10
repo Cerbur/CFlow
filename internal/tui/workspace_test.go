@@ -7,6 +7,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/model"
@@ -16,9 +17,14 @@ import (
 func TestRenderWorkspaceWide(t *testing.T) {
 	m := sampleWorkspaceModel()
 	got := RenderWorkspace(m, 120)
-	for _, want := range []string{"project:", "workflows:", "workflow wf-1", "actions:", "inspector:"} {
+	for _, want := range []string{"project:", "workflows:", "calculator", "workflow calculator (wf-1)", "actions:", "inspector:"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("wide render misses %q:\n%s", want, got)
+		}
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if width := utf8.RuneCountInString(stripANSI(line)); width > 120 {
+			t.Fatalf("wide render line has width %d > 120: %q", width, line)
 		}
 	}
 }
@@ -47,6 +53,11 @@ func TestRenderWorkspaceNarrow(t *testing.T) {
 	got := RenderWorkspace(m, 80)
 	if !strings.Contains(got, "inspector:") {
 		t.Fatalf("narrow render misses the inspector detail page:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if width := utf8.RuneCountInString(stripANSI(line)); width > 80 {
+			t.Fatalf("narrow render line has width %d > 80: %q", width, line)
+		}
 	}
 }
 
@@ -107,12 +118,12 @@ func sampleWorkspaceModel() WorkspaceModel {
 		Project:  app.ProjectView{Key: "k", Root: "/r", Name: "repo"},
 		Selected: "wf-1",
 		Workflows: []app.WorkflowSummary{
-			{ID: "wf-1", Runtime: model.RuntimePaused},
+			{ID: "wf-1", Name: "calculator", Runtime: model.RuntimePaused},
 			{ID: "wf-2", Runtime: model.RuntimeBlocked},
 		},
 		Lifecycle: &app.WorkflowLifecycleView{
 			Status: app.StatusView{
-				Workflow: "wf-1", Stage: model.StageWorkflowGeneration, Runtime: model.RuntimePaused,
+				Workflow: "wf-1", Name: "calculator", Stage: model.StageWorkflowGeneration, Runtime: model.RuntimePaused,
 				TargetBranch: "main",
 			},
 			Plan: &app.PlanView{PlanStatus: model.PlanApproved, Revision: 1, Approved: true},

@@ -753,7 +753,7 @@ func TestModelLoadsRealWorkspaceView(t *testing.T) {
 		t.Fatalf("workflows = %+v", m.workspace.Workflows)
 	}
 	got := render(m)
-	for _, want := range []string{"project:", "workflows:", "workflow " + string(wf.Workflow), "health:"} {
+	for _, want := range []string{"project:", "workflows:", "workflow calculator (" + string(wf.Workflow) + ")", "health:"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("workspace render misses %q:\n%s", want, got)
 		}

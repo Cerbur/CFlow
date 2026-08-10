@@ -27,7 +27,7 @@ func applyMutation(st *model.State, m model.Mutation) error {
 		// Identity is passed through unchanged; Execution Facts are not
 		// Kernel-owned and survive every Workflow Mutation.
 		st.Workflow = model.Workflow{
-			ID: m.ID, Project: m.Project, Stage: m.Stage, Runtime: m.Runtime,
+			ID: m.ID, Project: m.Project, Name: m.Name, Stage: m.Stage, Runtime: m.Runtime,
 			TargetBranch: m.TargetBranch, BaseCommit: m.BaseCommit,
 			IntegrationBranch: m.IntegrationBranch, IntegrationHead: m.IntegrationHead,
 			LayoutVersion:             m.LayoutVersion,
@@ -283,13 +283,13 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 		if !existed {
 			// The identity-establishing INSERT (creation).
 			if _, err := q.ExecContext(ctx, `INSERT INTO workflows
-				(id, project_id, stage, runtime_status, target_branch, base_commit,
+				(id, project_id, name, stage, runtime_status, target_branch, base_commit,
 				 integration_branch, integration_head,
 				 layout_version, workspace_path, workspace_branch,
 				 candidate_workspace_head, verified_workspace_head, workspace_dirty_fingerprint,
 				 cancel_requested_at, cancel_reason, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				m.ID, m.Project, string(m.Stage), string(m.Runtime),
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				m.ID, m.Project, m.Name, string(m.Stage), string(m.Runtime),
 				m.TargetBranch, m.BaseCommit, m.IntegrationBranch, m.IntegrationHead,
 				layoutVersion, m.WorkspacePath, m.WorkspaceBranch,
 				m.CandidateWorkspaceHead, m.VerifiedWorkspaceHead, m.WorkspaceDirtyFingerprint,
@@ -299,13 +299,13 @@ func persistMutation(ctx context.Context, q querier, st model.State, existed boo
 			return nil
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE workflows
-			SET stage = ?, runtime_status = ?, target_branch = ?, base_commit = ?,
+			SET name = ?, stage = ?, runtime_status = ?, target_branch = ?, base_commit = ?,
 			    integration_branch = ?, integration_head = ?,
 			    layout_version = ?, workspace_path = ?, workspace_branch = ?,
 			    candidate_workspace_head = ?, verified_workspace_head = ?, workspace_dirty_fingerprint = ?,
 			    cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
 			WHERE id = ?`,
-			string(m.Stage), string(m.Runtime), m.TargetBranch, m.BaseCommit,
+			m.Name, string(m.Stage), string(m.Runtime), m.TargetBranch, m.BaseCommit,
 			m.IntegrationBranch, m.IntegrationHead,
 			layoutVersion, m.WorkspacePath, m.WorkspaceBranch,
 			m.CandidateWorkspaceHead, m.VerifiedWorkspaceHead, m.WorkspaceDirtyFingerprint,

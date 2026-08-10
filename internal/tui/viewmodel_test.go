@@ -18,11 +18,11 @@ func TestMapWorkspace(t *testing.T) {
 	vm := MapWorkspace(app.WorkspaceView{
 		Project: app.ProjectView{Key: "k", Root: "/r", Name: "repo"},
 		Workflows: []app.WorkflowSummary{
-			{ID: "wf-1", Runtime: model.RuntimePaused},
+			{ID: "wf-1", Name: "calculator", Runtime: model.RuntimePaused},
 		},
 		Selected: "wf-1",
 		Lifecycle: &app.WorkflowLifecycleView{
-			Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimePaused},
+			Status: app.StatusView{Workflow: "wf-1", Name: "calculator", Runtime: model.RuntimePaused},
 		},
 		LegalActions: []app.LegalAction{
 			{Label: "Resume", Kind: model.ResumeWorkflow},
@@ -30,6 +30,9 @@ func TestMapWorkspace(t *testing.T) {
 	})
 	if vm.Selected.ID != "wf-1" || vm.Selected.Action != ActionResume {
 		t.Fatalf("%+v", vm.Selected)
+	}
+	if vm.Selected.Name != "calculator" || vm.Lifecycle.Name != "calculator" {
+		t.Fatalf("workflow name was not mapped: selected=%+v lifecycle=%+v", vm.Selected, vm.Lifecycle)
 	}
 	if len(vm.Workflows) != 1 || vm.Workflows[0].Action != ActionResume {
 		t.Fatalf("workflows = %+v", vm.Workflows)

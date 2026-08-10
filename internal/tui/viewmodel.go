@@ -33,6 +33,7 @@ const (
 // WorkflowItem is one workspace row of the workflow column.
 type WorkflowItem struct {
 	ID      model.WorkflowID
+	Name    string
 	Stage   model.WorkflowStage
 	Runtime model.RuntimeStatus
 	Blocked bool
@@ -43,6 +44,7 @@ type WorkflowItem struct {
 // column renders.
 type LifecycleItem struct {
 	ID      model.WorkflowID
+	Name    string
 	Stage   model.WorkflowStage
 	Runtime model.RuntimeStatus
 	Target  string
@@ -85,7 +87,7 @@ func MapWorkspace(v app.WorkspaceView) WorkspaceModel {
 	}
 	for _, w := range v.Workflows {
 		item := WorkflowItem{
-			ID: w.ID, Stage: w.Stage, Runtime: w.Runtime,
+			ID: w.ID, Name: w.Name, Stage: w.Stage, Runtime: w.Runtime,
 			Blocked: w.Runtime == model.RuntimeBlocked,
 		}
 		// The row action is NEVER inferred from the stage/runtime strings
@@ -105,7 +107,7 @@ func MapWorkspace(v app.WorkspaceView) WorkspaceModel {
 	}
 	if v.Lifecycle != nil {
 		lc := &LifecycleItem{
-			ID: v.Lifecycle.Status.Workflow, Stage: v.Lifecycle.Status.Stage,
+			ID: v.Lifecycle.Status.Workflow, Name: v.Lifecycle.Status.Name, Stage: v.Lifecycle.Status.Stage,
 			Runtime: v.Lifecycle.Status.Runtime, Target: v.Lifecycle.Status.TargetBranch,
 			Blocked: v.Lifecycle.Blocked, Adopted: v.Lifecycle.Adopted,
 			Head: v.Lifecycle.Status.VerifiedWorkspaceHead,

@@ -8,8 +8,10 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/model"
 )
 
 const (
@@ -33,9 +35,11 @@ func RenderWorkspace(m WorkspaceModel, width int) string {
 		return renderNarrowWorkspace(m, width)
 	}
 
-	leftWidth := clamp(25, width/4, 32)
-	rightWidth := clamp(27, width/4, 34)
-	middleWidth := width - leftWidth - rightWidth - 2
+	const columnGap = 3
+	available := width - columnGap*2
+	leftWidth := clamp(22, available/4, 32)
+	rightWidth := clamp(24, available/4, 34)
+	middleWidth := available - leftWidth - rightWidth
 	if middleWidth < 30 {
 		return renderNarrowWorkspace(m, width)
 	}
@@ -50,8 +54,8 @@ func RenderWorkspace(m WorkspaceModel, width int) string {
 }
 
 func renderNarrowWorkspace(m WorkspaceModel, width int) string {
-	if width < 44 {
-		width = 44
+	if width < 4 {
+		width = 4
 	}
 	header := renderWorkspaceHeader(m, width)
 	main := panel("WORKFLOWS", renderWorkflowLines(m), width)
@@ -68,7 +72,7 @@ func renderWorkspaceHeader(m WorkspaceModel, width int) string {
 	workflow := "no workflow selected"
 	target := ""
 	if m.Lifecycle != nil {
-		workflow = string(m.Lifecycle.ID)
+		workflow = workflowLabel(m.Lifecycle.Name, m.Lifecycle.ID)
 		target = m.Lifecycle.Target
 	}
 	if target == "" {
@@ -91,7 +95,7 @@ func renderWorkflowLines(m WorkspaceModel) []string {
 			mark = "●"
 			color = ansiWhite
 		}
-		lines = append(lines, ansi(color, fmt.Sprintf("%s %s", mark, w.ID)))
+		lines = append(lines, ansi(color, fmt.Sprintf("%s %s", mark, workflowLabel(w.Name, w.ID))))
 		lines = append(lines, "  "+strings.ToLower(string(w.Stage))+" · "+strings.ToLower(string(w.Runtime)))
 	}
 	if len(m.Workflows) == 0 {
@@ -118,7 +122,7 @@ func renderLifecycleLines(m WorkspaceModel) []string {
 	}
 	lc := m.Lifecycle
 	lines := []string{
-		fmt.Sprintf("workflow %s", lc.ID),
+		fmt.Sprintf("workflow %s", workflowLabel(lc.Name, lc.ID)),
 		fmt.Sprintf("%s · %s", strings.ToUpper(string(lc.Stage)), strings.ToUpper(string(lc.Runtime))),
 		"",
 		ansi(ansiMuted, "TASK GRAPH"),
@@ -265,11 +269,21 @@ func fitLine(s string, width int) string {
 
 func fitStyledLine(s string, width int) string {
 	plain := stripANSI(s)
+	if utf8.RuneCountInString(plain) > width {
+		return fitLine(plain, width)
+	}
 	padded := fitLine(plain, width)
 	if len(s) == len(plain) {
 		return padded
 	}
 	return s + strings.Repeat(" ", max(0, width-len([]rune(plain)))) + ansiReset
+}
+
+func workflowLabel(name string, id model.WorkflowID) string {
+	if strings.TrimSpace(name) == "" {
+		return string(id)
+	}
+	return fmt.Sprintf("%s (%s)", name, id)
 }
 
 func stripANSI(s string) string {

@@ -170,6 +170,7 @@ type View interface{ isView() }
 // WorkflowSummary is one list row.
 type WorkflowSummary struct {
 	ID           model.WorkflowID
+	Name         string
 	Stage        model.WorkflowStage
 	Runtime      model.RuntimeStatus
 	TargetBranch string
@@ -247,6 +248,7 @@ type ListView struct{ Workflows []WorkflowSummary }
 // StatusView is the status projection.
 type StatusView struct {
 	Workflow          model.WorkflowID
+	Name              string
 	Stage             model.WorkflowStage
 	Runtime           model.RuntimeStatus
 	LayoutVersion     int
@@ -933,40 +935,40 @@ type ConfirmApplyPolicyCommand struct {
 	Workflow model.WorkflowID
 }
 
-func (CreateWorkflowCommand) isCommand()          {}
-func (DiscussRequirementCommand) isCommand()      {}
-func (FreezeDiscussionCommand) isCommand()        {}
-func (GeneratePlanCommand) isCommand()            {}
-func (CheckPlanCommand) isCommand()               {}
-func (ApprovePlanCommand) isCommand()             {}
-func (StartWorkflowCommand) isCommand()           {}
-func (PauseWorkflowCommand) isCommand()           {}
-func (ResumeWorkflowCommand) isCommand()          {}
-func (CancelWorkflowCommand) isCommand()          {}
-func (DryRunCommand) isCommand()                  {}
-func (ExecuteCleanupCommand) isCommand()          {}
-func (GenerateSpecsCommand) isCommand()           {}
-func (CompileWorkflowCommand) isCommand()         {}
-func (ExecutionDryRunCommand) isCommand()         {}
-func (ApproveExecutionCommand) isCommand()        {}
-func (DispatchCommand) isCommand()                {}
-func (AdoptWorkspaceCommand) isCommand()          {}
-func (PrepareLayoutMigrationCommand) isCommand()  {}
-func (ExecuteLayoutMigrationCommand) isCommand()  {}
-func (PrepareNativeDiscussionCommand) isCommand() {}
+func (CreateWorkflowCommand) isCommand()           {}
+func (DiscussRequirementCommand) isCommand()       {}
+func (FreezeDiscussionCommand) isCommand()         {}
+func (GeneratePlanCommand) isCommand()             {}
+func (CheckPlanCommand) isCommand()                {}
+func (ApprovePlanCommand) isCommand()              {}
+func (StartWorkflowCommand) isCommand()            {}
+func (PauseWorkflowCommand) isCommand()            {}
+func (ResumeWorkflowCommand) isCommand()           {}
+func (CancelWorkflowCommand) isCommand()           {}
+func (DryRunCommand) isCommand()                   {}
+func (ExecuteCleanupCommand) isCommand()           {}
+func (GenerateSpecsCommand) isCommand()            {}
+func (CompileWorkflowCommand) isCommand()          {}
+func (ExecutionDryRunCommand) isCommand()          {}
+func (ApproveExecutionCommand) isCommand()         {}
+func (DispatchCommand) isCommand()                 {}
+func (AdoptWorkspaceCommand) isCommand()           {}
+func (PrepareLayoutMigrationCommand) isCommand()   {}
+func (ExecuteLayoutMigrationCommand) isCommand()   {}
+func (PrepareNativeDiscussionCommand) isCommand()  {}
 func (ContinueNativeDiscussionCommand) isCommand() {}
 func (SwitchAgentCommand) isCommand()              {}
 func (NativeDiscussionReturnCommand) isCommand()   {}
 func (FinishDiscussionCommand) isCommand()         {}
-func (ReconcileCommand) isCommand()               {}
-func (CommitPolicyConfirmCommand) isCommand()     {}
-func (ReplacementPreviewCommand) isCommand()      {}
-func (ApproveReplacementCommand) isCommand()      {}
-func (CompleteWorkflowCommand) isCommand()        {}
-func (RetryCommand) isCommand()                   {}
-func (PrepareApplyCommand) isCommand()            {}
-func (ExecuteApplyCommand) isCommand()            {}
-func (ConfirmApplyPolicyCommand) isCommand()      {}
+func (ReconcileCommand) isCommand()                {}
+func (CommitPolicyConfirmCommand) isCommand()      {}
+func (ReplacementPreviewCommand) isCommand()       {}
+func (ApproveReplacementCommand) isCommand()       {}
+func (CompleteWorkflowCommand) isCommand()         {}
+func (RetryCommand) isCommand()                    {}
+func (PrepareApplyCommand) isCommand()             {}
+func (ExecuteApplyCommand) isCommand()             {}
+func (ConfirmApplyPolicyCommand) isCommand()       {}
 
 // ---------------------------------------------------------------------------
 // Outcome

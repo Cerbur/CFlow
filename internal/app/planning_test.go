@@ -718,3 +718,37 @@ func TestProjectWorkspaceQueryProjectsAggregateFacts(t *testing.T) {
 		t.Fatal("git health unavailable")
 	}
 }
+
+// TestProjectWorkspaceQueryFallsBackToManifestNameForLegacyRows preserves
+// the custom name of workflows created before workflows.name was persisted.
+// The manifest is the only remaining source for that static identity.
+func TestProjectWorkspaceQueryFallsBackToManifestNameForLegacyRows(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("calculator", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := openRawDB(t, filepath.Join(fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE workflows SET name = '' WHERE id = ?`, string(wf)); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	qv, err := fx.app().Query(context.Background(), ProjectWorkspaceQuery{Selected: wf})
+	if err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	wv := qv.(WorkspaceView)
+	if len(wv.Workflows) != 1 || wv.Workflows[0].Name != "calculator" {
+		t.Fatalf("workflow summary = %+v, want manifest name calculator", wv.Workflows)
+	}
+	if wv.Lifecycle == nil || wv.Lifecycle.Status.Name != "calculator" {
+		t.Fatalf("lifecycle status = %+v, want manifest name calculator", wv.Lifecycle)
+	}
+}

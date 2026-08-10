@@ -34,7 +34,9 @@ func (a *Application) queryWorkspace(ctx context.Context, q ProjectWorkspaceQuer
 		if agg.State.Workflow.ID == "" {
 			continue // an orphaned workflow directory: Recovery's concern
 		}
-		view.Workflows = append(view.Workflows, workflowSummary(agg.State))
+		st := agg.State
+		st.Workflow.Name = a.workflowDisplayName(st)
+		view.Workflows = append(view.Workflows, workflowSummary(st))
 	}
 	// The selected workflow: the explicit id, else the first workflow.
 	selected := q.Selected
@@ -64,6 +66,7 @@ func (a *Application) workspaceLifecycle(ctx context.Context, wf model.WorkflowI
 		return nil, model.InvalidInputFault("no such workflow: " + string(wf))
 	}
 	st := agg.State
+	st.Workflow.Name = a.workflowDisplayName(st)
 	lc := &WorkflowLifecycleView{
 		Status:  statusView(st),
 		Blocked: workflowBlocked(st),

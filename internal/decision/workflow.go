@@ -155,6 +155,7 @@ func decideCreateWorkflow(state model.State, in model.WorkflowCommandInput) (mod
 	}
 	b := &builder{state: state}
 	m := wfMut(state, model.StageRequirementDiscussion, model.RuntimePending, nil)
+	m.Name = in.Name
 	// A create that carries the workspace layout records Layout Version 2
 	// and its canonical workspace facts (Task 4): new workflows run on a
 	// single long-lived Workspace; legacy workflows keep Layout 1 until an

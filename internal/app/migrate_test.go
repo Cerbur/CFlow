@@ -592,6 +592,33 @@ func (lf *legacyMigrationFixture) app() *Application {
 	return lf.fx.app()
 }
 
+func TestProjectWorkspaceQueryFallsBackToLegacyManifestName(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE workflows SET name = '' WHERE id = ?`, string(lf.wf)); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := lf.app().Query(context.Background(), ProjectWorkspaceQuery{Selected: lf.wf})
+	if err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	wv := view.(WorkspaceView)
+	if len(wv.Workflows) != 1 || wv.Workflows[0].Name != "legacy-demo" {
+		t.Fatalf("workflow summary = %+v, want legacy manifest name legacy-demo", wv.Workflows)
+	}
+	if wv.Lifecycle == nil || wv.Lifecycle.Status.Name != "legacy-demo" {
+		t.Fatalf("lifecycle status = %+v, want legacy manifest name legacy-demo", wv.Lifecycle)
+	}
+}
+
 // TestLegacyMigrationPreviewPrepareExecute drives the three explicit
 // steps and asserts the aggregated layout after Execute.
 func TestLegacyMigrationPreviewPrepareExecute(t *testing.T) {
