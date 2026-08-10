@@ -5,8 +5,8 @@ package tui
 // Finish, Switch Agent, Pause, and Cancel. Navigation only updates the
 // UI selection; Finish/Continue are explicit commands. Finish freezes
 // the Change Set (the Runtime facts) and opens the handoff editor where
-// the user supplies only the content fields; the merged strict handoff
-// body is validated by the Application against discussion-handoff.json.
+// the user may supply optional content fields; the managed structured
+// resume produces the strict handoff body validated by the Application.
 
 import (
 	"encoding/json"
@@ -43,7 +43,7 @@ type DiscussionPage struct {
 	Selected int
 	// Editing is true while the handoff content editor is open.
 	Editing bool
-	// Handoff is the user-typed handoff content JSON.
+	// Handoff is optional user-supplied handoff content JSON.
 	Handoff string
 	// SwitchReason is the user-typed switch-agent reason ("" until the
 	// user supplies one; the switch fails closed without a bounded reason).
@@ -146,12 +146,11 @@ func RenderDiscussionReturn(p DiscussionPage) string {
 	return b.String()
 }
 
-// renderHandoffEditor renders the strict handoff content editor: the
-// user types ONLY the content fields; the Runtime facts (workflow id,
-// session id, frozen Change Set) are merged by CFlow and re-validated
-// by the Application.
+// renderHandoffEditor renders the optional handoff content editor. The
+// managed structured resume uses the existing discussion as its authority;
+// any JSON entered here is additional structured guidance.
 func renderHandoffEditor(b *strings.Builder, p DiscussionPage) {
-	b.WriteString("handoff content (JSON):\n")
+	b.WriteString("optional handoff guidance (JSON):\n")
 	b.WriteString("  targets, constraints, non_goals, acceptance_criteria,\n")
 	b.WriteString("  open_questions, user_decisions\n")
 	if p.ChangeSet != "" {
@@ -164,13 +163,17 @@ func renderHandoffEditor(b *strings.Builder, p DiscussionPage) {
 	b.WriteString("\nEnter to finish the discussion, Esc to cancel\n")
 }
 
-// handoffDecisions validates the user's handoff content and returns the
-// Decisions the Finish command carries: the strict content fields only
-// (targets, constraints, non_goals, acceptance_criteria, open_questions,
-// user_decisions). The authoritative runtime facts (workflow_id,
-// session_id, change_set) are bound by the Application's managed structured
-// resume — the interface can never invent them.
+// handoffDecisions validates optional user guidance and returns the
+// Decisions the Finish command carries. Empty input is represented by an
+// empty JSON object so the Application can use the existing discussion
+// context for the managed structured resume.
 func handoffDecisions(content string, wf model.WorkflowID, session model.SessionID, ref *model.ArtifactRef) ([]byte, error) {
+	if strings.TrimSpace(content) == "" {
+		if ref == nil || ref.Revision < 1 || len(ref.Hash) < 64 {
+			return nil, fmt.Errorf("no frozen change set exists; finish again after the freeze")
+		}
+		return []byte(`{}`), nil
+	}
 	var user map[string]any
 	if err := json.Unmarshal([]byte(content), &user); err != nil {
 		return nil, fmt.Errorf("the handoff content is not valid JSON: %v", err)

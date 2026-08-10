@@ -166,8 +166,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("Continue Same Session")
 	keys(keyDown)  // select Finish (Continue is the default selection)
 	keys(keyEnter) // freeze the change set → handoff editor
-	waitOutput("handoff content (JSON)")
-	keys(handoffContentJSON)
+	waitOutput("optional handoff guidance (JSON)")
 	keys(keyEnter) // finish the discussion
 	waitApp("discussion finished", func() bool {
 		return sessionCompleted(t, ref.a, wf)
@@ -322,9 +321,9 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	}
 }
 
-// handoffContentJSON is the strict handoff content the user types in the
-// handoff editor (the Runtime fills the workflow/session/change-set
-// facts).
+// handoffContentJSON remains available for tests that exercise optional
+// structured guidance. The normal E2E path leaves the editor empty so the
+// managed resume uses the existing discussion context.
 const handoffContentJSON = `{"targets":"division by zero must error","constraints":"no external dependencies","non_goals":"no other arithmetic changes","acceptance_criteria":"Divide returns a typed error on zero","open_questions":"error wording","user_decisions":[{"topic":"error type","decision":"typed error"}]}`
 
 // hexHash reports whether s contains the prefix followed by at least 12
