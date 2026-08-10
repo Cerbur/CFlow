@@ -17,12 +17,18 @@ import (
 	"fmt"
 
 	"cflow.local/cflow/internal/agent"
+	"cflow.local/cflow/internal/agent/claude"
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/store"
 )
+
+// nativeDiscussionHandoffSchema is the Provider-facing schema for the
+// managed Finish resume. Runtime-owned fields are deliberately excluded:
+// assembleManagedHandoff binds workflow, session, and frozen Change Set facts.
+const nativeDiscussionHandoffSchema = `{"type":"object","additionalProperties":false,"required":["targets","constraints","non_goals","acceptance_criteria","open_questions","user_decisions"],"properties":{"targets":{"type":"string","minLength":1},"constraints":{"type":"string","minLength":1},"non_goals":{"type":"string","minLength":1},"acceptance_criteria":{"type":"string","minLength":1},"open_questions":{"type":"string"},"user_decisions":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,"required":["topic","decision"],"properties":{"topic":{"type":"string","minLength":1},"decision":{"type":"string","minLength":1}}}}}}`
 
 // prepareNativeDiscussion is the prepare-case of PrepareNativeDiscussionCommand:
 // it validates the workflow and the approved route, allocates the fresh
@@ -427,18 +433,31 @@ func (a *Application) prepareFinish(ctx context.Context, c FinishDiscussionComma
 		return nil, "", model.InvalidInputFault("no embedded prompt for the discussion finish")
 	}
 	finishInput := struct {
-		ChangeSet map[string]any `json:"change_set"`
+		ChangeSet map[string]any  `json:"change_set"`
 		Decisions json.RawMessage `json:"decisions"`
 	}{
 		ChangeSet: map[string]any{"revision": csRef.Revision, "sha256": csRef.Hash},
 		Decisions: c.Decisions,
 	}
+	resumeInput := a.providerTypedInput(ctx, rt, model.PurposePlanning, session.Provider, finishInput)
+	if session.Provider == "claude" {
+		in, ok := resumeInput.(claude.Input)
+		if !ok {
+			return nil, "", model.InvariantFault(fmt.Errorf("claude discussion finish did not produce typed provider input"))
+		}
+		in.SchemaJSON = nativeDiscussionHandoffSchema
+		resumeInput = in
+	}
+	finishPrompt := renderPrompt(prompt.Body, finishInput) + "\n\n" +
+		"For this Finish turn, return only the JSON object required by the managed\n" +
+		"schema. Do not return Markdown, prose, or runtime-owned fields such as\n" +
+		"workflow_id, session_id, or change_set."
 	res, err := rt.Resume(ctx, agent.ResumeRequest{
 		ProviderSessionID: agent.ProviderSessionID(session.ProviderSessionID),
 		Purpose:           model.PurposePlanning,
 		Provider:          session.Provider,
-		Prompt:            renderPrompt(prompt.Body, finishInput),
-		Input:             finishInput,
+		Prompt:            finishPrompt,
+		Input:             resumeInput,
 		CWD:               cwd,
 	})
 	if err != nil {

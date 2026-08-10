@@ -39,6 +39,13 @@ func (r *recordingAdapter) Start(ctx context.Context, req agent.StartRequest) (a
 	return r.Adapter.Start(ctx, req)
 }
 
+func (r *recordingAdapter) Resume(ctx context.Context, req agent.ResumeRequest) (agent.Run, error) {
+	r.mu.Lock()
+	r.input = req.Input
+	r.mu.Unlock()
+	return r.Adapter.Resume(ctx, req)
+}
+
 // bootstrapScript is a planning fixture whose session_started establishes
 // the Provider's own session id; the managed bootstrap stops the start run
 // after the validated start event.
@@ -57,7 +64,11 @@ func bootstrapScriptDialect(dialect, sessionID string) string {
 // handoffResumeScript is a planning fixture whose resume ("ok") produces
 // the strict handoff content fields the managed structured resume returns.
 func handoffResumeScript(sessionID, contentJSON string) string {
-	return `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"cflow.dialect.fake.v1","purpose":"planning","session_id":"` + sessionID + `","exit_code":0,"resume":"ok"}
+	return handoffResumeScriptDialect("cflow.dialect.fake.v1", sessionID, contentJSON)
+}
+
+func handoffResumeScriptDialect(dialect, sessionID, contentJSON string) string {
+	return `{"fixture":"fake-run","script_version":1,"provider":"fake","dialect":"` + dialect + `","purpose":"planning","session_id":"` + sessionID + `","exit_code":0,"resume":"ok"}
 {"type":"session_started","session_id":"` + sessionID + `","at_ms":0}
 {"type":"assistant_message","session_id":"` + sessionID + `","text":"assembling the handoff","at_ms":10}
 {"type":"session_finished","session_id":"` + sessionID + `","result":` + contentJSON + `,"at_ms":20}`
@@ -163,6 +174,61 @@ func TestNativeDiscussionClaudeBootstrapUsesTypedInput(t *testing.T) {
 	rec.mu.Unlock()
 	if _, ok := gotInput.(claude.Input); !ok {
 		t.Fatalf("claude bootstrap input type = %T, want claude.Input", gotInput)
+	}
+}
+
+func TestNativeDiscussionClaudeFinishUsesHandoffSchema(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("native-claude-finish", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := agent.LoadProviderRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad := namedFake(reg, "claude")
+	if err := ad.LoadScript([]byte(handoffResumeScriptDialect("cflow.dialect.claude-stream-json.v1", "claude-sess-finish", validHandoffDecisions))); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingAdapter{Adapter: ad}
+	a := fx.appWithAdapters(map[string]agent.Adapter{"claude": rec})
+	out, err := a.Execute(context.Background(), PrepareNativeDiscussionCommand{
+		Workflow: wf,
+		Provider: "claude",
+	})
+	if err != nil {
+		t.Fatalf("prepare claude native discussion: %v", err)
+	}
+	_, err = a.Execute(context.Background(), NativeDiscussionReturnCommand{
+		Workflow:        wf,
+		Session:         out.SessionID,
+		Exit:            process.Exit{Code: 0, Fact: process.FactProcessExit},
+		Provider:        "claude",
+		ProviderSession: agent.ProviderSessionID("claude-sess-finish"),
+	})
+	if err != nil {
+		t.Fatalf("native discussion return: %v", err)
+	}
+	if _, err := a.Execute(context.Background(), FreezeDiscussionCommand{Workflow: wf, Session: out.SessionID}); err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	if _, err := a.Execute(context.Background(), FinishDiscussionCommand{
+		Workflow:  wf,
+		Session:   out.SessionID,
+		Decisions: []byte(validHandoffDecisions),
+	}); err != nil {
+		t.Fatalf("finish claude native discussion: %v", err)
+	}
+	rec.mu.Lock()
+	gotInput := rec.input
+	rec.mu.Unlock()
+	in, ok := gotInput.(claude.Input)
+	if !ok {
+		t.Fatalf("claude finish input type = %T, want claude.Input", gotInput)
+	}
+	if in.SchemaJSON != nativeDiscussionHandoffSchema {
+		t.Fatalf("claude finish schema = %s, want handoff schema", in.SchemaJSON)
 	}
 }
 
