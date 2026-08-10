@@ -982,6 +982,36 @@ func TestModelPlanApprovalMapsToTypedCommand(t *testing.T) {
 	}
 }
 
+// TestModelPlanCheckWaitsForFreshProjection prevents a stale Plan Approval
+// projection from issuing CheckPlan while the GeneratePlan reload is still
+// in flight.
+func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
+	rec := &recordingController{ctrl: &migrationController{}}
+	m := newModel(Dependencies{})
+	m.ctrl = rec
+	m.page = PagePlanApproval
+	m.selected = "wf-1"
+	m.plan = app.PlanView{
+		Workflow: "wf-1",
+		Stage:    model.StagePlanGeneration,
+		Runtime:  model.RuntimeRunning,
+	}
+
+	// The command has completed, but its asynchronous projection reload has
+	// not been applied yet: this is the timing shown in the user report.
+	_, _ = m.applyCommand(commandDoneMsg{cmd: app.GeneratePlanCommand{}})
+	m = press(t, m, 'k', 0)
+
+	for _, cmd := range rec.executed {
+		if _, ok := cmd.(app.CheckPlanCommand); ok {
+			t.Fatalf("stale projection issued CheckPlanCommand: %v", rec.executed)
+		}
+	}
+	if !strings.Contains(m.status, "wait") {
+		t.Fatalf("status = %q, want a wait message", m.status)
+	}
+}
+
 // TestModelExecutionApprovalMapsToTypedCommand: 's' generates the specs,
 // 'w' compiles the workflow, 'd' runs the dry run, and the explicit
 // confirmation issues ApproveExecutionCommand binding the exact preview

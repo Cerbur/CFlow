@@ -1213,6 +1213,14 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.status = "generating a plan revision…"
 		return m, m.executeCmd(app.GeneratePlanCommand{Workflow: m.selected, Provider: m.discussionProvider()})
 	case msg.Code == 'k' || msg.Code == 'K':
+		// GeneratePlan settles before the asynchronous page projection
+		// reload is applied. Refuse a stale check request locally instead
+		// of sending CheckPlan against the still-visible PLAN_GENERATION
+		// stage.
+		if m.plan.Stage != model.StagePlanCheck || m.plan.Revision < 1 || m.plan.Hash == "" {
+			m.status = "plan projection is still refreshing; wait for PLAN_CHECK"
+			return m, nil
+		}
 		m.status = "running the independent plan check…"
 		return m, m.executeCmd(app.CheckPlanCommand{Workflow: m.selected, Provider: m.discussionProvider()})
 	case msg.Code == tea.KeyEsc || IsQuit(msg):
