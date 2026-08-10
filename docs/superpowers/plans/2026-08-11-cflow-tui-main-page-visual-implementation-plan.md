@@ -75,10 +75,10 @@
 
 ## Verification Evidence
 
-- Targeted: `go test ./internal/tui -run 'Workspace|Responsive|Layout|Navigation' -count=1` — passed on the final working tree.
-- TUI package gate: `go test ./internal/tui -count=1` — passed after the review fixes.
-- Package gate: `go test ./internal/tui ./internal/cli ./cmd/cflow -count=1` — passed before the full-suite retry.
-- Full suite: `go test ./... -count=1` — currently blocked by the existing fake-provider `internal/tui/TestTUIPlanToApplyAndCleanup` timing path: the latest run timed out after 121.34s waiting for `plan approved`; a subsequent isolated retry timed out after 121.35s waiting for `workflow compiled`. The same isolated test also timed out on the pre-refresh parent commit (`f1c7ba6^`), so this is not introduced by the Workspace visual refresh.
-- Review: two independent re-reviews reported no Critical or Important findings and marked the current tree Ready.
+- Targeted: `go test ./internal/tui -run 'Workspace|Responsive|Layout|Navigation' -count=1` — passed on the current working tree.
+- TUI/package gate: `go test ./internal/tui ./internal/cli ./cmd/cflow -count=1` — passed on the current working tree.
+- Lifecycle synchronization: `go test ./internal/tui -run '^TestTUIPlanToApplyAndCleanup$' -count=3 -v` — three consecutive passes after the test-only synchronization change. The test waits for authoritative Spec Generation completion and uses a bounded compile retry instead of relying on a fragile diff-rendered status marker.
+- Full suite: `go test ./... -count=1` — passed; all packages completed successfully, including `internal/tui` and `tests/e2e`.
+- Review: two independent specification/code-quality re-reviews reported no Critical or Important findings and marked the visual refresh Ready. The follow-up synchronization diff is test-only, introduces no production semantic changes, and was self-audited against the passing lifecycle and full-suite gates.
 - Width/height coverage: `160×45`, `120×30`, `100×24`, `80×24`, `60×18`, plus small-height `88×6`, `100×6`, `120×6` and root status heights `1`, `2`, `3`.
-- Delivery commit: `feat: refresh workspace tui presentation` (amended with the final review fixes and this verification record). Final Git-visible clean state is verified by empty `git status --short` and `git status --porcelain` output.
+- Delivery commits: `bfde5c0` (`feat: refresh workspace tui presentation`) and `537123e` (`test: stabilize tui lifecycle synchronization`). Final Git-visible clean state is verified with empty `git status --short` and `git status --porcelain` output.

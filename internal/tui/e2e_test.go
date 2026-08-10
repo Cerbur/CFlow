@@ -182,15 +182,49 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitApp("plan checked", func() bool {
 		return planStatus(t, ref.a, wf) == model.PlanChecked
 	})
+	// The Application fact can settle before the asynchronous Plan Approval
+	// projection reload reaches the Bubble Tea model. Wait for the rendered
+	// checked revision before sending the approval key; otherwise the key can
+	// race the stale page model and be rejected as "no plan revision".
+	waitBuffer("checked plan rendered", func(s string) bool {
+		return strings.Contains(s, "CHECKED")
+	})
 	keys("y") // approve (explicit confirmation)
 	waitApp("plan approved", func() bool { return planStatus(t, ref.a, wf) == model.PlanApproved })
+	waitBuffer("plan approval rendered", func(s string) bool {
+		return strings.Contains(s, "APPROVED")
+	})
 
 	// ---- execution approval ----
 	keys(keyTab) // → execution approval
 	waitOutput("execution approval")
 	keys("s") // generate the specs
+	waitApp("spec session completed", func() bool {
+		return sessionCompletedForPurpose(t, ref.a, wf, model.PurposeSpecGeneration)
+	})
 	waitApp("specs generated", func() bool { return workflowStage(t, ref.a, wf) == model.StageWorkflowGeneration })
-	keys("w") // compile the workflow
+	// The authoritative spec facts can settle before Bubble Tea handles
+	// commandDoneMsg. Retry the bounded compile command until its own
+	// authoritative workflow hash is committed; this keeps the test from
+	// depending on the renderer's diff fragments as a command completion ack.
+	compileDeadline := time.Now().Add(120 * time.Second)
+	for {
+		keys("w") // compile the workflow
+		compiled := false
+		sub := time.Now().Add(5 * time.Second)
+		for !compiled && time.Now().Before(sub) {
+			compiled = executionPreview(t, ref.a, wf).WorkflowHash != ""
+			if !compiled {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		if compiled {
+			break
+		}
+		if time.Now().After(compileDeadline) {
+			t.Fatalf("workflow compilation never completed\n--- screen ---\n%s", screen.String())
+		}
+	}
 	// The dry run requires the compiled workflow: wait until the
 	// workflow hash is recorded in the execution facts (the partial
 	// preview query succeeds once the compile committed) before pressing
@@ -390,6 +424,21 @@ func sessionCompleted(t *testing.T, a *app.Application, wf model.WorkflowID) boo
 		return false
 	}
 	return sessions[len(sessions)-1].Status == model.SessionCompleted
+}
+
+func sessionCompletedForPurpose(t *testing.T, a *app.Application, wf model.WorkflowID, purpose model.AgentPurpose) bool {
+	t.Helper()
+	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	if err != nil {
+		return false
+	}
+	for i := len(view.(app.InspectView).Sessions) - 1; i >= 0; i-- {
+		session := view.(app.InspectView).Sessions[i]
+		if session.Purpose == purpose {
+			return session.Status == model.SessionCompleted
+		}
+	}
+	return false
 }
 
 func planRevision(t *testing.T, a *app.Application, wf model.WorkflowID) int {
