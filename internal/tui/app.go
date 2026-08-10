@@ -378,12 +378,7 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 			m.workspace = MapWorkspace(v)
 			m.selected = v.Selected
 			if m.provider == "" {
-				for _, p := range v.Health.Providers {
-					if p.Compatible {
-						m.provider = p.Name
-						break
-					}
-				}
+				m.provider = preferredProvider(v.Health.Providers)
 			}
 			if msg.page == PageExecution && m.workspace.Lifecycle != nil {
 				m.execution = m.execution.WithWorkflow(m.workspace.Lifecycle.ID)
@@ -884,7 +879,21 @@ func (m Model) createProvider() string {
 	if m.provider != "" {
 		return m.provider
 	}
-	for _, p := range m.workspace.Health.Providers {
+	return preferredProvider(m.workspace.Health.Providers)
+}
+
+// preferredProvider selects the default TUI route. Real providers take
+// precedence over the deterministic Fake adapter when one is configured and
+// healthy; Fake remains the fallback for local development and tests.
+func preferredProvider(providers []app.ProviderHealth) string {
+	for _, preferred := range []string{"claude", "codex"} {
+		for _, p := range providers {
+			if p.Name == preferred && p.Compatible {
+				return p.Name
+			}
+		}
+	}
+	for _, p := range providers {
 		if p.Compatible {
 			return p.Name
 		}

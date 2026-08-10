@@ -1733,6 +1733,26 @@ func TestModelReturnContinueLaunchesNativeExec(t *testing.T) {
 	}
 }
 
+func TestPreferredProviderUsesConfiguredClaudeBeforeFake(t *testing.T) {
+	got := preferredProvider([]app.ProviderHealth{
+		{Name: "claude", Compatible: true},
+		{Name: "fake", Compatible: true},
+	})
+	if got != "claude" {
+		t.Fatalf("preferredProvider = %q, want claude", got)
+	}
+}
+
+func TestPreferredProviderFallsBackToFake(t *testing.T) {
+	got := preferredProvider([]app.ProviderHealth{
+		{Name: "claude", Compatible: false},
+		{Name: "fake", Compatible: true},
+	})
+	if got != "fake" {
+		t.Fatalf("preferredProvider = %q, want fake", got)
+	}
+}
+
 // TestModelReturnSwitchLaunchesNativeExec proves the Switch Agent action also
 // launches the native bridge exec (the switched Session's interactive turn
 // must run in the terminal, exactly like the Prepare case).
