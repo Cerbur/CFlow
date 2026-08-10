@@ -531,6 +531,21 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		}
 		m.status = "native discussion prepared"
 		return m, m.reloadCmd()
+	case app.ContinueNativeDiscussionCommand:
+		if msg.out.Native != nil {
+			m.status = "continuing the native discussion terminal…"
+			return m, newNativeExecCmd(msg.out.Native)
+		}
+		// The outcome carried no Bridge request (a re-armed Session without
+		// recoverable binding facts): fall back to the plain projection reload
+		// instead of launching a terminal that would run no supervised process.
+		return m, m.reloadCmd()
+	case app.SwitchAgentCommand:
+		if msg.out.Native != nil {
+			m.status = "starting the switched native discussion terminal…"
+			return m, newNativeExecCmd(msg.out.Native)
+		}
+		return m, m.reloadCmd()
 	case app.FreezeDiscussionCommand:
 		if msg.out.ChangeSet != nil {
 			// The Runtime facts are fixed: the handoff editor opens

@@ -8,6 +8,7 @@ package tui
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1606,4 +1607,171 @@ func (fx *tuiFixture) approvePlan(ctx context.Context, a *app.Application, wf mo
 	pv := view.(app.PlanView)
 	_, err = a.Execute(ctx, app.ApprovePlanCommand{Workflow: wf, Revision: pv.Revision, Hash: pv.Hash})
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Return Page: Continue Same Session / Switch Agent launch the native bridge
+// ---------------------------------------------------------------------------
+
+// nativeReturnController is the Return Page seam: Execute returns an Outcome
+// that carries the managed Native Bridge request facts for the native
+// discussion commands, so applyCommand can launch the blocking-exec adapter.
+// With native=false the Outcome carries no Native request (the reload
+// fallback case).
+type nativeReturnController struct {
+	executed []app.Command
+	native   bool
+}
+
+func (c *nativeReturnController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	out := app.Outcome{Workflow: "wf-1"}
+	if c.native {
+		out.SessionID = "sess-1"
+		out.Native = &app.NativeBridgeRequest{
+			Workflow:        "wf-1",
+			Session:         "sess-1",
+			Provider:        "fake",
+			ProviderSession: "prov-sess-1",
+			Worktree:        "/cflow/projects/p/wf-1/workspace",
+		}
+	}
+	return out, nil
+}
+
+func (c *nativeReturnController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePending}},
+		Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePending}},
+		Health: app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{
+			{Name: "fake", Compatible: true},
+			{Name: "alt", Compatible: true},
+		}},
+	}, nil
+}
+
+func (*nativeReturnController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*nativeReturnController) EscalateStop() {}
+
+// returnPage builds the root Model on the native discussion Return Page
+// with the full action set (Continue is the default selection).
+func returnPage(t *testing.T, ctrl controller) Model {
+	t.Helper()
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m.selected = "wf-1"
+	m.page = PageDiscussion
+	m.discussion = DiscussionPage{
+		Loaded:   true,
+		Session:  "sess-1",
+		Provider: "fake",
+		Actions:  []DiscussionReturnAction{ReturnContinue, ReturnFinish, ReturnSwitch, ReturnPause, ReturnCancel},
+	}
+	return m
+}
+
+// activateReturnAction presses Enter on the current Return action and runs
+// the issued typed Application Command to its commandDoneMsg, then returns
+// the command applyCommand produced for that result — WITHOUT running it, so
+// the test can assert whether it is the native bridge exec or the reload.
+func activateReturnAction(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	upd, keyCmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = upd.(Model)
+	if keyCmd == nil {
+		t.Fatal("Enter on the Return page produced no command")
+	}
+	doneMsg := keyCmd()
+	done, ok := doneMsg.(commandDoneMsg)
+	if !ok {
+		t.Fatalf("Enter on the Return page produced %T, want commandDoneMsg", doneMsg)
+	}
+	m2, execCmd := m.Update(done)
+	return m2.(Model), execCmd
+}
+
+// isNativeExecMsg reports whether the command is the Bubble Tea blocking-exec
+// adapter of the Native Session Bridge: calling it yields the tea.execMsg the
+// Program consumes to suspend the renderer and attach the terminal streams.
+func isNativeExecMsg(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	msg := cmd()
+	typ := reflect.TypeOf(msg)
+	return typ != nil && typ.Name() == "execMsg"
+}
+
+// TestModelReturnContinueLaunchesNativeExec proves the Continue Same Session
+// action (the default-selected Return action) launches the native bridge
+// exec: after the controller's Execute carries the managed Native request,
+// applyCommand must produce the blocking-exec adapter (never a plain reload
+// that leaves the re-armed Session's RUNNING process phantom).
+func TestModelReturnContinueLaunchesNativeExec(t *testing.T) {
+	ctrl := &nativeReturnController{native: true}
+	m := returnPage(t, ctrl)
+	if len(m.discussion.Actions) == 0 || m.discussion.Actions[0] != ReturnContinue {
+		t.Fatalf("Continue is not the default Return action: %+v", m.discussion.Actions)
+	}
+	_, execCmd := activateReturnAction(t, m)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("Enter on Continue executed %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.ContinueNativeDiscussionCommand); !ok {
+		t.Fatalf("Continue command type = %T", ctrl.executed[0])
+	}
+	if !isNativeExecMsg(execCmd) {
+		t.Fatal("Continue did not launch the native bridge exec")
+	}
+}
+
+// TestModelReturnSwitchLaunchesNativeExec proves the Switch Agent action also
+// launches the native bridge exec (the switched Session's interactive turn
+// must run in the terminal, exactly like the Prepare case).
+func TestModelReturnSwitchLaunchesNativeExec(t *testing.T) {
+	ctrl := &nativeReturnController{native: true}
+	m := returnPage(t, ctrl)
+	m = press(t, m, tea.KeyDown, 0) // Finish
+	m = press(t, m, tea.KeyDown, 0) // Switch Agent
+	if m.discussion.Actions[m.discussion.Selected] != ReturnSwitch {
+		t.Fatalf("selected Return action = %v, want switch-agent", m.discussion.Actions[m.discussion.Selected])
+	}
+	_, execCmd := activateReturnAction(t, m)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("Enter on Switch executed %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.SwitchAgentCommand); !ok {
+		t.Fatalf("Switch command type = %T", ctrl.executed[0])
+	}
+	if !isNativeExecMsg(execCmd) {
+		t.Fatal("Switch did not launch the native bridge exec")
+	}
+}
+
+// TestModelReturnContinueWithoutNativeReloads guards the fallback: when the
+// command outcome carries no Native bridge request, applyCommand must fall
+// through to the plain projection reload — never launch an exec with a nil
+// request and never wedge the Session.
+func TestModelReturnContinueWithoutNativeReloads(t *testing.T) {
+	ctrl := &nativeReturnController{native: false}
+	m := returnPage(t, ctrl)
+	_, execCmd := activateReturnAction(t, m)
+	if execCmd == nil {
+		t.Fatal("Continue without a native request produced no reload")
+	}
+	if isNativeExecMsg(execCmd) {
+		t.Fatal("Continue without a native bridge request launched the exec")
+	}
+	msg := execCmd()
+	if _, ok := msg.(tea.BatchMsg); !ok {
+		t.Fatalf("Continue fallback produced %T, want the projection reload batch", msg)
+	}
 }

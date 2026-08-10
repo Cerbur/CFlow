@@ -246,32 +246,38 @@ func (a *Application) revalidateWorkspaceReturn(ctx context.Context, wf model.Wo
 	if err != nil {
 		return "", "", err
 	}
-	if wfacts, ok := reg.(gitflow.WorktreeFacts); ok {
-		match := false
-		for _, e := range wfacts.Entries {
-			if e.Path != cwd {
-				continue
-			}
-			if e.Branch == "" || e.Branch != a.workspaceBranch(ctx, wf) {
-				return "", "", model.NewFault(model.CodeEvidenceSubjectChanged,
-					"the workspace branch drifted from the recorded binding")
-			}
-			match = true
+	wfacts, ok := reg.(gitflow.WorktreeFacts)
+	if !ok {
+		return "", "", model.InvariantFault(fmt.Errorf("worktree registry observation has an unexpected type"))
+	}
+	match := false
+	for _, e := range wfacts.Entries {
+		if e.Path != cwd {
+			continue
 		}
-		if !match {
+		if e.Branch == "" || e.Branch != a.workspaceBranch(ctx, wf) {
 			return "", "", model.NewFault(model.CodeEvidenceSubjectChanged,
-				"the workspace is not registered as a worktree")
+				"the workspace branch drifted from the recorded binding")
 		}
+		match = true
+	}
+	if !match {
+		return "", "", model.NewFault(model.CodeEvidenceSubjectChanged,
+			"the workspace is not registered as a worktree")
 	}
 	// An unfinished Git operation (merge/rebase/... or an admin lock) makes
 	// the return facts unsafe; fail closed.
-	if facts, err := a.git.Observe(ctx, gitflow.WorktreeInProgress{Path: cwd}); err == nil {
-		if p, ok := facts.(gitflow.WorktreeInProgressFacts); ok && (p.InProgress || p.Locked) {
-			return "", "", model.NewFault(model.CodeDirtyWorktreeDrifted,
-				"the workspace carries an in-progress git operation: "+p.Reason)
-		}
-	} else {
+	facts, err := a.git.Observe(ctx, gitflow.WorktreeInProgress{Path: cwd})
+	if err != nil {
 		return "", "", err
+	}
+	p, ok := facts.(gitflow.WorktreeInProgressFacts)
+	if !ok {
+		return "", "", model.InvariantFault(fmt.Errorf("worktree in-progress observation has an unexpected type"))
+	}
+	if p.InProgress || p.Locked {
+		return "", "", model.NewFault(model.CodeDirtyWorktreeDrifted,
+			"the workspace carries an in-progress git operation: "+p.Reason)
 	}
 	return status.Head, status.Dirty.Combined, nil
 }

@@ -604,7 +604,10 @@ type BackupFileEvidence struct {
 // BackupLayoutMigration creates a consistent, owner-only SQLite snapshot
 // before a layout migration intent is committed. It never overwrites an
 // existing path; an existing retry target must already be a valid SQLite
-// backup or Prepare blocks.
+// backup or Prepare blocks. A stale 0-byte file (a failed attempt that
+// created the guarded scratch file but never completed the online backup)
+// holds no database pages, so the retry self-heals by regenerating the
+// backup; a non-empty file that fails verification still fails closed.
 func (s *Store) BackupLayoutMigration(ctx context.Context, path string) (BackupFileEvidence, error) {
 	if path == "" {
 		return BackupFileEvidence{}, model.InvalidInputFault("layout migration backup path is required")
@@ -613,44 +616,32 @@ func (s *Store) BackupLayoutMigration(ctx context.Context, path string) (BackupF
 		if !os.IsNotExist(err) {
 			return BackupFileEvidence{}, err
 		}
-		f, err := security.CreateSensitiveFile(path)
-		if err != nil {
-			return BackupFileEvidence{}, err
-		}
-		if err := f.Close(); err != nil {
-			return BackupFileEvidence{}, err
-		}
-		conn, err := s.db.Conn(ctx)
-		if err != nil {
-			return BackupFileEvidence{}, err
-		}
-		err = conn.Raw(func(driverConn any) error {
-			backuper, ok := driverConn.(interface {
-				NewBackup(string) (*sqlite.Backup, error)
-			})
-			if !ok {
-				return fmt.Errorf("sqlite connection does not support online backup")
-			}
-			backup, err := backuper.NewBackup(path)
-			if err != nil {
-				return err
-			}
-			if _, err := backup.Step(-1); err != nil {
-				_ = backup.Finish()
-				return err
-			}
-			return backup.Finish()
-		})
-		_ = conn.Close()
-		if err != nil {
-			return BackupFileEvidence{}, fmt.Errorf("create layout migration backup: %w", err)
-		}
-		if err := syncFileAndParent(path); err != nil {
+		if err := s.createLayoutMigrationBackup(ctx, path); err != nil {
 			return BackupFileEvidence{}, err
 		}
 	} else {
-		if _, err := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); err != nil {
+		info, err := os.Lstat(path)
+		if err != nil {
 			return BackupFileEvidence{}, err
+		}
+		if info.Mode().IsRegular() && info.Size() == 0 {
+			// A stale failed attempt: CFlow created the owner-only scratch
+			// file but the online backup never streamed any pages. A 0-byte
+			// file passes PRAGMA integrity_check as an empty database and
+			// would otherwise record Size 0 evidence that readMigrationManifest
+			// rejects — permanently wedging the migration retry. Remove the
+			// incomplete scratch (it carries no data) and regenerate through
+			// the guarded create+online-backup path.
+			if err := os.Remove(path); err != nil {
+				return BackupFileEvidence{}, fmt.Errorf("remove stale layout migration backup: %w", err)
+			}
+			if err := s.createLayoutMigrationBackup(ctx, path); err != nil {
+				return BackupFileEvidence{}, err
+			}
+		} else {
+			if _, err := security.CheckPath(security.PathRequest{Path: path, Kind: security.KindFile}); err != nil {
+				return BackupFileEvidence{}, err
+			}
 		}
 	}
 	backup, err := sql.Open("sqlite", fileDSN(path, true, s.busyTimeout))
@@ -673,6 +664,60 @@ func (s *Store) BackupLayoutMigration(ctx context.Context, path string) (BackupF
 	}
 	sum := sha256.Sum256(body)
 	return BackupFileEvidence{Path: path, SHA256: fmt.Sprintf("%x", sum[:]), Size: info.Size()}, nil
+}
+
+// createLayoutMigrationBackup performs the guarded create+online-backup of
+// the consistent SQLite snapshot: the owner-only target is created first and
+// the online backup streams the live database into it. A failure leaves a
+// 0-byte scratch file behind; the next Prepare self-heals it.
+func (s *Store) createLayoutMigrationBackup(ctx context.Context, path string) error {
+	f, err := security.CreateSensitiveFile(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	err = conn.Raw(func(driverConn any) error {
+		backuper, ok := driverConn.(interface {
+			NewBackup(string) (*sqlite.Backup, error)
+		})
+		if !ok {
+			return fmt.Errorf("sqlite connection does not support online backup")
+		}
+		backup, err := backuper.NewBackup(path)
+		if err != nil {
+			return err
+		}
+		if _, err := backup.Step(-1); err != nil {
+			_ = backup.Finish()
+			return err
+		}
+		return backup.Finish()
+	})
+	_ = conn.Close()
+	if err != nil {
+		return fmt.Errorf("create layout migration backup: %w", err)
+	}
+	// The destination connection opened by modernc's online-backup API may
+	// leave copied pages in its journal until the connection is closed. Close
+	// that journal before recording durable file evidence.
+	dst, err := sql.Open("sqlite", fileDSN(path, false, s.busyTimeout))
+	if err != nil {
+		return fmt.Errorf("open completed layout migration backup: %w", err)
+	}
+	if _, err := dst.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		_ = dst.Close()
+		return fmt.Errorf("checkpoint layout migration backup: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("close layout migration backup: %w", err)
+	}
+	return syncFileAndParent(path)
 }
 
 func syncFileAndParent(path string) error {

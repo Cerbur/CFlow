@@ -220,6 +220,65 @@ func TestLegacyMigrationPrepareIsIdempotentOnRetry(t *testing.T) {
 	}
 }
 
+// TestPrepareSelfHealsStaleZeroByteBackup proves a failed online backup
+// cannot wedge the migration retry: BackupLayoutMigration creates the
+// owner-only target before the online backup, so a failure leaves a 0-byte
+// file that passes PRAGMA integrity_check (an empty database) and would
+// record Size 0 evidence that readMigrationManifest rejects — permanently
+// blocking Preview/Execute/Recovery. The next Prepare must remove the stale
+// 0-byte scratch and regenerate a real backup (Size > 0, valid manifest).
+func TestPrepareSelfHealsStaleZeroByteBackup(t *testing.T) {
+	lf := newLegacyMigrationFixture(t)
+	ctx := context.Background()
+	a := lf.app()
+	qv, err := a.Query(ctx, LayoutMigrationPreviewQuery{Workflow: lf.wf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := qv.(MigrationPreviewView)
+	id := migrationID(lf.wf, pv.ManifestHash)
+	backupPath := filepath.Join(a.layout.StateDir(lf.wf), "layout-migrations", id+".db.backup")
+	if err := os.MkdirAll(filepath.Dir(backupPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A failed attempt left the 0-byte backup scratch file.
+	if err := os.WriteFile(backupPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The next Prepare must self-heal: it succeeds and persists a manifest
+	// whose backup evidence is complete and valid.
+	if _, err := a.Execute(ctx, PrepareLayoutMigrationCommand{Workflow: lf.wf, ManifestHash: pv.ManifestHash}); err != nil {
+		t.Fatalf("prepare after a stale 0-byte backup: %v", err)
+	}
+	db, err := openRawDB(t, filepath.Join(lf.fx.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var manifestPath, manifestHash string
+	if err := db.QueryRow(`SELECT manifest_path, manifest_sha256
+		FROM layout_migrations WHERE workflow_id = ?`, string(lf.wf)).Scan(&manifestPath, &manifestHash); err != nil {
+		t.Fatalf("migration row: %v", err)
+	}
+	manifest, err := readMigrationManifest(manifestPath, manifestHash)
+	if err != nil {
+		t.Fatalf("recorded migration manifest is invalid: %v", err)
+	}
+	if manifest.Backup.Size <= 0 {
+		t.Fatalf("recorded backup size = %d, want > 0", manifest.Backup.Size)
+	}
+	if manifest.Backup.Path != backupPath {
+		t.Fatalf("recorded backup path = %q, want %q", manifest.Backup.Path, backupPath)
+	}
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != manifest.Backup.Size {
+		t.Fatalf("backup file size = %d, manifest = %d", info.Size(), manifest.Backup.Size)
+	}
+}
+
 func TestLegacyMigrationExecuteBlocksOutOfOrderBeforeAnyMove(t *testing.T) {
 	lf := newLegacyMigrationFixture(t)
 	ctx := context.Background()

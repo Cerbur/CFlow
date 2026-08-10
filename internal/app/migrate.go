@@ -74,8 +74,12 @@ func (a *Application) migrationPreview(ctx context.Context, wf model.WorkflowID,
 	if err != nil {
 		return layout.MigrationPreview{}, err
 	}
+	worktreeFacts, ok := registryFacts.(gitflow.WorktreeFacts)
+	if !ok {
+		return layout.MigrationPreview{}, model.InvariantFault(fmt.Errorf("worktree registry observation has an unexpected type"))
+	}
 	registry := map[string]gitflow.WorktreeEntry{}
-	for _, entry := range registryFacts.(gitflow.WorktreeFacts).Entries {
+	for _, entry := range worktreeFacts.Entries {
 		registry[filepath.Clean(entry.Path)] = entry
 	}
 	for _, name := range names {
