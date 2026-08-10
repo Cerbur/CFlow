@@ -785,6 +785,75 @@ func TestHistoryRange(t *testing.T) {
 	}
 }
 
+func TestAncestryCheck(t *testing.T) {
+	repo := newCommittedRepo(t)
+	first := strings.TrimSpace(string(repo.git("rev-parse", "HEAD")))
+	repo.write("a.txt", "a")
+	repo.git("add", "a.txt")
+	repo.git("commit", "-q", "-m", "second")
+	second := strings.TrimSpace(string(repo.git("rev-parse", "HEAD")))
+
+	// first is an ancestor of second.
+	facts, err := repo.flow().Observe(context.Background(), gitflow.AncestryCheck{Ancestor: first, Descendant: second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	af := facts.(gitflow.AncestryFacts)
+	if !af.AncestorOf {
+		t.Fatalf("ancestry %s..%s reported not-ancestor, want ancestor", first, second)
+	}
+
+	// second is NOT an ancestor of first (a past head is never a descendant).
+	facts, err = repo.flow().Observe(context.Background(), gitflow.AncestryCheck{Ancestor: second, Descendant: first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	af = facts.(gitflow.AncestryFacts)
+	if af.AncestorOf {
+		t.Fatalf("ancestry %s..%s reported ancestor, want not-ancestor", second, first)
+	}
+
+	// An unrelated side commit is not an ancestor.
+	repo.git("checkout", "-q", "-b", "side", first)
+	repo.write("side.txt", "s")
+	repo.git("add", "side.txt")
+	repo.git("commit", "-q", "-m", "side")
+	side := strings.TrimSpace(string(repo.git("rev-parse", "HEAD")))
+	facts, err = repo.flow().Observe(context.Background(), gitflow.AncestryCheck{Ancestor: side, Descendant: second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	af = facts.(gitflow.AncestryFacts)
+	if af.AncestorOf {
+		t.Fatalf("unrelated ancestry %s..%s reported ancestor, want not-ancestor", side, second)
+	}
+}
+
+func TestBranchInspect(t *testing.T) {
+	repo := newCommittedRepo(t)
+	head := strings.TrimSpace(string(repo.git("rev-parse", "HEAD")))
+	facts, err := repo.flow().Observe(context.Background(), gitflow.BranchInspect{Dir: repo.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bf := facts.(gitflow.BranchFacts)
+	if bf.Branch != "main" || bf.Head != head || bf.Detached || !bf.Exists {
+		t.Fatalf("branch facts = %+v, want attached main at %s", bf, head)
+	}
+
+	// A detached worktree reports no branch.
+	wt := repo.WtPath("detached")
+	repo.git("worktree", "add", "--detach", wt, head)
+	facts, err = repo.flow().Observe(context.Background(), gitflow.BranchInspect{Dir: wt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bf = facts.(gitflow.BranchFacts)
+	if bf.Branch != "" || !bf.Detached || bf.Head != head {
+		t.Fatalf("detached branch facts = %+v, want detached at %s", bf, head)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Argv discipline
 // ---------------------------------------------------------------------------

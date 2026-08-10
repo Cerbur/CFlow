@@ -64,8 +64,6 @@ func TestLegacyPreviewIsReadOnly(t *testing.T) {
 			filepath.Join(home, "projects", key, string(wf), "tmp", "tasks", "task-s01")},
 		{MoveKindWorktree, filepath.Join(home, "worktrees", key, string(wf), "tasks", "task-s02"),
 			filepath.Join(home, "projects", key, string(wf), "tmp", "tasks", "task-s02")},
-		{MoveKindArtifact, filepath.Join(home, "projects", key, "workflows", string(wf), "artifacts"),
-			filepath.Join(home, "projects", key, string(wf), "artifacts")},
 		{MoveKindArtifact, filepath.Join(home, "projects", key, "workflows", string(wf), "workflow.yaml"),
 			filepath.Join(home, "projects", key, string(wf), "workflow.yaml")},
 	}

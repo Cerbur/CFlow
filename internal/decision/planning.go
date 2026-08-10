@@ -94,6 +94,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 			if state.Workflow.Stage == model.StageExecution {
 				return decideImplementationRunEnded(state, in, created)
 			}
+		case model.PurposeAdoption:
+			// A settled managed adoption/coding Session (Task 4, design 8.4
+			// step 2): the adoption evidence (a new Commit, a clean
+			// Workspace, the candidate HEAD advanced) is judged inside the
+			// Workspace Adoption Gate, never from a claim.
+			if state.Workflow.Stage == model.StageExecution {
+				return decideAdoptionCodingRunEnded(state, in, created)
+			}
 		case model.PurposeReview:
 			// The independent Reviewer Session's verdict is evidence; the
 			// Kernel judges it (design 16.2: review never replaces
@@ -147,6 +155,14 @@ func decideProviderRunEnded(state model.State, in model.EffectResultInput) (mode
 	case model.PurposeImplementation, model.PurposeReview, model.PurposeRepair:
 		if state.Workflow.Stage == model.StageExecution {
 			return settleExecutionSessionFailure(state, in, created, code)
+		}
+	case model.PurposeAdoption:
+		// A failed or cancelled managed adoption/coding Session (Task 4,
+		// design 8.4 step 7): the adoption evidence is absent, so the
+		// adoption gate Blocks the Workflow and preserves the Workspace,
+		// the Change Set, and the Target Branch.
+		if state.Workflow.Stage == model.StageExecution {
+			return decideAdoptionCodingRunEnded(state, in, created)
 		}
 	case model.PurposeFinalVerification:
 		// A failed or cancelled Final Reviewer Session settles its
@@ -265,6 +281,36 @@ func appendFallbackSuccessor(b *builder, state model.State, created *model.Sessi
 	}
 	b.mutate(model.SessionAppendMutation{Session: s, Provider: s.Provider})
 	return nil
+}
+
+// decideNativeBootstrapEstablished binds the Provider's OWN session
+// identity the managed discussion bootstrap established on the exact
+// CFlow Session (design §9.1, TUI task 12). It fails closed when the
+// Provider returned no session id or the binding drifts, and it never
+// accepts a CFlow Session id as the Provider identity.
+func decideNativeBootstrapEstablished(state model.State, in model.EffectResultInput) (model.Decision, error) {
+	if in.Session.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("the bootstrap result carries no session")
+	}
+	session := findSessionState(state, in.Session.ID)
+	if session == nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("bootstrap result references unknown session %s", in.Session.ID))
+	}
+	if session.Status != model.SessionStarting {
+		return model.Decision{}, model.InvalidInputFault("the bootstrap result arrived after the session left STARTING")
+	}
+	if in.Session.ProviderSessionID == "" {
+		return model.Decision{}, model.NewFault(model.CodeProviderSessionIDMissing,
+			"the provider bootstrap returned no session id")
+	}
+	if in.Session.ProviderSessionID == string(in.Session.ID) {
+		return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"the provider session id must never be the CFlow session id")
+	}
+	b := &builder{state: state}
+	b.mutate(model.SessionBindMutation{ID: session.ID, ProviderSessionID: in.Session.ProviderSessionID})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion bootstrap bound the provider session")
+	return b.decision(), nil
 }
 
 // decideDiscussionTurnResult validates the CFlow-assembled turn body and

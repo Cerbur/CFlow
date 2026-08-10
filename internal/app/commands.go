@@ -249,6 +249,7 @@ type StatusView struct {
 	Workflow          model.WorkflowID
 	Stage             model.WorkflowStage
 	Runtime           model.RuntimeStatus
+	LayoutVersion     int
 	TargetBranch      string
 	BaseCommit        string
 	IntegrationBranch string
@@ -316,11 +317,21 @@ type ChangeSetView struct {
 // the exact ordered moves and the canonical manifest hash the Prepare
 // binds (TUI task 8, design §7.4).
 type MigrationPreviewView struct {
-	Workflow     model.WorkflowID
-	From         int
-	To           int
-	Moves        []model.PathMove
-	ManifestHash string
+	Workflow                model.WorkflowID
+	From                    int
+	To                      int
+	Moves                   []model.PathMove
+	ManifestHash            string
+	MigrationID             string
+	Status                  string
+	ManifestPath            string
+	BackupPath              string
+	BackupHash              string
+	BackupSize              int64
+	SourceSnapshotHash      string
+	ExpectedWorkspacePath   string
+	ExpectedWorkspaceBranch string
+	ExpectedWorkspaceHead   string
 }
 
 // DiscussionReturnView is the native discussion Return Page projection
@@ -332,6 +343,18 @@ type DiscussionReturnView struct {
 	Session model.SessionID
 	// Provider is the approved Provider of the bound Session.
 	Provider string
+	// ProviderSession is the Provider's own session identity the
+	// interactive resume targets ("" before the bootstrap bound one).
+	ProviderSession agent.ProviderSessionID
+	// SessionStatus is the bound Session's status; the Return actions are
+	// legal only per the revalidated facts (a resumable
+	// STARTING/INTERACTIVE_IDLE Session offers the return actions).
+	SessionStatus model.SessionStatus
+	// ExitCode is the last native turn's observed process exit code
+	// (-1 when no turn has returned yet).
+	ExitCode int
+	// WorkspaceHead is the revalidated Workspace HEAD of the last return.
+	WorkspaceHead string
 	// ChangeSet is the frozen Change Set Ref ("" until the first
 	// freeze).
 	ChangeSet *model.ArtifactRef
@@ -495,6 +518,7 @@ type InspectView struct {
 	Attempts        []model.Attempt
 	Approvals       []model.Approval
 	Sessions        []model.Session
+	Processes       []model.ProcessRecord
 	Runs            []model.Run
 	Quarantines     []model.Quarantine
 	ApplyAttempts   []model.ApplyAttempt
@@ -701,11 +725,52 @@ type AdoptWorkspaceCommand struct {
 // PrepareNativeDiscussionCommand establishes the exact CFlow Session of
 // one native interactive requirement discussion (design §9.1, TUI task
 // 12): it validates the workflow and the approved Provider route,
-// allocates the fresh Session identity, and returns the Provider
+// allocates the fresh Session identity, runs the managed bootstrap that
+// captures the Provider's own session id, and returns the Provider
 // binding facts the TUI's blocking exec callback passes to the Bridge.
 type PrepareNativeDiscussionCommand struct {
 	Workflow model.WorkflowID
 	Provider string
+}
+
+// ContinueNativeDiscussionCommand resumes the exact native discussion
+// Session (design §9.2, TUI task 12): the Bridge runs another interactive
+// turn on the SAME Provider Session and SAME provider binding — never a
+// new CFlow Session and never a new provider identity. A resume of a lost
+// or foreign Session fails closed.
+type ContinueNativeDiscussionCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
+}
+
+// SwitchAgentCommand switches one native discussion to a DIFFERENT
+// provider (design §9.4, TUI task 12): a NEW CFlow Session is created, its
+// Provider Session is established by a fresh managed start, an immutable
+// Context Bundle is injected, and the switch reason plus the superseded
+// Session linkage are persisted. A switch to the same provider fails
+// closed.
+type SwitchAgentCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
+	Provider string
+	Reason   string
+}
+
+// NativeDiscussionReturnCommand persists the return facts of one native
+// interactive turn (design §9.2, TUI task 12): the Application
+// revalidates the Session binding and the Workspace facts, the Kernel
+// persists the observed process exit facts and moves the Session to
+// INTERACTIVE_IDLE. A non-zero exit is NOT a discussion failure by itself.
+// Provider and ProviderSession echo the binding the Bridge ran on so the
+// Application revalidates it against the recorded facts.
+type NativeDiscussionReturnCommand struct {
+	Workflow model.WorkflowID
+	Session  model.SessionID
+	Exit     process.Exit
+	Provider string
+	// ProviderSession is the Provider's session identity the Bridge
+	// resumed (echoed from the managed request for revalidation).
+	ProviderSession agent.ProviderSessionID
 }
 
 // DiscussionReturnQuery projects the native discussion Return Page: the
@@ -718,17 +783,19 @@ type DiscussionReturnQuery struct {
 func (DiscussionReturnQuery) isQuery() {}
 
 // FinishDiscussionCommand finishes one native requirement discussion
-// (design §9.2, TUI task 12): it freezes the current Change Set if none
-// exists yet, then writes the immutable ArtifactDiscussionHandoff
-// carrying the strict targets/constraints/non-goals/acceptance/open
-// questions, the Change Set Ref, and the user's decisions. The handoff
-// is the only input Plan generation consumes from the discussion.
+// (design §9.2, TUI task 12): the Application freezes the Change Set if
+// none exists yet and drives a managed structured resume on the SAME
+// Provider session that produces the immutable ArtifactDiscussionHandoff
+// from the frozen Change Set, the session facts, and the user's Decisions
+// (never a caller-supplied hand-written body). The handoff is the only
+// input Plan generation consumes from the discussion.
 type FinishDiscussionCommand struct {
 	Workflow model.WorkflowID
 	Session  model.SessionID
-	// Handoff is the strict structured handoff body (canonical JSON
-	// validated against discussion-handoff.json).
-	Handoff []byte
+	// Decisions are the user's discussion decisions/content fields (the
+	// handoff content the user typed). The strict structured handoff body
+	// is produced by the managed resume, not assembled by the caller.
+	Decisions []byte
 }
 
 // LayoutMigrationPreviewQuery projects the read-only Legacy Layout
@@ -887,7 +954,10 @@ func (AdoptWorkspaceCommand) isCommand()          {}
 func (PrepareLayoutMigrationCommand) isCommand()  {}
 func (ExecuteLayoutMigrationCommand) isCommand()  {}
 func (PrepareNativeDiscussionCommand) isCommand() {}
-func (FinishDiscussionCommand) isCommand()        {}
+func (ContinueNativeDiscussionCommand) isCommand() {}
+func (SwitchAgentCommand) isCommand()              {}
+func (NativeDiscussionReturnCommand) isCommand()   {}
+func (FinishDiscussionCommand) isCommand()         {}
 func (ReconcileCommand) isCommand()               {}
 func (CommitPolicyConfirmCommand) isCommand()     {}
 func (ReplacementPreviewCommand) isCommand()      {}

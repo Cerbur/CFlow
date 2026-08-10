@@ -103,6 +103,29 @@ type SessionEndMutation struct {
 
 func (SessionEndMutation) isMutation() {}
 
+// SessionBindMutation records the Provider's own session identity on one
+// established CFlow Session without changing its status (design §9.1, TUI
+// task 12): the managed discussion bootstrap binds the Provider session id
+// the validated session_started event established, never a CFlow Session
+// id.
+type SessionBindMutation struct {
+	ID                SessionID
+	ProviderSessionID string
+}
+
+func (SessionBindMutation) isMutation() {}
+
+// SessionStatusMutation moves one Session to a non-terminal status without
+// touching its Provider Session identity or its end timestamp (design
+// §9.2, TUI task 12): the native discussion return moves the Session to
+// INTERACTIVE_IDLE while the binding stays exact.
+type SessionStatusMutation struct {
+	ID     SessionID
+	Status SessionStatus
+}
+
+func (SessionStatusMutation) isMutation() {}
+
 // NodeStatusMutation sets one Node's authoritative status and retry
 // charge. Terminal Nodes are never resurrected.
 type NodeStatusMutation struct {

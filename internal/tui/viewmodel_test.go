@@ -5,6 +5,7 @@ package tui
 // actions, lifecycle, and health — without ever calling Execute.
 
 import (
+	"strings"
 	"testing"
 
 	"cflow.local/cflow/internal/app"
@@ -42,7 +43,9 @@ func TestMapWorkspace(t *testing.T) {
 }
 
 // TestMapWorkspaceSelectsFirstWhenEmpty: no explicit selection resolves
-// to the first workflow.
+// to the first workflow. Row actions are NEVER inferred from the runtime
+// status: without a Runtime LegalActions projection no row carries an
+// action (Task 5: the TUI does not re-derive the state machine).
 func TestMapWorkspaceSelectsFirstWhenEmpty(t *testing.T) {
 	vm := MapWorkspace(app.WorkspaceView{
 		Workflows: []app.WorkflowSummary{
@@ -50,11 +53,59 @@ func TestMapWorkspaceSelectsFirstWhenEmpty(t *testing.T) {
 			{ID: "wf-2", Runtime: model.RuntimeBlocked},
 		},
 	})
-	if vm.Selected.ID != "wf-1" || vm.Selected.Action != ActionPause {
+	if vm.Selected.ID != "wf-1" {
 		t.Fatalf("selected = %+v", vm.Selected)
 	}
-	if vm.Workflows[1].Action != ActionInspect {
-		t.Fatalf("blocked row action = %s, want inspect", vm.Workflows[1].Action)
+	if vm.Selected.Action != ActionNone {
+		t.Fatalf("running row action = %s, want none (no LegalActions projection)", vm.Selected.Action)
+	}
+	if vm.Workflows[1].Action != ActionNone {
+		t.Fatalf("blocked row action = %s, want none (no LegalActions projection)", vm.Workflows[1].Action)
+	}
+}
+
+// TestMapWorkspaceBlockedWithoutResume: a blocked workflow whose Runtime
+// LegalActions contain NO Resume maps to no resume action, no resume key
+// hint, and no resume text on the blocked page.
+func TestMapWorkspaceBlockedWithoutResume(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeBlocked}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status:  app.StatusView{Workflow: "wf-1", Runtime: model.RuntimeBlocked},
+			Blocked: true,
+		},
+		LegalActions: []app.LegalAction{{Label: "Inspect", Hint: "blocked"}},
+	})
+	if hasAction(vm.Actions, ActionResume) {
+		t.Fatalf("blocked workflow without a resume legal action offered one: %v", vm.Actions)
+	}
+	if got := blockedHints(vm); strings.Contains(got, "r resume") {
+		t.Fatalf("blocked hints hard-code resume: %q", got)
+	}
+	if got := RenderBlocked(vm); strings.Contains(got, "resume") {
+		t.Fatalf("blocked render mentions resume: %q", got)
+	}
+}
+
+// TestMapWorkspaceKeepsRuntimeResumeAction: when the Runtime LegalActions
+// DO contain Resume the view model keeps the resume action verbatim (the
+// TUI renders whatever the authoritative Runtime provides).
+func TestMapWorkspaceKeepsRuntimeResumeAction(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeBlocked}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status:  app.StatusView{Workflow: "wf-1", Runtime: model.RuntimeBlocked},
+			Blocked: true,
+		},
+		LegalActions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+	})
+	if !hasAction(vm.Actions, ActionResume) {
+		t.Fatalf("the runtime resume legal action was dropped: %v", vm.Actions)
+	}
+	if got := blockedHints(vm); !strings.Contains(got, "r resume") {
+		t.Fatalf("a runtime resume legal action must keep the resume hint: %q", got)
 	}
 }
 
@@ -71,7 +122,7 @@ func TestMapWorkspaceEmptyWorkspace(t *testing.T) {
 // through unchanged.
 func TestMapWorkspaceLifecycleAndHealth(t *testing.T) {
 	vm := MapWorkspace(app.WorkspaceView{
-		Selected: "wf-1",
+		Selected:  "wf-1",
 		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeSucceeded}},
 		Lifecycle: &app.WorkflowLifecycleView{
 			Status: app.StatusView{

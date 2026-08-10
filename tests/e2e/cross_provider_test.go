@@ -487,8 +487,8 @@ func (fx *e2eFixture) realCrossProviderApp(t *testing.T) *app.Application {
 // never fall back to Fake adapters under the provider names).
 func (fx *e2eFixture) requireRealRoutingEvidence(t *testing.T, wf model.WorkflowID) {
 	t.Helper()
-	root := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, "workflows", string(wf), "artifacts")
-	store, err := artifact.New(root, security.Registry{})
+	root := filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, string(wf))
+	store, err := artifact.NewWorkflow(root, wf, security.Registry{})
 	if err != nil {
 		t.Fatalf("artifact store: %v", err)
 	}
@@ -603,7 +603,7 @@ func TestRealCrossProvider(t *testing.T) {
 		if binarySHA == "" || sourceCommit == "" {
 			t.Fatalf("CFLOW_REAL_E2E_EVIDENCE requires CFLOW_REAL_E2E_BINARY_SHA256 and CFLOW_REAL_E2E_SOURCE_COMMIT")
 		}
-		store, err := artifact.New(filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, "workflows", string(wf), "artifacts"), security.Registry{})
+		store, err := artifact.NewWorkflow(filepath.Join(fx.home, "projects", app.ProjectFor(fx.repo).Key, string(wf)), wf, security.Registry{})
 		if err != nil {
 			t.Fatalf("report artifact store: %v", err)
 		}

@@ -46,7 +46,10 @@ func (a *Application) executeFreeze(ctx context.Context, st *store.Store, wf mod
 	if base == "" {
 		return Outcome{}, model.InvariantFault(fmt.Errorf("the workflow has no recorded base commit"))
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return Outcome{}, err
+	}
 	status, err := a.observeChangeSetStatus(ctx, cwd)
 	if err != nil {
 		return Outcome{}, err

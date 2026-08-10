@@ -12,6 +12,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 
 	"cflow.local/cflow/internal/artifact"
@@ -54,7 +55,10 @@ func (a *Application) prepareApply(ctx context.Context, wf model.WorkflowID) (mo
 	if err != nil {
 		return nil, "", err
 	}
-	deliveryBranch, deliveryHead, _ := a.deliveryFacts(ctx, resolved, st)
+	deliveryBranch, deliveryHead, _, err := a.deliveryFacts(ctx, resolved, st)
+	if err != nil {
+		return nil, "", err
+	}
 	if deliveryBranch == "" || deliveryHead == "" {
 		return nil, "", model.InvalidInputFault("apply requires the recorded delivery branch and head")
 	}
@@ -78,7 +82,11 @@ func (a *Application) prepareApply(ctx context.Context, wf model.WorkflowID) (mo
 	reviewProcess := model.ProcessID(a.ids(model.IDProcess))
 	var resolutionSession model.SessionID
 	var resolutionProcess model.ProcessID
-	if a.applyResolutionNeeded(ctx, resolved, st) {
+	resolutionNeeded, err := a.applyResolutionNeeded(ctx, resolved, st)
+	if err != nil {
+		return nil, "", err
+	}
+	if resolutionNeeded {
 		resolutionSession = model.SessionID(a.ids(model.IDSession))
 		resolutionProcess = model.ProcessID(a.ids(model.IDProcess))
 	}
@@ -125,7 +133,10 @@ func (a *Application) prepareApplyExecute(ctx context.Context, wf model.Workflow
 	if err != nil {
 		return nil, "", err
 	}
-	deliveryBranch, deliveryHead, _ := a.deliveryFacts(ctx, resolved, st)
+	deliveryBranch, deliveryHead, _, err := a.deliveryFacts(ctx, resolved, st)
+	if err != nil {
+		return nil, "", err
+	}
 	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+deliveryBranch)
 	if err != nil {
 		return nil, "", err
@@ -174,7 +185,10 @@ func (a *Application) prepareApplyPolicyConfirm(ctx context.Context, wf model.Wo
 	if err != nil {
 		return nil, "", err
 	}
-	deliveryBranch, deliveryHead, _ := a.deliveryFacts(ctx, resolved, st)
+	deliveryBranch, deliveryHead, _, err := a.deliveryFacts(ctx, resolved, st)
+	if err != nil {
+		return nil, "", err
+	}
 	integrationHead, err := a.observedRefHead(ctx, "refs/heads/"+deliveryBranch)
 	if err != nil {
 		return nil, "", err
@@ -205,7 +219,11 @@ func (a *Application) prepareApplyPolicyConfirm(ctx context.Context, wf model.Wo
 	// identities, the newly discovered, validated, and fixed Revision is
 	// the APPLY_CATALOG approval's subject.
 	catalogRef := model.CatalogRef{}
-	if a.applyIdentityDrifted(ctx, resolved, att, st) {
+	identityDrifted, err := a.applyIdentityDrifted(ctx, resolved, att, st)
+	if err != nil {
+		return nil, "", err
+	}
+	if identityDrifted {
 		ref, err := a.rediscoverApplyCatalog(ctx, resolved, att)
 		if err != nil {
 			return nil, "", err
@@ -222,7 +240,11 @@ func (a *Application) prepareApplyPolicyConfirm(ctx context.Context, wf model.Wo
 	// itself can complete the conflict without an extra retry.
 	var resolutionSession model.SessionID
 	var resolutionProcess model.ProcessID
-	if a.applyResolutionNeeded(ctx, resolved, st) {
+	resolutionNeeded, err := a.applyResolutionNeeded(ctx, resolved, st)
+	if err != nil {
+		return nil, "", err
+	}
+	if resolutionNeeded {
 		resolutionSession = model.SessionID(a.ids(model.IDSession))
 		resolutionProcess = model.ProcessID(a.ids(model.IDProcess))
 	}
@@ -367,17 +389,29 @@ func (a *Application) applyReviewRoute(ctx context.Context, wf model.WorkflowID,
 // applyResolutionNeeded reports whether the ONE restricted Merge
 // Resolution Session must be allocated: the last attempt is BLOCKED and
 // its Apply Worktree still holds an unresolved conflicted merge.
-func (a *Application) applyResolutionNeeded(ctx context.Context, wf model.WorkflowID, st model.State) bool {
+func (a *Application) applyResolutionNeeded(ctx context.Context, wf model.WorkflowID, st model.State) (bool, error) {
 	att := lastApplyAttemptOf(st)
 	if att == nil || att.Status != model.ApplyBlocked || att.Number < 1 {
-		return false
+		return false, nil
 	}
-	path := a.applyWorktreePath(wf, att.Number)
+	path, err := a.applyWorktreePath(ctx, wf, att.Number)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
 	unmerged, err := a.unmergedPathsOf(ctx, path)
-	if err != nil || len(unmerged) == 0 {
-		return false
+	if err != nil {
+		return false, err
 	}
-	return true
+	if len(unmerged) == 0 {
+		return false, nil
+	}
+	return true, nil
 }
 
 // unmergedPathsOf returns the worktree-relative paths of the unmerged

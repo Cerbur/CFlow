@@ -29,6 +29,8 @@ package recovery
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -38,6 +40,7 @@ import (
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/security"
@@ -207,7 +210,7 @@ func (e *RecoveryEngine) Reconcile(ctx context.Context, scope Scope) (Reconcilia
 	// the persisted ledger (design 17.2). Every ledger entry receives
 	// exactly one disposition; the facts are collected per kind.
 	for _, pe := range view.PendingEffects {
-		d, err := e.classify(ctx, scope.Workflow, state, pe)
+		d, err := e.classify(ctx, scope.Workflow, state, view.LayoutMigration, pe)
 		if err != nil {
 			return out, err
 		}
@@ -226,7 +229,7 @@ func (e *RecoveryEngine) Reconcile(ctx context.Context, scope Scope) (Reconcilia
 
 // classify produces the exactly-one disposition of one unfinished Effect
 // Intent from the collected external facts (design 17.2).
-func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, state model.State, pe store.PendingEffect) (IntentDisposition, error) {
+func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, state model.State, migration *store.LayoutMigrationRecord, pe store.PendingEffect) (IntentDisposition, error) {
 	base := IntentDisposition{ID: pe.ID, Intent: pe.Intent}
 	switch intent := pe.Intent.(type) {
 	case model.IntegrationMergeIntent:
@@ -238,7 +241,7 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 	case model.WorkspaceRollbackIntent:
 		return e.classifyWorkspaceRollback(ctx, wf, state, base, intent)
 	case model.LayoutMigrationIntent:
-		return e.classifyLayoutMigration(ctx, wf, state, base, intent)
+		return e.classifyLayoutMigration(ctx, wf, state, migration, base, intent)
 	case model.GitAuditRefCreateIntent:
 		return e.classifyAuditRef(ctx, base, intent)
 	case model.TaskWorktreeCreateIntent:
@@ -255,18 +258,20 @@ func (e *RecoveryEngine) classify(ctx context.Context, wf model.WorkflowID, stat
 		return e.classifyWorktreeAt(ctx, base, intent.Path, "workspace",
 			intent.BaseHead, intent.Branch)
 	case model.VerificationRunIntent:
-		return e.classifyVerification(ctx, wf, base, intent)
-	case model.ProviderStartIntent, model.ProviderResumeIntent:
+		return e.classifyVerification(ctx, wf, state, base, intent)
+	case model.ProviderStartIntent, model.ProviderResumeIntent, model.NativeBootstrapIntent:
 		var session model.SessionID
 		switch t := intent.(type) {
 		case model.ProviderStartIntent:
 			session = t.Session
 		case model.ProviderResumeIntent:
 			session = t.Session
+		case model.NativeBootstrapIntent:
+			session = t.Session
 		}
 		return e.classifyProviderSession(base, state, session)
 	case model.ArtifactWriteIntent:
-		return e.classifyArtifact(ctx, wf, base, intent)
+		return e.classifyArtifact(ctx, wf, state, base, intent)
 	case model.WorkflowCompileIntent:
 		return e.classifyWorkflowCompile(ctx, wf, base)
 	case model.ManagedProcessStopIntent:
@@ -435,22 +440,133 @@ func (e *RecoveryEngine) classifyWorkspaceRollback(ctx context.Context, wf model
 // destination that exists while its source also exists, is drift the
 // user must act on (BlockedDrift); an unusable manifest is a Fatal
 // Invariant.
-func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.LayoutMigrationIntent) (IntentDisposition, error) {
-	if state.Workflow.LayoutVersion >= 2 {
-		return base.with(AlreadyCompleted, "the workflow layout already advanced to version 2"), nil
+func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.WorkflowID, state model.State, migration *store.LayoutMigrationRecord, base IntentDisposition, intent model.LayoutMigrationIntent) (IntentDisposition, error) {
+	dbAdvanced := state.Workflow.LayoutVersion == 2
+	if state.Workflow.LayoutVersion != 1 && !dbAdvanced {
+		return base.with(FatalInvariant, "the workflow carries an unsupported layout version"), nil
+	}
+	if intent.MigrationID == "" || intent.ManifestHash == "" || intent.Workflow != wf {
+		return base.with(FatalInvariant, "the layout migration intent identity is incomplete or mismatched"), nil
+	}
+	if migration == nil || migration.ID != intent.MigrationID || migration.Workflow != wf ||
+		migration.Status != "PREPARED" || migration.ManifestHash != intent.ManifestHash {
+		return base.with(FatalInvariant, "the authoritative layout migration row does not match the pending intent"), nil
+	}
+	expectedManifest := filepath.Join(e.home, "projects", e.projectKey, string(wf), "state", "layout-migrations", intent.MigrationID+".json")
+	if filepath.Clean(migration.ManifestPath) != filepath.Clean(expectedManifest) {
+		return base.with(FatalInvariant, "the layout migration manifest path is not canonical"), nil
+	}
+	if _, err := security.CheckPath(security.PathRequest{Path: migration.ManifestPath, Kind: security.KindFile}); err != nil {
+		return base.with(FatalInvariant, "the immutable layout migration manifest is unsafe"), nil
+	}
+	body, err := os.ReadFile(migration.ManifestPath)
+	if err != nil {
+		return base.with(FatalInvariant, "the immutable layout migration manifest is unreadable"), nil
+	}
+	manifestSum := sha256.Sum256(body)
+	var manifest layout.MigrationManifest
+	if json.Unmarshal(body, &manifest) != nil || fmt.Sprintf("%x", manifestSum[:]) != migration.ManifestHash ||
+		manifest.MigrationID != intent.MigrationID || manifest.Workflow != wf ||
+		manifest.Preview().Hash() != manifest.PreviewHash || !sameMigrationMoves(manifest.Moves, intent.Moves) {
+		return base.with(FatalInvariant, "the immutable layout migration manifest content does not match SQLite and intent"), nil
+	}
+	snapshotBody, _ := json.Marshal(manifest.SourceSnapshot)
+	snapshotSum := sha256.Sum256(snapshotBody)
+	wantVersion := manifest.SourceSnapshot.AggregateVersion + 1
+	if dbAdvanced {
+		wantVersion++
+	}
+	if fmt.Sprintf("%x", snapshotSum[:]) != manifest.SourceSnapshotHash ||
+		manifest.SourceSnapshot.PreviewHash != manifest.PreviewHash || uint64(state.Version) != wantVersion ||
+		manifest.SourceSnapshot.LayoutVersion != 1 || manifest.SourceSnapshot.BaseCommit != state.Workflow.BaseCommit ||
+		manifest.SourceSnapshot.IntegrationBranch != state.Workflow.IntegrationBranch ||
+		manifest.SourceSnapshot.IntegrationHead != state.Workflow.IntegrationHead {
+		return base.with(FatalInvariant, "the layout migration source snapshot identity does not match authoritative state"), nil
+	}
+	if manifest.DatabaseImpact.FromLayoutVersion != 1 || manifest.DatabaseImpact.ToLayoutVersion != 2 ||
+		manifest.DatabaseImpact.WorkspacePath != filepath.Join(e.home, "projects", e.projectKey, string(wf), "workspace") ||
+		manifest.DatabaseImpact.WorkspaceBranch != state.Workflow.IntegrationBranch ||
+		manifest.DatabaseImpact.WorkspaceHead != state.Workflow.IntegrationHead {
+		return base.with(FatalInvariant, "the layout migration database impact is invalid"), nil
+	}
+	expectedBackup := strings.TrimSuffix(migration.ManifestPath, ".json") + ".db.backup"
+	if manifest.Backup.Path != expectedBackup || manifest.Backup.SHA256 == "" || manifest.Backup.Size <= 0 {
+		return base.with(FatalInvariant, "the layout migration backup evidence is incomplete"), nil
+	}
+	if _, err := security.CheckPath(security.PathRequest{Path: manifest.Backup.Path, Kind: security.KindFile}); err != nil {
+		return base.with(FatalInvariant, "the immutable layout migration backup is unsafe"), nil
+	}
+	backupBody, err := os.ReadFile(manifest.Backup.Path)
+	if err != nil {
+		return base.with(FatalInvariant, "the immutable layout migration backup is unreadable"), nil
+	}
+	backupSum := sha256.Sum256(backupBody)
+	if int64(len(backupBody)) != manifest.Backup.Size || fmt.Sprintf("%x", backupSum[:]) != manifest.Backup.SHA256 {
+		return base.with(FatalInvariant, "the immutable layout migration backup identity drifted"), nil
+	}
+	backupDB, err := sql.Open("sqlite", "file:"+manifest.Backup.Path+"?mode=ro")
+	if err != nil {
+		return base.with(FatalInvariant, "the immutable layout migration backup cannot be opened"), nil
+	}
+	var integrity string
+	integrityErr := backupDB.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity)
+	_ = backupDB.Close()
+	if integrityErr != nil || integrity != "ok" {
+		return base.with(FatalInvariant, "the immutable layout migration backup failed integrity verification"), nil
 	}
 	if len(intent.Moves) == 0 {
 		return base.with(FatalInvariant, "the layout migration intent carries no moves"), nil
 	}
+	var worktrees map[string]gitflow.WorktreeEntry
+	if hasMigrationWorktree(intent.Moves) {
+		var err error
+		worktrees, err = e.worktreeEntries(ctx)
+		if err != nil {
+			return base.with(BlockedDrift, "the Git worktree registry is unreadable"), nil
+		}
+	}
+	pendingSeen := false
+	firstPending := -1
 	for i, mv := range intent.Moves {
 		srcPresent := e.pathExists(ctx, mv.Source)
 		dstPresent := e.pathExists(ctx, mv.Destination)
+		if mv.Kind == model.MoveKindArtifact && srcPresent != dstPresent {
+			at := mv.Source
+			if dstPresent {
+				at = mv.Destination
+			}
+			digest, err := layout.DigestPath(at)
+			if err != nil || mv.Digest == "" || digest != mv.Digest {
+				return base.with(BlockedDrift,
+					"layout migration artifact identity drifted for move "+itoa(i)), nil
+			}
+		}
+		if mv.Kind == model.MoveKindWorktree && srcPresent != dstPresent {
+			at := mv.Source
+			if dstPresent {
+				at = mv.Destination
+			}
+			entry, ok := worktrees[filepath.Clean(at)]
+			if !ok || entry.Head != mv.Head || entry.Branch != mv.Branch || (mv.Branch == "" && !entry.Detached) {
+				return base.with(BlockedDrift,
+					"layout migration Git worktree identity drifted for move "+itoa(i)), nil
+			}
+		}
 		switch {
 		case srcPresent && !dstPresent:
-			// This move has not landed yet: continue from here.
-			return base.with(SafeToRetry, "layout migration move "+itoa(i)+" has not landed yet"), nil
+			if dbAdvanced {
+				return base.with(BlockedDrift,
+					"the database advanced but layout migration move "+itoa(i)+" did not land"), nil
+			}
+			pendingSeen = true
+			if firstPending < 0 {
+				firstPending = i
+			}
 		case !srcPresent && dstPresent:
-			// This move landed; inspect the next one.
+			if pendingSeen {
+				return base.with(BlockedDrift,
+					"layout migration move "+itoa(i)+" landed out of order"), nil
+			}
 		case srcPresent && dstPresent:
 			return base.with(BlockedDrift,
 				"layout migration source and destination both exist for move "+itoa(i)), nil
@@ -459,9 +575,33 @@ func (e *RecoveryEngine) classifyLayoutMigration(ctx context.Context, wf model.W
 				"layout migration move "+itoa(i)+" has neither source nor destination"), nil
 		}
 	}
+	if pendingSeen {
+		return base.with(SafeToRetry, "layout migration continues from move "+itoa(firstPending)), nil
+	}
 	// Every move landed: the DB Layout facts advance in the next
 	// transaction (AlreadyCompleted for the moves themselves).
 	return base.with(AlreadyCompleted, "every layout migration move landed; the database facts advance next"), nil
+}
+
+func sameMigrationMoves(a, b []model.PathMove) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasMigrationWorktree(moves []model.PathMove) bool {
+	for _, move := range moves {
+		if move.Kind == model.MoveKindWorktree {
+			return true
+		}
+	}
+	return false
 }
 
 // pathExists reports whether one path exists (stat, ignoring errors).
@@ -496,9 +636,14 @@ func (e *RecoveryEngine) classifyAuditRef(ctx context.Context, base IntentDispos
 // 2 (design 8.5, TUI task 7), the legacy worktrees/<project-key>/
 // <workflow-id>/tasks/<node> on Layout 1 (PRD 全局目录结构).
 func (e *RecoveryEngine) classifyTaskWorktree(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.TaskWorktreeCreateIntent) (IntentDisposition, error) {
-	path := filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "tasks", string(intent.Node))
-	if state.Workflow.LayoutVersion >= 2 {
+	var path string
+	switch state.Workflow.LayoutVersion {
+	case 1:
+		path = filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "tasks", string(intent.Node))
+	case 2:
 		path = filepath.Join(e.home, "projects", e.projectKey, string(wf), "tmp", "tasks", string(intent.Node))
+	default:
+		return base.with(FatalInvariant, "the workflow carries an unsupported layout version"), nil
 	}
 	entries, err := e.worktreeEntries(ctx)
 	if err != nil {
@@ -547,8 +692,8 @@ func (e *RecoveryEngine) classifyWorktreeAt(ctx context.Context, base IntentDisp
 // from the persisted Evidence Manifest: the manifest is the unique proof
 // the run completed (already_completed); its absence with the expected
 // Worktree facts still matching is safe to retry.
-func (e *RecoveryEngine) classifyVerification(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.VerificationRunIntent) (IntentDisposition, error) {
-	manifest, err := e.readVerificationManifest(wf, intent.Node)
+func (e *RecoveryEngine) classifyVerification(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.VerificationRunIntent) (IntentDisposition, error) {
+	manifest, err := e.readVerificationManifest(wf, state.Workflow.LayoutVersion, intent.Node)
 	if err != nil {
 		return base.with(BlockedDrift, "verification evidence is unreadable"), nil
 	}
@@ -706,7 +851,7 @@ func (e *RecoveryEngine) classifyProviderSession(base IntentDisposition, state m
 // content file proves the write completed; a directory without its
 // content file is an orphan (blocked — the file vanished after the
 // write); an absent revision is safe to write.
-func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.WorkflowID, base IntentDisposition, intent model.ArtifactWriteIntent) (IntentDisposition, error) {
+func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.WorkflowID, state model.State, base IntentDisposition, intent model.ArtifactWriteIntent) (IntentDisposition, error) {
 	store, err := e.openArtifacts(ctx, wf)
 	if err != nil {
 		return base.with(BlockedDrift, "artifact facts are unreadable"), nil
@@ -718,36 +863,78 @@ func (e *RecoveryEngine) classifyArtifact(ctx context.Context, wf model.Workflow
 		if err == nil && ref.Revision >= 1 {
 			return base.with(AlreadyCompleted, "the artifact type carries a written revision"), nil
 		}
-		return base.with(SafeToRetry, "no artifact revision of the type exists"), nil
-	}
-	if intent.Ref.Hash != "" {
-		// The intent pinned an exact content identity: the file must read
-		// back with it.
-		if _, err := store.Get(ctx, intent.Ref); err == nil {
-			return base.with(AlreadyCompleted, "the artifact revision reads back with the exact identity"), nil
+		if artifact.IsNotFound(err) {
+			return base.with(SafeToRetry, "no artifact revision of the type exists"), nil
 		}
+		return base.with(BlockedDrift, "the artifact type contains unreadable or invalid revision evidence"), nil
 	}
-	dir := filepath.Join(e.artifactRoot(wf), string(wf), string(intent.Ref.Type), fmt.Sprintf("%d", intent.Ref.Revision))
-	entries, err := os.ReadDir(dir)
+	// Resolve the exact Revision through the immutable Store reader. A raw
+	// filename is never completion evidence: canonical form, schema,
+	// envelope identity, and content hash must all validate first.
+	resolved, resolveErr := store.Resolve(ctx, artifact.ResolveRequest{
+		WorkflowID: wf, Type: intent.Ref.Type, Revision: intent.Ref.Revision,
+	})
+	if resolveErr == nil {
+		if intent.Ref.Hash != "" && resolved.Hash != intent.Ref.Hash {
+			return base.with(BlockedDrift, "the artifact revision has a different content identity"), nil
+		}
+		return base.with(AlreadyCompleted, "the exact artifact revision validates through the Store"), nil
+	}
+	if !artifact.IsNotFound(resolveErr) {
+		return base.with(BlockedDrift, "the exact artifact revision is corrupt or carries the wrong identity"), nil
+	}
+	var dir, managedRoot string
+	switch state.Workflow.LayoutVersion {
+	case 1:
+		managedRoot = e.legacyArtifactRoot(wf)
+		dir = filepath.Join(managedRoot, string(wf), string(intent.Ref.Type), fmt.Sprintf("%d", intent.Ref.Revision))
+	case 2:
+		managedRoot = e.workflowRoot(wf)
+		dir, err = artifact.WorkflowRevisionDir(managedRoot, intent.Ref.Type, intent.Ref.Revision)
+		if err != nil {
+			return base.with(FatalInvariant, "the aggregate artifact revision path is invalid"), nil
+		}
+	default:
+		return base.with(FatalInvariant, "the workflow layout version cannot select an artifact path"), nil
+	}
+	absent, err := managedPathAbsent(managedRoot, dir)
 	switch {
-	case err == nil:
-		for _, entry := range entries {
-			if isArtifactContent(entry) {
-				return base.with(AlreadyCompleted, "the artifact revision directory carries its content file"), nil
-			}
-		}
-		return base.with(BlockedDrift, "the artifact revision directory exists without its content file"), nil
-	case os.IsNotExist(err):
+	case err != nil:
+		return base.with(BlockedDrift, "the artifact revision path or an ancestor is corrupt or unreadable"), nil
+	case absent:
 		return base.with(SafeToRetry, "the artifact revision is absent"), nil
 	default:
-		return base.with(BlockedDrift, "the artifact revision directory cannot be inspected"), nil
+		return base.with(BlockedDrift, "the artifact revision path exists but cannot resolve valid content"), nil
 	}
 }
 
-// isArtifactContent reports whether one directory entry is an Artifact
-// content file (not the atomic-write temp or a subdirectory).
-func isArtifactContent(entry os.DirEntry) bool {
-	return !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".")
+// managedPathAbsent distinguishes a genuinely absent descendant from ENOENT
+// caused by an existing corrupt ancestor. Every existing component from the
+// known managed root must be a real directory; symlinks, wrong types, and
+// inspection failures are drift rather than retryable absence.
+func managedPathAbsent(root, target string) (bool, error) {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, fmt.Errorf("managed path is outside its root")
+	}
+	current := root
+	parts := strings.Split(rel, string(filepath.Separator))
+	for index := 0; index <= len(parts); index++ {
+		if index > 0 {
+			current = filepath.Join(current, parts[index-1])
+		}
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return true, nil
+			}
+			return false, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false, fmt.Errorf("managed path component is not a real directory")
+		}
+	}
+	return false, nil
 }
 
 // classifyWorkflowCompile classifies one unfinished WorkflowCompileIntent
@@ -866,11 +1053,19 @@ type verificationManifest struct {
 	Passed      bool   `json:"Passed"`
 }
 
-func (e *RecoveryEngine) readVerificationManifest(wf model.WorkflowID, node model.NodeID) (*verificationManifest, error) {
-	if e.evidenceDir == "" {
-		return nil, nil
+func (e *RecoveryEngine) readVerificationManifest(wf model.WorkflowID, layoutVersion int, node model.NodeID) (*verificationManifest, error) {
+	var path string
+	switch layoutVersion {
+	case 1:
+		if e.evidenceDir == "" {
+			return nil, nil
+		}
+		path = filepath.Join(e.evidenceDir, "verification", string(wf), string(node)+".json")
+	case 2:
+		path = filepath.Join(e.workflowRoot(wf), "evidence", "verification", string(node)+".json")
+	default:
+		return nil, model.InvariantFault(fmt.Errorf("recovery: unsupported workflow layout version %d", layoutVersion))
 	}
-	path := filepath.Join(e.evidenceDir, "verification", string(wf), string(node)+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -901,8 +1096,12 @@ func (e *RecoveryEngine) planningPath(wf model.WorkflowID) string {
 	return filepath.Join(e.home, "worktrees", e.projectKey, string(wf), "planning")
 }
 
-// artifactRoot is the deterministic Artifact Store root of one workflow.
-func (e *RecoveryEngine) artifactRoot(wf model.WorkflowID) string {
+func (e *RecoveryEngine) workflowRoot(wf model.WorkflowID) string {
+	return filepath.Join(e.home, "projects", e.projectKey, string(wf))
+}
+
+// legacyArtifactRoot is the deterministic legacy Artifact Store root.
+func (e *RecoveryEngine) legacyArtifactRoot(wf model.WorkflowID) string {
 	return filepath.Join(e.home, "projects", e.projectKey, "workflows", string(wf), "artifacts")
 }
 

@@ -351,6 +351,13 @@ const (
 	PurposeRepair               AgentPurpose = "repair"
 	PurposeReview               AgentPurpose = "review"
 	PurposeFinalVerification    AgentPurpose = "final-verification"
+	// PurposeAdoption is the managed adoption/coding Session of the
+	// Workspace Adoption Gate (Task 4, design 8.4 step 2): when the
+	// Workspace carries uncommitted native changes, a managed Session runs
+	// inside the Workspace and organizes and commits them. Its output is
+	// judged by Git evidence (a new Commit, a clean Workspace, the candidate
+	// HEAD advanced), never by a claim.
+	PurposeAdoption AgentPurpose = "adoption"
 	// PurposeApplyVerification is the independent Apply Verification
 	// Session (PRD 已确认：显式受保护 Apply step 4): a fresh Session that
 	// performs the semantic Review of the combined Target + Integration
@@ -364,7 +371,8 @@ func (p AgentPurpose) Valid() bool {
 	switch p {
 	case PurposePlanning, PurposePlanCheck, PurposeSpecGeneration,
 		PurposeWorkflowOptimization, PurposeImplementation, PurposeRepair,
-		PurposeReview, PurposeFinalVerification, PurposeApplyVerification:
+		PurposeReview, PurposeFinalVerification, PurposeApplyVerification,
+		PurposeAdoption:
 		return true
 	}
 	return false
@@ -384,6 +392,13 @@ type Session struct {
 	Status            SessionStatus
 	Supersedes        SessionID
 	Provider          string
+	// ContextBundleRevision, ContextBundlePath, and ContextBundleSha256 are
+	// the persisted immutable Context Bundle reference of a successor
+	// Session (design §9.4, TUI task 12): the switch's bundle is recorded
+	// with the new Session row, mirroring the sessions table columns.
+	ContextBundleRevision int
+	ContextBundlePath     string
+	ContextBundleSha256   string
 }
 
 // ProcessStatus is the operational status of a managed process record.

@@ -50,12 +50,13 @@ type Application struct {
 	layout     layout.Resolver
 	probe      probe // test seam: protocol-order observation, nil in production
 
-	mu        sync.Mutex
-	locks     *platform.LockSet
-	stores    map[model.WorkflowID]*store.Store // open write Stores, per workflow
-	known     map[model.WorkflowID]struct{}     // workflows opened this session
-	procs     map[model.ProcessID]process.Handle
-	artifacts map[model.WorkflowID]*artifact.Store // open Artifact Stores, per workflow
+	mu              sync.Mutex
+	locks           *platform.LockSet
+	stores          map[model.WorkflowID]*store.Store // open write Stores, per workflow
+	known           map[model.WorkflowID]struct{}     // workflows opened this session
+	procs           map[model.ProcessID]process.Handle
+	artifacts       map[model.WorkflowID]*artifact.Store // open Artifact Stores, per workflow
+	artifactLayouts map[model.WorkflowID]int             // layout version bound by each cached Store
 	// dispatchMu serializes the aggregate transactions of one dispatch
 	// pass (Task 16 live parallelism): the selected Nodes' effect chains
 	// run concurrently — the Provider Sessions overlap in real time —
@@ -155,6 +156,7 @@ func New(opts Options) (*Application, error) {
 		known:              map[model.WorkflowID]struct{}{},
 		procs:              map[model.ProcessID]process.Handle{},
 		artifacts:          map[model.WorkflowID]*artifact.Store{},
+		artifactLayouts:    map[model.WorkflowID]int{},
 		processSessions:    map[model.ProcessID]model.SessionID{},
 		processIdentities:  map[model.ProcessID]process.ProcessIdentity{},
 		stopPolicy:         defaultStopPolicy(opts.StopPolicy),
@@ -249,7 +251,11 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 
 func (a *Application) queryList(ctx context.Context, q ListQuery) (View, error) {
 	var out ListView
-	for _, wf := range a.knownWorkflows() {
+	ids, err := a.knownWorkflows(ctx)
+	if err != nil {
+		return nil, orCtx(ctx, err)
+	}
+	for _, wf := range ids {
 		view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
 		if err != nil {
 			return nil, orCtx(ctx, err)
@@ -428,14 +434,17 @@ func (a *Application) Execute(ctx context.Context, cmd Command) (Outcome, error)
 			return Outcome{}, orCtx(ctx, merr)
 		}
 	}
-	// A prepared native discussion turn carries the managed Bridge
-	// request facts: the TUI's blocking-exec callback attaches the
-	// terminal streams and runs the supervised interactive process
-	// (design §9.1, TUI task 12). The request is assembled from the
+	// A prepared, continued, or switched native discussion turn carries the
+	// managed Bridge request facts: the TUI's blocking-exec callback
+	// attaches the terminal streams and runs the supervised interactive
+	// process (design §9.1, TUI task 12). The request is assembled from the
 	// recorded Session binding and the Application's own seams; the TUI
 	// never constructs the process by itself.
-	if _, ok := cmd.(PrepareNativeDiscussionCommand); ok && out.SessionID != "" {
-		out.Native = a.nativeBridgeRequest(ctx, wf, out.SessionID)
+	if out.SessionID != "" {
+		switch cmd.(type) {
+		case PrepareNativeDiscussionCommand, ContinueNativeDiscussionCommand, SwitchAgentCommand:
+			out.Native = a.nativeBridgeRequest(ctx, st, wf, out.SessionID)
+		}
 	}
 	// The workflow.yaml artifact manifest follows the Plan Revision it
 	// records (PRD Workflow 元信息: artifacts.active_plan). The read goes
@@ -675,6 +684,10 @@ func planningSessionOf(input model.Input) model.SessionID {
 		return in.Session
 	case model.PrepareNativeDiscussionInput:
 		return in.Session
+	case model.ContinueNativeDiscussionInput:
+		return in.Session
+	case model.SwitchAgentInput:
+		return in.Session
 	}
 	return ""
 }
@@ -743,6 +756,12 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		}, wf, nil
 	case PrepareNativeDiscussionCommand:
 		return a.prepareNativeDiscussion(ctx, c)
+	case ContinueNativeDiscussionCommand:
+		return a.prepareContinueNativeDiscussion(ctx, c)
+	case SwitchAgentCommand:
+		return a.prepareSwitchAgent(ctx, c)
+	case NativeDiscussionReturnCommand:
+		return a.prepareNativeDiscussionReturn(ctx, c)
 	case FinishDiscussionCommand:
 		return a.prepareFinish(ctx, c)
 	case FreezeDiscussionCommand:
@@ -762,9 +781,20 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 		if err != nil {
 			return nil, "", err
 		}
+		// Plan generation is gated on the immutable discussion inputs: the
+		// native discussion path resolves the ArtifactDiscussionHandoff and
+		// the frozen ArtifactChangeSet; a legacy headless workflow without
+		// either keeps the legacy plan input. A half-bound state (one of
+		// the two exists) fails closed (design §9.4, TUI task 12).
+		handoffRef, csRef, err := a.resolvePlanGenerationInputs(ctx, wf)
+		if err != nil {
+			return nil, "", err
+		}
 		return model.GeneratePlanInput{
-			Provider: c.Provider,
-			Session:  model.SessionID(a.ids(model.IDSession)),
+			Provider:    c.Provider,
+			Session:     model.SessionID(a.ids(model.IDSession)),
+			HandoffRef:  handoffRef,
+			ChangeSetRef: csRef,
 		}, wf, nil
 	case CheckPlanCommand:
 		wf, err := a.resolveMutationWorkflow(c.Workflow)

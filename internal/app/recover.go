@@ -176,6 +176,11 @@ func effectBudget(st model.State, pending int, cmd model.Input) int {
 		// One allocation chains the Task Worktree creation and the coding
 		// Session run (two Effects) before the settle Decision.
 		n += 2
+	case model.AdoptWorkspaceInput:
+		// The Workspace Adoption Gate chains the managed adoption/coding
+		// Session and the independent Adoption Review Session (two Effects)
+		// before the settle Decision (Task 4, design 8.4).
+		n += 2
 	}
 	for _, s := range st.Sessions {
 		if !s.Status.IsTerminal() {

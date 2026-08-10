@@ -59,6 +59,8 @@ func (a *Application) executeEffect(ctx context.Context, intent model.EffectInte
 		return a.providerStart(ctx, wf, e, input, rt)
 	case model.ProviderResumeIntent:
 		return a.providerResume(ctx, wf, e, input, rt)
+	case model.NativeBootstrapIntent:
+		return a.nativeBootstrap(ctx, wf, e, input, rt)
 	case model.ProviderCancelIntent:
 		// STUB (Task 17): the two-phase Provider stop protocol.
 		return model.EffectResultInput{}, stubEffect(e)
@@ -198,6 +200,13 @@ func validateEffectResult(intent model.EffectIntent, r model.EffectResultInput) 
 		}
 		if r.Kind != model.ProviderRunEnded || r.Session.ID != e.Session || r.Session.Purpose != e.Purpose {
 			return model.InvariantFault(fmt.Errorf("provider resume result does not match intent for session %s", e.Session))
+		}
+	case model.NativeBootstrapIntent:
+		if r.Kind != model.NativeBootstrapEstablished || r.Session.ID != e.Session {
+			return model.InvariantFault(fmt.Errorf("native bootstrap result does not match intent for session %s", e.Session))
+		}
+		if r.Session.ProviderSessionID == "" {
+			return model.InvariantFault(fmt.Errorf("native bootstrap result carries no provider session id"))
 		}
 	case model.ArtifactWriteIntent:
 		if r.Kind != model.ArtifactWritten ||
@@ -372,6 +381,12 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if intent.Purpose == model.PurposeImplementation {
 		return a.codingProviderStart(ctx, wf, intent, cmd, rt)
 	}
+	if intent.Purpose == model.PurposeAdoption {
+		// The managed adoption/coding Session (Task 4, design 8.4 step 2):
+		// a coding Session inside the Workspace that organizes and commits
+		// the dirty native changes; its output is judged by Git evidence.
+		return a.adoptionCodingProviderStart(ctx, wf, intent, cmd, rt)
+	}
 	if intent.Purpose == model.PurposeReview {
 		if intent.Node == "" {
 			// The Workspace Adoption Review (TUI task 6, design 8.4): the
@@ -402,12 +417,18 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for this planning command")
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
-	input := a.sessionInput(ctx, wf, cmd)
+	input, err := a.sessionInput(ctx, wf, cmd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	req := agent.StartRequest{
 		Purpose:    intent.Purpose,
 		Provider:   intent.Route,
@@ -440,6 +461,62 @@ func (a *Application) providerStart(ctx context.Context, wf model.WorkflowID, in
 		out.CatalogRef = ref
 	}
 	return out, nil
+}
+
+// nativeBootstrap runs the managed Provider start/bootstrap of one native
+// interactive discussion Session (design §9.1, TUI task 12): the Runtime
+// establishes the Provider's own session identity from the validated
+// session_started event, and the Result carries that exact identity for the
+// Kernel to bind. The bootstrap never uses a CFlow Session id as the
+// Provider identity, and it fails closed when the Provider returns no
+// session id or the binding drifts.
+func (a *Application) nativeBootstrap(ctx context.Context, wf model.WorkflowID, intent model.NativeBootstrapIntent, cmd model.Input, rt *agent.Runtime) (model.EffectResultInput, error) {
+	if rt == nil {
+		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("agent runtime is not configured for this application"))
+	}
+	prompt, ok := a.planningPrompt(cmd)
+	if !ok {
+		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the discussion bootstrap")
+	}
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.sessionInput(ctx, wf, cmd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	// The switch successor's bootstrap reads the superseded discussion's
+	// immutable Context Bundle (design §9.4, TUI task 12): the bundle content
+	// rides the managed bootstrap input so the successor Provider starts
+	// with the prior discussion context. A missing bundle fails closed.
+	if sw, ok := cmd.(model.SwitchAgentInput); ok && sw.Supersedes != "" {
+		bundle, ok := rt.FallbackBundle(sw.Supersedes)
+		if !ok {
+			return model.EffectResultInput{}, model.NewFault(model.CodeStateInvariantViolation,
+				"the switch successor's context bundle is not readable")
+		}
+		input = attachBundleInput(input, &bundle)
+	}
+	res, err := rt.Bootstrap(ctx, agent.BootstrapRequest{
+		Purpose: intent.Purpose, Provider: intent.Route,
+		Prompt: renderPrompt(prompt.Body, input), Input: input,
+		CWD: cwd, SessionID: intent.Session,
+	})
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if err := a.verifySnapshotUnchanged(ctx, cwd, pre); err != nil {
+		return model.EffectResultInput{}, err
+	}
+	return model.EffectResultInput{
+		Kind:    model.NativeBootstrapEstablished,
+		Session: res.Session,
+	}, nil
 }
 
 // providerResume re-establishes an existing Provider Session (design
@@ -476,8 +553,15 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		return model.EffectResultInput{}, model.NewFault(model.CodeSessionIndependenceViolation,
 			"session is not known to the agent runtime")
 	}
-	cwd := a.planningCWD(ctx, wf)
+	cwd, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	input, err := a.sessionInput(ctx, wf, cmd)
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
@@ -485,8 +569,8 @@ func (a *Application) providerResume(ctx context.Context, wf model.WorkflowID, i
 		ProviderSessionID: agent.ProviderSessionID(providerSessionID),
 		Purpose:           intent.Purpose,
 		Provider:          provider,
-		Prompt:            renderPrompt(prompt.Body, a.sessionInput(ctx, wf, cmd)),
-		Input:             a.sessionInput(ctx, wf, cmd),
+		Prompt:            renderPrompt(prompt.Body, input),
+		Input:             input,
 		CWD:               cwd,
 		Context:           a.resumeContext(ctx, wf, intent.Session, provider),
 	})
@@ -560,14 +644,29 @@ func (a *Application) successorHandoff(rt *agent.Runtime, session model.SessionI
 	return agent.ProviderSessionID(lostProviderSessionID), &b
 }
 
+// nativeBootstrapInput is the structured input of one native discussion
+// Session bootstrap (design §9.1, TUI task 12): for a switch the immutable
+// redacted Context Bundle handoff of the superseded Session rides the input
+// (the native counterpart of codingSessionInput.ContextBundle), so the
+// successor Provider's start reads the prior discussion context. It is never
+// a credential or an unredacted transcript.
+type nativeBootstrapInput struct {
+	Requirement   string               `json:"requirement"`
+	ContextBundle *agent.ContextBundle `json:"context_bundle,omitempty"`
+}
+
 // attachBundleInput attaches the immutable redacted Context Bundle
-// handoff of an automatic fallback to one Session start input (nil
-// bundle leaves the input unchanged).
+// handoff to one Session start input (nil bundle leaves the input
+// unchanged). Both the automatic fallback's coding input and the native
+// discussion bootstrap input carry the bundle.
 func attachBundleInput(input any, bundle *agent.ContextBundle) any {
 	if bundle == nil {
 		return input
 	}
-	if c, ok := input.(*codingSessionInput); ok {
+	switch c := input.(type) {
+	case *codingSessionInput:
+		c.ContextBundle = bundle
+	case *nativeBootstrapInput:
 		c.ContextBundle = bundle
 	}
 	return input
@@ -606,7 +705,10 @@ func (a *Application) taskWorktreeCreate(ctx context.Context, wf model.WorkflowI
 	if a.git == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
 	}
-	path := a.taskWorktreePath(wf, intent.Node)
+	path, err := a.taskWorktreePath(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	if err := a.ensureWorktreeParent(path); err != nil {
 		return model.EffectResultInput{}, err
 	}
@@ -650,7 +752,10 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	if !ok {
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the implementation purpose")
 	}
-	cwd := a.taskWorktreePath(wf, intent.Node)
+	cwd, err := a.taskWorktreePath(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	// The RUNNING Attempt already committed; only now may the Coding
 	// Session start (design 12: an in-memory queued goroutine is not an
 	// in-flight Attempt).
@@ -686,7 +791,10 @@ func (a *Application) codingProviderStart(ctx context.Context, wf model.Workflow
 	// and re-establishes the lineage through Supersedes (design 14.4,
 	// PRD 已确认：Session Resume 失败与跨 Provider 上下文交接).
 	supersedes, bundle := a.successorHandoff(rt, intent.Session)
-	sessionIn := a.sessionInput(ctx, wf, cmd)
+	sessionIn, err := a.sessionInput(ctx, wf, cmd)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	res, err := rt.Start(ctx, agent.StartRequest{
 		Purpose:  intent.Purpose,
 		Provider: intent.Route,
@@ -862,33 +970,53 @@ func renderPrompt(body string, input any) string {
 // the latest discussion-turn Artifact body when one exists; for Spec
 // generation, the approved Plan and the active Verification Catalog; for
 // Workflow optimization, the Spec and the eligible routes.
-func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd model.Input) any {
+func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd model.Input) (any, error) {
 	if in, ok := cmd.(model.DiscussRequirementInput); ok {
 		return struct {
 			Requirement string `json:"requirement"`
-		}{Requirement: in.Text}
+		}{Requirement: in.Text}, nil
+	}
+	if _, ok := cmd.(model.SwitchAgentInput); ok {
+		// The switch successor's native bootstrap input: the immutable
+		// redacted Context Bundle of the superseded discussion is attached by
+		// nativeBootstrap (the bundle content lives in the evidence root and
+		// is read back through the Runtime's FallbackBundle seam), so the
+		// successor Provider starts with the prior discussion context.
+		return &nativeBootstrapInput{}, nil
 	}
 	store, err := a.artifactStore(wf)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	switch cmd.(type) {
 	case model.SpecGenerationInput:
+		plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+		if err != nil {
+			return nil, err
+		}
+		catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+		if err != nil {
+			return nil, err
+		}
 		return struct {
 			Plan    string `json:"plan"`
 			Catalog string `json:"catalog"`
 		}{
-			Plan:    string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-			Catalog: string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		}
+			Plan:    string(plan),
+			Catalog: string(catalog),
+		}, nil
 	case model.WorkflowCompilationInput:
+		spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+		if err != nil {
+			return nil, err
+		}
 		return struct {
 			Spec           string   `json:"spec"`
 			EligibleRoutes []string `json:"eligible_routes"`
 		}{
-			Spec:           string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
+			Spec:           string(spec),
 			EligibleRoutes: eligibleRouteNames(),
-		}
+		}, nil
 	case model.DispatchInput:
 		// The coding Session receives only the approved context: the Spec
 		// set, the Verification Catalog it references, and the Task
@@ -897,34 +1025,66 @@ func (a *Application) sessionInput(ctx context.Context, wf model.WorkflowID, cmd
 	}
 	if _, ok := cmd.(model.GeneratePlanInput); !ok {
 		if _, ok := cmd.(model.CheckPlanInput); !ok {
-			return nil
+			return nil, nil
 		}
 	}
-	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactDiscussionTurn})
+	// Plan generation reads the immutable Discussion Handoff (the native
+	// discussion path) — never a terminal transcript. The legacy headless
+	// discussion (no handoff) falls back to the discussion turn body for
+	// backward compatibility.
+	handoff, err := readOptionalArtifact(ctx, store, wf, model.ArtifactDiscussionHandoff)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	body, err := store.Get(ctx, ref)
+	if handoff != nil {
+		return struct {
+			Requirement string `json:"requirement"`
+		}{Requirement: string(handoff)}, nil
+	}
+	body, err := readOptionalArtifact(ctx, store, wf, model.ArtifactDiscussionTurn)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+	if body == nil {
+		return nil, nil
 	}
 	return struct {
 		Requirement string `json:"requirement"`
-	}{Requirement: string(body)}
+	}{Requirement: string(body)}, nil
 }
 
-// readArtifact reads the active Revision body of one Artifact Type
-// ("" when none exists).
-func readArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) []byte {
+// readRequiredArtifact reads and validates the active Revision of one
+// approval-bound Artifact. Absence and every validation failure propagate.
+func readRequiredArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) ([]byte, error) {
 	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: typ})
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	body, err := store.Get(ctx, ref)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return body
+	if len(body) == 0 {
+		return nil, model.InvariantFault(fmt.Errorf("required %s artifact body is empty", typ))
+	}
+	return body, nil
+}
+
+// readOptionalArtifact differs only in allowing the Store's exact not-found
+// result. Corrupt or unsafe optional evidence still fails closed.
+func readOptionalArtifact(ctx context.Context, store *artifact.Store, wf model.WorkflowID, typ model.ArtifactType) ([]byte, error) {
+	ref, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: typ})
+	if err != nil {
+		if artifact.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	body, err := store.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 // eligibleRouteNames is the deterministic eligible route list for the

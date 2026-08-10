@@ -187,6 +187,29 @@ type HistoryRange struct {
 
 func (HistoryRange) isGitQuery() {}
 
+// AncestryCheck observes whether one commit is an ancestor of another
+// (git merge-base --is-ancestor). This is the Workspace Adoption gate's
+// new-commit closure: the pre-adoption HEAD must be an ancestor of the
+// post-adoption HEAD (the adoption may only append commits on top of the
+// recorded candidate; a session that moved the Workspace to a foreign
+// head fails closed).
+type AncestryCheck struct {
+	Ancestor   string // full commit hash, the candidate pre-adoption HEAD
+	Descendant string // full commit hash, the post-adoption HEAD
+}
+
+func (AncestryCheck) isGitQuery() {}
+
+// BranchInspect observes one working tree's attached Branch and HEAD
+// (design 15.3). This is the Workspace Adoption gate's branch-attachment
+// closure: the Workspace Worktree must stay attached to the recorded
+// CFlow-owned Workspace Branch.
+type BranchInspect struct {
+	Dir string // absolute canonical Worktree path; empty means the bound directory
+}
+
+func (BranchInspect) isGitQuery() {}
+
 // GitOperation is the closed union of Git operations. Operations are
 // compare-and-swap guarded: GitFlow verifies the repository state it was
 // told to expect before and after every mutation.
@@ -557,6 +580,26 @@ type RangeFacts struct {
 
 func (RangeFacts) isGitFacts() {}
 
+// AncestryFacts reports whether one commit is an ancestor of another.
+type AncestryFacts struct {
+	Ancestor   string
+	Descendant string
+	AncestorOf bool // true when Ancestor is an ancestor of Descendant
+}
+
+func (AncestryFacts) isGitFacts() {}
+
+// BranchFacts reports one working tree's attached Branch and HEAD.
+type BranchFacts struct {
+	Dir      string // the observed canonical directory
+	Branch   string // attached local branch (refs/heads/ prefix stripped), "" when detached or unborn
+	Head     string // full HEAD hash, "" when unborn
+	Detached bool   // HEAD is not attached to a local branch
+	Exists   bool   // the directory is a Git worktree with a resolvable HEAD or branch
+}
+
+func (BranchFacts) isGitFacts() {}
+
 // GitResult is the closed union of operation results.
 type GitResult interface{ isGitResult() }
 
@@ -742,6 +785,10 @@ func (g *GitFlow) Observe(ctx context.Context, q GitQuery) (GitFacts, error) {
 		return g.refLookup(ctx, q)
 	case HistoryRange:
 		return g.historyRange(ctx, q)
+	case AncestryCheck:
+		return g.ancestryCheck(ctx, q)
+	case BranchInspect:
+		return g.branchInspect(ctx, q)
 	case FingerprintObserve:
 		return g.fingerprintObserve(ctx, q)
 	case WorktreeInProgress:

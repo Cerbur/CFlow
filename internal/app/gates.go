@@ -70,7 +70,7 @@ func (a *Application) verificationRun(ctx context.Context, wf model.WorkflowID, 
 		code, _ := model.CodeOf(err)
 		return fail(code, err.Error()), nil
 	}
-	if err := a.writeVerificationManifest(wf, intent.Node, manifest); err != nil {
+	if err := a.writeVerificationManifest(ctx, wf, intent.Node, manifest); err != nil {
 		return fail(model.CodeSensitiveDataRedactionFailed, "verification evidence cannot be persisted"), nil
 	}
 	body, err := json.Marshal(manifest)
@@ -252,7 +252,10 @@ func (a *Application) workspaceMerge(ctx context.Context, wf model.WorkflowID, i
 	if a.git == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
 	}
-	path := a.planningCWD(ctx, wf)
+	path, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 
 	// Pre-merge facts (PRD: Merge 前再次比较已验收 Commit、Task Branch HEAD
 	// 和 Git-clean 状态).
@@ -338,7 +341,10 @@ func (a *Application) workspaceRollback(ctx context.Context, wf model.WorkflowID
 	if a.git == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("git seam is not configured for this application"))
 	}
-	path := a.planningCWD(ctx, wf)
+	path, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	evidence := []model.EvidenceRef{
 		{Kind: model.EvidenceGitSnapshot, Hash: intent.Head, Subject: "workspace"},
 	}
@@ -384,7 +390,10 @@ func (a *Application) reviewProviderStart(ctx context.Context, wf model.Workflow
 	if err != nil {
 		return model.EffectResultInput{}, err
 	}
-	cwd := a.taskWorktreePath(wf, taskNode)
+	cwd, err := a.taskWorktreePath(ctx, wf, taskNode)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -422,7 +431,10 @@ func (a *Application) reviewProviderStart(ctx context.Context, wf model.Workflow
 	// Kernel binds the deterministic test-result evidence to the review
 	// pass (design 16.2: review never replaces deterministic
 	// verification).
-	out.ManifestHash = a.verificationManifestHash(wf, intent.Node)
+	out.ManifestHash, err = a.verificationManifestHash(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	return out, nil
 }
 
@@ -444,8 +456,15 @@ func (a *Application) finalReviewProviderStart(ctx context.Context, wf model.Wor
 		return model.EffectResultInput{}, model.InvalidInputFault("no embedded prompt for the final review purpose")
 	}
 	cwd := a.integrationWorktreePath(wf)
-	if a.workflowLayout(ctx, wf) >= 2 {
-		cwd = a.planningCWD(ctx, wf)
+	layoutVersion, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
+	if layoutVersion == 2 {
+		cwd, err = a.planningCWD(ctx, wf)
+		if err != nil {
+			return model.EffectResultInput{}, err
+		}
 	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
@@ -476,7 +495,10 @@ func (a *Application) finalReviewProviderStart(ctx context.Context, wf model.Wor
 	if res.Terminal != nil {
 		out.Body = []byte(res.Terminal.Result)
 	}
-	out.ManifestHash = a.verificationManifestHash(wf, intent.Node)
+	out.ManifestHash, err = a.verificationManifestHash(ctx, wf, intent.Node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	return out, nil
 }
 
@@ -491,7 +513,7 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	if err != nil {
 		return nil, err
 	}
-	manifestBody, err := a.readVerificationManifestFile(wf, verifyNode)
+	manifestBody, err := a.readRequiredVerificationManifest(ctx, wf, verifyNode)
 	if err != nil {
 		return nil, err
 	}
@@ -506,7 +528,10 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	if st.Workflow.LayoutVersion >= 2 {
 		// Aggregated workspace layout (design 8.5, TUI task 7): the final
 		// acceptance covers the verified Workspace result.
-		worktree = a.planningCWD(ctx, wf)
+		worktree, err = a.planningCWD(ctx, wf)
+		if err != nil {
+			return nil, err
+		}
 		deliveryBranch = st.Workflow.WorkspaceBranch
 		deliveryHead = st.Workflow.VerifiedWorkspaceHead
 	}
@@ -518,9 +543,11 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 	var verifications []string
 	for id, n := range st.Nodes {
 		if n.Kind == model.NodeVerify || n.Kind == model.NodeFinalVerify {
-			if b, err := a.readVerificationManifestFile(wf, id); err == nil && len(b) > 0 {
-				verifications = append(verifications, string(b))
+			b, err := a.readRequiredVerificationManifest(ctx, wf, id)
+			if err != nil {
+				return nil, err
 			}
+			verifications = append(verifications, string(b))
 		}
 	}
 	sort.Strings(verifications)
@@ -545,6 +572,22 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		nodeAcceptance = append(nodeAcceptance, fmt.Sprintf("%s/%s=%s", id, n.Kind, n.Status))
 	}
 	sort.Strings(nodeAcceptance)
+	plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return nil, err
+	}
 	return struct {
 		Plan              string `json:"plan"`
 		Spec              string `json:"spec"`
@@ -558,10 +601,10 @@ func (a *Application) finalReviewSessionInput(ctx context.Context, wf model.Work
 		Commits           string `json:"commits"`
 		Nodes             string `json:"nodes"`
 	}{
-		Plan:              string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-		Spec:              string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		Catalog:           string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		Workflow:          string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		Plan:              string(plan),
+		Spec:              string(spec),
+		Catalog:           string(catalog),
+		Workflow:          string(workflow),
 		IntegrationBranch: deliveryBranch,
 		IntegrationHead:   deliveryHead,
 		TargetBranch:      st.Workflow.TargetBranch,
@@ -598,11 +641,22 @@ func (a *Application) reviewSessionInput(ctx context.Context, wf model.WorkflowI
 	if err != nil {
 		return nil, err
 	}
-	manifestBody, err := a.readVerificationManifestFile(wf, verifyNode)
+	manifestBody, err := a.readRequiredVerificationManifest(ctx, wf, verifyNode)
 	if err != nil {
 		return nil, err
 	}
-	worktree := a.taskWorktreePath(wf, taskNode)
+	worktree, err := a.taskWorktreePath(ctx, wf, taskNode)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
 	return struct {
 		Spec         string `json:"spec"`
 		Catalog      string `json:"catalog"`
@@ -611,8 +665,8 @@ func (a *Application) reviewSessionInput(ctx context.Context, wf model.WorkflowI
 		Verification string `json:"verification"`
 		Diff         string `json:"diff"`
 	}{
-		Spec:         string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		Catalog:      string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
+		Spec:         string(spec),
+		Catalog:      string(catalog),
 		CommitRange:  manifestRange(manifestBody),
 		Worktree:     worktree,
 		Verification: string(manifestBody),
@@ -657,13 +711,17 @@ func (a *Application) taskGateResult(ctx context.Context, wf model.WorkflowID, n
 	if nd == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("gate ran without a node %s", node))
 	}
+	worktree, err := a.taskWorktreePath(ctx, wf, node)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	prior := priorAttemptEnd(st, node)
 	preflight, ok := a.readPreflightEvidence(ctx, wf, st)
 	if !ok {
 		// The recorded Commit Preflight the Execution Approval bound is
 		// missing: the Commit identity cannot be verified, so the gate
 		// fails closed with COMMIT_POLICY_MISMATCH.
-		return gateEnded(attempt.Key, model.CodeCommitPolicyMismatch, gateEndFacts(ctx, a, wf, node)), nil
+		return gateEnded(attempt.Key, model.CodeCommitPolicyMismatch, gateEndFacts(ctx, a, worktree)), nil
 	}
 	engine, err := verify.NewEngine(verify.EngineOptions{
 		Supervisor: a.supervisor, GitFlow: a.git, Redaction: a.redaction,
@@ -685,11 +743,11 @@ func (a *Application) taskGateResult(ctx context.Context, wf model.WorkflowID, n
 		Author:          preflight.Author,
 		Committer:       preflight.Committer,
 		Signing:         preflight.Signing,
-		Worktree:        a.taskWorktreePath(wf, node),
+		Worktree:        worktree,
 	})
 	if err != nil {
 		code, _ := model.CodeOf(err)
-		return gateEnded(attempt.Key, code, gateEndFacts(ctx, a, wf, node)), nil
+		return gateEnded(attempt.Key, code, gateEndFacts(ctx, a, worktree)), nil
 	}
 	return model.EffectResultInput{
 		Kind:     model.AttemptEnded,
@@ -720,8 +778,8 @@ func gateEnded(key model.AttemptKey, code model.Code, facts gitflow.StatusFacts)
 
 // gateEndFacts observes the Task Worktree's current end facts after a
 // failed gate.
-func gateEndFacts(ctx context.Context, a *Application, wf model.WorkflowID, node model.NodeID) gitflow.StatusFacts {
-	facts, err := a.observeWorktree(ctx, a.taskWorktreePath(wf, node), "")
+func gateEndFacts(ctx context.Context, a *Application, worktree string) gitflow.StatusFacts {
+	facts, err := a.observeWorktree(ctx, worktree, "")
 	if err != nil {
 		return gitflow.StatusFacts{}
 	}
@@ -817,7 +875,10 @@ func (a *Application) verificationNodeFacts(ctx context.Context, wf model.Workfl
 	if err != nil {
 		return "", "", "", "", err
 	}
-	body := readArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	body, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return "", "", "", "", err
+	}
 	wfIR, err := compile.ParseWorkflow(body)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("the compiled workflow cannot be parsed")
@@ -843,8 +904,15 @@ func (a *Application) verificationNodeFacts(ctx context.Context, wf model.Workfl
 		// 18, PRD 最终验收: 全量构建与测试 over the full Integration
 		// range).
 		cwd := a.integrationWorktreePath(wf)
-		if a.workflowLayout(ctx, wf) >= 2 {
-			cwd = a.planningCWD(ctx, wf)
+		layoutVersion, err := a.workflowLayout(ctx, wf)
+		if err != nil {
+			return "", "", "", "", err
+		}
+		if layoutVersion == 2 {
+			cwd, err = a.planningCWD(ctx, wf)
+			if err != nil {
+				return "", "", "", "", err
+			}
 		}
 		return commandID, "", verify.PurposeFinalVerify, cwd, nil
 	}
@@ -852,7 +920,11 @@ func (a *Application) verificationNodeFacts(ctx context.Context, wf model.Workfl
 	if err != nil {
 		return "", "", "", "", err
 	}
-	return commandID, taskNode, verify.PurposeTaskVerify, a.taskWorktreePath(wf, taskNode), nil
+	worktree, err = a.taskWorktreePath(ctx, wf, taskNode)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	return commandID, taskNode, verify.PurposeTaskVerify, worktree, nil
 }
 
 // nodeKindOf maps one compiled Workflow Node's type to its kernel kind
@@ -932,12 +1004,17 @@ func (a *Application) readPreflightEvidence(ctx context.Context, wf model.Workfl
 
 // writeVerificationManifest persists one Evidence Manifest at the
 // deterministic evidence path the Recovery Engine reads (design 17.1
-// order 7): <evidence>/verification/<workflow>/<node>.json.
-func (a *Application) writeVerificationManifest(wf model.WorkflowID, node model.NodeID, m model.EvidenceManifest) error {
-	if a.agent.EvidenceDir == "" {
+// order 7): Layout 1 keeps <global-evidence>/verification/<workflow>/<node>.json;
+// Layout 2 uses <workflow>/evidence/verification/<node>.json.
+func (a *Application) writeVerificationManifest(ctx context.Context, wf model.WorkflowID, node model.NodeID, m model.EvidenceManifest) error {
+	root, err := a.workflowEvidenceDir(ctx, wf)
+	if err != nil {
+		return err
+	}
+	if root == "" {
 		return nil
 	}
-	dir := filepath.Join(a.agent.EvidenceDir, "verification", string(wf))
+	dir := filepath.Join(root, "verification")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -950,11 +1027,15 @@ func (a *Application) writeVerificationManifest(wf model.WorkflowID, node model.
 
 // readVerificationManifestFile reads the persisted manifest of one
 // verify Node (nil when absent).
-func (a *Application) readVerificationManifestFile(wf model.WorkflowID, node model.NodeID) ([]byte, error) {
-	if a.agent.EvidenceDir == "" {
+func (a *Application) readVerificationManifestFile(ctx context.Context, wf model.WorkflowID, node model.NodeID) ([]byte, error) {
+	root, err := a.workflowEvidenceDir(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
+	if root == "" {
 		return nil, nil
 	}
-	path := filepath.Join(a.agent.EvidenceDir, "verification", string(wf), string(node)+".json")
+	path := filepath.Join(root, "verification", string(node)+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -965,18 +1046,32 @@ func (a *Application) readVerificationManifestFile(wf model.WorkflowID, node mod
 	return data, nil
 }
 
+func (a *Application) readRequiredVerificationManifest(ctx context.Context, wf model.WorkflowID, node model.NodeID) ([]byte, error) {
+	body, err := a.readVerificationManifestFile(ctx, wf, node)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, model.InvariantFault(fmt.Errorf("required verification manifest for %s is missing", node))
+	}
+	if _, err := validateVerificationManifest(body, node); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
 // verificationManifestHash is the persisted manifest's self-hash ("" when
 // absent).
-func (a *Application) verificationManifestHash(wf model.WorkflowID, node model.NodeID) string {
-	body, err := a.readVerificationManifestFile(wf, node)
+func (a *Application) verificationManifestHash(ctx context.Context, wf model.WorkflowID, node model.NodeID) (string, error) {
+	body, err := a.readRequiredVerificationManifest(ctx, wf, node)
 	if err != nil || body == nil {
-		return ""
+		return "", err
 	}
 	var m model.EvidenceManifest
 	if err := json.Unmarshal(body, &m); err != nil {
-		return ""
+		return "", err
 	}
-	return m.Hash
+	return m.Hash, nil
 }
 
 // manifestRange extracts the CommitRange field of a persisted manifest.
@@ -1035,7 +1130,11 @@ func (a *Application) reuseWorktreeDrift(ctx context.Context, wf model.WorkflowI
 	if prior == nil || prior.EndHead == "" {
 		return "" // the first Attempt: the Worktree is created fresh
 	}
-	status, err := a.observeWorktree(ctx, a.taskWorktreePath(wf, node), "")
+	worktree, err := a.taskWorktreePath(ctx, wf, node)
+	if err != nil {
+		return string(model.CodeStateInvariantViolation)
+	}
+	status, err := a.observeWorktree(ctx, worktree, "")
 	if err != nil {
 		if ctx.Err() != nil {
 			return "" // the pass is interrupted: the stop protocol settles the attempt
@@ -1055,7 +1154,11 @@ func (a *Application) reuseWorktreeDrift(ctx context.Context, wf model.WorkflowI
 // for the failed Attempt result of a reuse drift ("" on an unreadable
 // Worktree).
 func (a *Application) driftEndFacts(ctx context.Context, wf model.WorkflowID, node model.NodeID) (head, dirty string) {
-	status, err := a.observeWorktree(ctx, a.taskWorktreePath(wf, node), "")
+	worktree, err := a.taskWorktreePath(ctx, wf, node)
+	if err != nil {
+		return "", ""
+	}
+	status, err := a.observeWorktree(ctx, worktree, "")
 	if err != nil {
 		return "", ""
 	}

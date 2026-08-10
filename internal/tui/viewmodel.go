@@ -20,13 +20,14 @@ import (
 type Action string
 
 const (
-	ActionNone   Action = ""
-	ActionResume Action = "resume"
-	ActionPause  Action = "pause"
-	ActionCancel Action = "cancel"
-	ActionAdopt  Action = "adopt"
+	ActionNone    Action = ""
+	ActionResume  Action = "resume"
+	ActionPause   Action = "pause"
+	ActionCancel  Action = "cancel"
+	ActionAdopt   Action = "adopt"
 	ActionInspect Action = "inspect"
 	ActionDiscuss Action = "discuss"
+	ActionMigrate Action = "layout-migration"
 )
 
 // WorkflowItem is one workspace row of the workflow column.
@@ -61,8 +62,8 @@ type PlanItem struct {
 
 // WorkspaceModel is the pure renderable workspace model.
 type WorkspaceModel struct {
-	Project  app.ProjectView
-	Selected WorkflowItem
+	Project   app.ProjectView
+	Selected  WorkflowItem
 	Workflows []WorkflowItem
 	Lifecycle *LifecycleItem
 	Health    app.HealthView
@@ -75,7 +76,7 @@ type WorkspaceModel struct {
 // permits.
 func MapWorkspace(v app.WorkspaceView) WorkspaceModel {
 	m := WorkspaceModel{
-		Project:  v.Project,
+		Project:   v.Project,
 		Workflows: make([]WorkflowItem, 0, len(v.Workflows)),
 	}
 	selected := v.Selected
@@ -86,7 +87,13 @@ func MapWorkspace(v app.WorkspaceView) WorkspaceModel {
 		item := WorkflowItem{
 			ID: w.ID, Stage: w.Stage, Runtime: w.Runtime,
 			Blocked: w.Runtime == model.RuntimeBlocked,
-			Action:  actionFor(w.Runtime, w.Stage),
+		}
+		// The row action is NEVER inferred from the stage/runtime strings
+		// (design §5.3: the TUI does not re-derive the state machine). The
+		// only authoritative actions are the selected workflow's Runtime
+		// LegalActions; other rows have no per-row action.
+		if w.ID == selected {
+			item.Action = primaryActionOf(legalActionsOf(v.LegalActions))
 		}
 		m.Workflows = append(m.Workflows, item)
 		if w.ID == selected {
@@ -116,22 +123,14 @@ func MapWorkspace(v app.WorkspaceView) WorkspaceModel {
 	return m
 }
 
-// actionFor is the deterministic legal action of one workflow row.
-func actionFor(rt model.RuntimeStatus, stage model.WorkflowStage) Action {
-	switch rt {
-	case model.RuntimePaused:
-		return ActionResume
-	case model.RuntimeBlocked:
-		return ActionInspect
-	case model.RuntimeRunning:
-		return ActionPause
-	case model.RuntimeSucceeded:
-		return ActionCancel
+// primaryActionOf reduces the selected workflow's mapped legal actions to
+// the single row action (the first in stable order), or ActionNone when
+// the Runtime projects no legal action.
+func primaryActionOf(actions []Action) Action {
+	if len(actions) == 0 {
+		return ActionNone
 	}
-	if stage == model.StageRequirementDiscussion || stage == model.StagePlanGeneration {
-		return ActionDiscuss
-	}
-	return ActionNone
+	return actions[0]
 }
 
 // legalActionsOf reduces the app's legal-action list to the distinct
@@ -152,6 +151,9 @@ func legalActionsOf(actions []app.LegalAction) []Action {
 		}
 		if a.Hint == "blocked" {
 			set[ActionInspect] = true
+		}
+		if a.Hint == "layout-migration" {
+			set[ActionMigrate] = true
 		}
 	}
 	out := make([]Action, 0, len(set))

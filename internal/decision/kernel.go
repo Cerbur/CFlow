@@ -32,6 +32,12 @@ func Decide(state model.State, input model.Input) (model.Decision, error) {
 		return decideDiscussRequirement(state, in)
 	case model.PrepareNativeDiscussionInput:
 		return decidePrepareNativeDiscussion(state, in)
+	case model.NativeDiscussionReturnInput:
+		return decideNativeDiscussionReturn(state, in)
+	case model.ContinueNativeDiscussionInput:
+		return decideContinueNativeDiscussion(state, in)
+	case model.SwitchAgentInput:
+		return decideSwitchAgent(state, in)
 	case model.FinishDiscussionInput:
 		return decideFinishDiscussion(state, in)
 	case model.GeneratePlanInput:

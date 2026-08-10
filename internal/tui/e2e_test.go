@@ -146,7 +146,13 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// ---- create the workflow through the TUI form ----
 	keys("n")
 	waitOutput("create workflow")
-	keys("calculator" + keyEnter)
+	keys("calculator")
+	// The Create page surfaces the target's dirty facts before the
+	// confirmation; the E2E target is clean.
+	waitOutput("target working tree: clean")
+	waitOutput("will not touch your files")
+	keys(keyEnter) // Enter only submits the name for the confirmation
+	keys("y")      // only an explicit y creates (the clean target carries no dirty flag)
 	// The TUI processed the create (the workspace renders the workflow
 	// with the status line).
 	waitOutput("workflow created")
@@ -226,8 +232,18 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	})
 
 	// ---- execution + workspace adoption + foreground runner ----
-	waitOutput("r resume & run")
-	keys("r") // resume & run
+	// The Execution page first renders the stale projection (the dry run
+	// paused the workflow, so Resume is still a legal action) and only after
+	// the post-approval projection reload renders the reloaded signal: the
+	// workflow is now RUNNING, so Resume is no longer a legal action and the
+	// hint drops the resume ("start the runner" instead of "resume & run").
+	// The marker is the diff renderer's changed fragment ("start the
+	// runner") — the hint keeps the common "r " prefix on screen, so the
+	// contiguous "r start the runner" is not guaranteed to be written.
+	// Waiting on the fragment guards the reload — pressing r before it would
+	// hit the stale Resume projection.
+	waitOutput("start the run")
+	keys("r") // start the runner
 	// The runner stops at the Workspace Adoption Gate (the execution
 	// approval bound the frozen Change Set).
 	waitBuffer("decision panel rendered", func(s string) bool {
@@ -491,9 +507,7 @@ func requireAppliedWorkingTree(t *testing.T, fx *tuiFixture, a *app.Application,
 
 // snapshotWorkflowEntries records the workflow directories that must
 // survive the Cleanup: the aggregated root's non-code entries (the
-// Cleanup may delete only the workspace and the tmp worktrees) and the
-// legacy workflow directory that holds the artifacts (plans, specs,
-// reports, evidence, sessions, logs, state).
+// Cleanup may delete only the workspace and the tmp worktrees).
 func snapshotWorkflowEntries(t *testing.T, fx *tuiFixture, wf model.WorkflowID) []string {
 	t.Helper()
 	wfRoot := workflowRoot(t, fx, wf)
@@ -523,22 +537,6 @@ func workflowRoot(t *testing.T, fx *tuiFixture, wf model.WorkflowID) string {
 		t.Fatalf("project dirs = %v", projectDirs)
 	}
 	return filepath.Join(root, projectDirs[0].Name(), string(wf))
-}
-
-// legacyWorkflowRoot resolves the legacy artifacts root of one workflow
-// (the aggregated code directories are new; the artifacts still live at
-// the legacy path, which the Cleanup must never touch).
-func legacyWorkflowRoot(t *testing.T, fx *tuiFixture, wf model.WorkflowID) string {
-	t.Helper()
-	root := filepath.Join(fx.home, "projects")
-	projectDirs, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(projectDirs) != 1 {
-		t.Fatalf("project dirs = %v", projectDirs)
-	}
-	return filepath.Join(root, projectDirs[0].Name(), "workflows", string(wf))
 }
 
 // requireCleanupPreservation asserts the Cleanup deleted exactly the
@@ -574,25 +572,22 @@ func requireCleanupPreservation(t *testing.T, fx *tuiFixture, wf model.WorkflowI
 			t.Fatalf("cleanup deleted the preserved %s directory: %v", name, err)
 		}
 	}
-	// Preserved: the artifacts (the plans, specs, workflows, reviews,
-	// reports, evidence, sessions, logs, and state at the legacy
-	// workflow path).
-	legacy := legacyWorkflowRoot(t, fx, wf)
-	artifactsRoot := filepath.Join(legacy, "artifacts", string(wf))
-	legacyEntries, err := os.ReadDir(artifactsRoot)
-	if err != nil {
-		t.Fatalf("cleanup deleted the artifacts: %v", err)
-	}
-	found := map[string]bool{}
-	for _, e := range legacyEntries {
-		found[e.Name()] = true
-	}
-	// The legacy layout names the artifact directories by their raw
-	// type; every artifact the flow produced must survive the Cleanup.
-	for _, want := range []string{"plan", "plan-check", "spec", "catalog", "workflow",
-		"discussion-handoff", "change-set", "report", "routing-policy", "budget-policy"} {
-		if !found[want] {
-			t.Fatalf("cleanup deleted the %s artifacts: %v", want, legacyEntries)
+	// Preserved: every immutable Artifact under its fixed aggregated
+	// category/type directory.
+	for name, rel := range map[string]string{
+		"plan":               "plans/plan",
+		"plan-check":         "reviews/plan-check",
+		"spec":               "specs/spec",
+		"catalog":            "specs/catalog",
+		"workflow":           "workflows/workflow",
+		"discussion-handoff": "discussion/discussion-handoff",
+		"change-set":         "evidence/change-set",
+		"report":             "reports/report",
+		"routing-policy":     "evidence/routing-policy",
+		"budget-policy":      "evidence/budget-policy",
+	} {
+		if _, err := os.Stat(filepath.Join(wfRoot, filepath.FromSlash(rel))); err != nil {
+			t.Fatalf("cleanup deleted the %s artifacts: %v", name, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(fx.home, "cflow.db")); err != nil {

@@ -73,7 +73,24 @@ func (a *Application) agentRuntime(ctx context.Context, st model.State) (*agent.
 	if a.agent.Registry == nil {
 		return nil, nil
 	}
+	// Before WORKFLOW_CREATED the aggregate is intentionally empty and no
+	// provider effect can be owed. Avoid selecting or creating any evidence
+	// root until the persisted workflow binds an exact layout version.
+	if st.Workflow.ID == "" {
+		return nil, nil
+	}
 	cfg := a.agent
+	switch st.Workflow.LayoutVersion {
+	case 1:
+		// Legacy workflows retain their exact historical global root.
+	case 2:
+		if err := a.ensureWorkflowDir(ctx, st.Workflow.ID); err != nil {
+			return nil, err
+		}
+		cfg.EvidenceDir = a.layout.SessionsDir(st.Workflow.ID)
+	default:
+		return nil, model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", st.Workflow.ID, st.Workflow.LayoutVersion))
+	}
 	if cfg.Now == nil {
 		cfg.Now = a.now
 	}
@@ -105,16 +122,29 @@ func (a *Application) agentRuntime(ctx context.Context, st model.State) (*agent.
 // lazily (per-workflow root under the workflow directory, PRD 全局目录
 // 结构).
 func (a *Application) artifactStore(wf model.WorkflowID) (*artifact.Store, error) {
+	layoutVersion, err := a.workflowLayout(context.Background(), wf)
+	if err != nil {
+		return nil, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if s := a.artifacts[wf]; s != nil {
+	if s := a.artifacts[wf]; s != nil && a.artifactLayouts[wf] == layoutVersion {
 		return s, nil
 	}
-	st, err := artifact.New(filepath.Join(a.workflowDir(wf), "artifacts"), a.redaction)
+	var st *artifact.Store
+	switch layoutVersion {
+	case 1:
+		st, err = artifact.New(filepath.Join(a.legacyWorkflowDir(wf), "artifacts"), a.redaction)
+	case 2:
+		st, err = artifact.NewWorkflow(a.layout.WorkflowRoot(wf), wf, a.redaction)
+	default:
+		return nil, model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, layoutVersion))
+	}
 	if err != nil {
 		return nil, err
 	}
 	a.artifacts[wf] = st
+	a.artifactLayouts[wf] = layoutVersion
 	return st, nil
 }
 
@@ -127,30 +157,58 @@ func (a *Application) planningWorktreePath(wf model.WorkflowID) string {
 // workflowLayout reads the persisted Layout Version of one workflow from
 // the open write Store when the caller holds it, else from a read view
 // (design §7: 1 = legacy planning snapshot, 2 = aggregated workspace).
-func (a *Application) workflowLayout(ctx context.Context, wf model.WorkflowID) int {
+// workflowLayout returns the authoritative persisted layout binding.
+// Artifact selection fails closed when the workflow cannot be read or carries
+// an unsupported value; it must never silently treat an unknown workflow as
+// legacy.
+func (a *Application) workflowLayout(ctx context.Context, wf model.WorkflowID) (int, error) {
 	a.mu.Lock()
 	st := a.stores[wf]
 	a.mu.Unlock()
 	if st != nil {
-		if view, err := st.View(ctx, store.StoreQuery{}); err == nil {
-			return view.State.Workflow.LayoutVersion
+		view, err := st.View(ctx, store.StoreQuery{})
+		if err != nil {
+			return 0, err
 		}
+		if view.State.Workflow.ID != wf {
+			return 0, model.InvalidInputFault("no such workflow: " + string(wf))
+		}
+		return supportedLayoutVersion(wf, view.State.Workflow.LayoutVersion)
 	}
-	if view, err := a.readAggregate(ctx, wf, store.StoreQuery{}); err == nil {
-		return view.State.Workflow.LayoutVersion
+	view, err := a.readAggregate(ctx, wf, store.StoreQuery{})
+	if err != nil {
+		return 0, err
 	}
-	return 0
+	if view.State.Workflow.ID != wf {
+		return 0, model.InvalidInputFault("no such workflow: " + string(wf))
+	}
+	return supportedLayoutVersion(wf, view.State.Workflow.LayoutVersion)
+}
+
+func supportedLayoutVersion(wf model.WorkflowID, version int) (int, error) {
+	if version != 1 && version != 2 {
+		return 0, model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
+	return version, nil
 }
 
 // planningCWD returns the deterministic session cwd of the planning
 // (non-coding) sessions: the long-lived Workspace on Layout Version 2,
 // the Planning Snapshot Worktree on the legacy Layout 1 (design 8.1,
 // Task 4: Artifact and Plan discovery run inside the Workspace).
-func (a *Application) planningCWD(ctx context.Context, wf model.WorkflowID) string {
-	if a.workflowLayout(ctx, wf) >= 2 {
-		return a.layout.Workspace(wf)
+func (a *Application) planningCWD(ctx context.Context, wf model.WorkflowID) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
 	}
-	return a.planningWorktreePath(wf)
+	switch version {
+	case 1:
+		return a.planningWorktreePath(wf), nil
+	case 2:
+		return a.layout.Workspace(wf), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
 }
 
 // deliveryFacts returns the layout-aware delivery mainline facts of one
@@ -158,11 +216,19 @@ func (a *Application) planningCWD(ctx context.Context, wf model.WorkflowID) stri
 // Branch and the verified Workspace Head (design 8.5, TUI task 7); on the
 // legacy Layout 1 the Integration Branch and Head. The verified head is
 // the only legal Task base and the delivery the protected Apply merges.
-func (a *Application) deliveryFacts(ctx context.Context, wf model.WorkflowID, st model.State) (branch, head, path string) {
-	if st.Workflow.LayoutVersion >= 2 {
-		return st.Workflow.WorkspaceBranch, st.Workflow.VerifiedWorkspaceHead, a.layout.Workspace(wf)
+func (a *Application) deliveryFacts(ctx context.Context, wf model.WorkflowID, st model.State) (branch, head, path string, err error) {
+	version, err := supportedLayoutVersion(wf, st.Workflow.LayoutVersion)
+	if err != nil {
+		return "", "", "", err
 	}
-	return st.Workflow.IntegrationBranch, st.Workflow.IntegrationHead, a.integrationWorktreePath(wf)
+	switch version {
+	case 1:
+		return st.Workflow.IntegrationBranch, st.Workflow.IntegrationHead, a.integrationWorktreePath(wf), nil
+	case 2:
+		return st.Workflow.WorkspaceBranch, st.Workflow.VerifiedWorkspaceHead, a.layout.Workspace(wf), nil
+	default:
+		return "", "", "", model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
 }
 
 // ensureWorktreeParent creates every missing ancestor from the managed
@@ -197,6 +263,8 @@ func (a *Application) planningPrompt(cmd model.Input) (agent.Prompt, bool) {
 	purpose := ""
 	switch cmd.(type) {
 	case model.DiscussRequirementInput:
+		purpose = "REQUIREMENT_DISCUSSION"
+	case model.PrepareNativeDiscussionInput, model.ContinueNativeDiscussionInput, model.SwitchAgentInput:
 		purpose = "REQUIREMENT_DISCUSSION"
 	case model.GeneratePlanInput:
 		purpose = "PLAN_GENERATION"
@@ -233,6 +301,11 @@ func (a *Application) promptForPurpose(purpose model.AgentPurpose) (agent.Prompt
 	case model.PurposeWorkflowOptimization:
 		name = "WORKFLOW_OPTIMIZATION"
 	case model.PurposeImplementation:
+		name = "TASK_IMPLEMENTATION"
+	case model.PurposeAdoption:
+		// The managed adoption/coding Session (Task 4, design 8.4 step 2) is
+		// a coding Session: it receives the same implementation prompt the
+		// coding Sessions use.
 		name = "TASK_IMPLEMENTATION"
 	case model.PurposeReview:
 		name = "TASK_REVIEW"
@@ -356,7 +429,11 @@ func (a *Application) writeWorkflowManifest(ctx context.Context, wf model.Workfl
 	if err != nil {
 		return model.InvariantFault(fmt.Errorf("workflow manifest cannot be serialized"))
 	}
-	return a.writeManifest(wf, filepath.Join(a.workflowDir(wf), "workflow.yaml"), body)
+	dir, err := a.workflowDir(ctx, wf)
+	if err != nil {
+		return err
+	}
+	return a.writeManifest(ctx, wf, filepath.Join(dir, "workflow.yaml"), body)
 }
 
 // workspaceBranchOf is the deterministic CFlow-owned workspace branch of
@@ -399,7 +476,11 @@ func (a *Application) writeLegacyWorkflowManifest(ctx context.Context, wf model.
 	if err != nil {
 		return model.InvariantFault(fmt.Errorf("workflow manifest cannot be serialized"))
 	}
-	return a.writeManifest(wf, filepath.Join(a.workflowDir(wf), "workflow.yaml"), body)
+	dir, err := a.workflowDir(ctx, wf)
+	if err != nil {
+		return err
+	}
+	return a.writeManifest(ctx, wf, filepath.Join(dir, "workflow.yaml"), body)
 }
 
 // refreshPlanManifest updates the Artifact Manifest's active_plan entry
@@ -415,7 +496,11 @@ func (a *Application) refreshPlanManifest(ctx context.Context, wf model.Workflow
 	if plan == nil {
 		return nil
 	}
-	path := filepath.Join(a.workflowDir(wf), "workflow.yaml")
+	dir, err := a.workflowDir(ctx, wf)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "workflow.yaml")
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return model.InvariantFault(fmt.Errorf("workflow manifest cannot be read: %w", err))
@@ -433,14 +518,14 @@ func (a *Application) refreshPlanManifest(ctx context.Context, wf model.Workflow
 	if err != nil {
 		return model.InvariantFault(fmt.Errorf("workflow manifest cannot be serialized"))
 	}
-	return a.writeManifest(wf, path, out)
+	return a.writeManifest(ctx, wf, path, out)
 }
 
 // writeManifest persists the workflow.yaml through the security guard: a
 // fresh file is born 0600 without replacement; an existing file (the
 // manifest update) is verified and atomically replaced.
-func (a *Application) writeManifest(wf model.WorkflowID, path string, body []byte) error {
-	if err := a.ensureWorkflowDir(wf); err != nil {
+func (a *Application) writeManifest(ctx context.Context, wf model.WorkflowID, path string, body []byte) error {
+	if err := a.ensureWorkflowDir(ctx, wf); err != nil {
 		return err
 	}
 	if _, err := os.Lstat(path); err == nil {

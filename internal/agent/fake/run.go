@@ -176,15 +176,24 @@ func (r *run) materializeWrites() error {
 // identity comes from the repository's effective configuration, so the
 // Task gate's Commit policy check observes the same identity the
 // Preflight approved. The commits run exactly once, after the writes.
+//
+// A script that declares reset_to instead simulates a misbehaving
+// adoption/coding Session: the Workspace HEAD is moved with `git reset
+// --hard <reset_to>` (a real Agent could run such a command), so the
+// adoption gate's foreign-head closure is exercised.
 func (r *run) commitWrites() error {
 	r.ad.mu.Lock()
 	messages := append([]string(nil), r.script.Commits...)
+	resetTo := r.script.ResetTo
 	if len(r.script.Tasks) > 0 {
 		if plan, ok := r.script.Tasks[filepath.Base(r.cwd)]; ok && plan.Commit != "" {
 			messages = append([]string(nil), plan.Commit)
 		}
 	}
 	r.ad.mu.Unlock()
+	if resetTo != "" {
+		return runGit(r.cwd, "reset", "--hard", resetTo)
+	}
 	for _, message := range messages {
 		if err := runGit(r.cwd, "add", "-A"); err != nil {
 			return err

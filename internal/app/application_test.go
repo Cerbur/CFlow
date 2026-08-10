@@ -294,6 +294,49 @@ func TestStatusDoesNotMigrateOrTakeWriter(t *testing.T) {
 	probe.RequireAbsent(t, "migration", "project-writer")
 }
 
+// TestListUsesSQLiteWithoutWorkflowDirectories: SQLite is authoritative for
+// workflow enumeration. A fresh process must list a persisted workflow even
+// when no legacy or aggregated workflow directory is present.
+func TestListUsesSQLiteWithoutWorkflowDirectories(t *testing.T) {
+	app, _ := fixtureApplication(t)
+	db, err := sql.Open("sqlite", filepath.Join(app.home, "cflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO projects
+		(id, project_key, canonical_path, display_name, git_root, created_at, updated_at, last_opened_at)
+		VALUES ('other-project', 'other-key', '/tmp/cflow-other-project', 'other', '/tmp/cflow-other-project', ?, ?, ?)`, now, now, now); err != nil {
+		db.Close()
+		t.Fatalf("seed other project: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO workflows
+		(id, project_id, stage, runtime_status, created_at, updated_at)
+		VALUES ('workflow-other', 'other-project', 'REQUIREMENT_DISCUSSION', 'PENDING', ?, ?)`, now, now); err != nil {
+		db.Close()
+		t.Fatalf("seed other-project workflow: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	projects := filepath.Join(app.home, "projects")
+	if err := os.Rename(projects, filepath.Join(app.home, "detached-projects-fixture")); err != nil {
+		t.Fatalf("detach workflow directories: %v", err)
+	}
+	fresh, err := New(Options{
+		Home: app.home, Project: app.project, CflowVersion: app.cflowVer,
+		Now: app.now, IDs: model.SequentialIDSource(), Supervisor: app.supervisor,
+		GitFlow: app.git,
+	})
+	requireNoError(t, err)
+	view, err := fresh.Query(context.Background(), ListQuery{})
+	requireNoError(t, err)
+	workflows := view.(ListView).Workflows
+	if len(workflows) != 1 || workflows[0].ID != "workflow-1" {
+		t.Fatalf("project-scoped SQLite workflows = %+v, want only workflow-1", workflows)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // mutation behavior
 // ---------------------------------------------------------------------------
@@ -494,7 +537,11 @@ func TestSafetyPathNeverRunsNonStopEffects(t *testing.T) {
 // generated from the Event sequence (never read by Recovery).
 func TestMutationWritesEventsJsonlExport(t *testing.T) {
 	app, _ := fixtureApplication(t)
-	exportPath := filepath.Join(app.workflowDir("workflow-1"), "events.jsonl")
+	dir, err := app.workflowDir(context.Background(), "workflow-1")
+	if err != nil {
+		t.Fatalf("resolve workflow directory: %v", err)
+	}
+	exportPath := filepath.Join(dir, "events.jsonl")
 	body, err := os.ReadFile(exportPath)
 	if err != nil {
 		t.Fatalf("events export missing after create/start: %v", err)

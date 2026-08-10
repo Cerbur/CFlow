@@ -17,11 +17,13 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"cflow.local/cflow/internal/agent"
 	"cflow.local/cflow/internal/app"
 	"cflow.local/cflow/internal/cli"
 	"cflow.local/cflow/internal/foreground"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/native"
+	"cflow.local/cflow/internal/security"
 )
 
 // Dependencies is what the TUI needs to run: the same command-tree
@@ -87,6 +89,7 @@ const (
 	PageCreate
 	PageCancel
 	PagePauseExit
+	PageMigration
 )
 
 // navPages is the lifecycle navigation order (left/right on the
@@ -119,13 +122,15 @@ type Model struct {
 	// to the first healthy provider).
 	provider string
 
-	discussion DiscussionPage
-	plan       app.PlanView
-	preview    app.ExecutionPreviewView
-	approval   ApprovalModel
-	execution  ExecutionModel
-	terminal   TerminalModel
-	cancel     app.CancelSummaryView
+	discussion       DiscussionPage
+	plan             app.PlanView
+	preview          app.ExecutionPreviewView
+	approval         ApprovalModel
+	execution        ExecutionModel
+	terminal         TerminalModel
+	cancel           app.CancelSummaryView
+	migration        app.MigrationPreviewView
+	migrationConfirm migrationConfirmation
 
 	// pendingDecision is the Runtime's reason the Foreground Runner
 	// stopped at (design §11.2): the Execution page surfaces the
@@ -134,6 +139,13 @@ type Model struct {
 
 	// createInput is the Create Workflow name field.
 	createInput string
+	// createConfirm is true after the user submitted the create name for
+	// the explicit confirmation (Task 5: Enter alone never creates).
+	createConfirm bool
+	// createDirty is the queried target Git facts the Create page displays
+	// (dirty state, fingerprint, and isolation); nil until the read-only
+	// DiscoveryQuery projection loads.
+	createDirty *app.DiscoveryView
 	// status is the transient status line.
 	status string
 
@@ -157,6 +169,14 @@ type Model struct {
 	// resume committed.
 	resumeThenRun bool
 }
+
+type migrationConfirmation uint8
+
+const (
+	migrationConfirmNone migrationConfirmation = iota
+	migrationConfirmPrepare
+	migrationConfirmExecute
+)
 
 // stopState is the two-phase stop state of an active Runner.
 type stopState int
@@ -290,7 +310,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyCommand(msg)
 	case runnerEventMsg:
 		m.execution = m.execution.OnEvent(msg.ev)
-		return m, m.pumpEvents()
+		if m.running {
+			return m, m.pumpEvents()
+		}
+		// The runner is no longer active (a terminal path already cleared
+		// running/eventCh): apply the in-flight event but never re-pump —
+		// re-pumping would capture the cleared nil eventCh and leak a
+		// goroutine blocked on a nil channel forever.
+		return m, nil
 	case eventsClosedMsg:
 		return m, nil
 	case runnerDoneMsg:
@@ -298,10 +325,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case nativeDoneMsg:
 		if msg.err != nil {
 			m.status = "native session: " + msg.err.Error()
-		} else {
-			m.status = fmt.Sprintf("native session %s returned (exit %d)", msg.result.Session, msg.result.Exit.Code)
+			return m, m.reloadCmd()
 		}
-		return m, m.reloadCmd()
+		// The Bridge return persists the process exit facts and moves the
+		// Session to INTERACTIVE_IDLE; the Return actions are legal only
+		// per the revalidated facts (design §9.2, TUI task 12).
+		m.status = fmt.Sprintf("native session %s returned (exit %d)", msg.result.Session, msg.result.Exit.Code)
+		return m, m.executeCmd(app.NativeDiscussionReturnCommand{
+			Workflow:        m.selected,
+			Session:         msg.result.Session,
+			Exit:            msg.result.Exit,
+			Provider:        msg.result.Provider,
+			ProviderSession: agent.ProviderSessionID(msg.result.ProviderSession),
+		})
 	case reportLoadedMsg:
 		if msg.err != nil {
 			m.status = "report: " + msg.err.Error()
@@ -314,6 +350,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	case error:
 		m.err = msg
+		// A renderer failure never leaves a background runner: clear the
+		// ownership state (design §16: the Runtime is unchanged; the user
+		// can recover through the Headless CLI).
+		m.clearRunner()
 		return m, nil
 	}
 	return m, nil
@@ -374,9 +414,20 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 			m.preview = v
 			m.approval = ApprovalModel{Preview: v}
 		}
+	case PageCreate:
+		if v, ok := msg.view.(app.DiscoveryView); ok {
+			// The read-only Discovery projection: the Create page surfaces
+			// the target's dirty state, fingerprint, and isolation before
+			// the explicit confirmation (Task 5).
+			m.createDirty = &v
+		}
 	case PageCancel:
 		if v, ok := msg.view.(app.CancelSummaryView); ok {
 			m.cancel = v
+		}
+	case PageMigration:
+		if v, ok := msg.view.(app.MigrationPreviewView); ok {
+			m.migration = v
 		}
 	}
 	return m, nil
@@ -406,6 +457,10 @@ func (m Model) reloadCmd() tea.Cmd {
 		cmds = append(cmds, func() tea.Msg {
 			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 		})
+	case PageMigration:
+		cmds = append(cmds, func() tea.Msg {
+			return m.queryProjectionMsg(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
+		})
 	}
 	return tea.Batch(cmds...)
 }
@@ -418,7 +473,19 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			// The pause failed; the user still asked to exit. Never
 			// leave a background runner: force-stop and quit.
 			m.forceStop()
-			return m, tea.Quit
+			return m.quit()
+		}
+		if _, ok := msg.cmd.(app.ResumeWorkflowCommand); ok && m.resumeThenRun {
+			// The Execution page requested the resume as the run start but
+			// the Runtime rejected it (the stale projection can still show
+			// Resume right after an execution approval while the workflow is
+			// already RUNNING). Clear the pending resume and fall back to
+			// starting the Foreground Runner directly: DriveOnce is a safe
+			// bounded step that stops when it cannot progress. Without this
+			// the pending resume-then-run would stay dangling and a later
+			// successful resume would double-start the runner.
+			m.resumeThenRun = false
+			return m.startRunner()
 		}
 		return m, nil
 	}
@@ -427,12 +494,14 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.selected = msg.out.Workflow
 		m.status = "workflow created"
 		m.page = PageWorkspace
+		m.createDirty = nil
+		m.createConfirm = false
 		return m, m.reloadCmd()
 	case app.PauseWorkflowCommand:
 		if m.stop == stopPauseAndExit {
 			// The Pause and Exit confirmation: the pause completed, so
 			// no background process is left; finish the exit.
-			return m, tea.Quit
+			return m.quit()
 		}
 		m.status = "workflow paused (controlled stop)"
 		m.pendingDecision = ""
@@ -443,7 +512,8 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		if m.resumeThenRun {
 			// The Execution page requested the resume as the run start.
 			m.resumeThenRun = false
-			return m, tea.Batch(m.reloadCmd(), m.startRunner())
+			m, run := m.startRunner()
+			return m, tea.Batch(m.reloadCmd(), run)
 		}
 		return m, m.reloadCmd()
 	case app.CancelWorkflowCommand:
@@ -460,6 +530,21 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			return m, newNativeExecCmd(msg.out.Native)
 		}
 		m.status = "native discussion prepared"
+		return m, m.reloadCmd()
+	case app.ContinueNativeDiscussionCommand:
+		if msg.out.Native != nil {
+			m.status = "continuing the native discussion terminal…"
+			return m, newNativeExecCmd(msg.out.Native)
+		}
+		// The outcome carried no Bridge request (a re-armed Session without
+		// recoverable binding facts): fall back to the plain projection reload
+		// instead of launching a terminal that would run no supervised process.
+		return m, m.reloadCmd()
+	case app.SwitchAgentCommand:
+		if msg.out.Native != nil {
+			m.status = "starting the switched native discussion terminal…"
+			return m, newNativeExecCmd(msg.out.Native)
+		}
 		return m, m.reloadCmd()
 	case app.FreezeDiscussionCommand:
 		if msg.out.ChangeSet != nil {
@@ -524,14 +609,27 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.terminal.Confirmed = false
 		m.terminal.Yes = false
 		return m, m.reloadCmd()
+	case app.PrepareLayoutMigrationCommand:
+		m.migrationConfirm = migrationConfirmNone
+		m.status = "layout migration prepared; immutable intent persisted"
+		return m, m.reloadCmd()
+	case app.ExecuteLayoutMigrationCommand:
+		m.migrationConfirm = migrationConfirmNone
+		m.status = "legacy layout migrated"
+		m.page = PageWorkspace
+		return m, m.reloadCmd()
 	}
 	return m, m.reloadCmd()
 }
 
 // applyRunnerDone handles the terminal result of the Foreground Runner.
+// Every terminal path clears the ownership state exactly once: the run
+// closure's defer unsubscribes the event subscription, and this clears
+// running, runCancel, and eventCh (Task 6).
 func (m Model) applyRunnerDone(msg runnerDoneMsg) (Model, tea.Cmd) {
 	m.running = false
 	m.runCancel = nil
+	m.eventCh = nil
 	if msg.err != nil {
 		m.err = msg.err
 		return m, nil
@@ -567,7 +665,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.selected != "" {
 				// The first Ctrl+C requests the controlled Pause: the
 				// typed command closes dispatch and stops the managed
-				// processes (never just a local flag).
+				// processes, and the run context is cancelled so the real
+				// Runner stops (never just a local flag).
+				if m.runCancel != nil {
+					m.runCancel()
+				}
 				cmds = append(cmds, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected}))
 			}
 			return m, tea.Batch(cmds...)
@@ -575,7 +677,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// The second Ctrl+C is the Force Stop of the active Runner
 			// (and of any running controlled stop).
 			m.forceStop()
-			return m, tea.Quit
+			return m.quit()
 		}
 	}
 	// Tab cycles the lifecycle pages from any page (left/right keep
@@ -613,6 +715,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleCreateKey(msg)
 	case PageCancel:
 		return m.handleCancelKey(msg)
+	case PageMigration:
+		return m.handleMigrationKey(msg)
 	case PageWorkspace:
 		return m.handleWorkspaceKey(msg)
 	case PageDiscussion:
@@ -654,6 +758,28 @@ func (m *Model) forceStop() {
 	}
 }
 
+// clearRunner resets the Foreground Runner ownership state (design §11,
+// Task 6): it cancels any live run context and clears running, runCancel,
+// and eventCh. It never unsubscribes the event sink — the run closure's
+// defer owns the subscription and drops it exactly once — so terminal
+// paths never double-clean. Idempotent and safe on every terminal path.
+func (m *Model) clearRunner() {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	m.running = false
+	m.runCancel = nil
+	m.eventCh = nil
+}
+
+// quit cleans the Foreground Runner ownership state and returns the quit
+// command (design §12.1): a quit never leaves an active Runner running or
+// a dangling event subscription.
+func (m Model) quit() (Model, tea.Cmd) {
+	m.clearRunner()
+	return m, tea.Quit
+}
+
 // executeCmd runs one typed Application Command and delivers its Outcome.
 func (m Model) executeCmd(cmd app.Command) tea.Cmd {
 	return func() tea.Msg {
@@ -678,7 +804,7 @@ func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
 		}
 		m.forceStop()
-		return m, tea.Quit
+		return m.quit()
 	case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
 		m.stop = stopIdle
 		m.page = m.prevPage
@@ -687,12 +813,46 @@ func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleCreateKey handles the Create Workflow form.
+// handleCreateKey handles the Create Workflow form (Task 5): the TUI
+// first queries and displays the target's dirty state, fingerprint, and
+// isolation; Enter only submits the name for the explicit confirmation
+// (default No) and NEVER creates; only an explicit y issues the typed
+// CreateWorkflowCommand, carrying ConfirmDirty: true exactly when the
+// queried target is dirty.
 func (m Model) handleCreateKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
+	if m.createConfirm {
+		// The explicit confirmation: default No. Enter alone never creates.
+		switch {
+		case msg.Code == 'y' || msg.Code == 'Y':
+			name := strings.TrimSpace(m.createInput)
+			if name == "" {
+				m.createConfirm = false
+				m.status = "a workflow name is required"
+				return m, nil
+			}
+			if m.createDirty == nil {
+				m.status = "target facts unavailable; press esc and retry"
+				return m, nil
+			}
+			m.status = "creating workflow…"
+			m.createInput = ""
+			m.createConfirm = false
+			return m, m.executeCmd(app.CreateWorkflowCommand{
+				Name: name, Provider: m.createProvider(), ConfirmDirty: m.createDirty.Dirty,
+			})
+		case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
+			m.createConfirm = false
+			m.status = "creation declined"
+			return m, nil
+		}
+		return m, nil
+	}
 	switch {
 	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		m.createInput = ""
+		m.createConfirm = false
+		m.createDirty = nil
 		return m, nil
 	case msg.Code == tea.KeyEnter:
 		name := strings.TrimSpace(m.createInput)
@@ -700,11 +860,9 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.status = "a workflow name is required"
 			return m, nil
 		}
-		m.status = "creating workflow…"
-		m.createInput = ""
-		return m, m.executeCmd(app.CreateWorkflowCommand{
-			Name: name, Provider: m.createProvider(), ConfirmDirty: true,
-		})
+		// Enter submits the name for the confirmation; it never creates.
+		m.createConfirm = true
+		return m, nil
 	case msg.Code == tea.KeyBackspace || msg.Code == tea.KeyDelete:
 		if len(m.createInput) > 0 {
 			m.createInput = m.createInput[:len(m.createInput)-1]
@@ -747,32 +905,89 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case IsRight(msg):
 		return m.moveNav(1)
 	case msg.Code == 'n' || msg.Code == 'N':
+		// Opening the Create page is a read-only step: it queries the
+		// target's Git facts (dirty state, fingerprint, isolation) that the
+		// explicit confirmation then renders.
 		m.page = PageCreate
 		m.createInput = ""
-		return m, nil
+		m.createConfirm = false
+		m.createDirty = nil
+		return m, m.queryCmd(PageCreate, app.DiscoveryQuery{})
 	case msg.Code == 'r' || msg.Code == 'R':
-		if m.selected == "" {
-			m.status = "no workflow selected"
+		if m.selected == "" || !hasAction(m.workspace.Actions, ActionResume) {
+			m.status = "resume is not a legal action"
 			return m, nil
 		}
 		m.status = "resuming…"
 		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
 	case msg.Code == 'p' || msg.Code == 'P':
-		if m.selected == "" {
-			m.status = "no workflow selected"
+		if m.selected == "" || !hasAction(m.workspace.Actions, ActionPause) {
+			m.status = "pause is not a legal action"
 			return m, nil
 		}
 		m.status = "pausing…"
 		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
 	case msg.Code == 'x' || msg.Code == 'X':
-		if m.selected == "" {
-			m.status = "no workflow selected"
+		if m.selected == "" || !hasAction(m.workspace.Actions, ActionCancel) {
+			m.status = "cancel is not a legal action"
 			return m, nil
 		}
 		m.page = PageCancel
 		return m, func() tea.Msg {
 			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 		}
+	case msg.Code == 'm' || msg.Code == 'M':
+		if m.selected == "" || !hasAction(m.workspace.Actions, ActionMigrate) {
+			m.status = "layout migration is not a legal action"
+			return m, nil
+		}
+		m.page = PageMigration
+		m.migration = app.MigrationPreviewView{}
+		m.migrationConfirm = migrationConfirmNone
+		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
+	}
+	return m, nil
+}
+
+func hasAction(actions []Action, want Action) bool {
+	for _, action := range actions {
+		if action == want {
+			return true
+		}
+	}
+	return false
+}
+
+// handleMigrationKey owns the explicit TUI Preview -> Prepare -> Execute
+// protocol. Enter and n are No at both confirmations; only y executes a
+// typed Application command bound to the displayed manifest hash.
+func (m Model) handleMigrationKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
+	if m.migrationConfirm != migrationConfirmNone {
+		switch {
+		case msg.Code == 'y' || msg.Code == 'Y':
+			confirm := m.migrationConfirm
+			m.migrationConfirm = migrationConfirmNone
+			if confirm == migrationConfirmPrepare {
+				return m, m.executeCmd(app.PrepareLayoutMigrationCommand{Workflow: m.selected, ManifestHash: m.migration.ManifestHash})
+			}
+			return m, m.executeCmd(app.ExecuteLayoutMigrationCommand{Workflow: m.selected, ManifestHash: m.migration.ManifestHash})
+		case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
+			m.migrationConfirm = migrationConfirmNone
+			m.status = "layout migration confirmation declined"
+			return m, nil
+		}
+		return m, nil
+	}
+	switch {
+	case msg.Code == 'p' || msg.Code == 'P':
+		m.migrationConfirm = migrationConfirmPrepare
+		return m, nil
+	case msg.Code == 'e' || msg.Code == 'E':
+		m.migrationConfirm = migrationConfirmExecute
+		return m, nil
+	case msg.Code == tea.KeyEsc:
+		m.page = PageWorkspace
+		return m, nil
 	}
 	return m, nil
 }
@@ -882,15 +1097,19 @@ func (m Model) activateDiscussionAction() (Model, tea.Cmd) {
 	}
 	action := m.discussion.Actions[m.discussion.Selected]
 	switch action {
-	case ReturnStart, ReturnContinue:
+	case ReturnStart:
 		m.status = "preparing the native discussion…"
 		return m, m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+	case ReturnContinue:
+		// Continue resumes the SAME Provider Session on the SAME provider.
+		m.status = "continuing the native discussion…"
+		return m, m.executeCmd(app.ContinueNativeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
 	case ReturnFinish:
 		m.status = "freezing the change set…"
 		return m, m.executeCmd(app.FreezeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
 	case ReturnSwitch:
 		m.status = "switching the discussion session…"
-		return m, m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		return m, m.switchAgentCmd()
 	case ReturnPause:
 		m.page = PageWorkspace
 		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
@@ -912,6 +1131,35 @@ func (m Model) discussionProvider() string {
 	return "fake"
 }
 
+// switchAgentCmd issues the switch-agent command: a DIFFERENT provider than
+// the bound Session's and the user-supplied reason. Without a different
+// healthy provider the switch fails closed without a mutation.
+func (m Model) switchAgentCmd() tea.Cmd {
+	current := m.discussion.Provider
+	alt := ""
+	for _, p := range m.workspace.Health.Providers {
+		if p.Compatible && p.Name != current {
+			alt = p.Name
+			break
+		}
+	}
+	if alt == "" {
+		return func() tea.Msg {
+			return commandDoneMsg{err: fmt.Errorf("no different provider is available to switch to")}
+		}
+	}
+	reason := m.discussion.SwitchReason
+	if strings.TrimSpace(reason) == "" {
+		reason = "user switched the discussion agent"
+	}
+	return m.executeCmd(app.SwitchAgentCommand{
+		Workflow: m.selected,
+		Session:  model.SessionID(m.discussion.Session),
+		Provider: alt,
+		Reason:   reason,
+	})
+}
+
 // handleHandoffKey handles the handoff content editor.
 func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
@@ -920,7 +1168,7 @@ func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.discussion.Handoff = ""
 		return m, nil
 	case msg.Code == tea.KeyEnter:
-		body, err := buildHandoff(m.discussion.Handoff, m.selected, model.SessionID(m.discussion.Session), m.discussion.ChangeSetRef)
+		content, err := handoffDecisions(m.discussion.Handoff, m.selected, model.SessionID(m.discussion.Session), m.discussion.ChangeSetRef)
 		if err != nil {
 			m.discussion.Status = err.Error()
 			return m, nil
@@ -929,7 +1177,7 @@ func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.discussion.Editing = false
 		m.status = "finishing the discussion…"
 		return m, m.executeCmd(app.FinishDiscussionCommand{
-			Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Handoff: body,
+			Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Decisions: content,
 		})
 	case msg.Code == tea.KeyBackspace || msg.Code == tea.KeyDelete:
 		if len(m.discussion.Handoff) > 0 {
@@ -1033,25 +1281,11 @@ func (m Model) handleExecutionApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) 
 	return m, cmd
 }
 
-// workflowRuntime queries the authoritative Runtime of the selected
-// workflow ("" when it cannot be observed).
-func (m Model) workflowRuntime() model.RuntimeStatus {
-	if m.ctrl == nil || m.selected == "" {
-		return ""
-	}
-	v, err := m.ctrl.Query(context.Background(), app.StatusQuery{Workflow: m.selected})
-	if err != nil {
-		return ""
-	}
-	if sv, ok := v.(app.StatusView); ok {
-		return sv.Runtime
-	}
-	return ""
-}
-
-// handleExecutionKey handles the Execution page: 'r' resumes and starts
-// the Foreground Runner, 'a' runs the Workspace Adoption Gate, and the
-// page panes navigate with left/right.
+// handleExecutionKey handles the Execution page: 'r' resumes & runs, 'a'
+// runs the Workspace Adoption Gate, and the page panes navigate with
+// left/right. The Resume command is issued ONLY when the Runtime's
+// LegalActions include it (a PAUSED workflow); otherwise the runner starts
+// directly (design §5.3: the TUI never re-infers the state machine).
 func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.selected == "" {
 		m.status = "no workflow selected"
@@ -1065,14 +1299,11 @@ func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 		m.status = "starting the foreground runner…"
 		m.pendingDecision = ""
-		// The authoritative runtime comes from the Application (the
-		// rendered projection may lag the committed approval by a
-		// frame); only a PAUSED workflow needs the resume first.
-		if m.workflowRuntime() == model.RuntimePaused {
+		if hasAction(m.workspace.Actions, ActionResume) {
 			m.resumeThenRun = true
 			return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
 		}
-		return m, m.startRunner()
+		return m.startRunner()
 	case msg.Code == 'a' || msg.Code == 'A':
 		if m.pendingDecision != "" {
 			m.status = "adopting the workspace…"
@@ -1088,13 +1319,15 @@ func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleBlockedKey handles the Blocked page: only the Runtime legal
-// actions are offered.
+// handleBlockedKey handles the Blocked page: the Resume key is offered
+// ONLY when the Runtime's LegalActions include it (design §5.3: the TUI
+// renders and issues only the Runtime's legal actions; a blocked workflow
+// whose LegalActions contain no Resume offers no resume key).
 func (m Model) handleBlockedKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
 	case msg.Code == 'r' || msg.Code == 'R':
-		if m.selected == "" {
-			m.status = "no workflow selected"
+		if m.selected == "" || !hasAction(m.workspace.Actions, ActionResume) {
+			m.status = "resume is not a legal action"
 			return m, nil
 		}
 		m.status = "resuming…"
@@ -1211,17 +1444,25 @@ func (m Model) handleCancelKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 // startRunner launches the Foreground Runner over the shared
 // controller: it drives the approved workflow to a terminal state, a
 // user decision, or a safe stop, streaming the committed events into
-// the Execution page.
-func (m Model) startRunner() tea.Cmd {
+// the Execution page. The root Model owns the runner lifecycle (design
+// §11): startRunner returns the updated Model with running, runCancel,
+// eventCh and the subscription set. Starting a Run while one is already
+// active is refused (idempotent guard) — no second runner and no second
+// subscription.
+func (m Model) startRunner() (Model, tea.Cmd) {
+	if m.running {
+		m.status = "a runner is already active"
+		return m, nil
+	}
 	if m.selected == "" {
-		return nil
+		return m, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	ch, id := m.sink.Subscribe()
 	m.runCancel = cancel
 	m.running = true
-	ch, id := m.sink.Subscribe()
 	m.eventCh = ch
-	return tea.Batch(
+	return m, tea.Batch(
 		func() tea.Msg {
 			defer m.sink.Unsubscribe(id)
 			r := &foreground.Runner{
@@ -1241,9 +1482,17 @@ func (m Model) startRunner() tea.Cmd {
 }
 
 // pumpEvents forwards one committed Runner event to the Execution page.
+// A terminal path can clear eventCh while a pump command is still in
+// flight (the renderer-error and the runner's event send come from
+// different goroutines with no happens-before edge): a cleared channel
+// must end the pump with eventsClosedMsg instead of blocking forever on
+// a nil channel (a leaked goroutine).
 func (m Model) pumpEvents() tea.Cmd {
 	ch := m.eventCh
 	return func() tea.Msg {
+		if ch == nil {
+			return eventsClosedMsg{}
+		}
 		ev, ok := <-ch
 		if !ok {
 			return eventsClosedMsg{}
@@ -1323,36 +1572,39 @@ func render(m Model) string {
 	switch m.page {
 	case PageWorkspace:
 		b.WriteString(RenderWorkspace(m.workspace, m.width))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageDiscussion:
 		b.WriteString(RenderDiscussionReturn(m.discussion))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PagePlanApproval:
 		b.WriteString(RenderPlanApproval(m.plan, m.approval))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageExecutionApproval:
 		b.WriteString(RenderApproval(m.approval))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageExecution:
 		b.WriteString(RenderExecution(m.execution))
 		if m.pendingDecision != "" {
 			b.WriteString(renderDecisionPanel(m.pendingDecision))
 		}
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageBlocked:
 		b.WriteString(RenderBlocked(m.workspace))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageTerminal:
 		b.WriteString(RenderTerminal(m.terminal))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageCreate:
 		b.WriteString(renderCreate(m))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PageCancel:
 		b.WriteString(renderCancel(m))
-		b.WriteString(hints(m.page))
+		b.WriteString(m.hints())
 	case PagePauseExit:
 		b.WriteString(RenderPauseExit())
+	case PageMigration:
+		b.WriteString(renderMigration(m))
+		b.WriteString(m.hints())
 	}
 	if m.status != "" {
 		fmt.Fprintf(&b, "\nstatus: %s\n", m.status)
@@ -1360,11 +1612,14 @@ func render(m Model) string {
 	return b.String()
 }
 
-// hints is the fixed key hint footer of one page.
-func hints(p Page) string {
-	switch p {
+// hints is the key hint footer of the current page. The workflow-action
+// hints are driven ONLY by the Runtime LegalActions projection (design
+// §5.3): a page never advertises a key whose action the Runtime does not
+// currently permit.
+func (m Model) hints() string {
+	switch m.page {
 	case PageWorkspace:
-		return "\n↑/↓ select workflow  ←/→ lifecycle  n create  r resume  p pause  x cancel  q quit\n"
+		return workspaceHints(m.workspace)
 	case PageDiscussion:
 		return "\n↑/↓ action  Enter run  b workspace\n"
 	case PagePlanApproval:
@@ -1372,28 +1627,147 @@ func hints(p Page) string {
 	case PageExecutionApproval:
 		return "\ns generate specs  w compile workflow  d dry run  Enter/y confirm  q quit\n"
 	case PageExecution:
-		return "\nr resume & run  a adopt workspace  ←/→ panes  b workspace\n"
+		// The hint is driven by the Runtime LegalActions: "r resume & run"
+		// only while the Runtime permits Resume (a PAUSED workflow); once the
+		// post-approval projection reloads the RUNNING workflow the hint
+		// becomes the plain "r start the runner" (the runner is started
+		// directly; it resumes first only when Resume is legal).
+		if hasAction(m.workspace.Actions, ActionResume) {
+			return "\nr resume & run  a adopt workspace  ←/→ panes  b workspace\n"
+		}
+		return "\nr start the runner  a adopt workspace  ←/→ panes  b workspace\n"
 	case PageBlocked:
-		return "\nr resume  b workspace\n"
+		return blockedHints(m.workspace)
 	case PageTerminal:
 		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter/y confirm  q quit\n"
 	case PageCreate:
-		return "\ntype the workflow name; Enter create, Esc cancel\n"
+		return createHints(m)
 	case PageCancel:
 		return "\nEnter/y cancel (default no), n/esc back\n"
 	case PagePauseExit:
 		return ""
+	case PageMigration:
+		return "\np prepare  e execute  y confirm  Enter/n default no  Esc back\n"
 	}
 	return ""
 }
 
+// workspaceHints renders the Workspace page hint from the selected
+// workflow's Runtime LegalActions only.
+func workspaceHints(m WorkspaceModel) string {
+	parts := []string{"↑/↓ select workflow", "←/→ lifecycle", "n create", "q quit"}
+	if hasAction(m.Actions, ActionResume) {
+		parts = append(parts, "r resume")
+	}
+	if hasAction(m.Actions, ActionPause) {
+		parts = append(parts, "p pause")
+	}
+	if hasAction(m.Actions, ActionCancel) {
+		parts = append(parts, "x cancel")
+	}
+	if hasAction(m.Actions, ActionMigrate) {
+		parts = append(parts, "m migrate")
+	}
+	return "\n" + strings.Join(parts, "  ") + "\n"
+}
+
+// blockedHints renders the Blocked page hint from the Runtime LegalActions
+// only: Resume appears solely when the Runtime permits it.
+func blockedHints(m WorkspaceModel) string {
+	parts := []string{"b workspace"}
+	if hasAction(m.Actions, ActionResume) {
+		parts = append(parts, "r resume")
+	}
+	return "\n" + strings.Join(parts, "  ") + "\n"
+}
+
+// createHints renders the Create page hint: the confirmation defaults to
+// No, so Enter alone never creates; only an explicit y does.
+func createHints(m Model) string {
+	if m.createConfirm {
+		return "\ny create (default no), Enter/n decline, esc back to edit\n"
+	}
+	return "\ntype the workflow name; Enter review, esc cancel\n"
+}
+
+func renderMigration(m Model) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "legacy layout migration %s\n", m.migration.Workflow)
+	r := func(value string) string { return redactMigrationText(m.deps.CLI.Redaction, value) }
+	fmt.Fprintf(&b, "layout: %d -> %d\nstatus: %s\nmanifest: %s\n", m.migration.From, m.migration.To, r(m.migration.Status), r(m.migration.ManifestHash))
+	if m.migration.MigrationID != "" {
+		fmt.Fprintf(&b, "migration id: %s\n", r(m.migration.MigrationID))
+	}
+	if m.migration.ManifestPath != "" {
+		fmt.Fprintf(&b, "manifest path: %s\n", r(m.migration.ManifestPath))
+	}
+	if m.migration.BackupPath != "" {
+		fmt.Fprintf(&b, "backup: %s sha256=%s size=%d\n", r(m.migration.BackupPath), r(m.migration.BackupHash), m.migration.BackupSize)
+	}
+	if m.migration.SourceSnapshotHash != "" {
+		fmt.Fprintf(&b, "source snapshot: %s\n", r(m.migration.SourceSnapshotHash))
+	}
+	fmt.Fprintf(&b, "database impact: workspace=%s branch=%s head=%s\n",
+		r(m.migration.ExpectedWorkspacePath), r(m.migration.ExpectedWorkspaceBranch), r(m.migration.ExpectedWorkspaceHead))
+	for i, move := range m.migration.Moves {
+		fmt.Fprintf(&b, "%d. %s\n   %s\n   -> %s\n   branch=%s head=%s digest=%s\n",
+			i+1, move.Kind, r(move.Source), r(move.Destination), r(move.Branch), r(move.Head), r(move.Digest))
+	}
+	switch m.migrationConfirm {
+	case migrationConfirmPrepare:
+		b.WriteString("\nPersist immutable manifest and recoverable intent? [y/N]\n")
+	case migrationConfirmExecute:
+		b.WriteString("\nExecute the exact persisted migration intent? [y/N]\n")
+	}
+	return b.String()
+}
+
+func redactMigrationText(reg security.Registry, value string) string {
+	if value == "" {
+		return "-"
+	}
+	red := security.NewRedactor(reg)
+	frame, err := red.WriteFrame([]byte(value))
+	if err != nil {
+		return "[REDACTED]"
+	}
+	flushed, err := red.Flush()
+	if err != nil {
+		return "[REDACTED]"
+	}
+	return frame.Text + flushed.Text
+}
+
+// renderCreate renders the Create Workflow page: the read-only Discovery
+// projection surfaces the target's dirty state, dirty fingerprint, and
+// isolation before the default-No confirmation (Task 5).
 func renderCreate(m Model) string {
 	var b strings.Builder
 	b.WriteString("create workflow\n")
 	b.WriteString("project: " + m.workspace.Project.Name + " (" + m.workspace.Project.Root + ")\n")
 	b.WriteString("provider: " + m.createProvider() + "\n")
-	fmt.Fprintf(&b, "name: %s_\n", m.createInput)
-	b.WriteString("\n(user workspace changes are isolated and never enter the workflow)\n")
+	if d := m.createDirty; d != nil {
+		if d.Branch != "" {
+			fmt.Fprintf(&b, "target: %s @ %s\n", d.Branch, shortHead(d.Head))
+		}
+		if d.Dirty {
+			fmt.Fprintf(&b, "target: DIRTY (%d staged, %d unstaged, %d untracked)\n",
+				d.StagedCount, d.UnstagedCount, d.UntrackedCount)
+			fmt.Fprintf(&b, "dirty fingerprint: %s\n", d.DirtyFingerprint)
+		} else {
+			b.WriteString("target working tree: clean\n")
+		}
+		b.WriteString("isolation: this workflow will not touch your files until explicit apply\n")
+	} else {
+		b.WriteString("target: (loading git facts…)\n")
+	}
+	if m.createConfirm {
+		fmt.Fprintf(&b, "name: %s\n", m.createInput)
+		b.WriteString("create workflow? [y/N]\n")
+	} else {
+		fmt.Fprintf(&b, "name: %s_\n", m.createInput)
+		b.WriteString("enter review, then y to create (default no)\n")
+	}
 	return b.String()
 }
 

@@ -861,6 +861,7 @@ func TestWorkflowStoreAggregatedTypeDirs(t *testing.T) {
 		model.ArtifactPlan, model.ArtifactSpec, model.ArtifactCatalog, model.ArtifactWorkflow,
 		model.ArtifactDiscussionTurn, model.ArtifactPlanCheck, model.ArtifactReport,
 		model.ArtifactCleanupManifest, model.ArtifactRoutingPolicy, model.ArtifactBudgetPolicy,
+		model.ArtifactChangeSet, model.ArtifactDiscussionHandoff,
 	} {
 		dir, ok := aggregatedTypeDirs[typ]
 		if !ok { // guard against dropping the map entry
@@ -917,14 +918,14 @@ func TestWorkflowStoreRootMustBeAggregatedRoot(t *testing.T) {
 }
 
 // TestWorkflowStorePhysicalLayout: an aggregated write lands exactly at
-// <root>/<type-dir>/<revision>/<hash> with owner-only mode, and the
+// <root>/<type-dir>/<artifact-type>/<revision>/<hash> with owner-only mode, and the
 // legacy artifacts/<wf>/<type> and <root>/<workflow-id> shapes never
 // appear on disk (design 7).
 func TestWorkflowStorePhysicalLayout(t *testing.T) {
 	s := newTestWorkflowStore(t, "wf-1")
 	ref := mustPut(t, s, fixturePlanRequest("wf-1", "Fix login bug", 1))
 
-	revisionDir := filepath.Join(s.root, "plans", "1")
+	revisionDir := filepath.Join(s.root, "plans", "plan", "1")
 	entries, err := os.ReadDir(revisionDir)
 	requireNoError(t, err)
 	if len(entries) != 1 || entries[0].Name() != ref.Hash {

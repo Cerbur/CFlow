@@ -10,6 +10,9 @@ package recovery_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +23,7 @@ import (
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/gitflow"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/process"
 	"cflow.local/cflow/internal/recovery"
@@ -200,6 +204,18 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 			return st.View(ctx, store.StoreQuery{})
 		},
 		OpenArtifacts: func(ctx context.Context, wf model.WorkflowID) (*artifact.Store, error) {
+			var version int
+			db, err := sql.Open("sqlite", fx.dbPath)
+			if err != nil {
+				return nil, err
+			}
+			defer db.Close()
+			if err := db.QueryRowContext(ctx, `SELECT layout_version FROM workflows WHERE id = ?`, wf).Scan(&version); err != nil {
+				return nil, err
+			}
+			if version == 2 {
+				return artifact.NewWorkflow(filepath.Join(home, "projects", key, string(wf)), wf, security.Registry{})
+			}
 			return artifact.New(filepath.Join(home, "projects", key, "workflows", string(wf), "artifacts"), security.Registry{})
 		},
 	})
@@ -207,6 +223,18 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 		t.Fatalf("new recovery engine: %v", err)
 	}
 	return fx
+}
+
+func (fx *recoveryFixture) setLayoutVersion(version int) {
+	fx.t.Helper()
+	db, err := sql.Open("sqlite", fx.dbPath)
+	if err != nil {
+		fx.t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE workflows SET layout_version = ? WHERE id = ?`, version, testWF); err != nil {
+		fx.t.Fatal(err)
+	}
 }
 
 func newRepo(t *testing.T) *gitRunner {
@@ -225,7 +253,6 @@ func newRepo(t *testing.T) *gitRunner {
 // seedIntent commits one Effect Intent into the pending ledger.
 func (fx *recoveryFixture) seedIntent(intent model.EffectIntent) {
 	fx.t.Helper()
-	fx.pending = append(fx.pending, intent)
 	st, err := store.Open(context.Background(), store.OpenOptions{
 		Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now,
 	})
@@ -237,6 +264,48 @@ func (fx *recoveryFixture) seedIntent(intent model.EffectIntent) {
 	if err != nil {
 		fx.t.Fatalf("view: %v", err)
 	}
+	if migration, ok := intent.(model.LayoutMigrationIntent); ok {
+		preview := layout.MigrationPreview{Workflow: testWF, From: 1, To: 2, Moves: migration.Moves}
+		preview.ManifestHash = preview.Hash()
+		migration.Workflow = testWF
+		migration.MigrationID = "migration-wf-1-" + preview.ManifestHash[:16]
+		manifestPath := filepath.Join(fx.home, "projects", fx.projectKey, testWF, "state", "layout-migrations", migration.MigrationID+".json")
+		if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+			fx.t.Fatal(err)
+		}
+		backupPath := strings.TrimSuffix(manifestPath, ".json") + ".db.backup"
+		backup, err := st.BackupLayoutMigration(context.Background(), backupPath)
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		snapshot := layout.SourceSnapshot{AggregateVersion: uint64(view.AggregateVersion), LayoutVersion: 1,
+			IntegrationBranch: view.State.Workflow.IntegrationBranch, IntegrationHead: view.State.Workflow.IntegrationHead,
+			BaseCommit: view.State.Workflow.BaseCommit, PreviewHash: preview.ManifestHash}
+		snapshotBody, _ := json.Marshal(snapshot)
+		snapshotHash := sha256.Sum256(snapshotBody)
+		manifest := layout.MigrationManifest{MigrationID: migration.MigrationID, Workflow: testWF,
+			PreviewHash: preview.ManifestHash, From: 1, To: 2, Moves: migration.Moves,
+			Backup:         layout.BackupEvidence{Path: backup.Path, SHA256: backup.SHA256, Size: backup.Size},
+			SourceSnapshot: snapshot, SourceSnapshotHash: fmt.Sprintf("%x", snapshotHash[:]),
+			DatabaseImpact: layout.DatabaseImpact{FromLayoutVersion: 1, ToLayoutVersion: 2,
+				WorkspacePath:   filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
+				WorkspaceBranch: view.State.Workflow.IntegrationBranch, WorkspaceHead: view.State.Workflow.IntegrationHead}}
+		body, err := json.Marshal(manifest)
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		manifestHash := sha256.Sum256(body)
+		migration.ManifestHash = fmt.Sprintf("%x", manifestHash[:])
+		migration.PreviewHash = preview.ManifestHash
+		intent = migration
+		if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+			fx.t.Fatal(err)
+		}
+		if err := st.RecordLayoutMigration(context.Background(), testWF, migration.MigrationID, manifestPath, migration.ManifestHash); err != nil {
+			fx.t.Fatalf("record migration: %v", err)
+		}
+	}
+	fx.pending = append(fx.pending, intent)
 	if _, err := st.Transact(context.Background(), view.AggregateVersion, func(state model.State) (model.Decision, error) {
 		return model.Decision{Effect: intent}, nil
 	}); err != nil {
@@ -524,6 +593,28 @@ func TestRecoveryVerificationManifestDispositions(t *testing.T) {
 	requireDisposition(t, out, recovery.AlreadyCompleted)
 }
 
+// TestRecoveryLayout2VerificationEvidence reads deterministic evidence from
+// the aggregate workflow evidence directory, not the legacy global root.
+func TestRecoveryLayout2VerificationEvidence(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	fx.setLayoutVersion(2)
+	dir := filepath.Join(fx.home, "projects", fx.projectKey, testWF, "evidence", "verification")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fmt.Sprintf(`{"Node":"%s","CatalogRef":{"Revision":1,"Hash":"%s"},"CommitRange":"%s..%s","Passed":true}`,
+		mergeNode, strings.Repeat("a", 64), fx.baseHead, fx.taskHead)
+	if err := os.WriteFile(filepath.Join(dir, mergeNode+".json"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(model.VerificationRunIntent{
+		Node:        mergeNode,
+		Catalog:     model.CatalogRef{Revision: 1, Hash: strings.Repeat("a", 64)},
+		CommitRange: fx.baseHead + ".." + fx.taskHead,
+	})
+	requireDisposition(t, mustReconcile(t, fx), recovery.AlreadyCompleted)
+}
+
 // TestRecoveryArtifactDispositions: an ArtifactWriteIntent whose exact
 // Revision exists in the Artifact Store is ALREADY_COMPLETED; an absent
 // Revision is SAFE_TO_RETRY; a Revision whose file was deleted afterwards
@@ -582,6 +673,215 @@ func TestRecoveryArtifactDispositions(t *testing.T) {
 	})
 	out = mustReconcile(t, orphan)
 	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryLayout2FixedRevisionCrashWindows proves fixed-revision
+// inspection uses the Layout 2 aggregate category/type path. A completed
+// write without an intent hash is recognized, while an orphaned revision
+// directory is blocked rather than retried.
+func TestRecoveryLayout2FixedRevisionCrashWindows(t *testing.T) {
+	write := func(fx *recoveryFixture) model.ArtifactRef {
+		fx.t.Helper()
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			fx.t.Fatal(err)
+		}
+		store, err := artifact.NewWorkflow(root, testWF, security.Registry{})
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		ref, err := store.Put(context.Background(), artifact.PutRequest{
+			WorkflowID: testWF, Type: model.ArtifactReport, Revision: 3,
+			SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+			Body: []byte("layout-two-report"),
+		})
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		return ref
+	}
+
+	t.Run("completed", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		write(fx)
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+		requireDisposition(t, mustReconcile(t, fx), recovery.AlreadyCompleted)
+	})
+
+	t.Run("orphaned", func(t *testing.T) {
+		fx := newRecoveryFixture(t)
+		ref := write(fx)
+		path := filepath.Join(fx.home, "projects", fx.projectKey, testWF,
+			"reports", "report", "3", ref.Hash)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+}
+
+// TestRecoveryFixedRevisionRejectsInvalidArtifactEvidence proves a content
+// filename is never completion evidence by itself: the exact revision must
+// resolve and validate through the immutable Store reader.
+func TestRecoveryFixedRevisionRejectsInvalidArtifactEvidence(t *testing.T) {
+	setup := func(t *testing.T) (*recoveryFixture, *artifact.Store, model.ArtifactRef, string) {
+		t.Helper()
+		fx := newRecoveryFixture(t)
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		st, err := artifact.NewWorkflow(root, testWF, security.Registry{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, err := st.Put(context.Background(), artifact.PutRequest{
+			WorkflowID: testWF, Type: model.ArtifactReport, Revision: 3,
+			SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+			Body: []byte("validated report"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(root, "reports", "report", "3")
+		return fx, st, ref, dir
+	}
+	seed := func(fx *recoveryFixture) {
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+	}
+
+	t.Run("corrupt content", func(t *testing.T) {
+		fx, _, ref, dir := setup(t)
+		if err := os.WriteFile(filepath.Join(dir, ref.Hash), []byte("not an artifact envelope"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("foreign extra content", func(t *testing.T) {
+		fx, _, _, dir := setup(t)
+		if err := os.WriteFile(filepath.Join(dir, strings.Repeat("f", 64)), []byte("foreign"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("wrong envelope", func(t *testing.T) {
+		fx, st, reportRef, dir := setup(t)
+		planRef, err := st.Put(context.Background(), artifact.PutRequest{
+			WorkflowID: testWF, Type: model.ArtifactPlan, Revision: 3,
+			SchemaVersion: "1.0.0", CreatedAt: "2026-01-01T00:00:00Z",
+			Body: []byte("---\nrevision: 3\ntitle: Wrong envelope\nworkflow_id: wf-1\n---\n\n# Wrong envelope\n"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		planPath := filepath.Join(fx.home, "projects", fx.projectKey, testWF,
+			"plans", "plan", "3", planRef.Hash)
+		body, err := os.ReadFile(planPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(dir, reportRef.Hash)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, planRef.Hash), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+}
+
+func TestRecoveryFixedRevisionRejectsNonDirectoryRevisionPath(t *testing.T) {
+	setup := func(t *testing.T) (*recoveryFixture, string) {
+		t.Helper()
+		fx := newRecoveryFixture(t)
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		dir, err := artifact.WorkflowRevisionDir(root, model.ArtifactReport, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return fx, dir
+	}
+	seed := func(fx *recoveryFixture) {
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+	}
+
+	t.Run("dangling symlink", func(t *testing.T) {
+		fx, dir := setup(t)
+		if err := os.Symlink("missing-revision-target", dir); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("regular file", func(t *testing.T) {
+		fx, dir := setup(t)
+		if err := os.WriteFile(dir, []byte("not a revision directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+}
+
+func TestRecoveryFixedRevisionRejectsCorruptRevisionAncestors(t *testing.T) {
+	setup := func(t *testing.T) (*recoveryFixture, string) {
+		t.Helper()
+		fx := newRecoveryFixture(t)
+		fx.setLayoutVersion(2)
+		root := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+		typeDir, err := artifact.WorkflowTypeDir(root, model.ArtifactReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(typeDir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return fx, typeDir
+	}
+	seed := func(fx *recoveryFixture) {
+		fx.seedIntent(model.ArtifactWriteIntent{Ref: model.ArtifactRef{
+			Workflow: testWF, Type: model.ArtifactReport, Revision: 3,
+		}})
+	}
+
+	t.Run("dangling type directory symlink", func(t *testing.T) {
+		fx, typeDir := setup(t)
+		if err := os.Symlink("missing-type-target", typeDir); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
+
+	t.Run("regular file type directory", func(t *testing.T) {
+		fx, typeDir := setup(t)
+		if err := os.WriteFile(typeDir, []byte("not a type directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed(fx)
+		requireDisposition(t, mustReconcile(t, fx), recovery.BlockedDrift)
+	})
 }
 
 // TestRecoveryProviderSessionDispositions: a ProviderStartIntent whose
@@ -705,11 +1005,20 @@ func migrationMoves(t *testing.T, fx *recoveryFixture) []model.PathMove {
 	t.Helper()
 	legacyRoot := filepath.Join(fx.home, "worktrees", fx.projectKey, testWF)
 	aggRoot := filepath.Join(fx.home, "projects", fx.projectKey, testWF)
+	digestRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(digestRoot, "seed.txt"), []byte("seed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := layout.DigestPath(digestRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return []model.PathMove{
 		{
-			Kind: model.MoveKindArtifact,
+			Kind:        model.MoveKindArtifact,
 			Source:      filepath.Join(fx.home, "projects", fx.projectKey, "workflows", testWF, "artifacts"),
 			Destination: filepath.Join(aggRoot, "artifacts"),
+			Digest:      digest,
 		},
 		{
 			Kind: model.MoveKindWorktree, Source: filepath.Join(legacyRoot, "integration"),
@@ -718,7 +1027,6 @@ func migrationMoves(t *testing.T, fx *recoveryFixture) []model.PathMove {
 		},
 	}
 }
-
 
 // ensureMigrationArtifactSource creates the legacy artifacts root the
 // crash-window tests move.
@@ -734,15 +1042,20 @@ func ensureMigrationArtifactSource(t *testing.T, fx *recoveryFixture) string {
 	return src
 }
 
+func migrationIntent(moves []model.PathMove, done int) model.LayoutMigrationIntent {
+	return model.LayoutMigrationIntent{
+		MigrationID: "migration-wf-1-manifest", Workflow: testWF,
+		ManifestHash: "manifest-test", Moves: moves, Done: done,
+	}
+}
+
 // TestRecoveryMigrationIntentAfterNoMovesIsSafeToRetry: the Intent was
 // persisted but nothing moved yet — every source still present, every
 // destination absent: SafeToRetry (continue from move 0).
 func TestRecoveryMigrationIntentAfterNoMovesIsSafeToRetry(t *testing.T) {
 	fx := newRecoveryFixture(t)
 	ensureMigrationArtifactSource(t, fx)
-	fx.seedIntent(model.LayoutMigrationIntent{
-		Workflow: testWF, Moves: migrationMoves(t, fx), Done: 0,
-	})
+	fx.seedIntent(migrationIntent(migrationMoves(t, fx), 0))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.SafeToRetry)
 }
@@ -761,9 +1074,28 @@ func TestRecoveryMigrationAfterFirstMoveIsSafeToRetry(t *testing.T) {
 	if err := os.Rename(moves[0].Source, moves[0].Destination); err != nil {
 		t.Fatalf("land first move: %v", err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 1})
+	fx.seedIntent(migrationIntent(moves, 1))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.SafeToRetry)
+}
+
+func TestRecoveryMigrationOutOfOrderLandedMoveIsBlocked(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	moves := migrationMoves(t, fx)
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.MkdirAll(filepath.Dir(moves[1].Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.repo.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Execute(context.Background(), gitflow.MoveWorktree{From: moves[1].Source, To: moves[1].Destination}); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(migrationIntent(moves, 1))
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
 }
 
 // TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted: every move
@@ -789,7 +1121,7 @@ func TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("move integration worktree: %v", err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 2})
+	fx.seedIntent(migrationIntent(moves, 2))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.AlreadyCompleted)
 }
@@ -799,9 +1131,22 @@ func TestRecoveryMigrationAfterAllMovesIsAlreadyCompleted(t *testing.T) {
 // intent is never re-run.
 func TestRecoveryMigrationAfterDBAdvanceIsAlreadyCompleted(t *testing.T) {
 	fx := newRecoveryFixture(t)
-	fx.seedIntent(model.LayoutMigrationIntent{
-		Workflow: testWF, Moves: migrationMoves(t, fx), Done: 0,
-	})
+	moves := migrationMoves(t, fx)
+	ensureMigrationArtifactSource(t, fx)
+	if err := os.MkdirAll(filepath.Dir(moves[0].Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moves[0].Source, moves[0].Destination); err != nil {
+		t.Fatal(err)
+	}
+	flow, err := gitflow.NewGitFlow(fx.sup, fx.repo.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Execute(context.Background(), gitflow.MoveWorktree{From: moves[1].Source, To: moves[1].Destination}); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(migrationIntent(moves, len(moves)))
 	// Advance the persisted Layout facts to Version 2.
 	st, err := store.Open(context.Background(), store.OpenOptions{
 		Path: fx.dbPath, Workflow: testWF, CflowVersion: "0.0.0-dev", Now: fx.now,
@@ -819,12 +1164,12 @@ func TestRecoveryMigrationAfterDBAdvanceIsAlreadyCompleted(t *testing.T) {
 			ID: testWF, Project: model.ProjectID(testProj),
 			Stage: state.Workflow.Stage, Runtime: state.Workflow.Runtime,
 			TargetBranch: state.Workflow.TargetBranch, BaseCommit: state.Workflow.BaseCommit,
-			IntegrationBranch: state.Workflow.IntegrationBranch,
-			IntegrationHead:   state.Workflow.IntegrationHead,
-			LayoutVersion:     2,
-			WorkspacePath:     filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
-			WorkspaceBranch:   "cflow/" + testWF + "/integration",
-			VerifiedWorkspaceHead: state.Workflow.IntegrationHead,
+			IntegrationBranch:      state.Workflow.IntegrationBranch,
+			IntegrationHead:        state.Workflow.IntegrationHead,
+			LayoutVersion:          2,
+			WorkspacePath:          filepath.Join(fx.home, "projects", fx.projectKey, testWF, "workspace"),
+			WorkspaceBranch:        "cflow/" + testWF + "/integration",
+			VerifiedWorkspaceHead:  state.Workflow.IntegrationHead,
 			CandidateWorkspaceHead: state.Workflow.IntegrationHead,
 		}}}, nil
 	}); err != nil {
@@ -844,7 +1189,7 @@ func TestRecoveryMigrationBothPathsPresentIsBlockedDrift(t *testing.T) {
 	if err := os.MkdirAll(moves[0].Destination, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 0})
+	fx.seedIntent(migrationIntent(moves, 0))
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.BlockedDrift)
 }
@@ -859,7 +1204,51 @@ func TestRecoveryMigrationNeitherPathPresentIsBlockedDrift(t *testing.T) {
 	if err := os.RemoveAll(moves[0].Source); err != nil {
 		t.Fatal(err)
 	}
-	fx.seedIntent(model.LayoutMigrationIntent{Workflow: testWF, Moves: moves, Done: 0})
+	fx.seedIntent(migrationIntent(moves, 0))
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryMigrationWorktreeIdentityDriftIsBlocked proves path
+// existence alone is not recovery evidence: the Git registry entry must
+// match the immutable branch/head in the persisted intent.
+func TestRecoveryMigrationWorktreeIdentityDriftIsBlocked(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	move := migrationMoves(t, fx)[1]
+	move.Head = "0000000000000000000000000000000000000001"
+	fx.seedIntent(model.LayoutMigrationIntent{
+		MigrationID: "migration-wf-test", Workflow: testWF,
+		ManifestHash: "manifest-test", Moves: []model.PathMove{move},
+	})
+	out := mustReconcile(t, fx)
+	requireDisposition(t, out, recovery.BlockedDrift)
+}
+
+// TestRecoveryMigrationArtifactIdentityDriftIsBlocked proves a landed
+// destination is not accepted merely because a path exists: its content
+// digest must still match the immutable intent.
+func TestRecoveryMigrationArtifactIdentityDriftIsBlocked(t *testing.T) {
+	fx := newRecoveryFixture(t)
+	move := migrationMoves(t, fx)[0]
+	ensureMigrationArtifactSource(t, fx)
+	digest, err := layout.DigestPath(move.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	move.Digest = digest
+	if err := os.MkdirAll(filepath.Dir(move.Destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(move.Source, move.Destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(move.Destination, "seed.txt"), []byte("drift\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.seedIntent(model.LayoutMigrationIntent{
+		MigrationID: "migration-wf-test", Workflow: testWF,
+		ManifestHash: "manifest-test", Moves: []model.PathMove{move},
+	})
 	out := mustReconcile(t, fx)
 	requireDisposition(t, out, recovery.BlockedDrift)
 }

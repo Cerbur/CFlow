@@ -6,6 +6,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,7 +24,11 @@ func (a *Application) resolveQueryWorkflow(explicit model.WorkflowID) (model.Wor
 	if explicit != "" {
 		return explicit, nil
 	}
-	switch ids := a.knownWorkflows(); len(ids) {
+	ids, err := a.knownWorkflows(context.Background())
+	if err != nil {
+		return "", err
+	}
+	switch len(ids) {
 	case 0:
 		return "", nil
 	case 1:
@@ -39,7 +44,11 @@ func (a *Application) resolveMutationWorkflow(explicit model.WorkflowID) (model.
 	if explicit != "" {
 		return explicit, nil
 	}
-	switch ids := a.knownWorkflows(); len(ids) {
+	ids, err := a.knownWorkflows(context.Background())
+	if err != nil {
+		return "", err
+	}
+	switch len(ids) {
 	case 0:
 		return "", model.InvalidInputFault("no workflow")
 	case 1:
@@ -49,32 +58,52 @@ func (a *Application) resolveMutationWorkflow(explicit model.WorkflowID) (model.
 	}
 }
 
-// knownWorkflows enumerates the project's workflows: the persisted
-// workflow directories plus the Stores opened this session.
-func (a *Application) knownWorkflows() []model.WorkflowID {
-	set := map[model.WorkflowID]struct{}{}
-	if entries, err := os.ReadDir(a.workflowsDir()); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				set[model.WorkflowID(e.Name())] = struct{}{}
-			}
+// knownWorkflows enumerates the project's workflows from SQLite, the
+// authoritative workflow state source (design §7). Artifact and worktree
+// directories are external facts used by recovery, never workflow identity.
+func (a *Application) knownWorkflows(ctx context.Context) ([]model.WorkflowID, error) {
+	if _, err := os.Stat(a.dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
+		return nil, err
 	}
-	a.mu.Lock()
-	for wf := range a.known {
-		set[wf] = struct{}{}
+	ls, err := a.lockSet()
+	if err != nil {
+		return nil, err
 	}
-	a.mu.Unlock()
-	ids := make([]model.WorkflowID, 0, len(set))
-	for wf := range set {
-		ids = append(ids, wf)
+	hold, err := ls.SchemaShared(ctx)
+	if err != nil {
+		return nil, lockFault(err)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids
+	defer hold.Release()
+	st, err := store.Open(ctx, store.OpenOptions{
+		Path: a.dbPath, ReadOnly: true, CflowVersion: a.cflowVer, Now: a.now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	return st.ListWorkflowIDs(ctx, model.ProjectID(a.project.Key))
 }
 
-func (a *Application) workflowDir(wf model.WorkflowID) string {
-	return filepath.Join(a.home, "projects", a.project.Key, "workflows", string(wf))
+func (a *Application) workflowDir(ctx context.Context, wf model.WorkflowID) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
+	}
+	switch version {
+	case 1:
+		return a.legacyWorkflowDir(wf), nil
+	case 2:
+		return a.layout.WorkflowRoot(wf), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
+}
+
+func (a *Application) legacyWorkflowDir(wf model.WorkflowID) string {
+	return filepath.Join(a.workflowsDir(), string(wf))
 }
 
 func (a *Application) workflowsDir() string {
@@ -84,13 +113,23 @@ func (a *Application) workflowsDir() string {
 // ensureWorkflowDir creates the workflow directory chain 0700 through the
 // security guard (design 19.1). Mutations only; the events export lives
 // there (design 21).
-func (a *Application) ensureWorkflowDir(wf model.WorkflowID) error {
-	for _, dir := range []string{
+func (a *Application) ensureWorkflowDir(ctx context.Context, wf model.WorkflowID) error {
+	dirs := []string{
 		filepath.Join(a.home, "projects"),
 		filepath.Join(a.home, "projects", a.project.Key),
-		a.workflowsDir(),
-		a.workflowDir(wf),
-	} {
+	}
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return err
+	}
+	if version == 2 {
+		dirs = append(dirs, a.layout.WorkflowRoot(wf))
+	} else if version == 1 {
+		dirs = append(dirs, a.workflowsDir(), a.legacyWorkflowDir(wf))
+	} else {
+		return model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
+	for _, dir := range dirs {
 		if _, err := os.Stat(dir); err == nil {
 			continue
 		}
@@ -104,10 +143,31 @@ func (a *Application) ensureWorkflowDir(wf model.WorkflowID) error {
 // exportEvents appends one committed Event window to the workflow's
 // events.jsonl audit export (design 21).
 func (a *Application) exportEvents(ctx context.Context, wf model.WorkflowID, events []model.Event) error {
-	if err := a.ensureWorkflowDir(wf); err != nil {
+	if err := a.ensureWorkflowDir(ctx, wf); err != nil {
 		return err
 	}
-	return observe.ExportEvents(filepath.Join(a.workflowDir(wf), "events.jsonl"), events, a.redaction)
+	dir, err := a.workflowDir(ctx, wf)
+	if err != nil {
+		return err
+	}
+	return observe.ExportEvents(filepath.Join(dir, "events.jsonl"), events, a.redaction)
+}
+
+// workflowEvidenceDir selects the deterministic evidence root. Layout 2 is
+// workflow-local; Layout 1 retains only the configured legacy global root.
+func (a *Application) workflowEvidenceDir(ctx context.Context, wf model.WorkflowID) (string, error) {
+	version, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return "", err
+	}
+	switch version {
+	case 1:
+		return a.agent.EvidenceDir, nil
+	case 2:
+		return a.layout.EvidenceDir(wf), nil
+	default:
+		return "", model.InvariantFault(fmt.Errorf("workflow %s has unsupported layout version %d", wf, version))
+	}
 }
 
 func workflowSummary(st model.State) WorkflowSummary {
@@ -120,16 +180,17 @@ func workflowSummary(st model.State) WorkflowSummary {
 func statusView(st model.State) StatusView {
 	v := StatusView{
 		Workflow: st.Workflow.ID, Stage: st.Workflow.Stage, Runtime: st.Workflow.Runtime,
-		TargetBranch: st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
-		IntegrationBranch: st.Workflow.IntegrationBranch,
-		IntegrationHead:   st.Workflow.IntegrationHead,
-		WorkspacePath:     st.Workflow.WorkspacePath,
-		WorkspaceBranch:   st.Workflow.WorkspaceBranch,
+		LayoutVersion: st.Workflow.LayoutVersion,
+		TargetBranch:  st.Workflow.TargetBranch, BaseCommit: st.Workflow.BaseCommit,
+		IntegrationBranch:         st.Workflow.IntegrationBranch,
+		IntegrationHead:           st.Workflow.IntegrationHead,
+		WorkspacePath:             st.Workflow.WorkspacePath,
+		WorkspaceBranch:           st.Workflow.WorkspaceBranch,
 		CandidateWorkspaceHead:    st.Workflow.CandidateWorkspaceHead,
 		VerifiedWorkspaceHead:     st.Workflow.VerifiedWorkspaceHead,
 		WorkspaceDirtyFingerprint: st.Workflow.WorkspaceDirtyFingerprint,
-		Findings:          st.Findings,
-		Processes:         st.Processes,
+		Findings:                  st.Findings,
+		Processes:                 st.Processes,
 	}
 	if st.Plan != nil {
 		v.PlanStatus = st.Plan.Status
@@ -184,6 +245,7 @@ func inspectView(st model.State, pending []string) InspectView {
 		Attempts:        attemptSlice(st.Attempts),
 		Approvals:       st.Approvals,
 		Sessions:        st.Sessions,
+		Processes:       st.Processes,
 		Runs:            st.Runs,
 		Quarantines:     st.Quarantines,
 		ApplyAttempts:   st.ApplyAttempts,

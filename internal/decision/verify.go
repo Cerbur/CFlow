@@ -51,6 +51,13 @@ func verifyFailureCode(node *model.Node) model.Code {
 // verified_workspace_head to the exact verified Candidate Head; a FAIL
 // verdict or a drifted Workspace Blocks the Workflow and preserves the
 // Workspace and the Target Branch.
+//
+// When the Workspace carries uncommitted native changes (Task 4, design
+// 8.4 step 2), the Application allocates a managed adoption/coding Session
+// (AdoptionSession/AdoptionRoute): the Kernel records that Session and
+// requests its Provider start first; the post-adoption gate chain then runs
+// against the NEW candidate Head and only then starts the independent
+// Adoption Review Session.
 func decideAdoptWorkspace(state model.State, in model.AdoptWorkspaceInput) (model.Decision, error) {
 	if state.Workflow.ID == "" {
 		return model.Decision{}, model.InvalidInputFault("no workflow to adopt")
@@ -84,6 +91,39 @@ func decideAdoptWorkspace(state model.State, in model.AdoptWorkspaceInput) (mode
 	if in.Route == "" {
 		return model.Decision{}, model.InvalidInputFault("workspace adoption requires the approved review route")
 	}
+	if in.AdoptionSession != "" {
+		// The managed adoption path (Task 4, design 8.4 step 2): the dirty
+		// Workspace first runs the adoption/coding Session that organizes
+		// and commits the native changes. The independent Adoption Review
+		// Session is recorded now (still STARTING) and started after the
+		// adoption evidence passes, so its identity stays a fresh Session of
+		// the review purpose (design 14.4). The candidate facts are recorded
+		// as the observed dirty facts; the post-adoption evidence replaces
+		// them when the adoption Session settles.
+		if err := validateFreshSession(state, in.AdoptionSession); err != nil {
+			return model.Decision{}, err
+		}
+		if in.AdoptionRoute == "" {
+			return model.Decision{}, model.InvalidInputFault("workspace adoption requires the approved adoption route")
+		}
+		b := &builder{state: state}
+		m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+		m.CandidateWorkspaceHead = in.CandidateHead
+		m.WorkspaceDirtyFingerprint = in.DirtyFingerprint
+		b.mutate(m)
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID: in.AdoptionSession, Purpose: model.PurposeAdoption, Status: model.SessionStarting,
+		}, Provider: in.AdoptionRoute})
+		b.mutate(model.SessionAppendMutation{Session: model.Session{
+			ID: in.Session, Purpose: model.PurposeReview, Status: model.SessionStarting,
+		}, Provider: in.Route})
+		b.effect(model.ProviderStartIntent{
+			Session: in.AdoptionSession,
+			Purpose: model.PurposeAdoption,
+			Route:   in.AdoptionRoute,
+		})
+		return b.decision(), nil
+	}
 	b := &builder{state: state}
 	// The verified candidate facts are recorded when the gate starts: the
 	// runtime re-verified the exact Candidate Head and Dirty Fingerprint,
@@ -102,6 +142,100 @@ func decideAdoptWorkspace(state model.State, in model.AdoptWorkspaceInput) (mode
 		Route:   in.Route,
 	})
 	return b.decision(), nil
+}
+
+// decideAdoptionCodingRunEnded settles one managed adoption/coding Session
+// (Task 4, design 8.4 step 2). The adoption output is judged by evidence,
+// never by a claim: a PASS requires the Workspace to be clean at a
+// Candidate Head that advanced past the recorded pre-adoption Head (a new
+// Commit exists). A failed or crashed Session, a dirty Workspace, or no new
+// Commit Blocks the Workflow through adoptionFailure — the Workspace, the
+// Change Set, and the Target Branch stay untouched. On a PASS the Kernel
+// re-binds the frozen Change Set facts to the post-adoption revision the
+// Runtime re-froze, advances the candidate facts, and starts the
+// independent Adoption Review Session recorded by decideAdoptWorkspace.
+func decideAdoptionCodingRunEnded(state model.State, in model.EffectResultInput, created *model.Session) (model.Decision, error) {
+	attempt := attemptBySession(state, created.ID)
+	if attempt != nil {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("adoption session %s has an execution attempt", created.ID))
+	}
+	b := &builder{state: state}
+	b.mutate(sessionEnd(state, created, in))
+	if in.Session.Status != model.SessionCompleted {
+		code := in.FailureCode
+		if code == "" {
+			code = model.CodeAgentProcessCrashed
+		}
+		return adoptionFailure(b, state, created, code), nil
+	}
+	if in.EndDirtyFingerprint != "" {
+		return adoptionFailure(b, state, created, model.CodeDirtyWorktreeDrifted), nil
+	}
+	if in.EndHead == "" || in.EndHead == state.Workflow.CandidateWorkspaceHead {
+		return adoptionFailure(b, state, created, model.CodeMissingImplementationCommit), nil
+	}
+	// The adoption evidence requires the re-frozen Change Set to carry at
+	// least one real Commit (design 8.4 step 2): a session that moved the
+	// workspace to a head with an empty commit range (e.g. `git reset
+	// --hard` to a foreign or past head) produced no adoption Commit and
+	// Blocks the gate.
+	if !adoptionChangeSetCarriesCommit(in.Body) {
+		return adoptionFailure(b, state, created, model.CodeMissingImplementationCommit), nil
+	}
+	// The adoption evidence passed: the Workspace is clean at the NEW
+	// candidate Head, and the Runtime re-froze the Change Set against it.
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	m.CandidateWorkspaceHead = in.EndHead
+	m.WorkspaceDirtyFingerprint = in.EndDirtyFingerprint
+	b.mutate(m)
+	if in.Artifact.Hash != "" {
+		// The active Change Set reference advances to the post-adoption
+		// revision the adoption re-froze (the frozen Change Set facts are
+		// re-bound to the new candidate Head).
+		b.mutate(model.ArtifactRefMutation{
+			Type: model.ArtifactChangeSet, Revision: in.Artifact.Revision,
+			Path: in.Artifact.String(), Hash: in.Artifact.Hash,
+		})
+	}
+	// Start the independent Adoption Review Session the adoption gate
+	// recorded (design 8.4 step 5).
+	review, ok := adoptionReviewSessionOf(state)
+	if !ok {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("the adoption review session is missing"))
+	}
+	b.effect(model.ProviderStartIntent{
+		Session: review.ID,
+		Purpose: model.PurposeReview,
+		Route:   review.Provider,
+	})
+	return b.decision(), nil
+}
+
+// adoptionReviewSessionOf returns the recorded independent Adoption Review
+// Session of the Workspace Adoption Gate (the fresh review-purpose Session
+// decideAdoptWorkspace recorded before the adoption/coding Session ran).
+func adoptionReviewSessionOf(state model.State) (model.Session, bool) {
+	for _, s := range state.Sessions {
+		if s.Purpose == model.PurposeReview && s.Status == model.SessionStarting {
+			return s, true
+		}
+	}
+	return model.Session{}, false
+}
+
+// adoptionChangeSetCarriesCommit re-judges the adoption evidence (design
+// 8.4 step 2): the re-frozen Change Set body the Runtime produced must
+// carry at least one real Commit (a non-empty commit range). An empty or
+// unparsable body fails closed — the evidence never yields to a claim.
+func adoptionChangeSetCarriesCommit(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var cs model.ChangeSet
+	if err := json.Unmarshal(body, &cs); err != nil {
+		return false
+	}
+	return len(cs.Commits) > 0
 }
 
 // decideAdoptionReviewRunEnded settles one Workspace Adoption Review

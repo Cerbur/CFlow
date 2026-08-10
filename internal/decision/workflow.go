@@ -2,6 +2,7 @@ package decision
 
 import (
 	"fmt"
+	"strconv"
 
 	"cflow.local/cflow/internal/model"
 )
@@ -220,10 +221,13 @@ func decideDiscussRequirement(state model.State, in model.DiscussRequirementInpu
 
 // decidePrepareNativeDiscussion establishes the exact CFlow Session of
 // one native interactive requirement discussion (design §9.1, TUI task
-// 12): the Kernel records the fresh Session as STARTING with no Provider
-// run — the TUI's blocking exec callback drives the Bridge, and the
-// Session becomes INTERACTIVE_IDLE when the turn ends. The Session is
-// persisted and recoverable before any terminal output.
+// 12): the Kernel records the fresh Session as STARTING with NO Provider
+// identity of its own and requests the managed bootstrap effect, which
+// captures the Provider's OWN session id from the validated
+// session_started event. The TUI's blocking exec callback later runs the
+// Bridge, and the Session becomes INTERACTIVE_IDLE when the turn ends. The
+// Session and its managed Process record are persisted and recoverable
+// before any terminal output.
 func decidePrepareNativeDiscussion(state model.State, in model.PrepareNativeDiscussionInput) (model.Decision, error) {
 	if state.Workflow.ID == "" {
 		return model.Decision{}, model.InvalidInputFault("no workflow to discuss natively")
@@ -240,27 +244,36 @@ func decidePrepareNativeDiscussion(state model.State, in model.PrepareNativeDisc
 	if err := validateFreshSession(state, in.Session); err != nil {
 		return model.Decision{}, err
 	}
+	if in.Process == "" {
+		return model.Decision{}, model.InvalidInputFault("native discussion requires the managed process identity")
+	}
 	b := &builder{state: state}
 	startIfNeeded(b, state)
 	parent := latestPlanningSession(state)
 	b.mutate(model.SessionAppendMutation{Session: model.Session{
 		ID: in.Session, Purpose: model.PurposePlanning,
-		// The bootstrap identity the native interactive resume targets
-		// (design §9.1): the Provider's own conversation identity the
-		// Bridge attaches to. Real Providers validate the identity when
-		// the resume starts; the Fake accepts any exact identity.
-		ProviderSessionID: string(in.Session),
-		Status:            model.SessionStarting,
-		Supersedes:        supersedesOf(parent),
+		// No Provider identity yet: the managed bootstrap binds the
+		// Provider's own session id (never a CFlow id) in the follow-up
+		// Result Decision.
+		Status:     model.SessionStarting,
+		Supersedes: supersedesOf(parent),
 	}, Provider: in.Provider})
+	b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+		ID: in.Process, Session: in.Session, Purpose: model.PurposePlanning,
+		Status: model.ProcessStatusRunning, StartedAt: state.Now,
+	}})
 	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion session prepared")
+	b.effect(model.NativeBootstrapIntent{Session: in.Session, Purpose: model.PurposePlanning, Route: in.Provider})
 	return b.decision(), nil
 }
 
 // decideFinishDiscussion settles one finished native discussion Session
 // COMPLETED and requests the immutable ArtifactDiscussionHandoff write
 // (design §9.2, TUI task 12): the handoff is the only discussion input
-// Plan generation consumes.
+// Plan generation consumes. The handoff body is the MANAGED structured
+// output the Application's structured resume on the same Provider Session
+// produced and schema-validated — the Kernel re-validates the bound
+// Session and refuses to write an empty body.
 func decideFinishDiscussion(state model.State, in model.FinishDiscussionInput) (model.Decision, error) {
 	if state.Workflow.ID == "" {
 		return model.Decision{}, model.InvalidInputFault("no workflow to finish")
@@ -275,12 +288,25 @@ func decideFinishDiscussion(state model.State, in model.FinishDiscussionInput) (
 	if session.Purpose != model.PurposePlanning {
 		return model.Decision{}, model.InvariantFault(fmt.Errorf("the finished session is not a discussion session"))
 	}
+	// Finish is legal only on a resumable interactive Session: a terminal
+	// Session (COMPLETED/FAILED/CANCELLED/LOST) must never be finished again
+	// — a direct-kernel double-finish would write a second Handoff from an
+	// immutable outcome (defense in depth; the Application gates too).
+	if session.Status != model.SessionStarting && session.Status != model.SessionInteractiveIdle {
+		return model.Decision{}, model.InvalidInputFault(
+			"finishing requires a resumable discussion session; the session is " + string(session.Status))
+	}
+	if session.ProviderSessionID == "" {
+		return model.Decision{}, model.NewFault(model.CodeProviderSessionIDMissing,
+			"the discussion session has no bound provider session; finish it after the managed bootstrap")
+	}
 	if len(in.Handoff) == 0 || len(in.Handoff) > maxTurnText {
 		return model.Decision{}, model.InvalidInputFault("the discussion handoff is required and bounded")
 	}
 	b := &builder{state: state}
 	b.mutate(model.SessionEndMutation{
-		ID: session.ID, Status: model.SessionCompleted, EndedAt: state.Now,
+		ID: session.ID, ProviderSessionID: session.ProviderSessionID,
+		Status: model.SessionCompleted, EndedAt: state.Now,
 	})
 	b.effect(model.ArtifactWriteIntent{
 		Ref:      model.ArtifactRef{Workflow: state.Workflow.ID, Type: model.ArtifactDiscussionHandoff},
@@ -289,6 +315,194 @@ func decideFinishDiscussion(state model.State, in model.FinishDiscussionInput) (
 		Session:  in.Session,
 	})
 	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion finished")
+	return b.decision(), nil
+}
+
+// decideNativeDiscussionReturn settles one native interactive turn (design
+// §9.2, TUI task 12): the Kernel persists the observed process exit facts
+// (a non-zero exit is NOT a discussion failure by itself), revalidates the
+// Session binding the Bridge ran on against the recorded facts, records
+// the revalidated Workspace candidate facts, and moves the Session to
+// INTERACTIVE_IDLE — resumable by the exact same Provider Session.
+func decideNativeDiscussionReturn(state model.State, in model.NativeDiscussionReturnInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow for a native discussion return")
+	}
+	session := findSessionState(state, in.Session)
+	if session == nil {
+		return model.Decision{}, model.InvalidInputFault("the returned discussion session is not bound to this workflow")
+	}
+	if session.Purpose != model.PurposePlanning {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("the returned session is not a discussion session"))
+	}
+	if session.Status != model.SessionStarting && session.Status != model.SessionActive {
+		return model.Decision{}, model.InvalidInputFault(
+			"the discussion return requires a starting or active session; the session is " + string(session.Status))
+	}
+	// Revalidate the exact binding the Bridge ran on: the Provider and the
+	// Provider's own session id must match the recorded facts (design 9.3:
+	// revalidate the Session and Binding on return).
+	if in.Provider == "" || in.Provider != session.Provider {
+		return model.Decision{}, model.NewFault(model.CodeProviderBindingChanged,
+			"the returned discussion provider does not match the recorded binding")
+	}
+	if in.ProviderSession == "" || in.ProviderSession != session.ProviderSessionID {
+		return model.Decision{}, model.NewFault(model.CodeProviderBindingChanged,
+			"the returned provider session does not match the recorded binding")
+	}
+	process := findProcess(state, in.Process)
+	if process == nil {
+		return model.Decision{}, model.InvalidInputFault("the returned discussion has no managed process record")
+	}
+	if process.Status != model.ProcessStatusRunning {
+		return model.Decision{}, model.InvalidInputFault("the returned discussion process is not running")
+	}
+	// The settled managed Process must be bound to the EXACT returned
+	// Session: a process of a sibling Session can never settle this turn
+	// (defense in depth; the Application gates too).
+	if process.Session != in.Session {
+		return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"the returned process is not bound to the discussion session")
+	}
+	b := &builder{state: state}
+	b.mutate(model.ProcessEndMutation{
+		ID: in.Process, Status: model.ProcessStatusExited, ExitCode: in.ExitCode, EndedAt: state.Now,
+	})
+	b.mutate(model.SessionStatusMutation{ID: in.Session, Status: model.SessionInteractiveIdle})
+	// The revalidated Workspace candidate facts (the observed HEAD and the
+	// dirty fingerprint of the interactive turn) are recorded so the Return
+	// Page and the Finish freeze bind the exact facts (design 9.3).
+	m := wfMut(state, state.Workflow.Stage, state.Workflow.Runtime, state.Workflow.CancelIntent)
+	if in.WorkspaceHead != "" {
+		m.CandidateWorkspaceHead = in.WorkspaceHead
+	}
+	m.WorkspaceDirtyFingerprint = in.WorkspaceDirtyFingerprint
+	b.mutate(m)
+	detail := "exit " + strconv.Itoa(in.ExitCode)
+	if in.ExitFact != "" {
+		detail += " (" + in.ExitFact + ")"
+	}
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion turn returned: "+detail)
+	return b.decision(), nil
+}
+
+// decideContinueNativeDiscussion re-arms the exact native discussion
+// Session for another interactive turn (design §9.2, TUI task 12): the
+// Bridge resumes the SAME Provider Session on the SAME provider — never a
+// new Session and never a new provider identity. Only a resumable
+// STARTING/INTERACTIVE_IDLE Session may continue; a lost or foreign
+// Session fails closed.
+func decideContinueNativeDiscussion(state model.State, in model.ContinueNativeDiscussionInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to continue natively")
+	}
+	if state.Workflow.Stage != model.StageRequirementDiscussion {
+		return model.Decision{}, model.InvalidInputFault("native discussion requires the REQUIREMENT_DISCUSSION stage")
+	}
+	if !planningRuntimeAllowed(state.Workflow.Runtime) {
+		return model.Decision{}, model.InvalidInputFault("workflow cannot continue natively from " + string(state.Workflow.Runtime))
+	}
+	session := findSessionState(state, in.Session)
+	if session == nil {
+		return model.Decision{}, model.InvalidInputFault("the continued session is not bound to this workflow")
+	}
+	if session.Purpose != model.PurposePlanning {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("the continued session is not a discussion session"))
+	}
+	if session.Status != model.SessionStarting && session.Status != model.SessionInteractiveIdle {
+		return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"only an interactive-idle discussion session may continue; the session is "+string(session.Status))
+	}
+	if session.ProviderSessionID == "" {
+		return model.Decision{}, model.NewFault(model.CodeProviderSessionIDMissing,
+			"the continued session has no bound provider session")
+	}
+	if in.Process == "" {
+		return model.Decision{}, model.InvalidInputFault("continuing the discussion requires the managed process identity")
+	}
+	b := &builder{state: state}
+	startIfNeeded(b, state)
+	b.mutate(model.SessionStatusMutation{ID: in.Session, Status: model.SessionActive})
+	b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+		ID: in.Process, Session: in.Session, Purpose: model.PurposePlanning,
+		Status: model.ProcessStatusRunning, StartedAt: state.Now,
+	}})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion resumed")
+	return b.decision(), nil
+}
+
+// decideSwitchAgent switches one native discussion to a DIFFERENT provider
+// (design §9.4, TUI task 12): a NEW CFlow Session is created, its Provider
+// Session is established by a fresh managed start, and the superseded
+// Session linkage plus the switch reason are persisted. A switch to the
+// SAME provider, or a resume of a lost/foreign Session, fails closed.
+func decideSwitchAgent(state model.State, in model.SwitchAgentInput) (model.Decision, error) {
+	if state.Workflow.ID == "" {
+		return model.Decision{}, model.InvalidInputFault("no workflow to switch")
+	}
+	if state.Workflow.Stage != model.StageRequirementDiscussion {
+		return model.Decision{}, model.InvalidInputFault("native discussion requires the REQUIREMENT_DISCUSSION stage")
+	}
+	if !planningRuntimeAllowed(state.Workflow.Runtime) {
+		return model.Decision{}, model.InvalidInputFault("workflow cannot switch natively from " + string(state.Workflow.Runtime))
+	}
+	if err := validateProvider(in.Provider); err != nil {
+		return model.Decision{}, err
+	}
+	if in.Reason == "" || len(in.Reason) > 4096 {
+		return model.Decision{}, model.InvalidInputFault("switching the discussion agent requires a bounded reason")
+	}
+	if err := validateFreshSession(state, in.Session); err != nil {
+		return model.Decision{}, err
+	}
+	if in.Process == "" {
+		return model.Decision{}, model.InvalidInputFault("switching the discussion agent requires the managed process identity")
+	}
+	superseded := findSessionState(state, in.Supersedes)
+	if superseded == nil {
+		return model.Decision{}, model.InvalidInputFault("the superseded discussion session is not bound to this workflow")
+	}
+	if superseded.Purpose != model.PurposePlanning {
+		return model.Decision{}, model.InvariantFault(fmt.Errorf("the superseded session is not a discussion session"))
+	}
+	if in.Provider == superseded.Provider {
+		return model.Decision{}, model.NewFault(model.CodeSessionIndependenceViolation,
+			"switching the discussion agent requires a different provider")
+	}
+	if superseded.ProviderSessionID == "" {
+		return model.Decision{}, model.NewFault(model.CodeProviderSessionIDMissing,
+			"the superseded session has no bound provider session")
+	}
+	b := &builder{state: state}
+	startIfNeeded(b, state)
+	b.mutate(model.SessionAppendMutation{Session: model.Session{
+		ID: in.Session, Purpose: model.PurposePlanning,
+		Status:     model.SessionStarting,
+		Supersedes: in.Supersedes,
+		// The immutable Context Bundle the superseded Session's switch
+		// created is persisted with the new Session row (design §9.4, TUI
+		// task 12): the successor's managed bootstrap reads the same bundle
+		// content so the successor Provider starts with the prior discussion
+		// context.
+		ContextBundleRevision: in.ContextBundleRevision,
+		ContextBundlePath:     in.ContextBundlePath,
+		ContextBundleSha256:   in.ContextBundleSha256,
+	}, Provider: in.Provider})
+	b.mutate(model.ProcessAppendMutation{Process: model.ProcessRecord{
+		ID: in.Process, Session: in.Session, Purpose: model.PurposePlanning,
+		Status: model.ProcessStatusRunning, StartedAt: state.Now,
+	}})
+	b.mutate(model.FindingAppendMutation{Finding: model.Finding{
+		ID:       model.FindingID(fmt.Sprintf("finding-%d", len(state.Findings)+1)),
+		Code:     model.CodeSessionSuperseded,
+		Scope:    model.ScopeSession,
+		Subject:  string(in.Supersedes),
+		Blocking: false,
+		Text:     "switch-agent: " + in.Reason,
+		Seq:      state.NextEventSeq,
+	}})
+	b.event(model.EventWorkflowResumed, "", model.AttemptKey{}, "", "native discussion switched agents")
+	b.effect(model.NativeBootstrapIntent{Session: in.Session, Purpose: model.PurposePlanning, Route: in.Provider})
 	return b.decision(), nil
 }
 
@@ -315,6 +529,24 @@ func decideGeneratePlan(state model.State, in model.GeneratePlanInput) (model.De
 	}
 	if err := validateFreshSession(state, in.Session); err != nil {
 		return model.Decision{}, err
+	}
+	// Plan generation is gated on the immutable discussion inputs (design
+	// §9.4, TUI task 12): when the input claims a native Discussion Handoff
+	// or a frozen Change Set, it must carry BOTH exact Revisions, and a
+	// workflow WITH a native discussion lineage never falls back to the
+	// terminal transcript — it requires the Handoff + frozen Change Set even
+	// when the input carries no refs (a cancelled or finished-without-handoff
+	// native discussion is still a native lineage). A pure headless workflow
+	// without a native lineage keeps the documented legacy turn fallback for
+	// the headless CLI (AGENTS.md).
+	if in.HandoffRef.Hash == "" && in.ChangeSetRef.Hash == "" {
+		if hasNativeDiscussionLineage(state) {
+			return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
+				"plan generation requires both the discussion handoff and the frozen change set for a native discussion")
+		}
+	} else if in.HandoffRef.Hash == "" || in.ChangeSetRef.Hash == "" {
+		return model.Decision{}, model.NewFault(model.CodeApprovalInputChanged,
+			"plan generation requires both the discussion handoff and the frozen change set")
 	}
 	b := &builder{state: state}
 	// One WorkflowMutation carries the stage change and the started
@@ -472,6 +704,44 @@ func providerSessionOf(s *model.Session) string {
 		return ""
 	}
 	return s.ProviderSessionID
+}
+
+// hasNativeDiscussionLineage reports whether the aggregate carries a native
+// interactive discussion lineage (design §9, TUI task 12): a Planning
+// Session that went through the managed bootstrap carries a bound Provider
+// Session id. The plan-generation gate uses the lineage to refuse the legacy
+// discussion-turn fallback: the native path requires the Handoff + frozen
+// Change Set, never a terminal transcript. A resumable interactive Session
+// (STARTING/ACTIVE/INTERACTIVE_IDLE) is native; a terminal Planning Session
+// is native only when it carries a managed Process record (prepare/switch
+// append one) — a COMPLETED native discussion that finished without a
+// Handoff is still a native lineage, while a legacy headless discussion turn
+// (COMPLETED, no managed process) is not.
+func hasNativeDiscussionLineage(state model.State) bool {
+	for i := range state.Sessions {
+		s := &state.Sessions[i]
+		if s.Purpose != model.PurposePlanning || s.ProviderSessionID == "" {
+			continue
+		}
+		if !s.Status.IsTerminal() {
+			return true
+		}
+		if sessionHasManagedProcess(state, s.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionHasManagedProcess reports whether one Session has a managed Process
+// record (the native interactive turn ledger, design 13.3).
+func sessionHasManagedProcess(state model.State, id model.SessionID) bool {
+	for i := range state.Processes {
+		if state.Processes[i].Session == id {
+			return true
+		}
+	}
+	return false
 }
 
 // decideStart starts the first Run: PENDING→RUNNING with an open dispatch

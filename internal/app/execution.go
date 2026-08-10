@@ -44,7 +44,11 @@ import (
 // only produces Candidates: the written Revision is what an Execution
 // Approval may bind (design 16.1).
 func (a *Application) assembleCatalog(ctx context.Context, wf model.WorkflowID, session model.SessionID) (model.ArtifactRef, error) {
-	wrappers, err := verify.DiscoverWrappers(a.planningCWD(ctx, wf))
+	base, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
+	wrappers, err := verify.DiscoverWrappers(base)
 	if err != nil {
 		return model.ArtifactRef{}, err
 	}
@@ -142,7 +146,10 @@ func (a *Application) promoteCatalogProposals(ctx context.Context, wf model.Work
 	for _, e := range catalog.Entries {
 		candidates = append(candidates, catalogEntryCandidate(e))
 	}
-	base := a.planningCWD(ctx, wf)
+	base, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return model.ArtifactRef{}, err
+	}
 	accepted := 0
 	for _, p := range doc.ProposedCommands {
 		c := proposalCandidate(p, base)
@@ -588,7 +595,11 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 	for _, n := range wfIR.Nodes {
 		if n.Type == "merge" {
 			lock := "integration:" + string(wf)
-			if a.workflowLayout(ctx, wf) >= 2 {
+			layoutVersion, err := a.workflowLayout(ctx, wf)
+			if err != nil {
+				return nil, err
+			}
+			if layoutVersion == 2 {
 				// Aggregated workspace layout (design 8.5, TUI task 7): the
 				// serial --no-ff merges advance the same Workspace.
 				lock = "workspace:" + string(wf)
@@ -612,10 +623,18 @@ func (a *Application) queryExecutionPreview(ctx context.Context, q ExecutionPrev
 	// worktrees branch from the verified Workspace Head at readiness; the
 	// legacy layout withholds the Integration Branch until the Execution
 	// Approval (PRD Worktree 策略).
-	worktreePlan := []string{
-		"planning snapshot: " + a.planningCWD(ctx, wf),
+	planningPath, err := a.planningCWD(ctx, wf)
+	if err != nil {
+		return nil, err
 	}
-	if a.workflowLayout(ctx, wf) >= 2 {
+	layoutVersion, err := a.workflowLayout(ctx, wf)
+	if err != nil {
+		return nil, err
+	}
+	worktreePlan := []string{
+		"planning snapshot: " + planningPath,
+	}
+	if layoutVersion == 2 {
 		worktreePlan = append(worktreePlan,
 			"workspace: "+a.layout.Workspace(wf),
 			"workspace branch: cflow/"+string(wf)+"/workspace",

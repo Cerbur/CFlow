@@ -22,7 +22,11 @@ func (a *Application) queryWorkspace(ctx context.Context, q ProjectWorkspaceQuer
 	view := WorkspaceView{
 		Project: ProjectView{Key: a.project.Key, Root: a.project.Root, Name: filepath.Base(a.project.Root)},
 	}
-	for _, wf := range a.knownWorkflows() {
+	ids, err := a.knownWorkflows(ctx)
+	if err != nil {
+		return nil, orCtx(ctx, err)
+	}
+	for _, wf := range ids {
 		agg, err := a.readAggregate(ctx, wf, store.StoreQuery{})
 		if err != nil {
 			return nil, orCtx(ctx, err)
@@ -98,6 +102,9 @@ func workflowBlocked(st model.State) bool {
 // them). The actions never mutate by themselves.
 func legalActions(st StatusView) []LegalAction {
 	var actions []LegalAction
+	if st.LayoutVersion == 1 {
+		actions = append(actions, LegalAction{Label: "Migrate layout", Hint: "layout-migration"})
+	}
 	switch st.Runtime {
 	case model.RuntimePaused:
 		if st.Stage == model.StageWorkflowGeneration {

@@ -123,6 +123,11 @@ const (
 	CodeWorkflowPatchApplied         Code = "WORKFLOW_PATCH_APPLIED"
 	CodeSchemaInvalid                Code = "SCHEMA_INVALID"
 	CodeSessionIndependenceViolation Code = "SESSION_INDEPENDENCE_VIOLATION"
+	// CodeSessionSuperseded: a native discussion Session was superseded by
+	// a switch-agent successor; the superseded Session stays preserved for
+	// audit while the new Session owns the discussion lineage (design §9.4,
+	// TUI task 12).
+	CodeSessionSuperseded Code = "SESSION_SUPERSEDED"
 	// CodeUnexpectedAgentMutation: a non-coding Session changed the
 	// Planning Snapshot's HEAD or Git-visible state; its output is
 	// invalid and can never enter an Artifact or Approval (PRD Worktree
@@ -214,6 +219,7 @@ func Codes() []Code {
 		CodeWorkflowPatchApplied,
 		CodeSchemaInvalid,
 		CodeSessionIndependenceViolation,
+		CodeSessionSuperseded,
 		CodeUnexpectedAgentMutation,
 		CodeDispatchGateClosed,
 		CodeWorkspaceAdoptionRequired,
@@ -462,6 +468,7 @@ var faultPolicies = []FaultPolicy{
 	p(CodeWorkflowPatchApplied, CatInvalidInput, ScopeWorkflowRevision, false, false, StopNone, false),
 	p(CodeSchemaInvalid, CatInvalidInput, ScopeArtifact, false, false, StopNone, false),
 	p(CodeSessionIndependenceViolation, CatInvariantFailure, ScopeSession, false, true, StopAll, false),
+	p(CodeSessionSuperseded, CatUserActionRequired, ScopeSession, false, false, StopNone, false),
 	p(CodeUnexpectedAgentMutation, CatSafetyStop, ScopeSession, false, true, StopAll, false),
 	p(CodeDispatchGateClosed, CatInvalidInput, ScopeRun, false, false, StopNone, false),
 	p(CodeWorkspaceAdoptionRequired, CatUserActionRequired, ScopeWorkflow, false, false, StopNone, false),

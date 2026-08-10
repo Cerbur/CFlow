@@ -8,14 +8,17 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/foreground"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/process"
 )
 
 // recordingController wraps the shared Application and records every
@@ -24,6 +27,561 @@ type recordingController struct {
 	ctrl      controller
 	executed  []app.Command
 	escalated int
+}
+
+type migrationController struct{ executed []app.Command }
+
+func (m *migrationController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	m.executed = append(m.executed, cmd)
+	return app.Outcome{Workflow: "wf-legacy"}, nil
+}
+func (m *migrationController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Selected: "wf-legacy", Workflows: []app.WorkflowSummary{{ID: "wf-legacy", Runtime: model.RuntimePaused}},
+			Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-legacy", LayoutVersion: 1}},
+			LegalActions: []app.LegalAction{{Label: "Migrate layout", Hint: "layout-migration"}},
+		}, nil
+	case app.LayoutMigrationPreviewQuery:
+		return app.MigrationPreviewView{Workflow: "wf-legacy", From: 1, To: 2,
+			ManifestHash: "manifest-1", Moves: []model.PathMove{{Kind: model.MoveKindArtifact, Source: "/old", Destination: "/new"}}}, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+func (*migrationController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*migrationController) EscalateStop() {}
+
+// TestModelMigrationEntryPointsDefaultNo drives the TUI's explicit
+// Preview/Prepare/Execute surface. Enter at either confirmation is No;
+// only an explicit y sends the typed mutation command.
+func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
+	ctrl := &migrationController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = press(t, m, 'm', 0) // read-only Preview
+	if !strings.Contains(render(m), "manifest-1") {
+		t.Fatalf("migration preview page not opened:\n%s", render(m))
+	}
+	m = press(t, m, 'p', 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("Enter confirmed Prepare: %v", ctrl.executed)
+	}
+	m = press(t, m, 'p', 0)
+	m = press(t, m, 'y', 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("explicit y did not Prepare: %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.PrepareLayoutMigrationCommand); !ok {
+		t.Fatalf("Prepare command type = %T", ctrl.executed[0])
+	}
+	m = press(t, m, 'e', 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("Enter confirmed Execute: %v", ctrl.executed)
+	}
+	m = press(t, m, 'e', 0)
+	m = press(t, m, 'y', 0)
+	if len(ctrl.executed) != 2 {
+		t.Fatalf("explicit y did not Execute: %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[1].(app.ExecuteLayoutMigrationCommand); !ok {
+		t.Fatalf("Execute command type = %T", ctrl.executed[1])
+	}
+}
+
+// preparedMigrationController returns a complete PREPARED migration
+// preview so the render test can assert the full evidence.
+type preparedMigrationController struct{}
+
+func (preparedMigrationController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	return app.Outcome{Workflow: "wf-legacy"}, nil
+}
+func (preparedMigrationController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Selected: "wf-legacy", Workflows: []app.WorkflowSummary{{ID: "wf-legacy", Runtime: model.RuntimePaused}},
+			Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-legacy", LayoutVersion: 1}},
+			LegalActions: []app.LegalAction{{Label: "Migrate layout", Hint: "layout-migration"}},
+		}, nil
+	case app.LayoutMigrationPreviewQuery:
+		return app.MigrationPreviewView{
+			Workflow: "wf-legacy", From: 1, To: 2, Status: "PREPARED",
+			MigrationID: "migration-wf-legacy-abc123", ManifestHash: "manifest-1",
+			ManifestPath: "/cflow/projects/p/wf-legacy/state/layout-migrations/migration-wf-legacy-abc123.json",
+			BackupPath:   "/cflow/projects/p/wf-legacy/state/layout-migrations/migration-wf-legacy-abc123.db.backup",
+			BackupHash:   "backup-1", BackupSize: 4096,
+			SourceSnapshotHash:      "snapshot-hash-1",
+			ExpectedWorkspacePath:   "/cflow/projects/p/wf-legacy/workspace",
+			ExpectedWorkspaceBranch: "cflow/wf-legacy/integration",
+			ExpectedWorkspaceHead:   "1111111111111111111111111111111111111111",
+			Moves: []model.PathMove{
+				{Kind: model.MoveKindWorktree, Source: "/cflow/worktrees/p/wf-legacy/integration",
+					Destination: "/cflow/projects/p/wf-legacy/workspace",
+					Branch:      "cflow/wf-legacy/integration", Head: "1111111111111111111111111111111111111111"},
+				{Kind: model.MoveKindArtifact, Source: "/cflow/projects/p/wf-legacy/workflows/wf-legacy/artifacts",
+					Destination: "/cflow/projects/p/wf-legacy/artifacts", Digest: "digest-1"},
+			},
+		}, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+func (preparedMigrationController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (preparedMigrationController) EscalateStop() {}
+
+// TestModelMigrationRenderShowsCompleteEvidence proves the TUI migration
+// page renders the full prepared evidence (finding 6): migration row/
+// status, manifest and backup identity, database impact, and per-move
+// branch/head/digest.
+func TestModelMigrationRenderShowsCompleteEvidence(t *testing.T) {
+	ctrl := &preparedMigrationController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = press(t, m, 'm', 0) // read-only Preview
+	out := render(m)
+	for _, want := range []string{
+		"status: PREPARED",
+		"migration id: migration-wf-legacy-abc123",
+		"manifest path:",
+		"backup:",
+		"source snapshot: snapshot-hash-1",
+		"database impact: workspace=",
+		"branch=cflow/wf-legacy/integration",
+		"digest=digest-1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("migration render missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// blockedController returns a BLOCKED workspace whose LegalActions the
+// test controls: resumeLegal decides whether the Runtime permits Resume.
+type blockedController struct {
+	executed    []app.Command
+	resumeLegal bool
+}
+
+func (c *blockedController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (c *blockedController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	actions := []app.LegalAction{{Label: "Inspect", Hint: "blocked"}}
+	if c.resumeLegal {
+		actions = append(actions, app.LegalAction{Label: "Resume", Kind: model.ResumeWorkflow})
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeBlocked}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status:  app.StatusView{Workflow: "wf-1", Stage: model.StageExecution, Runtime: model.RuntimeBlocked},
+			Blocked: true,
+		},
+		LegalActions: actions,
+		Health:       app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{{Name: "fake", Compatible: true}}},
+	}, nil
+}
+func (*blockedController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*blockedController) EscalateStop() {}
+
+// TestModelBlockedPageIssuesNoResumeWithoutLegalAction: the Blocked page
+// issues a Resume command ONLY when the Runtime LegalActions include it.
+// A blocked workflow whose LegalActions contain NO Resume renders no
+// resume key/hint and pressing r issues no Resume command.
+func TestModelBlockedPageIssuesNoResumeWithoutLegalAction(t *testing.T) {
+	ctrl := &blockedController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m.page = PageBlocked
+	if got := render(m); strings.Contains(got, "r resume") {
+		t.Fatalf("blocked page hard-codes the resume hint:\n%s", got)
+	}
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("blocked page without a resume legal action executed %v", ctrl.executed)
+	}
+}
+
+// TestModelBlockedPageKeepsResumeWhenLegal: when the Runtime LegalActions
+// DO contain Resume the Blocked page renders the hint and pressing r
+// issues the typed ResumeWorkflowCommand.
+func TestModelBlockedPageKeepsResumeWhenLegal(t *testing.T) {
+	ctrl := &blockedController{resumeLegal: true}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m.page = PageBlocked
+	if got := render(m); !strings.Contains(got, "r resume") {
+		t.Fatalf("blocked page lost the runtime resume hint:\n%s", got)
+	}
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("blocked page with a resume legal action executed %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("blocked resume command type = %T", ctrl.executed[0])
+	}
+}
+
+// workspaceActionsController returns one workspace whose LegalActions the
+// test controls (a PAUSED workflow for the resume tests).
+type workspaceActionsController struct {
+	executed    []app.Command
+	resumeLegal bool
+}
+
+func (c *workspaceActionsController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (c *workspaceActionsController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	var actions []app.LegalAction
+	if c.resumeLegal {
+		actions = append(actions, app.LegalAction{Label: "Resume", Kind: model.ResumeWorkflow})
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePaused}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{Workflow: "wf-1", Stage: model.StageWorkflowGeneration, Runtime: model.RuntimePaused},
+		},
+		LegalActions: actions,
+		Health:       app.HealthView{GitAvailable: true},
+	}, nil
+}
+func (*workspaceActionsController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*workspaceActionsController) EscalateStop() {}
+
+// TestModelWorkspaceResumeRequiresLegalAction: the Workspace r key is not
+// an unconditional Resume; it executes ResumeWorkflowCommand only when the
+// Runtime LegalActions include it.
+func TestModelWorkspaceResumeRequiresLegalAction(t *testing.T) {
+	// Without the resume legal action the key is a no-op.
+	ctrl := &workspaceActionsController{}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("workspace r without a resume legal action executed %v", ctrl.executed)
+	}
+	// With the resume legal action the key issues the typed command.
+	ctrl2 := &workspaceActionsController{resumeLegal: true}
+	m2 := load(t, testModel(&recordingController{ctrl: ctrl2}))
+	m2 = press(t, m2, 'r', 0)
+	if len(ctrl2.executed) != 1 {
+		t.Fatalf("workspace r with a resume legal action executed %v", ctrl2.executed)
+	}
+	if _, ok := ctrl2.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("workspace resume command type = %T", ctrl2.executed[0])
+	}
+}
+
+// executionController is the Execution page seam: the workspace projection
+// and the DriveOnce result the test controls. resumeErr, when set, makes
+// the Runtime reject the Resume command (the stale-projection case: the
+// workspace still shows Resume against an already-RUNNING workflow).
+type executionController struct {
+	executed   []app.Command
+	driveCalls int
+	actions    []app.LegalAction
+	runtime    model.RuntimeStatus
+	resumeErr  error
+}
+
+func (c *executionController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	if _, ok := cmd.(app.ResumeWorkflowCommand); ok && c.resumeErr != nil {
+		return app.Outcome{}, c.resumeErr
+	}
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (c *executionController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: c.runtime}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{Workflow: "wf-1", Stage: model.StageExecution, Runtime: c.runtime},
+		},
+		LegalActions: c.actions,
+		Health:       app.HealthView{GitAvailable: true},
+	}, nil
+}
+func (c *executionController) DriveOnce(_ context.Context, _ model.WorkflowID) (app.DriveOutcome, error) {
+	c.driveCalls++
+	return app.DriveOutcome{Kind: app.DriveTerminal, Reason: "terminal"}, nil
+}
+func (*executionController) EscalateStop() {}
+
+// TestModelExecutionResumeDrivenByLegalActions: the Execution page issues
+// the Resume command ONLY when the Runtime LegalActions include it; a
+// workflow without the resume legal action starts the Foreground Runner
+// directly and never sends ResumeWorkflowCommand.
+func TestModelExecutionResumeDrivenByLegalActions(t *testing.T) {
+	// A PAUSED workflow whose LegalActions include Resume: r resumes first.
+	paused := &executionController{
+		actions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		runtime: model.RuntimePaused,
+	}
+	m := load(t, testModel(&recordingController{ctrl: paused}))
+	m.page = PageExecution
+	m = press(t, m, 'r', 0)
+	if len(paused.executed) != 1 {
+		t.Fatalf("execution r with a resume legal action executed %v", paused.executed)
+	}
+	if _, ok := paused.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("execution resume command type = %T", paused.executed[0])
+	}
+
+	// A RUNNING workflow whose LegalActions contain NO Resume: r starts the
+	// runner directly and never issues ResumeWorkflowCommand.
+	running := &executionController{
+		actions: []app.LegalAction{{Label: "Pause", Kind: model.PauseWorkflow}},
+		runtime: model.RuntimeRunning,
+	}
+	m2 := load(t, testModel(&recordingController{ctrl: running}))
+	m2.page = PageExecution
+	m2 = press(t, m2, 'r', 0)
+	if len(running.executed) != 0 {
+		t.Fatalf("execution r without a resume legal action executed %v", running.executed)
+	}
+	if running.driveCalls != 1 {
+		t.Fatalf("the runner was not started (drive calls = %d)", running.driveCalls)
+	}
+}
+
+// TestModelExecutionResumeRejectedStartsRunner covers the stale-projection
+// window after an execution approval: the workflow is already RUNNING but
+// the workspace projection still renders Resume as a legal action. Pressing
+// r issues a ResumeWorkflowCommand the Kernel rejects; the rejected resume
+// must clear the pending resume-then-run and fall back to starting the
+// Foreground Runner directly (DriveOnce is a safe bounded step over the
+// already-running workflow).
+func TestModelExecutionResumeRejectedStartsRunner(t *testing.T) {
+	ctrl := &executionController{
+		actions:   []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		runtime:   model.RuntimeRunning,
+		resumeErr: model.InvalidInputFault("resume rejected: workflow is already running"),
+	}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.page = PageExecution
+	m = press(t, m, 'r', 0)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("execution r executed %v, want exactly the rejected resume", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.ResumeWorkflowCommand); !ok {
+		t.Fatalf("execution resume command type = %T", ctrl.executed[0])
+	}
+	if ctrl.driveCalls != 1 {
+		t.Fatalf("the runner was not started after the rejected resume (drive calls = %d)", ctrl.driveCalls)
+	}
+	if m.resumeThenRun {
+		t.Fatal("resumeThenRun was not cleared after the rejected resume")
+	}
+}
+
+// TestModelExecutionHintDrivenByLegalActions pins the reloaded-UI signal of
+// the E2E: the Execution page hint is driven by the Runtime LegalActions.
+// A PAUSED workflow (Resume legal) renders "r resume & run"; once the
+// post-approval projection reloads the RUNNING workflow (no Resume legal)
+// the hint drops the resume and renders "r start the runner".
+func TestModelExecutionHintDrivenByLegalActions(t *testing.T) {
+	paused := &executionController{
+		actions: []app.LegalAction{{Label: "Resume", Kind: model.ResumeWorkflow}},
+		runtime: model.RuntimePaused,
+	}
+	m := load(t, testModel(&recordingController{ctrl: paused}))
+	m.page = PageExecution
+	if got := render(m); !strings.Contains(got, "r resume & run") {
+		t.Fatalf("paused execution hint lost the resume:\n%s", got)
+	}
+
+	running := &executionController{
+		actions: []app.LegalAction{{Label: "Pause", Kind: model.PauseWorkflow}},
+		runtime: model.RuntimeRunning,
+	}
+	m2 := load(t, testModel(&recordingController{ctrl: running}))
+	m2.page = PageExecution
+	got := render(m2)
+	if !strings.Contains(got, "r start the runner") {
+		t.Fatalf("running execution hint did not drop the resume:\n%s", got)
+	}
+	if strings.Contains(got, "resume & run") {
+		t.Fatalf("running execution hint still offers the resume:\n%s", got)
+	}
+}
+
+// createController is the Create page seam: it answers the workspace load
+// and the DiscoveryQuery with the target Git facts the test controls, and
+// records every CreateWorkflowCommand. discoveryErr, when set, makes the
+// DiscoveryQuery fail so no target facts ever load.
+type createController struct {
+	executed     []app.Command
+	dirty        bool
+	discoveryErr error
+}
+
+func (c *createController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-new"}, nil
+}
+func (c *createController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Project: app.ProjectView{Name: "repo", Root: "/repo"},
+			Health:  app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{{Name: "fake", Compatible: true}}},
+		}, nil
+	case app.DiscoveryQuery:
+		if c.discoveryErr != nil {
+			return nil, c.discoveryErr
+		}
+		return app.DiscoveryView{
+			Branch: "main", Head: "0123456789abcdef",
+			Dirty: c.dirty, DirtyFingerprint: "sha256:deadbeef",
+			StagedCount: 1, UnstagedCount: 0, UntrackedCount: 1,
+		}, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+func (*createController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*createController) EscalateStop() {}
+
+// createPage opens the Create page and types the workflow name.
+func createPage(t *testing.T, m Model, name string) Model {
+	t.Helper()
+	m = press(t, m, 'n', 0)
+	return typeText(t, m, name)
+}
+
+// typeText types one string through the Model as individual text key
+// presses (the create name and handoff inputs use KeyPressMsg.Text).
+func typeText(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	for _, r := range s {
+		m = step(t, m, tea.KeyPressMsg{Code: r, Text: string(r), Mod: 0})
+	}
+	return m
+}
+
+// TestCreateDirtyTargetEnterDoesNotCreate: a dirty target is queried and
+// displayed before creation; the confirmation defaults to No, so Enter
+// (both to submit the name and on the confirmation) never creates.
+func TestCreateDirtyTargetEnterDoesNotCreate(t *testing.T) {
+	ctrl := &createController{dirty: true}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	got := render(m)
+	for _, want := range []string{"DIRTY", "dirty fingerprint: sha256:deadbeef", "will not touch your files"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("create page misses %q:\n%s", want, got)
+		}
+	}
+	// Enter submits the name for the confirmation; it never creates.
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("Enter created the workflow: %v", ctrl.executed)
+	}
+	// Enter on the confirmation is No too.
+	m = press(t, m, tea.KeyEnter, 0)
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("Enter confirmed the workflow: %v", ctrl.executed)
+	}
+}
+
+// TestCreateDirtyTargetYConfirmsDirty: only an explicit y sends the create
+// command with ConfirmDirty: true on a dirty target.
+func TestCreateDirtyTargetYConfirmsDirty(t *testing.T) {
+	ctrl := &createController{dirty: true}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
+	m = press(t, m, 'y', 0)          // the explicit confirmation
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("explicit y did not create: %v", ctrl.executed)
+	}
+	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
+	if !ok {
+		t.Fatalf("create command type = %T", ctrl.executed[0])
+	}
+	if cc.Name != "calculator" || !cc.ConfirmDirty {
+		t.Fatalf("create = %+v, want Name calculator and ConfirmDirty:true", cc)
+	}
+}
+
+// TestCreateCleanTargetCreatesWithoutDirtyFlag: a clean target creates
+// with an explicit y and carries no dirty flag.
+func TestCreateCleanTargetCreatesWithoutDirtyFlag(t *testing.T) {
+	ctrl := &createController{dirty: false}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	if got := render(m); !strings.Contains(got, "clean") {
+		t.Fatalf("clean target create page misses the clean state:\n%s", got)
+	}
+	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
+	m = press(t, m, 'y', 0)          // the explicit confirmation
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("explicit y did not create: %v", ctrl.executed)
+	}
+	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
+	if !ok {
+		t.Fatalf("create command type = %T", ctrl.executed[0])
+	}
+	if cc.ConfirmDirty {
+		t.Fatalf("clean target create carried a dirty flag: %+v", cc)
+	}
+}
+
+// TestCreateMissingFactsYFailsClosed: when the DiscoveryQuery projection has
+// not loaded (createDirty == nil), an explicit y on the confirmation never
+// issues CreateWorkflowCommand — the create is fail-closed on the missing
+// target facts instead of guessing the dirty state.
+func TestCreateMissingFactsYFailsClosed(t *testing.T) {
+	ctrl := &createController{dirty: true, discoveryErr: model.InvalidInputFault("discovery failed")}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+	if got := render(m); !strings.Contains(got, "loading git facts") {
+		t.Fatalf("create page without the queried facts:\n%s", got)
+	}
+	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
+	m = press(t, m, 'y', 0)          // confirm without the target facts
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("y created without the target facts: %v", ctrl.executed)
+	}
+	if got := render(m); !strings.Contains(got, "target facts unavailable") {
+		t.Fatalf("create page did not refuse the missing facts:\n%s", got)
+	}
 }
 
 func (r *recordingController) Execute(ctx context.Context, cmd app.Command) (app.Outcome, error) {
@@ -617,9 +1175,382 @@ func TestModelQShowsPauseAndExit(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Task 6: Foreground Runner ownership
+// ---------------------------------------------------------------------------
+
+// blockingController drives the Foreground Runner into a bounded wait: its
+// DriveOnce returns a DriveWaiting outcome whose channel never closes, so
+// the Runner blocks until its run context is cancelled (design §12.1).
+type blockingController struct {
+	executed []app.Command
+	wait     chan struct{}
+}
+
+func (c *blockingController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+
+func (c *blockingController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeRunning}},
+		Lifecycle: &app.WorkflowLifecycleView{
+			Status: app.StatusView{Workflow: "wf-1", Stage: model.StageExecution, Runtime: model.RuntimeRunning},
+		},
+		Health: app.HealthView{GitAvailable: true},
+	}, nil
+}
+
+func (c *blockingController) DriveOnce(_ context.Context, _ model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{Kind: app.DriveWaiting, Wait: c.wait}, nil
+}
+
+func (*blockingController) EscalateStop() {}
+
+// runBatchMessages runs a Batch command's sub-commands to completion and
+// returns their messages. The synchronous test harness cannot run a
+// blocking Runner, so the cancellation tests run it in a goroutine.
+func runBatchMessages(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	var results []tea.Msg
+	switch batch := msg.(type) {
+	case tea.BatchMsg:
+		for _, c := range batch {
+			if c != nil {
+				results = append(results, c())
+			}
+		}
+	default:
+		results = append(results, msg)
+	}
+	return results
+}
+
+// hasRunnerStopped reports whether the messages contain the Runner's
+// terminal result with the given stop reason.
+func hasRunnerStopped(msgs []tea.Msg, reason foreground.StopReason) bool {
+	for _, msg := range msgs {
+		if rd, ok := msg.(runnerDoneMsg); ok && rd.err == nil {
+			return rd.res.Reason == reason
+		}
+	}
+	return false
+}
+
+// TestRunnerStartOwnsState: the root Model owns the Foreground Runner
+// lifecycle (design §11, Task 6): startRunner returns the updated Model
+// with running, runCancel, eventCh and the subscription set, and the
+// runner-done terminal path clears them exactly once.
+func TestRunnerStartOwnsState(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m2, runCmd := m.startRunner()
+	if !m2.running || m2.runCancel == nil || m2.eventCh == nil {
+		t.Fatalf("runner ownership after start: running=%v runCancel=%v eventCh=%v",
+			m2.running, m2.runCancel == nil, m2.eventCh == nil)
+	}
+	if runCmd == nil {
+		t.Fatal("startRunner returned no runner command")
+	}
+
+	// A terminal run clears the ownership state exactly once.
+	m3 := runCmds(t, m2, runCmd)
+	if m3.running || m3.runCancel != nil || m3.eventCh != nil {
+		t.Fatalf("runner ownership after done: running=%v runCancel=%v eventCh=%v",
+			m3.running, m3.runCancel != nil, m3.eventCh != nil)
+	}
+}
+
+// TestRunnerDuplicateStartRefused: starting a Run while one is already
+// active is refused (Task 6): no second runner command and no second
+// subscription (the event channel is unchanged).
+func TestRunnerDuplicateStartRefused(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m, firstCmd := m.startRunner()
+	firstCh := m.eventCh
+	if firstCmd == nil {
+		t.Fatal("the first start produced no runner command")
+	}
+
+	m2, secondCmd := m.startRunner()
+	if secondCmd != nil {
+		t.Fatal("duplicate start issued a second runner command")
+	}
+	if m2.eventCh != firstCh {
+		t.Fatal("duplicate start replaced the event subscription")
+	}
+	if !m2.running {
+		t.Fatal("duplicate start cleared the running state")
+	}
+	if !strings.Contains(m2.status, "already active") {
+		t.Fatalf("duplicate start status = %q", m2.status)
+	}
+}
+
+// TestRunnerRunKeyRefusesDuplicate: pressing r while a Runner is active
+// refuses the second start (the Execution page never spawns a second
+// runner or a second subscription).
+func TestRunnerRunKeyRefusesDuplicate(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+	m.page = PageExecution
+
+	m, _ = m.startRunner()
+	m2 := press(t, m, 'r', 0)
+	if !strings.Contains(m2.status, "already active") {
+		t.Fatalf("r on an active runner status = %q", m2.status)
+	}
+	if ctrl.driveCalls != 0 {
+		t.Fatalf("duplicate r drove the runner again (drive calls = %d)", ctrl.driveCalls)
+	}
+}
+
+// TestModelPauseAndExitCancelsRunner: y on the Pause and Exit
+// confirmation cancels the REAL Runner (the run context is cancelled) so
+// the runner stops with StopCancelled — a quit never leaves a process.
+func TestModelPauseAndExitCancelsRunner(t *testing.T) {
+	ctrl := &blockingController{wait: make(chan struct{})}
+	rec := &recordingController{ctrl: ctrl}
+	m := load(t, testModel(rec))
+	m.selected = "wf-1"
+	m.page = PageExecution
+
+	m, runCmd := m.startRunner()
+	if !m.running || m.runCancel == nil {
+		t.Fatalf("runner did not start: running=%v runCancel=%v", m.running, m.runCancel == nil)
+	}
+	done := make(chan []tea.Msg, 1)
+	go func() {
+		done <- runBatchMessages(runCmd)
+	}()
+
+	// q shows the Pause and Exit confirmation instead of quitting directly.
+	m2, cmd := m.Update(tea.KeyPressMsg{Code: KeyQuit})
+	if cmd != nil {
+		t.Fatal("q quit directly while a runner is active")
+	}
+	m2m := m2.(Model)
+	if m2m.page != PagePauseExit || m2m.stop != stopPauseAndExit {
+		t.Fatalf("q state = page %d stop %d, want pause-and-exit", m2m.page, m2m.stop)
+	}
+
+	// y requests the controlled pause and cancels the real runner.
+	_, yCmd := m2m.Update(tea.KeyPressMsg{Code: 'y'})
+	if yCmd == nil {
+		t.Fatal("y produced no pause command")
+	}
+	if pauseMsg := yCmd(); pauseMsg == nil {
+		t.Fatal("the pause command produced no message")
+	}
+	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
+		t.Fatalf("y did not request the controlled pause: %v", rec.executed)
+	}
+
+	// The real runner stopped with StopCancelled (the run context was
+	// cancelled on the controlled-stop path).
+	select {
+	case msgs := <-done:
+		if !hasRunnerStopped(msgs, foreground.StopCancelled) {
+			t.Fatalf("the runner did not stop with StopCancelled: %#v", msgs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner was not cancelled by the pause-and-exit")
+	}
+}
+
+// TestModelCtrlCCancelsRunnerOnPause: the first Ctrl+C requests the
+// controlled Pause AND cancels the real Runner (the run context is
+// cancelled), so the runner stops with StopCancelled instead of driving
+// on.
+func TestModelCtrlCCancelsRunnerOnPause(t *testing.T) {
+	ctrl := &blockingController{wait: make(chan struct{})}
+	rec := &recordingController{ctrl: ctrl}
+	m := load(t, testModel(rec))
+	m.selected = "wf-1"
+	m.page = PageExecution
+
+	m, runCmd := m.startRunner()
+	done := make(chan []tea.Msg, 1)
+	go func() {
+		done <- runBatchMessages(runCmd)
+	}()
+
+	// The first Ctrl+C requests the controlled pause and cancels the
+	// runner.
+	m2 := press(t, m, KeyCtrlCRune, tea.ModCtrl)
+	if m2.stop != stopFirstCtrlC {
+		t.Fatalf("stop = %d, want first-ctrl-c", m2.stop)
+	}
+	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
+		t.Fatalf("the first Ctrl+C did not request the controlled pause: %v", rec.executed)
+	}
+
+	select {
+	case msgs := <-done:
+		if !hasRunnerStopped(msgs, foreground.StopCancelled) {
+			t.Fatalf("the runner did not stop with StopCancelled: %#v", msgs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner was not cancelled by the first Ctrl+C")
+	}
+}
+
+// TestModelCtrlCSecondForceStopCleansUp: the second Ctrl+C escalates the
+// controlled stop to the force-kill phase (EscalateStop), quits, and
+// cleans the runner ownership state.
+func TestModelCtrlCSecondForceStopCleansUp(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	rec := &recordingController{ctrl: ctrl}
+	m := load(t, testModel(rec))
+	m.selected = "wf-1"
+
+	m, _ = m.startRunner()
+	m2 := press(t, m, KeyCtrlCRune, tea.ModCtrl)
+	if m2.stop != stopFirstCtrlC {
+		t.Fatalf("stop = %d, want first-ctrl-c", m2.stop)
+	}
+	m3, quitCmd := m2.Update(tea.KeyPressMsg{Code: KeyCtrlCRune, Mod: tea.ModCtrl})
+	if rec.escalated != 1 {
+		t.Fatalf("the second Ctrl+C did not escalate: %d", rec.escalated)
+	}
+	if quitCmd == nil {
+		t.Fatal("the second Ctrl+C did not quit")
+	}
+	mm := m3.(Model)
+	if mm.running || mm.runCancel != nil || mm.eventCh != nil {
+		t.Fatalf("the second Ctrl+C left runner ownership: running=%v runCancel=%v eventCh=%v",
+			mm.running, mm.runCancel != nil, mm.eventCh != nil)
+	}
+}
+
+// TestRunnerDoneClearsEventChannel pins the applyRunnerDone terminal path:
+// a runner error resets running, runCancel, AND the event channel (no
+// stale subscription field is left on the Model).
+func TestRunnerDoneClearsEventChannel(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m, runCmd := m.startRunner()
+	m = runCmds(t, m, runCmd)
+	if m.running || m.runCancel != nil || m.eventCh != nil {
+		t.Fatalf("runner done left ownership: running=%v runCancel=%v eventCh=%v",
+			m.running, m.runCancel != nil, m.eventCh != nil)
+	}
+}
+
+// TestRunnerRendererErrorClearsOwnership: a renderer failure (an error
+// message) never leaves a background Runner — the ownership state is
+// cleared (design §16: the Runtime is unchanged; the user recovers
+// through the Headless CLI).
+func TestRunnerRendererErrorClearsOwnership(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := load(t, testModel(&recordingController{ctrl: ctrl}))
+	m.selected = "wf-1"
+
+	m, _ = m.startRunner()
+	m2 := step(t, m, model.InvalidInputFault("renderer exploded"))
+	if m2.running || m2.runCancel != nil || m2.eventCh != nil {
+		t.Fatalf("renderer error left runner ownership: running=%v runCancel=%v eventCh=%v",
+			m2.running, m2.runCancel != nil, m2.eventCh != nil)
+	}
+}
+
+// TestPumpEventsNilChannel is the nil-channel regression test: after a
+// terminal path clears eventCh (applyRunnerDone, clearRunner), a pump
+// command that is still in flight must terminate with eventsClosedMsg
+// instead of blocking forever on a nil channel (a leaked goroutine). The
+// timeout guard turns the pre-fix hang into a test failure rather than
+// freezing the suite.
+func TestPumpEventsNilChannel(t *testing.T) {
+	ctrl := &executionController{runtime: model.RuntimeRunning}
+	m := testModel(&recordingController{ctrl: ctrl})
+	m.eventCh = nil
+
+	cmd := m.pumpEvents()
+	if cmd == nil {
+		t.Fatal("pumpEvents returned a nil command")
+	}
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+	select {
+	case msg := <-done:
+		if _, ok := msg.(eventsClosedMsg); !ok {
+			t.Fatalf("pumpEvents on a nil channel yielded %T, want eventsClosedMsg", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pumpEvents on a nil channel hung (blocked on the nil channel)")
+	}
+}
+
+// TestRunnerEventInactiveNoRepump is the stale-event regression test: a
+// runnerEventMsg arriving after the runner is no longer active (the
+// renderer-error and the runner's event send come from different
+// goroutines, so an in-flight event can arrive after clearRunner) must be
+// applied to the Execution page but MUST NOT re-pump — re-pumping there
+// captures the cleared nil channel and leaks the pump goroutine.
+func TestRunnerEventInactiveNoRepump(t *testing.T) {
+	m := testModel(&recordingController{ctrl: &executionController{runtime: model.RuntimeRunning}})
+	m.running = false
+	m.eventCh = nil
+
+	upd, cmd := m.Update(runnerEventMsg{ev: model.Event{Seq: 1, Kind: model.EventRunStarted, Workflow: "wf-1", Text: "run started"}})
+	if cmd != nil {
+		t.Fatalf("runnerEventMsg while the runner is inactive re-pumped: cmd = %v", cmd)
+	}
+	mm := upd.(Model)
+	if mm.running {
+		t.Fatal("runnerEventMsg while inactive set the running flag")
+	}
+	if len(mm.execution.Log) != 1 {
+		t.Fatalf("inactive runnerEventMsg was not applied to the Execution page: log = %v", mm.execution.Log)
+	}
+}
+
+// TestRunnerEventActiveRepumps guards the normal-flow counterpart: while
+// the runner IS active, a runnerEventMsg still re-pumps (the Execution
+// page keeps consuming committed events until the runner terminal path).
+func TestRunnerEventActiveRepumps(t *testing.T) {
+	ch := make(chan model.Event, 1)
+	ch <- model.Event{Seq: 2, Kind: model.EventNodeSucceeded, Workflow: "wf-1", Node: "n1"}
+	m := testModel(&recordingController{ctrl: &executionController{runtime: model.RuntimeRunning}})
+	m.running = true
+	m.eventCh = ch
+
+	upd, cmd := m.Update(runnerEventMsg{ev: model.Event{Seq: 1, Kind: model.EventRunStarted, Workflow: "wf-1", Text: "run started"}})
+	if cmd == nil {
+		t.Fatal("runnerEventMsg while active did not re-pump")
+	}
+	mm := upd.(Model)
+	if !mm.running {
+		t.Fatal("runnerEventMsg while active cleared the running flag")
+	}
+	// The re-pump command reads the next committed event.
+	if msg := cmd(); msg == nil {
+		t.Fatal("the re-pump command produced no message")
+	}
+}
+
 // createWithDiscussion drives the requirement discussion setup through
-// the Application: create, prepare the native session, freeze the Change
-// Set, and finish with the strict handoff. Returns the workflow id.
+// the Application: create, prepare the native session (managed bootstrap
+// binds the Provider's own session id), the Bridge return persists the
+// process exit facts and moves the Session to INTERACTIVE_IDLE, freeze the
+// Change Set, and finish with the managed structured resume producing the
+// strict handoff. Returns the workflow id.
 func (fx *tuiFixture) createWithDiscussion(ctx context.Context, a *app.Application) model.WorkflowID {
 	fx.t.Helper()
 	out, err := a.Execute(ctx, app.CreateWorkflowCommand{Name: "calculator", Provider: "fake", ConfirmDirty: true})
@@ -631,26 +1562,30 @@ func (fx *tuiFixture) createWithDiscussion(ctx context.Context, a *app.Applicati
 	if err != nil {
 		fx.t.Fatalf("prepare native discussion: %v", err)
 	}
+	if prep.Native == nil {
+		fx.t.Fatal("prepare carried no native bridge request")
+	}
+	// The Bridge return revalidates the binding and moves the Session to
+	// INTERACTIVE_IDLE.
+	if _, err := a.Execute(ctx, app.NativeDiscussionReturnCommand{
+		Workflow: wf, Session: prep.SessionID,
+		Exit:            process.Exit{Code: 0, Fact: process.FactProcessExit},
+		Provider:        "fake",
+		ProviderSession: prep.Native.ProviderSession,
+	}); err != nil {
+		fx.t.Fatalf("native discussion return: %v", err)
+	}
 	frozen, err := a.Execute(ctx, app.FreezeDiscussionCommand{Workflow: wf, Session: prep.SessionID})
 	if err != nil {
 		fx.t.Fatalf("freeze: %v", err)
 	}
-	ref := frozen.ChangeSet.Ref
-	handoff, err := json.Marshal(map[string]any{
-		"workflow_id":         string(wf),
-		"session_id":          string(prep.SessionID),
-		"targets":             "division by zero must error",
-		"constraints":         "no external dependencies",
-		"non_goals":           "no other arithmetic changes",
-		"acceptance_criteria": "Divide returns a typed error on zero",
-		"open_questions":      "error wording",
-		"change_set":          map[string]any{"revision": ref.Revision, "sha256": ref.Hash},
-		"user_decisions":      []map[string]any{{"topic": "error type", "decision": "typed error"}},
-	})
-	if err != nil {
-		fx.t.Fatal(err)
-	}
-	if _, err := a.Execute(ctx, app.FinishDiscussionCommand{Workflow: wf, Session: prep.SessionID, Handoff: handoff}); err != nil {
+	_ = frozen.ChangeSet.Ref
+	// Finish drives the managed structured resume on the same provider
+	// session that produces the strict handoff from the user's decisions.
+	if _, err := a.Execute(ctx, app.FinishDiscussionCommand{
+		Workflow: wf, Session: prep.SessionID,
+		Decisions: []byte(`{` + handoffContentFields + `}`),
+	}); err != nil {
 		fx.t.Fatalf("finish: %v", err)
 	}
 	return wf
@@ -672,4 +1607,171 @@ func (fx *tuiFixture) approvePlan(ctx context.Context, a *app.Application, wf mo
 	pv := view.(app.PlanView)
 	_, err = a.Execute(ctx, app.ApprovePlanCommand{Workflow: wf, Revision: pv.Revision, Hash: pv.Hash})
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Return Page: Continue Same Session / Switch Agent launch the native bridge
+// ---------------------------------------------------------------------------
+
+// nativeReturnController is the Return Page seam: Execute returns an Outcome
+// that carries the managed Native Bridge request facts for the native
+// discussion commands, so applyCommand can launch the blocking-exec adapter.
+// With native=false the Outcome carries no Native request (the reload
+// fallback case).
+type nativeReturnController struct {
+	executed []app.Command
+	native   bool
+}
+
+func (c *nativeReturnController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	out := app.Outcome{Workflow: "wf-1"}
+	if c.native {
+		out.SessionID = "sess-1"
+		out.Native = &app.NativeBridgeRequest{
+			Workflow:        "wf-1",
+			Session:         "sess-1",
+			Provider:        "fake",
+			ProviderSession: "prov-sess-1",
+			Worktree:        "/cflow/projects/p/wf-1/workspace",
+		}
+	}
+	return out, nil
+}
+
+func (c *nativeReturnController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); !ok {
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+	return app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePending}},
+		Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePending}},
+		Health: app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{
+			{Name: "fake", Compatible: true},
+			{Name: "alt", Compatible: true},
+		}},
+	}, nil
+}
+
+func (*nativeReturnController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*nativeReturnController) EscalateStop() {}
+
+// returnPage builds the root Model on the native discussion Return Page
+// with the full action set (Continue is the default selection).
+func returnPage(t *testing.T, ctrl controller) Model {
+	t.Helper()
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m.selected = "wf-1"
+	m.page = PageDiscussion
+	m.discussion = DiscussionPage{
+		Loaded:   true,
+		Session:  "sess-1",
+		Provider: "fake",
+		Actions:  []DiscussionReturnAction{ReturnContinue, ReturnFinish, ReturnSwitch, ReturnPause, ReturnCancel},
+	}
+	return m
+}
+
+// activateReturnAction presses Enter on the current Return action and runs
+// the issued typed Application Command to its commandDoneMsg, then returns
+// the command applyCommand produced for that result — WITHOUT running it, so
+// the test can assert whether it is the native bridge exec or the reload.
+func activateReturnAction(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	upd, keyCmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = upd.(Model)
+	if keyCmd == nil {
+		t.Fatal("Enter on the Return page produced no command")
+	}
+	doneMsg := keyCmd()
+	done, ok := doneMsg.(commandDoneMsg)
+	if !ok {
+		t.Fatalf("Enter on the Return page produced %T, want commandDoneMsg", doneMsg)
+	}
+	m2, execCmd := m.Update(done)
+	return m2.(Model), execCmd
+}
+
+// isNativeExecMsg reports whether the command is the Bubble Tea blocking-exec
+// adapter of the Native Session Bridge: calling it yields the tea.execMsg the
+// Program consumes to suspend the renderer and attach the terminal streams.
+func isNativeExecMsg(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	msg := cmd()
+	typ := reflect.TypeOf(msg)
+	return typ != nil && typ.Name() == "execMsg"
+}
+
+// TestModelReturnContinueLaunchesNativeExec proves the Continue Same Session
+// action (the default-selected Return action) launches the native bridge
+// exec: after the controller's Execute carries the managed Native request,
+// applyCommand must produce the blocking-exec adapter (never a plain reload
+// that leaves the re-armed Session's RUNNING process phantom).
+func TestModelReturnContinueLaunchesNativeExec(t *testing.T) {
+	ctrl := &nativeReturnController{native: true}
+	m := returnPage(t, ctrl)
+	if len(m.discussion.Actions) == 0 || m.discussion.Actions[0] != ReturnContinue {
+		t.Fatalf("Continue is not the default Return action: %+v", m.discussion.Actions)
+	}
+	_, execCmd := activateReturnAction(t, m)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("Enter on Continue executed %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.ContinueNativeDiscussionCommand); !ok {
+		t.Fatalf("Continue command type = %T", ctrl.executed[0])
+	}
+	if !isNativeExecMsg(execCmd) {
+		t.Fatal("Continue did not launch the native bridge exec")
+	}
+}
+
+// TestModelReturnSwitchLaunchesNativeExec proves the Switch Agent action also
+// launches the native bridge exec (the switched Session's interactive turn
+// must run in the terminal, exactly like the Prepare case).
+func TestModelReturnSwitchLaunchesNativeExec(t *testing.T) {
+	ctrl := &nativeReturnController{native: true}
+	m := returnPage(t, ctrl)
+	m = press(t, m, tea.KeyDown, 0) // Finish
+	m = press(t, m, tea.KeyDown, 0) // Switch Agent
+	if m.discussion.Actions[m.discussion.Selected] != ReturnSwitch {
+		t.Fatalf("selected Return action = %v, want switch-agent", m.discussion.Actions[m.discussion.Selected])
+	}
+	_, execCmd := activateReturnAction(t, m)
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("Enter on Switch executed %v", ctrl.executed)
+	}
+	if _, ok := ctrl.executed[0].(app.SwitchAgentCommand); !ok {
+		t.Fatalf("Switch command type = %T", ctrl.executed[0])
+	}
+	if !isNativeExecMsg(execCmd) {
+		t.Fatal("Switch did not launch the native bridge exec")
+	}
+}
+
+// TestModelReturnContinueWithoutNativeReloads guards the fallback: when the
+// command outcome carries no Native bridge request, applyCommand must fall
+// through to the plain projection reload — never launch an exec with a nil
+// request and never wedge the Session.
+func TestModelReturnContinueWithoutNativeReloads(t *testing.T) {
+	ctrl := &nativeReturnController{native: false}
+	m := returnPage(t, ctrl)
+	_, execCmd := activateReturnAction(t, m)
+	if execCmd == nil {
+		t.Fatal("Continue without a native request produced no reload")
+	}
+	if isNativeExecMsg(execCmd) {
+		t.Fatal("Continue without a native bridge request launched the exec")
+	}
+	msg := execCmd()
+	if _, ok := msg.(tea.BatchMsg); !ok {
+		t.Fatalf("Continue fallback produced %T, want the projection reload batch", msg)
+	}
 }

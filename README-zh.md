@@ -6,7 +6,7 @@ CFlow 是一个面向 Coding Agent 的 local-first 工作流 Runtime。它把一
 
 CFlow 不是 `codex` 或 `claude` 的薄封装。它负责可恢复的 Plan-to-Done 生命周期，并且只依据持久化证据推进状态，而不会因为 Agent 声称“已经完成”就判定成功。
 
-> **项目状态：**2026-08-07 的 TUI 方向已确认，可运行的 TUI 根 Model 现已真正接通：它加载只读项目工作台，导航各生命周期页面，并通过共享 Application 驱动原生讨论、Plan/Execution 批准、Foreground Runner、受保护 Apply 与显式 Cleanup，同时实现受控停止协议。确定性 Fake TUI Gate（`TestTUIPlanToApplyAndCleanup` 通过真实根 TUI 与 Fake 终端）是当前 **Internal Candidate**，详见[验收报告](docs/cflow-demo-acceptance-report.md)、[TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与[实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood **尚未运行**，需要在新精确 Candidate Commit 上单独明确授权。
+> **项目状态：**2026-08-07 的 TUI 方向已确认，可运行的 TUI 根 Model 现已真正接通：它加载只读项目工作台，导航各生命周期页面，并通过共享 Application 驱动原生讨论、Plan/Execution 批准、Foreground Runner、受保护 Apply 与显式 Cleanup，同时实现受控停止协议。确定性 Fake TUI Gate（`TestTUIPlanToApplyAndCleanup` 通过真实根 TUI 与 Fake 终端）正在被加固为 Candidate Gate；Gate 证据尚未生成，因此在修复后的 Gate 于精确 Candidate Commit 上通过之前，TUI **还不是 Internal Candidate**。详见[验收报告](docs/cflow-demo-acceptance-report.md)、[TUI 设计](docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md) 与[实施 Plan](docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md)。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood **尚未运行**，需要在新精确 Candidate Commit 上单独明确授权。
 
 ## 为什么需要 CFlow
 
@@ -107,7 +107,7 @@ Approval 命令需要交互确认，并且默认选择“否”。Provider 执�
 
 `doctor` 中部分有状态检查仍会显示 `NOT_YET_AVAILABLE`。真实 Codex/Claude Native + Headless E2E 与 Self-Dogfood 尚未针对该分支重跑；它们需要在精确 Candidate Commit 上单独授权。
 
-聚合布局、Workspace Adoption、Native Discussion Bridge 和 Foreground Runner 已存在于类型化 Application API 之后，但根 TUI 尚未将它们变成可操作流程。当前 headless 需求讨论仍使用上文所示的行式 `discuss` 命令。
+聚合布局、Workspace Adoption、Native Discussion Bridge 和 Foreground Runner 已接入根 TUI，并由 Fake TUI E2E 通过共享 Application 驱动；headless 需求讨论仍使用上文所示的行式 `discuss` 命令。
 
 ## 命令概览
 
@@ -149,7 +149,7 @@ Gate 1 和 Gate 2 只产生内部 Candidate。Gate 3 可以产生 Demo Complete 
 
 历史证据只证明其绑定的精确二进制与源码 Commit，不会自动覆盖后续 Commit。
 
-当前 `TestTUIPlanToApplyAndCleanup` 直接调用 Application 方法与独立 TUI Model，没有通过 Fake Terminal 输入启动根 TUI，而且在 Report、Apply 与 Cleanup 前结束。补齐此缺口前，即使 Fake TUI Gate 通过，也不能将其视为完整交互生命周期的证据。
+当前 `TestTUIPlanToApplyAndCleanup` 通过 Fake Terminal 输入启动真实根 TUI（Bubble Tea Program），并经共享 Application 驱动完整交互生命周期直至最终报告、受保护 Apply 与显式 Cleanup。通过修复后的 Fake TUI Gate 是这一交互生命周期的证据链；但在其于精确 Candidate Commit 上通过之前，它本身并不断言 Internal Candidate。
 
 ## 文档
 

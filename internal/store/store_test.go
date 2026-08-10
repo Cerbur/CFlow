@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/security"
 )
 
 // ---------------------------------------------------------------------------
@@ -869,5 +870,65 @@ func TestStoreRejectsMutationOnReadOnlyStore(t *testing.T) {
 	_, err := s.Transact(context.Background(), 0, fixtureDecision)
 	if err == nil {
 		t.Fatal("expected read-only rejection")
+	}
+}
+
+// TestBackupLayoutMigrationSelfHealsStaleZeroByteScratch proves a failed
+// online backup cannot wedge the migration retry forever: BackupLayoutMigration
+// creates the owner-only target before the online backup, so a failure leaves
+// a 0-byte file that passes PRAGMA integrity_check as an empty database and
+// would otherwise record Size 0 evidence that readMigrationManifest rejects.
+// The next Prepare must recognize the 0-byte file as CFlow's own incomplete
+// scratch, remove it, and regenerate a real backup with Size > 0.
+func TestBackupLayoutMigrationSelfHealsStaleZeroByteScratch(t *testing.T) {
+	s := openTestStore(t)
+	mustTransact(t, s, 0, fixtureDecision)
+	// The scratch path must not resolve through a symlink (macOS temp roots
+	// resolve /var -> /private/var) and its parent must be owner-only, like
+	// every guarded CFLOW_HOME path.
+	tempRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp root: %v", err)
+	}
+	parent := filepath.Join(tempRoot, "managed")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "migration.db.backup")
+	// A failed attempt left the owner-only scratch file before the online
+	// backup streamed any pages (CreateSensitiveFile succeeded, the backup
+	// never did).
+	f, err := security.CreateSensitiveFile(path)
+	if err != nil {
+		t.Fatalf("create stale scratch: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("fixture scratch size = %d, want 0", info.Size())
+	}
+	// The next Prepare must self-heal: the backup is regenerated with real
+	// content and the evidence carries a positive size and a real hash.
+	backup, err := s.BackupLayoutMigration(context.Background(), path)
+	if err != nil {
+		t.Fatalf("backup after stale 0-byte scratch: %v", err)
+	}
+	if backup.Size <= 0 {
+		t.Fatalf("regenerated backup size = %d, want > 0", backup.Size)
+	}
+	if backup.SHA256 == "" {
+		t.Fatal("regenerated backup carries no sha256")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(body)) != backup.Size {
+		t.Fatalf("backup file size = %d, evidence = %d", len(body), backup.Size)
 	}
 }

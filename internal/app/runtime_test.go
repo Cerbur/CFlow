@@ -420,12 +420,16 @@ func TestResumeFallbackReportsLostFactsForKernelCharge(t *testing.T) {
 	if err := ad.LoadScript([]byte(resumeMissingScript)); err != nil {
 		t.Fatal(err)
 	}
+	evidenceDir := fx.app().layout.SessionsDir(wf)
+	if err := os.MkdirAll(evidenceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	rt, err := agent.NewRuntime(agent.RuntimeOptions{
 		Now:         fx.now,
 		IDs:         fx.ids,
 		Registry:    reg,
 		Redaction:   security.Registry{},
-		EvidenceDir: filepath.Join(fx.home, "evidence"),
+		EvidenceDir: evidenceDir,
 		Adapters:    map[string]agent.Adapter{"fake": ad},
 	})
 	if err != nil {
@@ -446,6 +450,10 @@ func TestResumeFallbackReportsLostFactsForKernelCharge(t *testing.T) {
 	sess := rt.Sessions()[0].Session
 
 	a := fx.app()
+	putRequiredSpec(t, a, wf, "s01")
+	putRequiredCatalog(t, a, wf)
+	seedNodeRow(t, filepath.Join(fx.home, "cflow.db"), wf,
+		"S01", "s01", string(model.NodeAgentTask), string(model.NodeRunning), "cflow/"+string(wf)+"/task-S01")
 	input := model.DispatchInput{Node: "S01", Session: sess.ID, Route: "fake", BaseHead: "base"}
 	result, err := a.executeEffect(context.Background(), model.ProviderResumeIntent{
 		Session: sess.ID, Purpose: model.PurposeImplementation,

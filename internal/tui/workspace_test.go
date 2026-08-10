@@ -43,6 +43,25 @@ func TestRenderWorkspaceEmpty(t *testing.T) {
 	}
 }
 
+// TestMapWorkspaceIncludesLayoutMigrationLegalAction proves the TUI
+// exposes migration only when the Application's authoritative
+// LegalActions projection permits it.
+func TestMapWorkspaceIncludesLayoutMigrationLegalAction(t *testing.T) {
+	m := MapWorkspace(app.WorkspaceView{
+		Selected:     "wf-legacy",
+		Workflows:    []app.WorkflowSummary{{ID: "wf-legacy", Runtime: model.RuntimePaused}},
+		Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-legacy"}},
+		LegalActions: []app.LegalAction{{Label: "Migrate layout", Hint: "layout-migration"}},
+	})
+	found := false
+	for _, action := range m.Actions {
+		found = found || action == Action("layout-migration")
+	}
+	if !found {
+		t.Fatalf("migration legal action missing: %v", m.Actions)
+	}
+}
+
 // TestWorkspaceNavigationOnlyUpdatesSelection: navigation keys update
 // only the UI selection; no Execute is ever called (the mapping is pure).
 func TestWorkspaceNavigationOnlyUpdatesSelection(t *testing.T) {
@@ -68,7 +87,7 @@ func TestWorkspaceNavigationOnlyUpdatesSelection(t *testing.T) {
 
 func sampleWorkspaceModel() WorkspaceModel {
 	return MapWorkspace(app.WorkspaceView{
-		Project: app.ProjectView{Key: "k", Root: "/r", Name: "repo"},
+		Project:  app.ProjectView{Key: "k", Root: "/r", Name: "repo"},
 		Selected: "wf-1",
 		Workflows: []app.WorkflowSummary{
 			{ID: "wf-1", Runtime: model.RuntimePaused},

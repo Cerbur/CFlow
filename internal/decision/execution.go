@@ -35,6 +35,8 @@ func decideEffectResult(state model.State, in model.EffectResultInput) (model.De
 		return model.Decision{}, nil
 	case model.ProviderRunEnded:
 		return decideProviderRunEnded(state, in)
+	case model.NativeBootstrapEstablished:
+		return decideNativeBootstrapEstablished(state, in)
 	case model.ArtifactWritten:
 		return decideArtifactWritten(state, in)
 	case model.WorkflowCompiled:

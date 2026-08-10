@@ -78,19 +78,98 @@ func (DiscussRequirementInput) isInput() {}
 
 // PrepareNativeDiscussionInput establishes the exact CFlow Session of one
 // native interactive requirement discussion (design §9.1, TUI task 12):
-// the Kernel records the fresh Session as STARTING so the TUI's blocking
-// exec callback runs the Bridge against a persisted, recoverable Session.
+// the Kernel records the fresh Session as STARTING and requests the
+// managed bootstrap effect that captures the Provider's own session
+// identity, so the TUI's blocking exec callback runs the Bridge against a
+// persisted, recoverable Session. Process is the Application-allocated
+// managed Process identity the Kernel records as RUNNING with the Session
+// (the controlled-stop ledger, design 13.3) — the supervised interactive
+// turn later settles it on the Bridge return.
 type PrepareNativeDiscussionInput struct {
 	Provider string
 	Session  SessionID
+	Process  ProcessID
 }
 
 func (PrepareNativeDiscussionInput) isInput() {}
 
+// NativeDiscussionReturnInput settles one native interactive turn (design
+// §9.2, TUI task 12): the Kernel persists the observed process exit facts,
+// the revalidated Session binding, and the revalidated Workspace facts,
+// and moves the Session to INTERACTIVE_IDLE. A non-zero exit is NOT a
+// discussion failure by itself: the user may continue the same Session,
+// finish, switch Agent, pause, or cancel. The Application revalidated the
+// echoed binding and the Workspace facts before the Kernel judges them.
+type NativeDiscussionReturnInput struct {
+	Session SessionID
+	// Process is the managed Process identity the prepare decision recorded.
+	Process ProcessID
+	// ExitCode and ExitFact are the typed process exit facts of the
+	// interactive turn ("" fact means the process exited).
+	ExitCode int
+	ExitFact string
+	// Provider and ProviderSession are the binding the Bridge ran on; the
+	// Kernel re-validates them against the recorded Session binding.
+	Provider        string
+	ProviderSession string
+	// WorkspaceHead and WorkspaceDirtyFingerprint are the revalidated
+	// Workspace facts observed on the return.
+	WorkspaceHead            string
+	WorkspaceDirtyFingerprint string
+}
+
+func (NativeDiscussionReturnInput) isInput() {}
+
+// ContinueNativeDiscussionInput resumes the exact native discussion
+// Session (design §9.2, TUI task 12): the Bridge runs another interactive
+// turn on the SAME Provider Session and SAME provider binding — never a
+// new Session or a new provider identity. Process is the managed Process
+// identity of the continued turn's chain.
+type ContinueNativeDiscussionInput struct {
+	Session SessionID
+	Process ProcessID
+}
+
+func (ContinueNativeDiscussionInput) isInput() {}
+
+// SwitchAgentInput switches one native discussion to a DIFFERENT provider
+// (design §9.4, TUI task 12): a NEW CFlow Session is created, its Provider
+// Session is established by a fresh managed start, and the superseded
+// Session linkage plus the switch reason are persisted. The immutable
+// redacted Context Bundle the Application created from the superseded
+// Session's context is carried on the new Session start input.
+type SwitchAgentInput struct {
+	// Session is the new CFlow Session identity.
+	Session SessionID
+	// Provider is the DIFFERENT provider the discussion switches to.
+	Provider string
+	// Reason is the user-supplied switch reason, persisted with the
+	// superseded Session linkage.
+	Reason string
+	// Supersedes is the superseded native discussion Session.
+	Supersedes SessionID
+	// Process is the managed Process identity of the new Session's chain.
+	Process ProcessID
+	// ContextBundleRevision, ContextBundlePath, and ContextBundleSha256 are
+	// the immutable redacted Context Bundle the superseded Session's switch
+	// created (design §9.4, TUI task 12): the reference is persisted on the
+	// new Session row and the bundle content rides the successor's managed
+	// bootstrap input, so the successor Provider starts with the prior
+	// discussion context.
+	ContextBundleRevision int
+	ContextBundlePath     string
+	ContextBundleSha256   string
+}
+
+func (SwitchAgentInput) isInput() {}
+
 // FinishDiscussionInput settles one finished native discussion Session
 // and writes its immutable ArtifactDiscussionHandoff (design §9.2, TUI
 // task 12): the Kernel validates the Session is bound to the workflow,
-// settles it COMPLETED, and requests the handoff write.
+// settles it COMPLETED, and requests the handoff write. The Handoff body
+// is the MANAGED structured output the Application's structured resume on
+// the same Provider Session produced and schema-validated — never a
+// caller-supplied hand-written JSON.
 type FinishDiscussionInput struct {
 	Session SessionID
 	Handoff []byte
@@ -100,11 +179,22 @@ func (FinishDiscussionInput) isInput() {}
 
 // GeneratePlanInput is the /finish transition (PRD Plan 生成): the
 // planner produces a new immutable Plan Revision from the requirement
-// discussion lineage. The Plan body arrives through the Provider run
+// discussion lineage. Plan generation is gated on the immutable
+// discussion inputs: HandoffRef and ChangeSetRef carry the exact
+// ArtifactDiscussionHandoff and frozen ArtifactChangeSet Revisions the
+// Application resolved; when either is set, BOTH must be set (design
+// §9.4, TUI task 12). The Plan body arrives through the Provider run
 // Result; the Kernel validates it against the PRD's required sections.
 type GeneratePlanInput struct {
 	Provider string
 	Session  SessionID
+	// HandoffRef is the immutable ArtifactDiscussionHandoff Revision/Hash
+	// the discussion produced (required for the native discussion path;
+	// Plan generation never consumes a terminal transcript).
+	HandoffRef ArtifactRef
+	// ChangeSetRef is the frozen ArtifactChangeSet Revision/Hash the
+	// handoff references (required for the native discussion path).
+	ChangeSetRef ArtifactRef
 }
 
 func (GeneratePlanInput) isInput() {}
@@ -152,7 +242,7 @@ type ExecutionApprovalInput struct {
 func (ExecutionApprovalInput) isInput() {}
 
 // AdoptWorkspaceInput is the Runtime-verified input of the Workspace
-// Adoption Gate (TUI task 6, design 8.4): the Execution Approval bound a
+// Adoption Gate (TUI task 6, design 8.4; Task 4): the Execution Approval bound a
 // frozen Change Set, and the Application re-verified the Workspace's
 // Change Set, Commit Policy, Identity/Signing, Clean/Scope, Catalog
 // Verification, and review route before the Kernel records the independent
@@ -177,6 +267,13 @@ type AdoptWorkspaceInput struct {
 	// at the verified Candidate Head (the frozen Change Set's
 	// fingerprint, re-observed unchanged).
 	DirtyFingerprint string
+	// AdoptionSession is the fresh managed adoption/coding Session identity
+	// allocated when the Workspace carries uncommitted native changes
+	// (Task 4, design 8.4 step 2; "" when the Workspace is already clean and
+	// no adoption Session runs). AdoptionRoute is the approved coding route
+	// the adoption Session runs on.
+	AdoptionSession SessionID
+	AdoptionRoute   string
 }
 
 func (AdoptWorkspaceInput) isInput() {}
@@ -287,6 +384,11 @@ const (
 	// ProviderRunEnded settles one Provider run with its Session facts and
 	// the redacted artifact body it produced (planning lifecycle).
 	ProviderRunEnded EffectResultKind = "provider-run-ended"
+	// NativeBootstrapEstablished reports that the managed discussion
+	// bootstrap established the Provider's own session identity from the
+	// validated session_started event (design §9.1, TUI task 12). The
+	// recorded identity is never a CFlow Session id.
+	NativeBootstrapEstablished EffectResultKind = "native-bootstrap-established"
 	// ArtifactWritten reports the immutable reference of a persisted
 	// Artifact Revision, echoing the written body for the Result Decision.
 	ArtifactWritten EffectResultKind = "artifact-written"
@@ -341,7 +443,7 @@ func (k EffectResultKind) Valid() bool {
 	case AttemptEnded, ProcessStopped, ApplyStagingSucceeded, ApplyStagingFailed,
 		ApplyFastForwardSucceeded, ApplyFastForwardFailed,
 		CleanupItemRemovedResult, CleanupItemFailedResult,
-		ProviderRunEnded, ArtifactWritten, PlanningWorktreeCreated,
+		ProviderRunEnded, NativeBootstrapEstablished, ArtifactWritten, PlanningWorktreeCreated,
 		WorkspaceWorktreeCreated,
 		WorkflowCompiled, IntegrationWorktreeCreated, TaskWorktreeCreated,
 		VerificationRunEnded, IntegrationMerged, IntegrationMergeFailed,

@@ -882,6 +882,129 @@ func TestPlanApprovalBindsExactRevision(t *testing.T) {
 	}
 }
 
+// TestPlanGenerationRequiresHandoffAndChangeSet (remediation plan
+// requirement 5): Plan generation is gated on the immutable Discussion
+// Handoff AND the frozen Change Set. An input that claims a native handoff
+// without the frozen Change Set (or vice versa) is refused — a workflow
+// cannot generate a Plan from discussion turns alone.
+func TestPlanGenerationRequiresHandoffAndChangeSet(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	handoff := model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactDiscussionHandoff, Revision: 1, Hash: "handoff-h"}
+	cs := model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 1, Hash: "change-set-h"}
+
+	// A handoff without the frozen Change Set is refused.
+	if _, err := decision.Decide(st, model.GeneratePlanInput{
+		Provider: "fake", Session: "s-1", HandoffRef: handoff,
+	}); err == nil {
+		t.Fatal("plan generation with a handoff but no change set was accepted")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
+		t.Fatalf("handoff-only fault = %v, want APPROVAL_INPUT_CHANGED", err)
+	}
+	// A Change Set without the handoff is refused.
+	if _, err := decision.Decide(st, model.GeneratePlanInput{
+		Provider: "fake", Session: "s-2", ChangeSetRef: cs,
+	}); err == nil {
+		t.Fatal("plan generation with a change set but no handoff was accepted")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
+		t.Fatalf("change-set-only fault = %v, want APPROVAL_INPUT_CHANGED", err)
+	}
+	// With BOTH immutable refs the plan generation proceeds.
+	if _, err := decision.Decide(st, model.GeneratePlanInput{
+		Provider: "fake", Session: "s-3", HandoffRef: handoff, ChangeSetRef: cs,
+	}); err != nil {
+		t.Fatalf("plan generation with both refs: %v", err)
+	}
+}
+
+// TestPlanGenerationRefusedWithoutHandoffForNativeLineage (remediation
+// plan requirement 5, kernel gate): a workflow WITH a native discussion
+// lineage (a bound, resumable interactive Planning Session plus its
+// managed Process record) must NOT generate a Plan from zero refs — the
+// legacy terminal-transcript fallback never applies to a native lineage.
+func TestPlanGenerationRefusedWithoutHandoffForNativeLineage(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-native", Purpose: model.PurposePlanning, Status: model.SessionInteractiveIdle,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	st.Processes = append(st.Processes, model.ProcessRecord{
+		ID: "p-1", Session: "s-native", Purpose: model.PurposePlanning, Status: model.ProcessStatusExited,
+	})
+	if _, err := decision.Decide(st, model.GeneratePlanInput{Provider: "fake", Session: "s-new"}); err == nil {
+		t.Fatal("plan generation without a handoff was accepted for a native discussion lineage")
+	} else if code, ok := model.CodeOf(err); !ok || code != model.CodeApprovalInputChanged {
+		t.Fatalf("zero-ref native lineage fault = %v, want APPROVAL_INPUT_CHANGED", err)
+	}
+}
+
+// TestPlanGenerationLegacyHeadlessFallbackAllowed (remediation plan
+// requirement 5, kernel gate): a PURE headless workflow (no native lineage)
+// keeps the documented legacy discussion-turn fallback for the headless
+// CLI — zero-ref plan generation is allowed there.
+func TestPlanGenerationLegacyHeadlessFallbackAllowed(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	// Legacy headless discussion sessions carry a provider binding but never
+	// a managed process record; they are terminal (COMPLETED).
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-legacy-1", Purpose: model.PurposePlanning, Status: model.SessionCompleted,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-legacy-2", Purpose: model.PurposePlanning, Status: model.SessionCompleted,
+		Provider: "fake", ProviderSessionID: "ps-2",
+	})
+	if _, err := decision.Decide(st, model.GeneratePlanInput{Provider: "fake", Session: "s-new"}); err != nil {
+		t.Fatalf("pure headless zero-ref plan generation was refused: %v", err)
+	}
+}
+
+// TestNativeDiscussionReturnRejectsForeignProcess (security finding, defense
+// in depth): the return Decision re-validates that the settled managed
+// Process record is bound to the EXACT returned Session — a process of a
+// sibling Session can never settle this turn.
+func TestNativeDiscussionReturnRejectsForeignProcess(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-1", Purpose: model.PurposePlanning, Status: model.SessionActive,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-2", Purpose: model.PurposePlanning, Status: model.SessionActive,
+		Provider: "fake", ProviderSessionID: "ps-2",
+	})
+	st.Processes = append(st.Processes, model.ProcessRecord{
+		ID: "p-2", Session: "s-2", Purpose: model.PurposePlanning, Status: model.ProcessStatusRunning,
+	})
+	_, err := decision.Decide(st, model.NativeDiscussionReturnInput{
+		Session: "s-1", Process: "p-2", ExitCode: 0,
+		Provider: "fake", ProviderSession: "ps-1",
+	})
+	if err == nil {
+		t.Fatal("a return carrying a process bound to another session was accepted")
+	}
+	if code, ok := model.CodeOf(err); !ok || code != model.CodeSessionIndependenceViolation {
+		t.Fatalf("foreign-process return fault = %v, want SESSION_INDEPENDENCE_VIOLATION", err)
+	}
+}
+
+// TestFinishDiscussionRequiresResumableSession (security finding, defense
+// in depth): the Kernel enforces the resumable-status precondition
+// (STARTING/INTERACTIVE_IDLE) so a direct-kernel double-finish cannot write
+// a second handoff from a terminal Session.
+func TestFinishDiscussionRequiresResumableSession(t *testing.T) {
+	st := workflowState(model.StageRequirementDiscussion, model.RuntimeRunning)
+	st.Sessions = append(st.Sessions, model.Session{
+		ID: "s-1", Purpose: model.PurposePlanning, Status: model.SessionCompleted,
+		Provider: "fake", ProviderSessionID: "ps-1",
+	})
+	_, err := decision.Decide(st, model.FinishDiscussionInput{
+		Session: "s-1", Handoff: []byte(`{"targets":"t"}`),
+	})
+	if err == nil {
+		t.Fatal("finish of a non-resumable session was accepted")
+	}
+}
+
 func TestExecutionApprovalAdvancesToExecution(t *testing.T) {
 	state := fixtureAwaitingExecutionApproval("workflow-a")
 	got, err := decision.Decide(state, model.ExecutionApprovalInput{WorkflowHash: "workflow-a",
@@ -1926,6 +2049,159 @@ func TestDispatchCommitsRunningAttemptBeforeEffects(t *testing.T) {
 	if effect.Node != "task-1" || effect.BaseHead != "int-1" ||
 		effect.Branch != "cflow/wf-1/task-task-1" {
 		t.Fatalf("task worktree intent = %+v", effect)
+	}
+}
+
+// TestDispatchWaitsForAdoptionWhenCandidateUnverified is the Task 4
+// scheduler gate (design 8.2: any automatic Task may only be created from
+// verified_workspace_head): when the Execution Approval bound a frozen
+// Change Set and verified_workspace_head is unset, the Kernel refuses to
+// allocate a normal Task from the unverified candidate Head with
+// WORKSPACE_ADOPTION_REQUIRED and mutates nothing.
+func TestDispatchWaitsForAdoptionWhenCandidateUnverified(t *testing.T) {
+	state := fixtureExecutionStage()
+	state.Workflow.ExecutionFacts = &model.ExecutionFacts{ChangeSetHash: "cs-1", ChangeSetRevision: 1}
+	addNode(&state, "task-1", model.NodeAgentTask, model.NodePending, 2)
+	got, err := decision.Decide(state, model.DispatchInput{Node: "task-1", Session: "s-1", Route: "fake", BaseHead: "int-1"})
+	assertFaultCode(t, err, model.CodeWorkspaceAdoptionRequired)
+
+	// No mutation happened: no Attempt, no Session, no Effect.
+	if len(got.Mutations) != 0 || len(got.Events) != 0 || got.Effect != nil {
+		t.Fatalf("dispatch for an unadopted workspace emitted a mutation/effect: %+v", got)
+	}
+}
+
+// adoptionGateState builds the aggregated EXECUTION state right after
+// decideAdoptWorkspace recorded the managed adoption/coding Session and the
+// independent Adoption Review Session (Task 4, design 8.4 step 2).
+func adoptionGateState() model.State {
+	st := workflowState(model.StageExecution, model.RuntimeRunning)
+	st.Workflow.LayoutVersion = 2
+	st.Workflow.WorkspacePath = "/ws"
+	st.Workflow.WorkspaceBranch = "cflow/wf-1/workspace"
+	st.Workflow.ExecutionFacts = &model.ExecutionFacts{ChangeSetHash: "cs-1"}
+	st.Workflow.CandidateWorkspaceHead = "pre-head"
+	st.Sessions = append(st.Sessions,
+		model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionStarting, Provider: "fake"},
+		model.Session{ID: "review-1", Purpose: model.PurposeReview, Status: model.SessionStarting, Provider: "fake"})
+	return st
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidencePass: the adoption evidence (a
+// new Commit, a clean Workspace, the candidate HEAD advanced, and a
+// re-frozen Change Set that carries at least one real Commit) PASSes, the
+// Kernel re-binds the Change Set facts to the re-frozen revision and starts
+// the independent Adoption Review Session (Task 4, design 8.4 step 2/5).
+func TestAdoptionCodingRunEndedJudgesEvidencePass(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "post-head",
+		EndDirtyFingerprint: "",
+		Body:                []byte(`{"base_commit":"base","candidate_head":"post-head","verified_head":"post-head","commits":["c1"],"tracked_diff":[{"path":"src/divide/divide.go"}],"untracked":[],"dirty_fingerprint":"","session_id":"adopt-1","content_hash":""}`),
+		Artifact:            model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 2, Hash: "cs-2"},
+	})
+	requireNoError(t, err)
+	effect, ok := got.Effect.(model.ProviderStartIntent)
+	if !ok || effect.Session != "review-1" || effect.Purpose != model.PurposeReview {
+		t.Fatalf("adoption pass effect = %#v, want the review start for review-1", got.Effect)
+	}
+	foundRef := false
+	for _, m := range got.Mutations {
+		switch mm := m.(type) {
+		case model.ArtifactRefMutation:
+			if mm.Type == model.ArtifactChangeSet && mm.Revision == 2 && mm.Hash == "cs-2" {
+				foundRef = true
+			}
+		case model.WorkflowMutation:
+			if mm.CandidateWorkspaceHead != "post-head" || mm.VerifiedWorkspaceHead != "" {
+				t.Fatalf("workflow mutation = %+v", mm)
+			}
+		}
+	}
+	if !foundRef {
+		t.Fatalf("adoption pass did not re-bind the change set ref: %+v", got.Mutations)
+	}
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidenceDirtyBlocks: the adoption Session
+// settled but the evidence shows the Workspace is still dirty — the
+// evidence never yields to a claim, and the Kernel Blocks the Workflow
+// (Task 4, design 8.4 step 7).
+func TestAdoptionCodingRunEndedJudgesEvidenceDirtyBlocks(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "pre-head",
+		EndDirtyFingerprint: "sha256:dirty",
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("dirty adoption emitted an effect: %+v", got.Effect)
+	}
+	blocked := false
+	for _, m := range got.Mutations {
+		if mm, ok := m.(model.WorkflowMutation); ok && mm.Runtime == model.RuntimeBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("dirty adoption did not block the workflow: %+v", got.Mutations)
+	}
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidenceNoCommitBlocks: the adoption
+// Session settled clean but the candidate HEAD did NOT advance — the
+// adoption produced no Commit and the Kernel Blocks with
+// MISSING_IMPLEMENTATION_COMMIT (Task 4, design 8.4 step 7).
+func TestAdoptionCodingRunEndedJudgesEvidenceNoCommitBlocks(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "pre-head", // == CandidateWorkspaceHead
+		EndDirtyFingerprint: "",
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("no-commit adoption emitted an effect: %+v", got.Effect)
+	}
+	blocked := false
+	for _, m := range got.Mutations {
+		if mm, ok := m.(model.WorkflowMutation); ok && mm.Runtime == model.RuntimeBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("no-commit adoption did not block the workflow: %+v", got.Mutations)
+	}
+}
+
+// TestAdoptionCodingRunEndedJudgesEvidenceEmptyCommitRangeBlocks: the
+// adoption Session settled clean at a CHANGED head, but the re-frozen
+// Change Set the Runtime produced carries NO Commit — a head-string
+// inequality without a real commit range is not adoption evidence, and the
+// Kernel Blocks with MISSING_IMPLEMENTATION_COMMIT (F2, design 8.4 step 2).
+func TestAdoptionCodingRunEndedJudgesEvidenceEmptyCommitRangeBlocks(t *testing.T) {
+	got, err := decision.Decide(adoptionGateState(), model.EffectResultInput{
+		Kind:                model.ProviderRunEnded,
+		Session:             model.Session{ID: "adopt-1", Purpose: model.PurposeAdoption, Status: model.SessionCompleted, ProviderSessionID: "p-ad1"},
+		EndHead:             "post-head",
+		EndDirtyFingerprint: "",
+		Body:                []byte(`{"base_commit":"base","candidate_head":"post-head","verified_head":"post-head","commits":[],"tracked_diff":[{"path":"src/divide/divide.go"}],"untracked":[],"dirty_fingerprint":"","session_id":"adopt-1","content_hash":""}`),
+		Artifact:            model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactChangeSet, Revision: 2, Hash: "cs-2"},
+	})
+	requireNoError(t, err)
+	if got.Effect != nil {
+		t.Fatalf("empty-commit-range adoption emitted an effect: %+v", got.Effect)
+	}
+	blocked := false
+	for _, m := range got.Mutations {
+		if mm, ok := m.(model.WorkflowMutation); ok && mm.Runtime == model.RuntimeBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("empty-commit-range adoption did not block the workflow: %+v", got.Mutations)
 	}
 }
 

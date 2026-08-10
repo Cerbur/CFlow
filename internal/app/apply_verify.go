@@ -74,7 +74,7 @@ func (a *Application) applyVerificationRun(ctx context.Context, wf model.Workflo
 	if err != nil {
 		return model.EvidenceManifest{}, err
 	}
-	if err := a.writeVerificationManifest(wf, model.NodeID(string(att.ID)), manifest); err != nil {
+	if err := a.writeVerificationManifest(ctx, wf, model.NodeID(string(att.ID)), manifest); err != nil {
 		return model.EvidenceManifest{}, err
 	}
 	return manifest, nil
@@ -115,18 +115,27 @@ func (a *Application) applyCatalogRef(ctx context.Context, wf model.WorkflowID, 
 // identities (PRD 已确认：Apply Command Identity Drift): the revalidation
 // compares the pinned wrapper hashes against the files of the attempt's
 // Apply Worktree.
-func (a *Application) applyIdentityDrifted(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt, st model.State) bool {
+func (a *Application) applyIdentityDrifted(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt, st model.State) (bool, error) {
 	catalog, err := a.applyCatalogRef(ctx, wf, att, st)
 	if err != nil {
-		return false
+		return false, err
 	}
 	if catalog.Hash != st.Workflow.ExecutionFacts.CatalogHash {
 		// The approval already fixed a successor Catalog Revision.
-		return false
+		return false, nil
 	}
-	path := a.applyWorktreePath(wf, att.Number)
-	if _, err := os.Stat(path); err != nil {
-		return false
+	path, err := a.applyWorktreePath(ctx, wf, att.Number)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := a.observeWorktree(ctx, path, ""); err != nil {
+		return false, err
 	}
 	engine, err := verify.NewEngine(verify.EngineOptions{
 		Supervisor: a.supervisor, GitFlow: a.git, Redaction: a.redaction,
@@ -135,11 +144,11 @@ func (a *Application) applyIdentityDrifted(ctx context.Context, wf model.Workflo
 		},
 	})
 	if err != nil {
-		return false
+		return false, err
 	}
 	validated, err := engine.ValidateCatalog(ctx, catalog)
 	if err != nil {
-		return true // the approved identity no longer validates
+		return true, nil // the approved identity no longer validates
 	}
 	for _, entry := range validated.Entries {
 		if entry.ExecutableKind != verify.KindProjectRelative {
@@ -148,10 +157,10 @@ func (a *Application) applyIdentityDrifted(ctx context.Context, wf model.Workflo
 		joined := filepath.Join(path, filepath.FromSlash(entry.Executable))
 		data, err := os.ReadFile(joined)
 		if err != nil || entry.SHA256 == "" || sha256HexString(data) != entry.SHA256 {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // rediscoverApplyCatalog re-discovers, validates, and fixes a NEW Apply
@@ -159,7 +168,10 @@ func (a *Application) applyIdentityDrifted(ctx context.Context, wf model.Workflo
 // (the tree the verification runs in, at the new Target HEAD) and writes
 // it through the immutable Artifact Store as the successor Revision.
 func (a *Application) rediscoverApplyCatalog(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt) (model.CatalogRef, error) {
-	path := a.applyWorktreePath(wf, att.Number)
+	path, err := a.applyWorktreePath(ctx, wf, att.Number)
+	if err != nil {
+		return model.CatalogRef{}, err
+	}
 	wrappers, err := verify.DiscoverWrappers(path)
 	if err != nil {
 		return model.CatalogRef{}, err
@@ -225,7 +237,10 @@ func (a *Application) applyReviewProviderStart(ctx context.Context, wf model.Wor
 	if att == nil {
 		return model.EffectResultInput{}, model.InvariantFault(fmt.Errorf("no staging apply attempt for session %s", intent.Session))
 	}
-	cwd := a.applyWorktreePath(wf, att.Number)
+	cwd, err := a.applyWorktreePath(ctx, wf, att.Number)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	pre, err := a.observeSnapshot(ctx, cwd)
 	if err != nil {
 		return model.EffectResultInput{}, err
@@ -264,7 +279,10 @@ func (a *Application) applyReviewProviderStart(ctx context.Context, wf model.Wor
 	if res.Terminal != nil {
 		out.Body = []byte(res.Terminal.Result)
 	}
-	out.ManifestHash = a.applyVerificationManifestHash(wf, att)
+	out.ManifestHash, err = a.applyVerificationManifestHash(ctx, wf, att)
+	if err != nil {
+		return model.EffectResultInput{}, err
+	}
 	return out, nil
 }
 
@@ -298,9 +316,11 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 	var verifications []string
 	for id, n := range st.Nodes {
 		if n.Kind == model.NodeVerify || n.Kind == model.NodeFinalVerify {
-			if b, err := a.readVerificationManifestFile(wf, id); err == nil && len(b) > 0 {
-				verifications = append(verifications, string(b))
+			b, err := a.readRequiredVerificationManifest(ctx, wf, id)
+			if err != nil {
+				return nil, err
 			}
+			verifications = append(verifications, string(b))
 		}
 	}
 	sort.Strings(verifications)
@@ -310,12 +330,35 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 	}
 	sort.Strings(nodeAcceptance)
 	rangeSpec := st.Workflow.TargetBranch + ".." + att.StagingHead
-	worktree := a.applyWorktreePath(wf, att.Number)
+	worktree, err := a.applyWorktreePath(ctx, wf, att.Number)
+	if err != nil {
+		return nil, err
+	}
+	verificationHash, err := a.applyVerificationManifestHash(ctx, wf, att)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := readRequiredArtifact(ctx, store, wf, model.ArtifactPlan)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := readRequiredArtifact(ctx, store, wf, model.ArtifactSpec)
+	if err != nil {
+		return nil, err
+	}
+	catalogBody, err := readRequiredArtifact(ctx, store, wf, model.ArtifactCatalog)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err := readRequiredArtifact(ctx, store, wf, model.ArtifactWorkflow)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
-		"plan":               string(readArtifact(ctx, store, wf, model.ArtifactPlan)),
-		"spec":               string(readArtifact(ctx, store, wf, model.ArtifactSpec)),
-		"catalog":            string(readArtifact(ctx, store, wf, model.ArtifactCatalog)),
-		"workflow":           string(readArtifact(ctx, store, wf, model.ArtifactWorkflow)),
+		"plan":               string(plan),
+		"spec":               string(spec),
+		"catalog":            string(catalogBody),
+		"workflow":           string(workflow),
 		"integration_branch": st.Workflow.IntegrationBranch,
 		"integration_head":   st.Workflow.IntegrationHead,
 		"target_branch":      st.Workflow.TargetBranch,
@@ -328,7 +371,7 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 		"apply_branch":       a.applyBranchName(wf, att.Number),
 		"catalog_revision":   catalog.Revision,
 		"catalog_hash":       catalog.Hash,
-		"verification_hash":  a.applyVerificationManifestHash(wf, att),
+		"verification_hash":  verificationHash,
 		"message":            "review the combined target + integration result inside the apply worktree",
 	}, nil
 }
@@ -336,14 +379,14 @@ func (a *Application) applyReviewSessionInput(ctx context.Context, wf model.Work
 // applyVerificationManifestHash re-reads the persisted deterministic
 // apply verification manifest and returns its self-hash ("" when
 // absent).
-func (a *Application) applyVerificationManifestHash(wf model.WorkflowID, att *model.ApplyAttempt) string {
-	body, err := a.readVerificationManifestFile(wf, model.NodeID(string(att.ID)))
+func (a *Application) applyVerificationManifestHash(ctx context.Context, wf model.WorkflowID, att *model.ApplyAttempt) (string, error) {
+	body, err := a.readRequiredVerificationManifest(ctx, wf, model.NodeID(string(att.ID)))
 	if err != nil || len(body) == 0 {
-		return ""
+		return "", err
 	}
 	var m model.EvidenceManifest
 	if err := json.Unmarshal(body, &m); err != nil {
-		return ""
+		return "", err
 	}
-	return m.Hash
+	return m.Hash, nil
 }

@@ -53,6 +53,21 @@ type ProviderResumeIntent struct {
 
 func (ProviderResumeIntent) isEffectIntent() {}
 
+// NativeBootstrapIntent runs the managed Provider start/bootstrap of one
+// native interactive discussion Session (design §9.1, TUI task 12): the
+// Runtime starts the Provider and captures the Provider's own session
+// identity from the validated session_started event. The bootstrap only
+// establishes the context and the Provider Session — it never represents
+// the discussion as complete; the interactive terminal continues the
+// exact Session later through the Native Session Bridge.
+type NativeBootstrapIntent struct {
+	Session SessionID
+	Purpose AgentPurpose
+	Route   string
+}
+
+func (NativeBootstrapIntent) isEffectIntent() {}
+
 // ProviderCancelIntent cancels a Provider Session.
 type ProviderCancelIntent struct {
 	Session SessionID
@@ -155,10 +170,10 @@ func (IntegrationRollbackIntent) isEffectIntent() {}
 // verified Workspace Head at scheduling time; merges are serial --no-ff
 // and never auto-rebase or rewrite Task history.
 type WorkspaceMergeIntent struct {
-	Node                NodeID
+	Node                  NodeID
 	ExpectedWorkspaceHead string
-	TaskBranch          string
-	VerifiedCommit      string
+	TaskBranch            string
+	VerifiedCommit        string
 }
 
 func (WorkspaceMergeIntent) isEffectIntent() {}
@@ -195,6 +210,7 @@ type PathMove struct {
 	Destination string       `json:"destination"`
 	Branch      string       `json:"branch,omitempty"`
 	Head        string       `json:"head,omitempty"`
+	Digest      string       `json:"digest,omitempty"`
 }
 
 // LayoutMigrationIntent performs the explicit Legacy Layout Migration of
@@ -206,9 +222,15 @@ type PathMove struct {
 // derived and Prepare bound by manifest hash; Done counts the moves
 // already completed (recovery continues from the actual state).
 type LayoutMigrationIntent struct {
-	Workflow WorkflowID
-	Moves    []PathMove
-	Done     int
+	MigrationID  string     `json:"migration_id"`
+	Workflow     WorkflowID `json:"workflow"`
+	ManifestHash string     `json:"manifest_hash"`
+	PreviewHash  string     `json:"preview_hash"`
+	Moves        []PathMove `json:"moves"`
+	// Done is retained for forward/backward codec compatibility. Recovery
+	// does not trust it: source/destination and Git registry facts are the
+	// authoritative per-step progress.
+	Done int `json:"done,omitempty"`
 }
 
 func (LayoutMigrationIntent) isEffectIntent() {}

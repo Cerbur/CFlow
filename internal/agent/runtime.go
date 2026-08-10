@@ -419,10 +419,139 @@ func (r *Runtime) Start(ctx context.Context, req StartRequest) (*RunResult, erro
 }
 
 // ---------------------------------------------------------------------------
+// Managed bootstrap (design §9.1, TUI task 12)
+// ---------------------------------------------------------------------------
+
+// Bootstrap runs the managed Provider start/bootstrap of one native
+// interactive discussion Session: the Runtime resolves the approved
+// Provider binding (fail closed on drift), starts the Provider, captures
+// the Provider's OWN session identity from the validated session_started
+// event, and stops the start run — the interactive terminal continues the
+// exact Session later through the Native Session Bridge. The bootstrap
+// only establishes the context and Session; it never represents the
+// discussion as complete. It fails closed when the Provider returns no
+// session id or the binding drifts, and it never uses a CFlow Session id
+// as the Provider identity.
+func (r *Runtime) Bootstrap(ctx context.Context, req BootstrapRequest) (*BootstrapResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !req.Purpose.Valid() {
+		return nil, model.InvalidInputFault("unknown agent purpose")
+	}
+	if req.Provider == "" {
+		return nil, model.InvalidInputFault("provider is required")
+	}
+	if req.Prompt == "" {
+		return nil, model.InvalidInputFault("prompt is required")
+	}
+	if req.SessionID == "" {
+		return nil, model.InvalidInputFault("a bootstrap requires the CFlow session identity")
+	}
+	binding, ad, err := r.resolveProvider(ctx, req.Purpose, req.Provider, false)
+	if err != nil {
+		return nil, err
+	}
+	arun, err := ad.Start(ctx, StartRequest{
+		Purpose:   req.Purpose,
+		Provider:  req.Provider,
+		Prompt:    req.Prompt,
+		Input:     req.Input,
+		CWD:       req.CWD,
+		SessionID: req.SessionID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	red := security.NewRedactor(r.redaction)
+	seq := newProtocolSequence(binding, "")
+	cfg := drainConfig{
+		binding:   binding,
+		purpose:   req.Purpose,
+		provider:  req.Provider,
+		sessionID: req.SessionID,
+		runID:     model.RunID(r.ids(model.IDRun)),
+		startedAt: r.now(),
+	}
+	lr := &liveRun{}
+	r.mu.Lock()
+	r.live[cfg.runID] = lr
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.live, cfg.runID)
+		r.mu.Unlock()
+	}()
+
+	var session *sessionRecord
+	for {
+		ev, err := arun.Next(ctx)
+		if err != nil {
+			if session == nil {
+				// The stream ended before any validated session_started
+				// established an identity: fail closed, no vague Session.
+				return nil, model.NewFault(model.CodeProviderSessionIDMissing,
+					"the discussion bootstrap ended before establishing the provider session id")
+			}
+			break
+		}
+		if err := seq.accept(&ev); err != nil {
+			return nil, err
+		}
+		if ev.Type == EventSessionStarted {
+			if ev.SessionID == "" {
+				return nil, model.NewFault(model.CodeProviderSessionIDMissing,
+					"the provider session_started event carried no session id")
+			}
+			session, err = r.establish(ctx, cfg, ev.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			r.mu.Lock()
+			session.runID = cfg.runID
+			session.session.Status = model.SessionActive
+			lr.setHandle(RunHandle{RunID: cfg.runID, Session: session.session.ID, ProviderSessionID: ev.SessionID})
+			r.mu.Unlock()
+			redEv, err := redactEvent(red, &ev)
+			if err != nil {
+				return nil, err
+			}
+			if err := r.persistEvent(ctx, cfg, session, redEv); err != nil {
+				return nil, err
+			}
+			// Stop the start run: the interactive terminal continues the
+			// exact Session through the Bridge. The adapter's controlled
+			// stop unregisters the run at its next event boundary. A stop
+			// failure fails the bootstrap closed (the Session was already
+			// established; the caller must not proceed as if the start run
+			// is fully stopped).
+			lr.cancel()
+			if err := ad.Cancel(ctx, RunHandle{RunID: cfg.runID, Session: session.session.ID, ProviderSessionID: ev.SessionID}); err != nil {
+				return nil, err
+			}
+			break
+		}
+		// A frame before the start event (bounded redacted evidence only;
+		// the protocol sequence already validated it).
+		redEv, err := redactEvent(red, &ev)
+		if err != nil {
+			return nil, err
+		}
+		if err := r.persistEvent(ctx, cfg, session, redEv); err != nil {
+			return nil, err
+		}
+	}
+	if session == nil {
+		return nil, model.NewFault(model.CodeProviderSessionIDMissing,
+			"the discussion bootstrap established no provider session")
+	}
+	return &BootstrapResult{Session: session.session, Provider: req.Provider}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Resume and fallback (design 14.4, PRD 已确认：Session Resume 失败与跨
 // Provider 上下文交接)
 // ---------------------------------------------------------------------------
-
 // Resume re-establishes an existing Session. When native Resume fails
 // unrecoverably (no protocol/auth/binding fault), the original Session is
 // retained as LOST, an immutable redacted Context Bundle is persisted, the

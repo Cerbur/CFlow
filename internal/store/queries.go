@@ -97,7 +97,9 @@ const queryFindings = `
 
 const querySessions = `
 	SELECT id, COALESCE(supersedes_session_id, ''), purpose,
-	       COALESCE(provider, ''), COALESCE(provider_session_id, ''), status
+	       COALESCE(provider, ''), COALESCE(provider_session_id, ''), status,
+	       COALESCE(context_bundle_revision, 0), COALESCE(context_bundle_path, ''),
+	       COALESCE(context_bundle_sha256, '')
 	FROM sessions WHERE workflow_id = ? ORDER BY id`
 
 const queryProcesses = `
@@ -152,6 +154,34 @@ const queryEvents = `
 const queryPendingEffects = `
 	SELECT id, kind, payload_json, decision_version
 	FROM effects WHERE workflow_id = ? AND status = 'PENDING' ORDER BY id`
+
+const queryWorkflowIDs = `
+	SELECT id FROM workflows WHERE project_id = ? ORDER BY id`
+
+// ListWorkflowIDs returns the workflows persisted for one project. SQLite is
+// the authority: callers must not infer workflow identity from artifact or
+// worktree directories, which may be absent, legacy, or orphaned.
+func (s *Store) ListWorkflowIDs(ctx context.Context, project model.ProjectID) ([]model.WorkflowID, error) {
+	if project == "" {
+		return nil, model.InvalidInputFault("workflow enumeration requires a project identity")
+	}
+	if !s.exists || s.db == nil {
+		return nil, nil
+	}
+	ids := []model.WorkflowID{}
+	err := forEachRow(ctx, s.db, queryWorkflowIDs, []any{project}, func(row rowScanner) error {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			return fmt.Errorf("scan workflow id: %w", err)
+		}
+		ids = append(ids, model.WorkflowID(id))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
 
 // hydrate reconstructs the aggregate for one Workflow from the database
 // (design 7.1, 8.1). A Workflow that does not exist returns the zero
@@ -400,7 +430,8 @@ func hydrate(ctx context.Context, q querier, workflow model.WorkflowID, now func
 	// Sessions.
 	if err := forEachRow(ctx, q, querySessions, []any{workflow}, func(row rowScanner) error {
 		var se model.Session
-		if err := row.Scan(&se.ID, &se.Supersedes, &se.Purpose, &se.Provider, &se.ProviderSessionID, &se.Status); err != nil {
+		if err := row.Scan(&se.ID, &se.Supersedes, &se.Purpose, &se.Provider, &se.ProviderSessionID, &se.Status,
+			&se.ContextBundleRevision, &se.ContextBundlePath, &se.ContextBundleSha256); err != nil {
 			return fmt.Errorf("scan session: %w", err)
 		}
 		st.Sessions = append(st.Sessions, se)

@@ -45,6 +45,9 @@ type DiscussionPage struct {
 	Editing bool
 	// Handoff is the user-typed handoff content JSON.
 	Handoff string
+	// SwitchReason is the user-typed switch-agent reason ("" until the
+	// user supplies one; the switch fails closed without a bounded reason).
+	SwitchReason string
 	// Status is the transient editor error/status line.
 	Status string
 	// Loaded is true once the Return projection arrived: before that the
@@ -161,13 +164,13 @@ func renderHandoffEditor(b *strings.Builder, p DiscussionPage) {
 	b.WriteString("\nEnter to finish the discussion, Esc to cancel\n")
 }
 
-// buildHandoff merges the user's handoff content fields with the
-// authoritative Runtime facts (the workflow, the bound Session, and the
-// frozen Change Set Revision/Hash) into the strict handoff body the
-// Application validates against discussion-handoff.json. User-supplied
-// values for the Runtime-fact keys are refused: the facts are never
-// invented by the interface.
-func buildHandoff(content string, wf model.WorkflowID, session model.SessionID, ref *model.ArtifactRef) ([]byte, error) {
+// handoffDecisions validates the user's handoff content and returns the
+// Decisions the Finish command carries: the strict content fields only
+// (targets, constraints, non_goals, acceptance_criteria, open_questions,
+// user_decisions). The authoritative runtime facts (workflow_id,
+// session_id, change_set) are bound by the Application's managed structured
+// resume — the interface can never invent them.
+func handoffDecisions(content string, wf model.WorkflowID, session model.SessionID, ref *model.ArtifactRef) ([]byte, error) {
 	var user map[string]any
 	if err := json.Unmarshal([]byte(content), &user); err != nil {
 		return nil, fmt.Errorf("the handoff content is not valid JSON: %v", err)
@@ -184,14 +187,11 @@ func buildHandoff(content string, wf model.WorkflowID, session model.SessionID, 
 		return nil, fmt.Errorf("no frozen change set exists; finish again after the freeze")
 	}
 	body, err := json.Marshal(map[string]any{
-		"workflow_id":         string(wf),
-		"session_id":          string(session),
 		"targets":             user["targets"],
 		"constraints":         user["constraints"],
 		"non_goals":           user["non_goals"],
 		"acceptance_criteria": user["acceptance_criteria"],
 		"open_questions":      user["open_questions"],
-		"change_set":          map[string]any{"revision": ref.Revision, "sha256": ref.Hash},
 		"user_decisions":      user["user_decisions"],
 	})
 	if err != nil {
