@@ -42,6 +42,13 @@ START_EPOCH="$(date +%s)"
 # the deterministic Fake suites
 # ---------------------------------------------------------------------------
 
+# Task 11 keyboard/evidence gate. These tests use only fake controllers and
+# typed Application commands; they prove that q is inert, /exit is explicit,
+# Enter is the sole confirmation key, Home Esc is harmless, Runner exit waits
+# for join, and palette input cannot become shell text.
+go test ./internal/tui -run '^(TestModelQIsOrdinaryInput|TestModelHomeEscIsNoOp|TestIdleExitCommandQuitsTUI|TestRunningExitWaitsForRunnerDoneAfterControlledPause|TestRunningExitPreviewUsesOnlyEnter|TestHierarchicalOperationTraceRecordsSafeUIActions|TestTUIWorkflowMenuResumeActionPreview)$' -count=1 \
+  >"$ARTIFACT_DIR/tui-keyboard-gate.log" 2>&1
+
 go test ./internal/tui ./internal/foreground ./internal/native -count=1 \
   >"$ARTIFACT_DIR/tui-suites.log" 2>&1
 TUI_SUITES="pass"

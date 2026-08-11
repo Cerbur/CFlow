@@ -1,6 +1,6 @@
 package tui
 
-// Fake TUI E2E (TUI task 16): the deterministic, fully-Fake-provider
+// Fake TUI E2E (TUI task 11): the deterministic, fully-Fake-provider
 // lifecycle driven through the ACTUAL root TUI — the Bubble Tea Program
 // runs the real root Model over a Fake terminal (an os.Pipe input) and
 // the shared Application. Every key press flows through the TUI; the
@@ -72,11 +72,60 @@ func TestVisibleTerminalTextStripsInterleavedControlSequences(t *testing.T) {
 	}
 }
 
-// fakeTerminal keys: plain text is written verbatim; enter is CR; tab is
-// HT; ctrl+c is 0x03; arrows are the CSI sequences.
+func TestTUIWorkflowMenuResumeActionPreview(t *testing.T) {
+	var log bytes.Buffer
+	ctrl := &workflowMenuController{view: app.WorkflowMenuView{
+		Workflow: "wf-paused",
+		Name:     "calculator",
+		Runtime:  model.RuntimePaused,
+		Entries: []app.WorkflowMenuEntry{{
+			ID: "resume", Kind: app.MenuEntryAction, Label: "Resume",
+			Action: app.MenuActionResume,
+		}},
+		DefaultIndex: 0,
+	}}
+	m := newModel(Dependencies{OperationLog: &log})
+	m.ctrl = ctrl
+	m.selected = "wf-paused"
+	m.workspace.Rows = []WorkflowRow{{Kind: WorkflowRowExisting, ID: "wf-paused", Name: "calculator"}}
+
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.page != PageWorkflowMenu {
+		t.Fatalf("Home Enter page = %v, want Workflow Menu", m.page)
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.page != PageActionPreview {
+		t.Fatalf("Resume menu entry page = %v, want Action Preview", m.page)
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.actionPreviewed == false || len(ctrl.executed) != 0 {
+		t.Fatalf("first Action Preview Enter = previewed %v executes %d, want preview only", m.actionPreviewed, len(ctrl.executed))
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.page != PageExecution || len(ctrl.executed) != 1 {
+		t.Fatalf("confirmed Resume page = %v executes %d, want Execution and one typed command", m.page, len(ctrl.executed))
+	}
+
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
+	if m.page != PageWorkflowMenu {
+		t.Fatalf("Execution Esc page = %v, want Workflow Menu", m.page)
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
+	if m.page != PageWorkspace {
+		t.Fatalf("Workflow Menu Esc page = %v, want Home", m.page)
+	}
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	m = step(t, m, tea.KeyPressMsg{Text: "exit"})
+	_, quit := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if quit == nil {
+		t.Fatal("/exit Enter did not return the TUI quit command")
+	}
+}
+
+// fakeTerminal keys: plain text is written verbatim; enter is CR; ctrl+c is
+// 0x03; arrows are the CSI sequences.
 const (
 	keyEnter = "\r"
-	keyTab   = "\t"
 	keyEsc   = "\x1b"
 	keyCtrlC = "\x03"
 	keyRight = "\x1b[C"
@@ -208,7 +257,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("no workflows yet")
 
 	// ---- create the workflow through the TUI form ----
-	keys("n")
+	keys(keyDown)  // select NEW WORKFLOW
+	keys(keyEnter) // enter the Create Workspace form
 	waitOutput("create workflow")
 	keys("calculator")
 	// The Create page surfaces the target's dirty facts before the
@@ -216,7 +266,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("target working tree: clean")
 	waitOutput("will not touch your files")
 	keys(keyEnter) // Enter only submits the name for the confirmation
-	keys("y")      // only an explicit y creates (the clean target carries no dirty flag)
+	keys(keyEnter) // Enter creates from the exact preview
 	waitApp("workflow created in application", func(ctx context.Context) bool { return len(ref.listContext(ctx)) == 1 })
 	waitProjectWriterIdle("workflow creation")
 	// The TUI processed the create (the workspace renders the workflow
@@ -232,7 +282,6 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	wf := wfIDs[0]
 
 	// ---- native discussion ----
-	keys(keyRight) // → discussion (the workspace arrows navigate)
 	waitOutput("Start Native Discussion")
 	keys(keyEnter) // Start Native Discussion (prepare + bridge turn)
 	waitOutput("Continue Same Session")
@@ -247,7 +296,11 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("discussion finished")
 
 	// ---- plan approval ----
-	keys(keyTab) // → plan approval
+	keys(keyEsc)   // Discussion Return → Workflow Menu
+	keys(keyEsc)   // Workflow Menu → Home
+	keys(keyEnter) // reopen the selected Workflow Menu
+	keys(keyDown)  // select the next available action route
+	keys(keyEnter) // open the selected stage
 	waitOutput("plan approval")
 	keys("g") // generate the plan
 	waitApp("plan generated", func(ctx context.Context) bool { return planRevision(ctx, t, ref.a, wf) >= 1 })
@@ -265,7 +318,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitBuffer("checked plan rendered", func(s string) bool {
 		return strings.Contains(s, "CHECKED")
 	})
-	keys("y") // approve (explicit confirmation)
+	keys(keyEnter) // first Enter opens the exact approval preview
+	keys(keyEnter) // second Enter approves
 	waitApp("plan approved", func(ctx context.Context) bool { return planStatus(ctx, t, ref.a, wf) == model.PlanApproved })
 	waitProjectWriterIdle("plan approval")
 	// After approval the plan page advances to the next lifecycle stage. The
@@ -277,7 +331,11 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	})
 
 	// ---- execution approval ----
-	keys(keyTab) // → execution approval
+	keys(keyEsc)   // return to Workflow Menu
+	keys(keyEsc)   // return to Home
+	keys(keyEnter) // reopen the selected Workflow Menu
+	keys(keyDown)  // select the next available action route
+	keys(keyEnter) // open Execution Approval
 	waitOutput("execution approval")
 	keys("s") // generate the specs
 	waitApp("spec session completed", func(ctx context.Context) bool {
@@ -335,7 +393,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		// an unambiguous post-dry-run projection marker.
 		return strings.Contains(s, preview.CommitPolicyHash[:12])
 	})
-	keys("y") // approve the execution (binds the frozen change set)
+	keys(keyEnter) // first Enter opens the exact execution preview
+	keys(keyEnter) // second Enter approves the execution
 	waitApp("execution approved", func(ctx context.Context) bool {
 		return workflowRuntime(ctx, t, ref.a, wf) == model.RuntimeRunning &&
 			workflowStage(ctx, t, ref.a, wf) == model.StageExecution
@@ -381,8 +440,11 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("runner: terminal")
 
 	// ---- final report ----
-	keys(keyTab) // → blocked
-	keys(keyTab) // → terminal
+	keys(keyEsc)   // Execution → Workflow Menu
+	keys(keyEsc)   // Workflow Menu → Home
+	keys(keyEnter) // reopen the selected Workflow Menu
+	keys(keyDown)  // select the terminal action route
+	keys(keyEnter) // open Terminal
 	// The terminal page has a unique section marker; the generic word
 	// "terminal" is already present in the preceding runner status.
 	waitOutput(">report")
@@ -392,18 +454,18 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	})
 
 	// ---- protected apply ----
-	keys(keyRight) // → apply section
+	keys(keyRight) // → apply section within Terminal
 	keys("p")      // stage the apply
 	waitBuffer("apply preview rendered", func(s string) bool {
 		return strings.Contains(s, "AWAITING_CONFIRMATION")
 	})
 	waitOutput("apply staged (preview ready)")
-	// The explicit delivery: Enter alone must not deliver; y delivers.
+	// The explicit delivery requires the second Enter; the first only previews.
 	keys(keyEnter)
 	waitApp("apply not delivered by enter", func(ctx context.Context) bool {
 		return applyStatus(ctx, t, ref.a, wf) == model.ApplyAwaitingConfirmation
 	})
-	keys("y")
+	keys(keyEnter)
 	waitApp("apply delivered", func(ctx context.Context) bool { return applyStatus(ctx, t, ref.a, wf) == model.ApplySucceeded })
 	waitOutput("apply delivered")
 
@@ -416,12 +478,13 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	preserved := snapshotWorkflowEntries(t, fx, wf)
 
 	// ---- explicit cleanup ----
-	keys(keyRight) // → cleanup section
+	keys(keyRight) // → cleanup section within Terminal
 	keys("c")      // cleanup dry run
 	waitOutput("cleanup dry run manifest ready")
 	waitApp("cleanup manifest", func(ctx context.Context) bool { return cleanupStatus(ctx, t, ref.a, wf) != "" })
 	waitProjectWriterIdle("cleanup dry run")
-	keys("y") // execute the bound manifest
+	keys(keyEnter) // preview the bound manifest
+	keys(keyEnter) // execute the bound manifest
 	waitApp("cleanup executed", func(ctx context.Context) bool {
 		return cleanupStatus(ctx, t, ref.a, wf) == model.CleanupStatusSucceeded
 	})
@@ -431,9 +494,9 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// artifacts, evidence, report, database, and refs.
 	requireCleanupPreservation(t, fx, wf, preserved)
 
-	// q is ordinary input. With no runner active, Ctrl+C twice is the
-	// supported controlled shutdown path.
-	keys(keyCtrlC + keyCtrlC)
+	// q is ordinary input; /exit Enter is the only idle exit path.
+	keys("q")
+	keys("/exit" + keyEnter)
 	err = <-runDone
 	runFinished = true
 	if err != nil {

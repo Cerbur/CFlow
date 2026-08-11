@@ -10,6 +10,10 @@ import (
 
 const operationLogName = "tui.jsonl"
 
+func operationLogPath(home string) string {
+	return filepath.Join(home, "logs", operationLogName)
+}
+
 // OpenOperationLog opens the process-wide TUI diagnostic log under
 // <CFLOW_HOME>/logs/tui.jsonl. These records are non-authoritative
 // breadcrumbs for GUI debugging; workflow events remain in the existing
@@ -58,7 +62,7 @@ func OpenOperationLog(home string) (*os.File, error) {
 		return nil, fmt.Errorf("open TUI operation log: validate logs directory: %w", err)
 	}
 
-	path := filepath.Join(logsDir, operationLogName)
+	path := operationLogPath(home)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		file, createErr := security.CreateSensitiveFile(path)
 		if createErr == nil {

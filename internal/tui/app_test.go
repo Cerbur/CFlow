@@ -2551,6 +2551,97 @@ func TestModelQIsOrdinaryInput(t *testing.T) {
 	}
 }
 
+func TestHierarchicalOperationTraceRecordsSafeUIActions(t *testing.T) {
+	var log bytes.Buffer
+	m := newModel(Dependencies{OperationLog: &log})
+	m.ctrl = &workflowMenuController{view: app.WorkflowMenuView{
+		Workflow: "wf-1",
+		Entries: []app.WorkflowMenuEntry{{
+			ID: "resume", Kind: app.MenuEntryAction, Label: "Resume",
+			Action: app.MenuActionResume,
+		}},
+		DefaultIndex: 0,
+	}}
+	m.selected = "wf-1"
+	m.workspace.Rows = []WorkflowRow{{Kind: WorkflowRowExisting, ID: "wf-1", Name: "calculator"}}
+	m.workflowMenuModel = WorkflowMenuModel{
+		Workflow: "wf-1",
+		Loaded:   true,
+		Items: []MenuItem{{
+			SourceIndex: 0,
+			Kind:        app.MenuEntryAction,
+			Label:       "Resume",
+			Action:      app.MenuActionResume,
+		}},
+	}
+	m.workflowMenu = app.WorkflowMenuView{
+		Workflow: "wf-1",
+		Entries: []app.WorkflowMenuEntry{{
+			ID:     "resume",
+			Kind:   app.MenuEntryAction,
+			Label:  "Resume",
+			Action: app.MenuActionResume,
+		}},
+	}
+
+	// Exercise the actual root dispatch for palette open/execute and menu
+	// selection. The arbitrary text must never be copied into the trace.
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	m = step(t, m, tea.KeyPressMsg{Text: "rm -rf /"})
+	m = press(t, m, tea.KeyEsc, 0)
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	m = step(t, m, tea.KeyPressMsg{Text: "exit"})
+	m = press(t, m, tea.KeyEnter, 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	m, _ = m.popNavigation()
+
+	var entries []operationLogEntry
+	for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry operationLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode operation log: %v", err)
+		}
+		entries = append(entries, entry)
+	}
+	wantActions := []string{
+		"command_palette.open",
+		"command_palette.execute",
+		"navigation.push",
+		"workflow_menu.query",
+		"workflow_menu.select",
+		"action_preview.open",
+		"action_preview.confirm",
+		"navigation.pop",
+	}
+	seen := make(map[string]operationLogEntry)
+	for _, entry := range entries {
+		if entry.Action != "" {
+			seen[entry.Action] = entry
+		}
+		if strings.Contains(log.String(), "rm -rf /") {
+			t.Fatalf("operation trace leaked arbitrary palette input: %q", log.String())
+		}
+	}
+	for _, action := range wantActions {
+		entry, ok := seen[action]
+		if !ok {
+			t.Fatalf("operation trace missing %q: %+v", action, entries)
+		}
+		if action != "command_palette.open" && action != "command_palette.execute" && entry.Workflow != "wf-1" {
+			t.Fatalf("operation %q workflow = %q, want wf-1", action, entry.Workflow)
+		}
+		if action == "action_preview.confirm" && entry.OperationID == "" {
+			t.Fatalf("operation %q has no bound operation id: %+v", action, entry)
+		}
+	}
+}
+
 func TestSlashOpensOnlyOutsideTextInput(t *testing.T) {
 	m := newModel(Dependencies{})
 	m.page = PageWorkspace

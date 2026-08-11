@@ -190,6 +190,7 @@ func (m Model) routeWorkflowMenuItem(item MenuItem) (Model, tea.Cmd) {
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageMigration, Workflow: m.selected})
 		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
 	case app.MenuActionResume, app.MenuActionPause, app.MenuActionStartRunner:
+		m.traceUIAction(uiActionActionPreviewOpen)
 		m = m.pushNavigation(NavigationFrame{Layer: LayerActionPreview, Page: PageActionPreview, Workflow: m.selected})
 		return m, nil
 	case app.MenuActionApply, app.MenuActionCleanup:

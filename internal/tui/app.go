@@ -434,6 +434,9 @@ func (m Model) queryProjectionMsgAt(page Page, q app.Query, generation, commandG
 	if m.commandState != nil {
 		operationID = m.commandState.operationID
 	}
+	if _, ok := q.(app.WorkflowMenuQuery); ok {
+		m.traceUIActionFor(uiActionWorkflowMenuQuery, workflow, operationID)
+	}
 	m.trace.write(operationLogEntry{
 		OperationID:       operationID,
 		Workflow:          string(workflow),
@@ -1388,6 +1391,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.commandPalette, event = m.commandPalette.Update(msg)
 		switch event {
 		case CommandPaletteExit:
+			m.traceUIAction(uiActionCommandPaletteExecute)
 			return m.handleGlobalExit()
 		case CommandPaletteClose, CommandPaletteNone:
 			return m, nil
@@ -1396,6 +1400,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	// Slash is global only when the current page does not own text input. It
 	// is consumed here so no page handler sees the opener a second time.
 	if IsSlash(msg) && !m.typingText() {
+		m.traceUIAction(uiActionCommandPaletteOpen)
 		m.commandPalette = NewCommandPalette()
 		m.commandPalette.Open = true
 		m.commandPalette.Input = "/"
@@ -1458,6 +1463,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
+			m.traceUIAction(uiActionWorkflowMenuSelect)
 			if item.Action == app.MenuActionCancel {
 				m.cancelPreview = false
 			}
@@ -2414,14 +2420,22 @@ func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.actionPreviewed = false
+	operationID := m.currentOperationID()
 	switch m.workflowMenuPreviewItem.Action {
 	case app.MenuActionResume:
 		m.status = "resuming…"
-		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
+		cmd := m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
+		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, m.currentOperationID())
+		m, _ = m.popNavigation()
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
+		return m, cmd
 	case app.MenuActionPause:
 		m.status = "pausing…"
-		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
+		cmd := m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
+		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, m.currentOperationID())
+		return m, cmd
 	case app.MenuActionStartRunner:
+		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, operationID)
 		m.page = PageExecution
 		m.navigation = m.navigation.Push(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
 		return m.startRunner()

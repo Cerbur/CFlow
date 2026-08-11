@@ -87,6 +87,7 @@ func (m Model) pushNavigation(frame NavigationFrame) Model {
 	if frame.Workflow != "" {
 		m.selected = frame.Workflow
 	}
+	m.traceUIActionFor(uiActionNavigationPush, frame.Workflow, m.currentOperationID())
 	return m
 }
 
@@ -115,6 +116,7 @@ func (m Model) popNavigation() (Model, bool) {
 	if parent.Layer == LayerWorkflowMenu {
 		m.workflowMenuIndex = parent.Index
 	}
+	m.traceUIActionFor(uiActionNavigationPop, parent.Workflow, m.currentOperationID())
 	return m, true
 }
 

@@ -34,6 +34,28 @@ type operationLogger struct {
 	w  io.Writer
 }
 
+const (
+	uiActionCommandPaletteOpen    = "command_palette.open"
+	uiActionCommandPaletteExecute = "command_palette.execute"
+	uiActionNavigationPush        = "navigation.push"
+	uiActionNavigationPop         = "navigation.pop"
+	uiActionWorkflowMenuQuery     = "workflow_menu.query"
+	uiActionWorkflowMenuSelect    = "workflow_menu.select"
+	uiActionActionPreviewOpen     = "action_preview.open"
+	uiActionActionPreviewConfirm  = "action_preview.confirm"
+)
+
+var safeUIActions = map[string]struct{}{
+	uiActionCommandPaletteOpen:    {},
+	uiActionCommandPaletteExecute: {},
+	uiActionNavigationPush:        {},
+	uiActionNavigationPop:         {},
+	uiActionWorkflowMenuQuery:     {},
+	uiActionWorkflowMenuSelect:    {},
+	uiActionActionPreviewOpen:     {},
+	uiActionActionPreviewConfirm:  {},
+}
+
 func newOperationLogger(w io.Writer) *operationLogger {
 	if w == nil {
 		w = io.Discard
@@ -53,6 +75,34 @@ func (l *operationLogger) write(entry operationLogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	_, _ = l.w.Write(append(body, '\n'))
+}
+
+// traceUIAction records a fixed, UI-only breadcrumb. The allow-list is
+// deliberate: palette input, menu labels, and arbitrary command text never
+// become operation-log fields. Runtime state and command authority remain in
+// the Application/Runtime event paths.
+func (m Model) traceUIAction(action string) {
+	m.traceUIActionFor(action, m.selected, m.currentOperationID())
+}
+
+func (m Model) traceUIActionFor(action string, workflow model.WorkflowID, operationID string) {
+	if _, ok := safeUIActions[action]; !ok {
+		return
+	}
+	m.trace.write(operationLogEntry{
+		OperationID: operationID,
+		Workflow:    string(workflow),
+		Page:        pageName(m.page),
+		Kind:        "ui_action",
+		Action:      action,
+	})
+}
+
+func (m Model) currentOperationID() string {
+	if m.commandState == nil {
+		return ""
+	}
+	return m.commandState.operationID
 }
 
 func operationType(v any) string {
