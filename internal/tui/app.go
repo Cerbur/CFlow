@@ -170,9 +170,13 @@ type Model struct {
 	// Application projections and is never inferred from these frames.
 	navigation NavigationStack
 	// workflowMenu is the authoritative Task 2 projection currently bound to
-	// the selected Workflow. Task 5 adds its dedicated render model/query flow.
-	workflowMenu      app.WorkflowMenuView
-	workflowMenuIndex int
+	// the selected Workflow. workflowMenuModel is its pure TUI presentation
+	// copy; neither owns Runtime state.
+	workflowMenu            app.WorkflowMenuView
+	workflowMenuModel       WorkflowMenuModel
+	workflowMenuIndex       int
+	workflowMenuError       string
+	workflowMenuPreviewItem MenuItem
 
 	// selected is the workflow the workspace focuses.
 	selected model.WorkflowID
@@ -485,6 +489,8 @@ func queryWorkflowID(q app.Query) model.WorkflowID {
 		return q.Workflow
 	case app.LayoutMigrationPreviewQuery:
 		return q.Workflow
+	case app.WorkflowMenuQuery:
+		return q.Workflow
 	default:
 		return ""
 	}
@@ -542,6 +548,9 @@ func projectionViewMatches(page Page, view app.View) bool {
 	switch page {
 	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
 		_, ok := view.(app.WorkspaceView)
+		return ok
+	case PageWorkflowMenu:
+		_, ok := view.(app.WorkflowMenuView)
 		return ok
 	case PageDiscussion:
 		_, ok := view.(app.DiscussionReturnView)
@@ -739,6 +748,13 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 	// closed so stale legal actions cannot be issued against old facts. A
 	// later matching successful projection can still release the gate.
 	if msg.err != nil {
+		if msg.page == PageWorkflowMenu {
+			m.workflowMenu = app.WorkflowMenuView{Workflow: msg.workflow}
+			m.workflowMenuModel = WorkflowMenuModel{Workflow: msg.workflow}
+			m.workflowMenuError = msg.err.Error()
+			m.status = "workflow menu: " + msg.err.Error()
+			return m, nil
+		}
 		if acknowledgesCommand {
 			return m.retryOrBlockCommandAcknowledgement(msg.page)
 		}
@@ -798,6 +814,13 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 		m.projectionBlocked = false
 	}
 	switch msg.page {
+	case PageWorkflowMenu:
+		if v, ok := msg.view.(app.WorkflowMenuView); ok {
+			m.workflowMenu = v
+			m.workflowMenuModel = MapWorkflowMenu(v)
+			m.workflowMenuIndex = m.workflowMenuModel.Selected
+			m.workflowMenuError = ""
+		}
 	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
 		if v, ok := msg.view.(app.WorkspaceView); ok {
 			previousSelected := m.selected
@@ -1336,6 +1359,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m, _ = m.popNavigation()
+		if m.page == PageWorkspace {
+			m.restoreHomeWorkflowRow()
+		}
 		return m, nil
 	}
 	if m.navigationIsNested() && msg.Code == tea.KeyTab {
@@ -1362,8 +1388,17 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case PageWorkspace:
 		return m.handleWorkspaceKey(msg)
 	case PageWorkflowMenu:
-		if IsEnter(msg) {
-			return m.enterSelectedWorkflowMenuRoute(), nil
+		switch {
+		case IsUp(msg):
+			return m.moveWorkflowMenuSelection(-1), nil
+		case IsDown(msg):
+			return m.moveWorkflowMenuSelection(1), nil
+		case IsEnter(msg):
+			item, ok := m.selectedWorkflowMenuItem()
+			if !ok {
+				return m, nil
+			}
+			return m.routeWorkflowMenuItem(item)
 		}
 		return m, nil
 	case PageReadonlyWorkspace, PageActionPreview, PageCreatePreview:
@@ -1702,7 +1737,12 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.createDirty = nil
 			return m, m.queryCmd(PageCreate, app.DiscoveryQuery{})
 		}
-		return m.enterWorkflowMenu(), nil
+		m = m.enterWorkflowMenu()
+		m.workflowMenu = app.WorkflowMenuView{Workflow: m.selected}
+		m.workflowMenuModel = WorkflowMenuModel{Workflow: m.selected}
+		m.workflowMenuIndex = 0
+		m.workflowMenuError = ""
+		return m, m.queryCmd(PageWorkflowMenu, app.WorkflowMenuQuery{Workflow: m.selected})
 	case msg.Code == 'r' || msg.Code == 'R':
 		if m.selected == "" || !hasAction(m.workspace.Actions, ActionResume) {
 			m.status = "resume is not a legal action"
@@ -2464,6 +2504,12 @@ func render(m Model) string {
 		// rendered footer, not an authoritative WorkspaceViewModel field.
 		workspace := RenderWorkspace(m.workspace, m.width, m.height)
 		b.WriteString(overlayWorkspaceStatus(workspace, m.workspace, m.status, m.width))
+	case PageWorkflowMenu:
+		b.WriteString(RenderWorkflowMenuState(m.workflowMenuModel, m.workflowMenuError))
+	case PageReadonlyWorkspace:
+		b.WriteString(renderReadonlyWorkspace(m.workflowMenuModel))
+	case PageActionPreview:
+		b.WriteString(renderWorkflowActionPreview(m.workflowMenuModel, m.workflowMenuPreviewItem))
 	case PageDiscussion:
 		b.WriteString(RenderDiscussionReturn(m.discussion))
 		b.WriteString(m.hints())

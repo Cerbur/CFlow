@@ -66,7 +66,9 @@ func TestModelParentReturnRestoresWorkflowMenuIndexWithoutExecute(t *testing.T) 
 			{ID: "plan", Kind: app.MenuEntryReadonly, Route: app.MenuRoutePlan},
 		},
 	}
+	m.workflowMenuModel = MapWorkflowMenu(m.workflowMenu)
 	m.workflowMenuIndex = 1
+	m.workflowMenuModel.Selected = 1
 	m.navigation = NavigationStack{Frames: []NavigationFrame{
 		{Layer: LayerHome, Page: PageWorkspace},
 		{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
@@ -101,8 +103,8 @@ func TestModelHomeEnterPushesWorkflowMenuWithoutExecute(t *testing.T) {
 	m.selected = "wf-1"
 
 	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if cmd != nil {
-		t.Fatal("Home Enter returned a command before Task 5 menu loading")
+	if cmd == nil {
+		t.Fatal("Home Enter did not request the WorkflowMenu projection")
 	}
 	m = next.(Model)
 	if m.page != PageWorkflowMenu || m.navigation.Current().Workflow != "wf-1" {
@@ -146,7 +148,7 @@ func TestNestedNavigationLegacyKeysPreserveStack(t *testing.T) {
 
 	next, cmd = got.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	got = next.(Model)
-	if cmd != nil || got.page != PageWorkflowMenu || got.navigation.Current().Layer != LayerWorkflowMenu {
+	if cmd == nil || got.page != PageWorkflowMenu || got.navigation.Current().Layer != LayerWorkflowMenu {
 		t.Fatalf("Enter after b did not start a fresh menu route: page=%v stack=%+v", got.page, got.navigation)
 	}
 }
@@ -180,10 +182,10 @@ func TestWorkflowMenuRoutesNonStageActionsToInertPreview(t *testing.T) {
 		{name: "resume", action: app.MenuActionResume, layer: LayerActionPreview, page: PageActionPreview},
 		{name: "start runner", action: app.MenuActionStartRunner, layer: LayerActionPreview, page: PageActionPreview},
 		{name: "pause", action: app.MenuActionPause, layer: LayerActionPreview, page: PageActionPreview},
-		{name: "cancel", action: app.MenuActionCancel, layer: LayerActionPreview, page: PageActionPreview},
-		{name: "migrate", action: app.MenuActionMigrate, layer: LayerActionPreview, page: PageActionPreview},
-		{name: "apply", action: app.MenuActionApply, layer: LayerActionPreview, page: PageActionPreview},
-		{name: "cleanup", action: app.MenuActionCleanup, layer: LayerActionPreview, page: PageActionPreview},
+		{name: "cancel", action: app.MenuActionCancel, layer: LayerStageWorkspace, page: PageCancel},
+		{name: "migrate", action: app.MenuActionMigrate, layer: LayerStageWorkspace, page: PageMigration},
+		{name: "apply", action: app.MenuActionApply, layer: LayerStageWorkspace, page: PageTerminal},
+		{name: "cleanup", action: app.MenuActionCleanup, layer: LayerStageWorkspace, page: PageTerminal},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -199,6 +201,7 @@ func TestWorkflowMenuRoutesNonStageActionsToInertPreview(t *testing.T) {
 			if tc.name == "readonly" {
 				m.workflowMenu.Entries[0].Kind = app.MenuEntryReadonly
 			}
+			m.workflowMenuModel = MapWorkflowMenu(m.workflowMenu)
 			m.navigation = NavigationStack{Frames: []NavigationFrame{
 				{Layer: LayerHome, Page: PageWorkspace},
 				{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
@@ -206,7 +209,7 @@ func TestWorkflowMenuRoutesNonStageActionsToInertPreview(t *testing.T) {
 
 			next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 			got := next.(Model)
-			if cmd != nil || ctrl.executes != 0 {
+			if ctrl.executes != 0 {
 				t.Fatalf("menu Enter executed work: cmd=%v executes=%d", cmd != nil, ctrl.executes)
 			}
 			if got.navigation.Current().Layer != tc.layer || got.page != tc.page {

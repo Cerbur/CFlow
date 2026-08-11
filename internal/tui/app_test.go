@@ -1571,7 +1571,7 @@ func TestModelHomeRowsEnterRoutesByRowKind(t *testing.T) {
 	})
 	next, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	got = next.(Model)
-	if cmd != nil || got.page != PageWorkflowMenu || got.navigation.Current().Layer != LayerWorkflowMenu || got.navigation.Current().Workflow != "wf-1" {
+	if cmd == nil || got.page != PageWorkflowMenu || got.navigation.Current().Layer != LayerWorkflowMenu || got.navigation.Current().Workflow != "wf-1" {
 		t.Fatalf("existing Workflow Enter = page %v frame %+v cmd=%v", got.page, got.navigation.Current(), cmd != nil)
 	}
 	if ctrl.executes != 0 {
@@ -1809,8 +1809,8 @@ func TestModelPlanApprovalMapsToTypedCommand(t *testing.T) {
 	rec := &recordingController{ctrl: a}
 	m := load(t, testModel(rec))
 	// Navigate to the Plan Approval page.
-	m = press(t, m, tea.KeyRight, 0) // discussion
-	m = press(t, m, tea.KeyRight, 0) // plan approval
+	m = press(t, m, tea.KeyTab, 0) // discussion
+	m = press(t, m, tea.KeyTab, 0) // plan approval
 	if m.page != PagePlanApproval {
 		t.Fatalf("page = %d, want plan approval", m.page)
 	}
@@ -2270,9 +2270,9 @@ func TestModelExecutionApprovalMapsToTypedCommand(t *testing.T) {
 	}
 	rec := &recordingController{ctrl: a}
 	m := load(t, testModel(rec))
-	// Navigate: right to the discussion page, then Tab twice to the
-	// execution approval page.
-	m = press(t, m, tea.KeyRight, 0)
+	// Navigate from Home with Tab: discussion, plan approval, then
+	// execution approval.
+	m = press(t, m, tea.KeyTab, 0)
 	m = press(t, m, tea.KeyTab, 0)
 	m = press(t, m, tea.KeyTab, 0)
 	if m.page != PageExecutionApproval {

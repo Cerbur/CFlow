@@ -80,6 +80,14 @@ func pageName(page Page) string {
 	switch page {
 	case PageWorkspace:
 		return "workspace"
+	case PageWorkflowMenu:
+		return "workflow_menu"
+	case PageReadonlyWorkspace:
+		return "readonly_workspace"
+	case PageActionPreview:
+		return "action_preview"
+	case PageCreatePreview:
+		return "create_preview"
 	case PageDiscussion:
 		return "discussion"
 	case PagePlanApproval:
