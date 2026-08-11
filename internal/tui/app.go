@@ -214,8 +214,12 @@ type Model struct {
 	// createInput is the Create Workflow name field.
 	createInput string
 	// createConfirm is true after the user submitted the create name for
-	// the explicit confirmation (Task 5: Enter alone never creates).
+	// the Create Preview (Task 6: the next Enter executes).
 	createConfirm bool
+	// createAwaitingWorkspace remains true between a successful
+	// CreateWorkflowCommand and its bound Workspace acknowledgement. The
+	// navigation transition waits for that authoritative projection.
+	createAwaitingWorkspace bool
 	// createDirty is the queried target Git facts the Create page displays
 	// (dirty state, fingerprint, and isolation); nil until the read-only
 	// DiscoveryQuery projection loads.
@@ -728,6 +732,7 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 		msg.page == m.commandState.ackPage &&
 		((msg.page == PageWorkspace && msg.workflow == "" && m.commandState.workflow == "") ||
 			(msg.workflow != "" && m.commandState.workflow != "" && msg.workflow == m.commandState.workflow))
+	createdWorkflowAcknowledged := acknowledgesCommand && msg.page == PageWorkspace && m.createAwaitingWorkspace
 	// A query can finish after navigation or selection changed. Drop a
 	// workflow-bound result that no longer belongs to the root selection; the
 	// workspace fallback remains unbound and is allowed to normalize selection.
@@ -925,6 +930,21 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 			m.migration = v
 		}
 	}
+	if createdWorkflowAcknowledged {
+		applied = true
+		m.createAwaitingWorkspace = false
+		// Creation replaces the transient Create route with a fresh Home root;
+		// the new Workflow Menu is its child. This keeps Esc synchronized with
+		// the visible page and prevents a successful create from returning to
+		// the obsolete name editor.
+		m = m.resetNavigationHome()
+		m = m.enterWorkflowMenu()
+		m.workflowMenu = app.WorkflowMenuView{Workflow: m.selected}
+		m.workflowMenuModel = WorkflowMenuModel{Workflow: m.selected}
+		m.workflowMenuIndex = 0
+		m.workflowMenuError = ""
+		return m, m.queryCmd(PageWorkflowMenu, app.WorkflowMenuQuery{Workflow: m.selected})
+	}
 	applied = true
 	return m, nil
 }
@@ -1103,6 +1123,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 	switch msg.cmd.(type) {
 	case app.CreateWorkflowCommand:
 		m.selected = msg.out.Workflow
+		m.createAwaitingWorkspace = msg.out.Workflow != ""
 		if m.commandState != nil && msg.out.Workflow != "" {
 			// Creation changes the selected Workflow identity. Bind the
 			// acknowledgement refresh to the newly created aggregate rather
@@ -1627,17 +1648,17 @@ func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleCreateKey handles the Create Workflow form (Task 5): the TUI
+// handleCreateKey handles the Create Workflow form (Task 6): the TUI
 // first queries and displays the target's dirty state, fingerprint, and
-// isolation; Enter only submits the name for the explicit confirmation
-// (default No) and NEVER creates; only an explicit y issues the typed
-// CreateWorkflowCommand, carrying ConfirmDirty: true exactly when the
-// queried target is dirty.
+// isolation; Enter submits the name for the Create Preview, and Enter on
+// that preview issues the typed CreateWorkflowCommand, carrying
+// ConfirmDirty: true exactly when the queried target is dirty.
 func (m Model) handleCreateKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.createConfirm {
-		// The explicit confirmation: default No. Enter alone never creates.
+		// The Create Preview accepts only Enter. Esc returns to editing while
+		// preserving the name; y/Y/n/N/q are ordinary, non-confirming input.
 		switch {
-		case msg.Code == 'y' || msg.Code == 'Y':
+		case IsEnter(msg):
 			name := strings.TrimSpace(m.createInput)
 			if name == "" {
 				m.createConfirm = false
@@ -1654,9 +1675,9 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.executeCmd(app.CreateWorkflowCommand{
 				Name: name, Provider: m.createProvider(), ConfirmDirty: m.createDirty.Dirty,
 			})
-		case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
+		case msg.Code == tea.KeyEsc:
 			m.createConfirm = false
-			m.status = "creation declined"
+			m.status = ""
 			return m, nil
 		}
 		return m, nil
@@ -1674,7 +1695,7 @@ func (m Model) handleCreateKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.status = "a workflow name is required"
 			return m, nil
 		}
-		// Enter submits the name for the confirmation; it never creates.
+		// Enter submits the name for the Create Preview; it never creates.
 		m.createConfirm = true
 		return m, nil
 	case msg.Code == tea.KeyBackspace || msg.Code == tea.KeyDelete:
@@ -2615,11 +2636,10 @@ func blockedHints(m WorkspaceViewModel) string {
 	return "\n" + strings.Join(parts, "  ") + "\n"
 }
 
-// createHints renders the Create page hint: the confirmation defaults to
-// No, so Enter alone never creates; only an explicit y does.
+// createHints renders the Create Workspace -> Create Preview Enter-only flow.
 func createHints(m Model) string {
 	if m.createConfirm {
-		return "\ny create (default no), Enter/n decline, esc back to edit\n"
+		return "\nEnter create, esc back to edit\n"
 	}
 	return "\ntype the workflow name; Enter review, esc cancel\n"
 }
@@ -2672,9 +2692,9 @@ func redactMigrationText(reg security.Registry, value string) string {
 	return frame.Text + flushed.Text
 }
 
-// renderCreate renders the Create Workflow page: the read-only Discovery
-// projection surfaces the target's dirty state, dirty fingerprint, and
-// isolation before the default-No confirmation (Task 5).
+// renderCreate renders the Create Workspace and Create Preview states. The
+// read-only Discovery projection surfaces the target's dirty state, dirty
+// fingerprint, and isolation before the Enter-only confirmation (Task 6).
 func renderCreate(m Model) string {
 	var b strings.Builder
 	b.WriteString("create workflow\n")
@@ -2697,10 +2717,10 @@ func renderCreate(m Model) string {
 	}
 	if m.createConfirm {
 		fmt.Fprintf(&b, "name: %s\n", m.createInput)
-		b.WriteString("create workflow? [y/N]\n")
+		b.WriteString("create workflow?\n")
 	} else {
 		fmt.Fprintf(&b, "name: %s_\n", m.createInput)
-		b.WriteString("enter review, then y to create (default no)\n")
+		b.WriteString("Enter review, then Enter to create\n")
 	}
 	return b.String()
 }

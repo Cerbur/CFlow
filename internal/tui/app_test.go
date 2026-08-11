@@ -1103,6 +1103,7 @@ func TestModelExecutionHintDrivenByLegalActions(t *testing.T) {
 // DiscoveryQuery fail so no target facts ever load.
 type createController struct {
 	executed     []app.Command
+	queries      []app.Query
 	dirty        bool
 	discoveryErr error
 }
@@ -1112,11 +1113,28 @@ func (c *createController) Execute(_ context.Context, cmd app.Command) (app.Outc
 	return app.Outcome{Workflow: "wf-new"}, nil
 }
 func (c *createController) Query(_ context.Context, q app.Query) (app.View, error) {
+	c.queries = append(c.queries, q)
 	switch q.(type) {
 	case app.ProjectWorkspaceQuery:
-		return app.WorkspaceView{
+		workspaceQ := q.(app.ProjectWorkspaceQuery)
+		view := app.WorkspaceView{
 			Project: app.ProjectView{Name: "repo", Root: "/repo"},
 			Health:  app.HealthView{GitAvailable: true, Providers: []app.ProviderHealth{{Name: "fake", Compatible: true}}},
+		}
+		if workspaceQ.Selected == "wf-new" {
+			view.Selected = "wf-new"
+			view.Workflows = []app.WorkflowSummary{{ID: "wf-new", Name: "calculator", Runtime: model.RuntimePaused}}
+		}
+		return view, nil
+	case app.WorkflowMenuQuery:
+		return app.WorkflowMenuView{
+			Workflow: "wf-new",
+			Name:     "calculator",
+			Entries: []app.WorkflowMenuEntry{
+				{ID: "current-stage", Group: app.MenuGroupView, Kind: app.MenuEntryReadonly, Label: "Current Stage", Route: app.MenuRouteCurrentStage},
+				{ID: "start-discussion", Group: app.MenuGroupContinue, Kind: app.MenuEntryAction, Label: "Start Native Discussion", Action: app.MenuActionStartDiscussion},
+			},
+			DefaultIndex: 1,
 		}, nil
 	case app.DiscoveryQuery:
 		if c.discoveryErr != nil {
@@ -1152,45 +1170,45 @@ func typeText(t *testing.T, m Model, s string) Model {
 	return m
 }
 
-// TestCreateDirtyTargetEnterDoesNotCreate: a dirty target is queried and
-// displayed before creation; the confirmation defaults to No, so Enter
-// (both to submit the name and on the confirmation) never creates.
-func TestCreateDirtyTargetEnterDoesNotCreate(t *testing.T) {
-	ctrl := &createController{dirty: true}
+func TestCreateNameEnterOpensPreviewButDoesNotCreate(t *testing.T) {
+	ctrl := &createController{}
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
-	m = load(t, m)
-	m = createPage(t, m, "calculator")
-	got := render(m)
-	for _, want := range []string{"DIRTY", "dirty fingerprint: sha256:deadbeef", "will not touch your files"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("create page misses %q:\n%s", want, got)
-		}
-	}
-	// Enter submits the name for the confirmation; it never creates.
+	m.page = PageCreate
+	m.createInput = "calculator"
+	m.createDirty = &app.DiscoveryView{Branch: "main", Head: "abc123"}
+
 	m = press(t, m, tea.KeyEnter, 0)
-	if len(ctrl.executed) != 0 {
-		t.Fatalf("Enter created the workflow: %v", ctrl.executed)
+	if !m.createConfirm {
+		t.Fatal("Enter did not open Create Preview")
 	}
-	// Enter on the confirmation is No too.
-	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 0 {
-		t.Fatalf("Enter confirmed the workflow: %v", ctrl.executed)
+		t.Fatalf("name Enter executed commands: %v", ctrl.executed)
 	}
 }
 
-// TestCreateDirtyTargetYConfirmsDirty: only an explicit y sends the create
-// command with ConfirmDirty: true on a dirty target.
-func TestCreateDirtyTargetYConfirmsDirty(t *testing.T) {
+func TestCreatePreviewEnterExecutes(t *testing.T) {
 	ctrl := &createController{dirty: true}
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
-	m = load(t, m)
-	m = createPage(t, m, "calculator")
-	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
-	m = press(t, m, 'y', 0)          // the explicit confirmation
+	m.page = PageCreate
+	m.createInput = "calculator"
+	m.createDirty = &app.DiscoveryView{
+		Branch:           "main",
+		Head:             "abc123",
+		Dirty:            true,
+		DirtyFingerprint: "sha256:dirty",
+		StagedCount:      1,
+	}
+	m.createConfirm = true
+	m.ready, m.width, m.height = true, 120, 40
+
+	if got := render(m); !strings.Contains(got, "DIRTY") || !strings.Contains(got, "sha256:dirty") {
+		t.Fatalf("preview lost dirty target facts:\n%s", got)
+	}
+	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 1 {
-		t.Fatalf("explicit y did not create: %v", ctrl.executed)
+		t.Fatalf("preview Enter did not create: %v", ctrl.executed)
 	}
 	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
 	if !ok {
@@ -1201,52 +1219,74 @@ func TestCreateDirtyTargetYConfirmsDirty(t *testing.T) {
 	}
 }
 
-// TestCreateCleanTargetCreatesWithoutDirtyFlag: a clean target creates
-// with an explicit y and carries no dirty flag.
-func TestCreateCleanTargetCreatesWithoutDirtyFlag(t *testing.T) {
-	ctrl := &createController{dirty: false}
+func TestCreatePreviewYNAQDoNotConfirm(t *testing.T) {
+	ctrl := &createController{}
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
-	m = load(t, m)
-	m = createPage(t, m, "calculator")
-	if got := render(m); !strings.Contains(got, "clean") {
-		t.Fatalf("clean target create page misses the clean state:\n%s", got)
+	m.page = PageCreate
+	m.createInput = "calculator"
+	m.createDirty = &app.DiscoveryView{Branch: "main", Head: "abc123"}
+	m.createConfirm = true
+	m.ready, m.width, m.height = true, 120, 40
+	if got := render(m); strings.Contains(got, "y create") || strings.Contains(got, "[y/N]") || strings.Contains(got, "default no") {
+		t.Fatalf("preview still advertises y/n confirmation:\n%s", got)
 	}
-	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
-	m = press(t, m, 'y', 0)          // the explicit confirmation
-	if len(ctrl.executed) != 1 {
-		t.Fatalf("explicit y did not create: %v", ctrl.executed)
-	}
-	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
-	if !ok {
-		t.Fatalf("create command type = %T", ctrl.executed[0])
-	}
-	if cc.ConfirmDirty {
-		t.Fatalf("clean target create carried a dirty flag: %+v", cc)
+	for _, key := range []rune{'y', 'Y', 'n', 'N', 'q'} {
+		m = press(t, m, key, 0)
+		if len(ctrl.executed) != 0 || !m.createConfirm {
+			t.Fatalf("%q confirmed creation: executed=%v confirm=%v", key, ctrl.executed, m.createConfirm)
+		}
 	}
 }
 
-// TestCreateMissingFactsYFailsClosed: when the DiscoveryQuery projection has
-// not loaded (createDirty == nil), an explicit y on the confirmation never
-// issues CreateWorkflowCommand — the create is fail-closed on the missing
-// target facts instead of guessing the dirty state.
-func TestCreateMissingFactsYFailsClosed(t *testing.T) {
-	ctrl := &createController{dirty: true, discoveryErr: model.InvalidInputFault("discovery failed")}
+func TestCreatePreviewEscReturnsToEditing(t *testing.T) {
+	ctrl := &createController{}
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
-	m = load(t, m)
-	m = createPage(t, m, "calculator")
-	if got := render(m); !strings.Contains(got, "loading git facts") {
-		t.Fatalf("create page without the queried facts:\n%s", got)
+	m.page = PageCreate
+	m.createInput = "calculator"
+	m.createDirty = &app.DiscoveryView{Branch: "main", Head: "abc123"}
+	m.createConfirm = true
+
+	m = press(t, m, tea.KeyEsc, 0)
+	if m.createConfirm || m.createInput != "calculator" {
+		t.Fatalf("preview Esc did not restore editing: confirm=%v input=%q", m.createConfirm, m.createInput)
 	}
-	m = press(t, m, tea.KeyEnter, 0) // submit the name for the confirmation
-	m = press(t, m, 'y', 0)          // confirm without the target facts
-	if len(ctrl.executed) != 0 {
-		t.Fatalf("y created without the target facts: %v", ctrl.executed)
+}
+
+func TestWorkflowMenuAfterCreateAcknowledgement(t *testing.T) {
+	ctrl := &createController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.page = PageCreate
+	m.navigation = NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}, {Layer: LayerCreateWorkspace, Page: PageCreate}}}
+	m.createInput = "calculator"
+	m.createDirty = &app.DiscoveryView{Branch: "main", Head: "abc123"}
+	m.createConfirm = true
+
+	m = press(t, m, tea.KeyEnter, 0)
+	if m.selected != "wf-new" || m.page != PageWorkflowMenu {
+		t.Fatalf("create acknowledgement route = selected=%q page=%v", m.selected, m.page)
 	}
-	if got := render(m); !strings.Contains(got, "target facts unavailable") {
-		t.Fatalf("create page did not refuse the missing facts:\n%s", got)
+	if got := m.navigation.Current(); got.Layer != LayerWorkflowMenu || got.Page != PageWorkflowMenu {
+		t.Fatalf("create acknowledgement navigation = %+v", got)
 	}
+	if m.workflowMenuIndex != 1 || m.workflowMenuModel.Selected != 1 {
+		t.Fatalf("menu did not use Application default index: index=%d model=%+v", m.workflowMenuIndex, m.workflowMenuModel)
+	}
+	workspaceQuery := false
+	for _, q := range ctrl.queries {
+		if workspace, ok := q.(app.ProjectWorkspaceQuery); ok && workspace.Selected == "wf-new" {
+			workspaceQuery = true
+		}
+		if menu, ok := q.(app.WorkflowMenuQuery); ok && menu.Workflow == "wf-new" {
+			if !workspaceQuery {
+				t.Fatal("workflow menu query ran before bound workspace acknowledgement")
+			}
+			return
+		}
+	}
+	t.Fatal("create acknowledgement did not query the bound Workflow Menu")
 }
 
 func (r *recordingController) Execute(ctx context.Context, cmd app.Command) (app.Outcome, error) {
