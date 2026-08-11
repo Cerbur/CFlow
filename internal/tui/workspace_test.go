@@ -1,7 +1,7 @@
 package tui
 
-// Workspace screen tests (TUI task 10): the three-column layout renders
-// the workflow column, the lifecycle main column, and the inspector; a
+// Workspace screen tests: the three-column Home layout renders the
+// workflow column, the central workspace, and the inspector; a
 // narrow terminal collapses the inspector below the main column.
 
 import (
@@ -36,10 +36,10 @@ func TestRenderWorkspaceUsesWorkbenchFrame(t *testing.T) {
 	for _, want := range []string{
 		"CFlow",
 		"WORKFLOWS",
-		"LIFECYCLE",
+		"WORKSPACE",
 		"INSPECTOR",
 		"Provider:",
-		"Navigate",
+		"↑↓ navigate",
 		"│",
 	} {
 		if !strings.Contains(got, want) {
@@ -74,8 +74,8 @@ func TestRenderWorkspaceResponsiveBoundsAndStructure(t *testing.T) {
 		want   []string
 		avoid  []string
 	}{
-		{name: "wide-large", width: 160, height: 45, want: []string{"WORKFLOWS", "LIFECYCLE", "INSPECTOR"}},
-		{name: "wide-threshold", width: 120, height: 30, want: []string{"WORKFLOWS", "LIFECYCLE", "INSPECTOR"}},
+		{name: "wide-large", width: 160, height: 45, want: []string{"WORKFLOWS", "WORKSPACE", "INSPECTOR"}},
+		{name: "wide-threshold", width: 120, height: 30, want: []string{"WORKFLOWS", "WORKSPACE", "INSPECTOR"}},
 		{name: "medium", width: 100, height: 24, want: []string{"WORKFLOWS", "WORKSPACE", "SUMMARY", "TARGET", "WORKSPACE"}},
 		{name: "compact", width: 80, height: 24, want: []string{"WORKSPACE", "STAGE", "RUNTIME", "LEGAL ACTIONS"}, avoid: []string{"INSPECTOR"}},
 		{name: "compact-small", width: 60, height: 18, want: []string{"WORKSPACE", "STAGE", "RUNTIME", "LEGAL ACTIONS"}, avoid: []string{"INSPECTOR"}},
@@ -96,6 +96,37 @@ func TestRenderWorkspaceResponsiveBoundsAndStructure(t *testing.T) {
 				}
 			}
 			assertCompletePanelBorders(t, got)
+		})
+	}
+}
+
+func TestRenderWorkspaceHomeRowsAtTargetSizes(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+	}{
+		{width: 160, height: 45},
+		{width: 120, height: 30},
+		{width: 100, height: 24},
+		{width: 80, height: 24},
+		{width: 60, height: 18},
+		{width: 88, height: 6},
+		{width: 100, height: 6},
+		{width: 120, height: 6},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", tc.width, tc.height), func(t *testing.T) {
+			frame := RenderWorkspace(longWorkspaceViewModel(), tc.width, tc.height)
+			visible := visibleTerminalText(frame)
+			if strings.Contains(frame, "←→ lifecycle") {
+				t.Fatal("Home still advertises lifecycle navigation")
+			}
+			if !strings.Contains(visible, "NEW WORKFLOW") {
+				t.Fatal("Home misses the New Workflow row")
+			}
+			if !strings.Contains(visible, "WORKSPACE") {
+				t.Fatal("Home misses the central workspace panel")
+			}
+			assertWorkspaceBounds(t, frame, tc.width, tc.height)
 		})
 	}
 }
@@ -142,18 +173,18 @@ func TestRenderWorkspaceFallsBackToMinimalBeforePanelsLosePrimaryContext(t *test
 		if strings.ContainsAny(got, "╭╮├┤╰╯") {
 			t.Fatalf("unsafe threshold rendered a panel at %dx%d:\n%s", tc.width, tc.height, got)
 		}
-		if !strings.Contains(got, "q") {
+		if !strings.Contains(got, "/") {
 			t.Fatalf("minimal threshold lost footer at %dx%d:\n%s", tc.width, tc.height, got)
 		}
 	}
 }
 
-func TestRenderWorkspaceFooterKeepsQuitHintAtTinyWidths(t *testing.T) {
+func TestRenderWorkspaceFooterKeepsCommandHintAtTinyWidths(t *testing.T) {
 	m := sampleWorkspaceViewModel()
 	for _, width := range []int{1, 4, 5, 6} {
 		got := renderWorkspaceFooter(m, "", width)
-		if !strings.Contains(got, "q") {
-			t.Fatalf("footer at width %d lost quit affordance: %q", width, got)
+		if !strings.Contains(got, "/") {
+			t.Fatalf("footer at width %d lost command affordance: %q", width, got)
 		}
 		if gotWidth := lipgloss.Width(got); gotWidth > width {
 			t.Fatalf("footer width %d > %d: %q", gotWidth, width, got)
@@ -223,14 +254,19 @@ func TestWorkspacePanelKeepsBorderColumnsAlignedAfterUnicodeTruncation(t *testin
 	}
 }
 
-func TestWorkspaceFooterPreservesProjectedActionHints(t *testing.T) {
+func TestWorkspaceFooterUsesOnlyHomeNavigationHints(t *testing.T) {
 	m := longWorkspaceViewModel()
 	m.Actions = []Action{ActionResume, ActionPause, ActionCancel, ActionMigrate}
 	for _, width := range []int{60, 80} {
 		got := renderWorkspaceFooter(m, "", width)
-		for _, want := range []string{"q quit", "r resume", "p pause", "x cancel", "m migrate"} {
+		for _, want := range []string{"/ command", "Enter open", "Esc back", "↑↓ navigate"} {
 			if !strings.Contains(got, want) {
-				t.Fatalf("footer at width %d misses projected hint %q: %q", width, want, got)
+				t.Fatalf("footer at width %d misses Home hint %q: %q", width, want, got)
+			}
+		}
+		for _, forbidden := range []string{"q quit", "r resume", "p pause", "x cancel", "m migrate", "n create", "←→ lifecycle"} {
+			if strings.Contains(got, forbidden) {
+				t.Fatalf("footer at width %d retains legacy hint %q: %q", width, forbidden, got)
 			}
 		}
 		if gotWidth := lipgloss.Width(got); gotWidth > width {
@@ -257,10 +293,10 @@ func TestRenderWorkspaceMinimalViewportHasNoPartialPanel(t *testing.T) {
 
 func TestRenderWorkspaceDoesNotInventLegalActions(t *testing.T) {
 	got := RenderWorkspace(sampleWorkspaceViewModel(), 160, 45)
-	if !strings.Contains(got, "r resume") {
+	if !strings.Contains(got, "→ resume") {
 		t.Fatalf("projected resume action missing:\n%s", got)
 	}
-	for _, forbidden := range []string{"p pause", "x cancel", "m migrate"} {
+	for _, forbidden := range []string{"→ pause", "→ cancel", "→ layout-migration"} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("unprojected action %q rendered:\n%s", forbidden, got)
 		}
@@ -321,7 +357,7 @@ func longWorkspaceViewModel() WorkspaceViewModel {
 func TestRenderWorkspaceEmpty(t *testing.T) {
 	m := MapWorkspace(app.WorkspaceView{})
 	got := RenderWorkspace(m, 120, 45)
-	if !strings.Contains(got, "no workflows") {
+	if !strings.Contains(got, "no existing workflows") || !strings.Contains(got, "NEW WORKFLOW") {
 		t.Fatalf("empty render = %q", got)
 	}
 }

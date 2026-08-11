@@ -1674,8 +1674,9 @@ func preferredProvider(providers []app.ProviderHealth) string {
 	return "fake"
 }
 
-// handleWorkspaceKey handles the workspace screen keys: workflow
-// selection, lifecycle navigation, and the legal actions.
+// handleWorkspaceKey handles Home selection and routing plus the existing
+// projected legal-action shortcuts. New Workflow is a selectable UI row;
+// it has no standalone command key and never mutates Runtime state.
 func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
 	case IsUp(msg):
@@ -1687,16 +1688,14 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case IsRight(msg):
 		return m.moveNav(1)
 	case IsEnter(msg):
+		if m.selected == "" {
+			m = m.pushNavigation(NavigationFrame{Layer: LayerCreateWorkspace, Page: PageCreate})
+			m.createInput = ""
+			m.createConfirm = false
+			m.createDirty = nil
+			return m, m.queryCmd(PageCreate, app.DiscoveryQuery{})
+		}
 		return m.enterWorkflowMenu(), nil
-	case msg.Code == 'n' || msg.Code == 'N':
-		// Opening the Create page is a read-only step: it queries the
-		// target's Git facts (dirty state, fingerprint, isolation) that the
-		// explicit confirmation then renders.
-		m.page = PageCreate
-		m.createInput = ""
-		m.createConfirm = false
-		m.createDirty = nil
-		return m, m.queryCmd(PageCreate, app.DiscoveryQuery{})
 	case msg.Code == 'r' || msg.Code == 'R':
 		if m.selected == "" || !hasAction(m.workspace.Actions, ActionResume) {
 			m.status = "resume is not a legal action"
@@ -1807,30 +1806,41 @@ func (m Model) handleMigrationKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// moveSelection moves the workflow selection by one row and reloads the
-// workspace projection (navigation is a read-only UI state change).
+// moveSelection moves the Home selection by one row. The UI-only New row
+// clears workflow-bound presentation facts without querying or mutating the
+// Application. Existing rows reload their authoritative Workspace projection.
 func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 	if m.running {
 		m.status = "stop the active runner before changing workflow"
 		return m, nil
 	}
-	if len(m.workspace.Workflows) == 0 {
+	if len(m.workspace.Rows) == 0 {
 		return m, nil
 	}
 	idx := 0
-	for i, w := range m.workspace.Workflows {
-		if w.ID == m.selected {
+	for i, row := range m.workspace.Rows {
+		if row.Kind == WorkflowRowExisting && row.ID == m.selected {
 			idx = i
+			break
 		}
 	}
 	idx += delta
 	if idx < 0 {
-		idx = len(m.workspace.Workflows) - 1
+		idx = len(m.workspace.Rows) - 1
 	}
-	if idx >= len(m.workspace.Workflows) {
+	if idx >= len(m.workspace.Rows) {
 		idx = 0
 	}
-	m.selected = m.workspace.Workflows[idx].ID
+	row := m.workspace.Rows[idx]
+	if row.Kind == WorkflowRowNew {
+		m.selected = ""
+		m.workspace.Selected = WorkflowItem{}
+		m.workspace.Lifecycle = nil
+		m.workspace.Actions = nil
+		m.resetSelectionState()
+		return m, nil
+	}
+	m.selected = row.ID
 	m.resetSelectionState()
 	return m, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.selected})
 }

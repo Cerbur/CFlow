@@ -45,22 +45,59 @@ func TestMapWorkspace(t *testing.T) {
 	}
 }
 
-// TestMapWorkspaceSelectsFirstWhenEmpty: no explicit selection resolves
-// to the first workflow. Row actions are NEVER inferred from the runtime
-// status: without a Runtime LegalActions projection no row carries an
-// action (Task 5: the TUI does not re-derive the state machine).
-func TestMapWorkspaceSelectsFirstWhenEmpty(t *testing.T) {
+func TestMapWorkspaceHomeRowsStartWithUIOnlyNewWorkflow(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Selected: "wf-2",
+		Workflows: []app.WorkflowSummary{
+			{ID: "wf-1", Name: "one", Stage: model.StagePlanGeneration, Runtime: model.RuntimePaused},
+			{ID: "wf-2", Name: "two", Stage: model.StageExecution, Runtime: model.RuntimeRunning},
+		},
+	})
+
+	if len(vm.Rows) != 3 {
+		t.Fatalf("rows = %+v, want New Workflow plus two projected workflows", vm.Rows)
+	}
+	if got := vm.Rows[0]; got.Kind != WorkflowRowNew || got.ID != "" || got.Name != "NEW WORKFLOW" || got.Stage != "" || got.Runtime != "" {
+		t.Fatalf("new workflow row invented application facts: %+v", got)
+	}
+	if got := vm.Rows[1]; got.Kind != WorkflowRowExisting || got.ID != "wf-1" || got.Name != "one" || got.Stage != model.StagePlanGeneration || got.Runtime != model.RuntimePaused {
+		t.Fatalf("first projected workflow row = %+v", got)
+	}
+	if got := vm.Rows[2]; got.Kind != WorkflowRowExisting || got.ID != "wf-2" || got.Name != "two" || got.Stage != model.StageExecution || got.Runtime != model.RuntimeRunning {
+		t.Fatalf("second projected workflow row = %+v", got)
+	}
+}
+
+func TestMapWorkspaceNewWorkflowRowKeepsSelectionFactFree(t *testing.T) {
+	vm := MapWorkspace(app.WorkspaceView{
+		Workflows: []app.WorkflowSummary{
+			{ID: "wf-1", Name: "one", Stage: model.StageExecution, Runtime: model.RuntimeRunning},
+		},
+	})
+
+	if vm.Selected.ID != "" || vm.Selected.Stage != "" || vm.Selected.Runtime != "" {
+		t.Fatalf("New Workflow selection invented runtime facts: %+v", vm.Selected)
+	}
+	if vm.Lifecycle != nil || len(vm.Actions) != 0 {
+		t.Fatalf("New Workflow selection retained workflow facts: lifecycle=%+v actions=%v", vm.Lifecycle, vm.Actions)
+	}
+}
+
+// TestMapWorkspaceSelectsNewWorkflowWhenProjectionIsUnbound: an empty
+// projection selection is the UI-only New Workflow row. Existing row actions
+// are NEVER inferred from Runtime status.
+func TestMapWorkspaceSelectsNewWorkflowWhenProjectionIsUnbound(t *testing.T) {
 	vm := MapWorkspace(app.WorkspaceView{
 		Workflows: []app.WorkflowSummary{
 			{ID: "wf-1", Runtime: model.RuntimeRunning},
 			{ID: "wf-2", Runtime: model.RuntimeBlocked},
 		},
 	})
-	if vm.Selected.ID != "wf-1" {
+	if vm.Selected.ID != "" {
 		t.Fatalf("selected = %+v", vm.Selected)
 	}
-	if vm.Selected.Action != ActionNone {
-		t.Fatalf("running row action = %s, want none (no LegalActions projection)", vm.Selected.Action)
+	if vm.Selected.Action != ActionNone || vm.Lifecycle != nil || len(vm.Actions) != 0 {
+		t.Fatalf("New Workflow selection retained runtime facts: selected=%+v lifecycle=%+v actions=%v", vm.Selected, vm.Lifecycle, vm.Actions)
 	}
 	if vm.Workflows[1].Action != ActionNone {
 		t.Fatalf("blocked row action = %s, want none (no LegalActions projection)", vm.Workflows[1].Action)

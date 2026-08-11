@@ -583,7 +583,7 @@ func TestWorkspaceStatusIsSingleLineAndBounded(t *testing.T) {
 				}
 			}
 			if tc.height == 1 {
-				if !strings.Contains(out, "quit") {
+				if !strings.Contains(out, "/") {
 					t.Fatalf("minimal Workspace footer disappeared: %q", out)
 				}
 			} else if !strings.Contains(out, "status:") {
@@ -615,14 +615,14 @@ func TestWorkspaceMinimalViewportKeepsFooterVisible(t *testing.T) {
 			if got := lipgloss.Height(out); got > tc.height {
 				t.Fatalf("render height %d > %d: %q", got, tc.height, out)
 			}
-			if !strings.Contains(out, "quit") {
+			if !strings.Contains(out, "/") {
 				t.Fatalf("minimal Workspace footer is missing: %q", out)
 			}
 		})
 	}
 }
 
-func TestWorkspaceRootCompactFooterPreservesProjectedActions(t *testing.T) {
+func TestWorkspaceRootCompactFooterUsesHomeNavigationHints(t *testing.T) {
 	for _, tc := range []struct {
 		width  int
 		height int
@@ -648,9 +648,14 @@ func TestWorkspaceRootCompactFooterPreservesProjectedActions(t *testing.T) {
 					t.Fatalf("row %d width %d > %d: %q", i, got, tc.width, line)
 				}
 			}
-			for _, want := range []string{"r resume", "p pause", "x cancel", "m migrate"} {
+			for _, want := range []string{"/ command", "status:"} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("compact root render misses %q: %q", want, out)
+				}
+			}
+			for _, forbidden := range []string{"r resume", "p pause", "x cancel", "m migrate", "n create", "←→ lifecycle"} {
+				if strings.Contains(out, forbidden) {
+					t.Fatalf("compact root render retains legacy Home hint %q: %q", forbidden, out)
 				}
 			}
 		})
@@ -1133,7 +1138,7 @@ func (*createController) EscalateStop() {}
 // createPage opens the Create page and types the workflow name.
 func createPage(t *testing.T, m Model, name string) Model {
 	t.Helper()
-	m = press(t, m, 'n', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	return typeText(t, m, name)
 }
 
@@ -1535,6 +1540,132 @@ func TestModelWorkspaceSelectionIsReadOnly(t *testing.T) {
 		t.Fatalf("selection executed commands: %v", rec.executed)
 	}
 }
+
+func TestModelHomeRowsSelectNewWithoutQueryOrMutation(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+		Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimePaused}},
+	})
+
+	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	got := next.(Model)
+	if cmd != nil {
+		t.Fatal("selecting the UI-only New Workflow row queried the Application")
+	}
+	if got.selected != "" || got.workspace.Selected.ID != "" || got.workspace.Lifecycle != nil || len(got.workspace.Actions) != 0 {
+		t.Fatalf("New Workflow selection retained runtime facts: selected=%q workspace=%+v", got.selected, got.workspace)
+	}
+	if ctrl.executes != 0 || len(ctrl.queries) != 0 {
+		t.Fatalf("New Workflow selection touched Application: executes=%d queries=%v", ctrl.executes, ctrl.queries)
+	}
+}
+
+func TestModelHomeRowsEnterRoutesByRowKind(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+	})
+
+	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	got := next.(Model)
+	if got.page != PageCreate || got.navigation.Current().Layer != LayerCreateWorkspace {
+		t.Fatalf("New Workflow Enter = page %v frame %+v", got.page, got.navigation.Current())
+	}
+	if cmd == nil {
+		t.Fatal("New Workflow Enter did not request the read-only discovery projection")
+	}
+	if ctrl.executes != 0 {
+		t.Fatalf("New Workflow Enter executed %d mutations", ctrl.executes)
+	}
+
+	m = newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+	})
+	next, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	got = next.(Model)
+	if cmd != nil || got.page != PageWorkflowMenu || got.navigation.Current().Layer != LayerWorkflowMenu || got.navigation.Current().Workflow != "wf-1" {
+		t.Fatalf("existing Workflow Enter = page %v frame %+v cmd=%v", got.page, got.navigation.Current(), cmd != nil)
+	}
+	if ctrl.executes != 0 {
+		t.Fatalf("existing Workflow Enter executed %d mutations", ctrl.executes)
+	}
+}
+
+func TestModelHomeRowsReloadOnlyExistingWorkflowSelection(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+	})
+
+	m = press(t, m, tea.KeyDown, 0)
+	if m.selected != "wf-1" || m.workspace.Selected.ID != "wf-1" {
+		t.Fatalf("existing row selection = selected %q workspace %+v", m.selected, m.workspace.Selected)
+	}
+	if len(ctrl.queries) != 1 {
+		t.Fatalf("existing row selection queries = %v, want one", ctrl.queries)
+	}
+	q, ok := ctrl.queries[0].(app.ProjectWorkspaceQuery)
+	if !ok || q.Selected != "wf-1" {
+		t.Fatalf("existing row query = %#v", ctrl.queries[0])
+	}
+	if ctrl.executes != 0 {
+		t.Fatalf("existing row selection executed %d mutations", ctrl.executes)
+	}
+}
+
+func TestModelHomeNDoesNotOpenCreateWorkspace(t *testing.T) {
+	m := newModel(Dependencies{})
+	next, cmd := m.Update(tea.KeyPressMsg{Code: 'n'})
+	got := next.(Model)
+	if cmd != nil || got.page != PageWorkspace || got.navigation.Current().Layer != LayerHome {
+		t.Fatalf("n changed Home route: page=%v frame=%+v cmd=%v", got.page, got.navigation.Current(), cmd != nil)
+	}
+}
+
+type homeRowsController struct {
+	executes int
+	queries  []app.Query
+}
+
+func (c *homeRowsController) Execute(context.Context, app.Command) (app.Outcome, error) {
+	c.executes++
+	return app.Outcome{}, nil
+}
+
+func (c *homeRowsController) Query(_ context.Context, q app.Query) (app.View, error) {
+	c.queries = append(c.queries, q)
+	switch q := q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Selected:  q.Selected,
+			Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+			Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: q.Selected, Runtime: model.RuntimePaused}},
+		}, nil
+	case app.DiscoveryQuery:
+		return app.DiscoveryView{}, nil
+	default:
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+}
+
+func (*homeRowsController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*homeRowsController) EscalateStop() {}
 
 // TestModelActionsMapToTypedCommands: the workspace legal actions map to
 // the exact typed Application Commands.

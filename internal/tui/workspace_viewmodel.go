@@ -39,6 +39,27 @@ type WorkflowItem struct {
 	Action  Action
 }
 
+// WorkflowRowKind distinguishes the UI-only creation affordance from a
+// workflow projected by the Application. The New row never represents a
+// Runtime workflow and therefore never carries an ID, stage, or status.
+type WorkflowRowKind uint8
+
+const (
+	WorkflowRowNew WorkflowRowKind = iota
+	WorkflowRowExisting
+)
+
+// WorkflowRow is one selectable row on Home. Existing rows preserve the
+// Application projection order; the first row is always the UI-only New
+// Workflow affordance.
+type WorkflowRow struct {
+	Kind    WorkflowRowKind
+	ID      model.WorkflowID
+	Name    string
+	Stage   model.WorkflowStage
+	Runtime model.RuntimeStatus
+}
+
 // LifecycleItem is the selected workflow's lifecycle facts the main
 // column renders.
 type LifecycleItem struct {
@@ -68,6 +89,7 @@ type WorkspaceModel = WorkspaceViewModel
 
 type WorkspaceViewModel struct {
 	Project   app.ProjectView
+	Rows      []WorkflowRow
 	Selected  WorkflowItem
 	Workflows []WorkflowItem
 	Lifecycle *LifecycleItem
@@ -82,26 +104,35 @@ type WorkspaceViewModel struct {
 func MapWorkspace(v app.WorkspaceView) WorkspaceViewModel {
 	m := WorkspaceViewModel{
 		Project:   v.Project,
+		Rows:      make([]WorkflowRow, 1, len(v.Workflows)+1),
 		Workflows: make([]WorkflowItem, 0, len(v.Workflows)),
 	}
+	m.Rows[0] = WorkflowRow{Kind: WorkflowRowNew, Name: "NEW WORKFLOW"}
 	selected := v.Selected
-	selectedFound := false
-	for _, workflow := range v.Workflows {
-		if workflow.ID == selected {
-			selectedFound = true
-			break
+	if selected != "" {
+		selectedFound := false
+		for _, workflow := range v.Workflows {
+			if workflow.ID == selected {
+				selectedFound = true
+				break
+			}
 		}
-	}
-	if len(v.Workflows) == 0 {
-		selected = ""
-	} else if !selectedFound {
-		selected = v.Workflows[0].ID
+		if !selectedFound {
+			if len(v.Workflows) == 0 {
+				selected = ""
+			} else {
+				selected = v.Workflows[0].ID
+			}
+		}
 	}
 	var projectedActions []Action
 	if v.Lifecycle != nil && selected != "" && v.Lifecycle.Status.Workflow == selected {
 		projectedActions = legalActionsOf(v.LegalActions)
 	}
 	for _, w := range v.Workflows {
+		m.Rows = append(m.Rows, WorkflowRow{
+			Kind: WorkflowRowExisting, ID: w.ID, Name: w.Name, Stage: w.Stage, Runtime: w.Runtime,
+		})
 		item := WorkflowItem{
 			ID: w.ID, Name: w.Name, Stage: w.Stage, Runtime: w.Runtime,
 			Blocked: w.Runtime == model.RuntimeBlocked,
@@ -117,9 +148,6 @@ func MapWorkspace(v app.WorkspaceView) WorkspaceViewModel {
 		if w.ID == selected {
 			m.Selected = item
 		}
-	}
-	if m.Selected.ID == "" && len(m.Workflows) > 0 {
-		m.Selected = m.Workflows[0]
 	}
 	// Lifecycle facts and legal actions are authoritative only for the
 	// normalized selected workflow. A stale projection must not render facts

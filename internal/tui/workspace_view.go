@@ -80,7 +80,7 @@ func renderWideWorkspace(m WorkspaceViewModel, width, height int) string {
 	}
 
 	left := workspacePanelWithHeight("WORKFLOWS", renderWorkflowLines(m), leftWidth, bodyHeight)
-	middle := workspacePanelWithHeight("LIFECYCLE", renderLifecycleLines(m), middleWidth, bodyHeight)
+	middle := workspacePanelWithHeight("WORKSPACE", renderLifecycleLines(m), middleWidth, bodyHeight)
 	right := workspacePanelWithHeight("INSPECTOR", renderInspectorLines(m), rightWidth, bodyHeight)
 	return joinWorkspaceSections(header, joinWorkspaceColumns([]string{left, middle, right}, []int{leftWidth, middleWidth, rightWidth}), footer, width, height)
 }
@@ -173,7 +173,8 @@ func renderMinimalWorkspace(m WorkspaceViewModel, width, height int) string {
 	}
 	lines := []string{
 		workspaceTheme.Brand.Render("CFLOW") + " · " + workflow,
-		stage + " · " + runtime,
+		"WORKFLOWS · " + minimalWorkflowRows(m),
+		"WORKSPACE · " + stage + " · " + runtime,
 		renderWorkspaceFooter(m, "", width),
 	}
 	return boundWorkspaceLines(lines, width, height, true)
@@ -242,30 +243,37 @@ func renderWorkflowLines(m WorkspaceViewModel) []string {
 		workspaceTheme.Muted.Render("PROJECT") + "  " + workspaceValueOr(m.Project.Name, "(unnamed)"),
 		workspaceTheme.Muted.Render("workflows:"),
 	}
-	for _, w := range m.Workflows {
+	for _, row := range m.Rows {
 		marker := "•"
 		lineStyle := workspaceTheme.Muted
-		if w.ID == m.Selected.ID {
+		if (row.Kind == WorkflowRowNew && m.Selected.ID == "") ||
+			(row.Kind == WorkflowRowExisting && row.ID == m.Selected.ID) {
 			marker = "▸"
 			lineStyle = workspaceTheme.Selected
 		}
-		lines = append(lines, lineStyle.Render(marker+" "+workflowLabel(w.Name, w.ID)))
-		lines = append(lines, "  "+strings.ToLower(workspaceValueOr(string(w.Stage), "stage"))+" · "+strings.ToLower(workspaceValueOr(string(w.Runtime), "runtime")))
+		if row.Kind == WorkflowRowNew {
+			lines = append(lines, lineStyle.Render(marker+" "+row.Name))
+			continue
+		}
+		lines = append(lines, lineStyle.Render(marker+" "+workflowLabel(row.Name, row.ID)))
+		lines = append(lines, "  "+strings.ToLower(workspaceValueOr(string(row.Stage), "stage"))+" · "+strings.ToLower(workspaceValueOr(string(row.Runtime), "runtime")))
 	}
 	if len(m.Workflows) == 0 {
-		lines = append(lines, workspaceTheme.Muted.Render("  no workflows yet"))
-	}
-	lines = append(lines, "", workspaceTheme.Muted.Render("LIFECYCLE"))
-	for i, step := range lifecycleSteps {
-		marker := "○"
-		style := workspaceTheme.Muted
-		if m.Lifecycle != nil && lifecycleStepIndex(m.Lifecycle.Stage) == i {
-			marker = "●"
-			style = workspaceTheme.Selected
-		}
-		lines = append(lines, style.Render(marker+" "+step.Label))
+		lines = append(lines, workspaceTheme.Muted.Render("  no existing workflows"))
 	}
 	return lines
+}
+
+func minimalWorkflowRows(m WorkspaceViewModel) string {
+	newMarker := "•"
+	if m.Selected.ID == "" {
+		newMarker = "▸"
+	}
+	label := newMarker + " NEW WORKFLOW"
+	if m.Selected.ID != "" {
+		label += " · ▸ " + workflowLabel(m.Selected.Name, m.Selected.ID)
+	}
+	return label
 }
 
 type lifecycleStep struct {
@@ -300,9 +308,9 @@ func lifecycleStepIndex(stage model.WorkflowStage) int {
 func renderLifecycleLines(m WorkspaceViewModel) []string {
 	if m.Lifecycle == nil {
 		return []string{
-			workspaceTheme.Muted.Render("select a workflow to inspect its lifecycle"),
+			workspaceTheme.Heading.Render("New Workflow"),
 			"",
-			"n create a workflow",
+			workspaceTheme.Muted.Render("Press Enter to open the Create Workspace."),
 		}
 	}
 	lc := m.Lifecycle
@@ -343,8 +351,10 @@ func renderLifecycleLines(m WorkspaceViewModel) []string {
 func renderCompactLines(m WorkspaceViewModel) []string {
 	if m.Lifecycle == nil {
 		return []string{
+			workspaceTheme.Muted.Render("WORKFLOWS · ▸ NEW WORKFLOW"),
+			"",
 			workspaceTheme.Heading.Render("No workflow selected"),
-			workspaceTheme.Muted.Render("Create a workflow with n."),
+			workspaceTheme.Muted.Render("Press Enter to open the Create Workspace."),
 			"",
 			workspaceTheme.Muted.Render("LEGAL ACTIONS"),
 			"none projected",
@@ -352,6 +362,8 @@ func renderCompactLines(m WorkspaceViewModel) []string {
 	}
 	lc := m.Lifecycle
 	lines := []string{
+		workspaceTheme.Muted.Render("WORKFLOWS · • NEW WORKFLOW · ▸ " + workflowLabel(m.Selected.Name, m.Selected.ID)),
+		"",
 		workspaceTheme.Heading.Render(workflowLabel(lc.Name, lc.ID)),
 		"STAGE    " + workspaceValueOr(strings.ToUpper(string(lc.Stage)), "UNKNOWN"),
 		"RUNTIME  " + workspaceValueOr(strings.ToUpper(string(lc.Runtime)), "UNKNOWN"),
@@ -425,26 +437,26 @@ func renderWorkspaceFooter(m WorkspaceViewModel, status string, width int) strin
 		width = 1
 	}
 
-	// Keep the universal quit affordance and projected legal-action hints ahead
-	// of optional context. The footer is one bounded row; status is included
-	// here rather than appended by the root renderer.
-	parts := []string{"q quit"}
-	for _, action := range workspaceActionHints(m.Actions) {
-		if footerPartsWidth(parts, action) <= width {
-			parts = append(parts, action)
-		}
-	}
+	// Home exposes only hierarchical navigation. Runtime legal actions remain
+	// visible in the central Workspace summary and are entered through the
+	// selected workflow's menu, never advertised as direct Home shortcuts.
+	parts := []string{"/ command"}
 	if status != "" {
-		if remaining := width - footerWidth(parts) - 2; remaining >= lipglossWidth("status:") {
+		remaining := width - footerWidth(parts) - 2
+		if remaining < lipglossWidth("status: ") && width >= lipglossWidth("/  status:") {
+			parts = []string{"/"}
+			remaining = width - footerWidth(parts) - 2
+		}
+		if remaining >= lipglossWidth("status:") {
 			parts = append(parts, workspaceTruncateText("status: "+workspaceSingleLine(status), remaining))
 		}
 	}
-	controls := []string{"↑↓ Navigate", "←→ lifecycle", "n create"}
+	controls := []string{"Enter open", "Esc back", "↑↓ navigate"}
 	switch {
-	case width < 24:
+	case width < 20:
 		controls = nil
-	case width < 88:
-		controls = []string{"↑↓ nav", "←→ life", "n new"}
+	case width < 60:
+		controls = []string{"Enter", "Esc", "↑↓"}
 	}
 	for _, control := range controls {
 		if footerPartsWidth(parts, control) <= width {
@@ -452,18 +464,10 @@ func renderWorkspaceFooter(m WorkspaceViewModel, status string, width int) strin
 		}
 	}
 
-	// Health is useful context on a roomy footer, but provider names are
-	// optional presentation detail and must never displace quit, status, or
-	// projected legal actions.
-	health := healthSummary(m.Health)
-	if footerWidth(append([]string{health}, parts...)) <= width {
-		parts = append([]string{health}, parts...)
-	}
-
-	// At widths below the textual quit hint, retain a one-character actionable
+	// At widths below the textual command hint, retain a one-character actionable
 	// affordance instead of allowing optional content to consume the row.
-	if width < lipglossWidth("q quit") {
-		parts = []string{"q"}
+	if width < lipglossWidth("/ command") {
+		parts = []string{"/"}
 	}
 	return workspaceTheme.KeyHint.Render(workspaceTruncateText(strings.Join(parts, "  "), width))
 }
