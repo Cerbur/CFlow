@@ -224,6 +224,9 @@ type Model struct {
 	// (dirty state, fingerprint, and isolation); nil until the read-only
 	// DiscoveryQuery projection loads.
 	createDirty *app.DiscoveryView
+	// commandPalette is the transient global command surface. It is UI-only;
+	// selected commands are translated into the existing typed stop seam.
+	commandPalette CommandPaletteModel
 	// status is the transient status line.
 	status                  string
 	pendingProjectionStatus string
@@ -362,17 +365,18 @@ func newModel(deps Dependencies) Model {
 		modelContext = context.Background()
 	}
 	return Model{
-		deps:         deps,
-		ctx:          modelContext,
-		page:         PageWorkspace,
-		navigation:   NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}}},
-		commandState: new(commandState),
-		trace:        newOperationLogger(deps.OperationLog),
-		discussion:   DiscussionPage{},
-		approval:     ApprovalModel{},
-		execution:    ExecutionModel{},
-		terminal:     NewTerminalModel(),
-		sink:         foreground.NewEventSink(),
+		deps:           deps,
+		ctx:            modelContext,
+		page:           PageWorkspace,
+		navigation:     NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}}},
+		commandState:   new(commandState),
+		trace:          newOperationLogger(deps.OperationLog),
+		discussion:     DiscussionPage{},
+		approval:       ApprovalModel{},
+		execution:      ExecutionModel{},
+		terminal:       NewTerminalModel(),
+		sink:           foreground.NewEventSink(),
+		commandPalette: NewCommandPalette(),
 	}
 }
 
@@ -1356,6 +1360,26 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m.quit()
 		}
 	}
+	// An open palette owns every ordinary key. The only exception is Ctrl+C,
+	// which remains the process-wide controlled-stop signal above.
+	if m.commandPalette.Open {
+		var event CommandPaletteEvent
+		m.commandPalette, event = m.commandPalette.Update(msg)
+		switch event {
+		case CommandPaletteExit:
+			return m.handleGlobalExit()
+		case CommandPaletteClose, CommandPaletteNone:
+			return m, nil
+		}
+	}
+	// Slash is global only when the current page does not own text input. It
+	// is consumed here so no page handler sees the opener a second time.
+	if IsSlash(msg) && !m.typingText() {
+		m.commandPalette = NewCommandPalette()
+		m.commandPalette.Open = true
+		m.commandPalette.Input = "/"
+		return m, nil
+	}
 	if m.commandInFlight() && !m.typingText() &&
 		!(m.page == PagePlanApproval &&
 			(msg.Code == 'k' || msg.Code == 'K') &&
@@ -1438,6 +1462,18 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleTerminalKey(msg)
 	}
 	return m, nil
+}
+
+// handleGlobalExit translates the sole global command into either immediate
+// TUI exit or the existing controlled Pause-and-Exit preview.
+func (m Model) handleGlobalExit() (Model, tea.Cmd) {
+	if m.running {
+		m.prevPage = m.page
+		m.page = PagePauseExit
+		m.stop = stopIdle
+		return m, nil
+	}
+	return m, tea.Quit
 }
 
 // typingText reports whether the active page is a text input.
@@ -1628,7 +1664,7 @@ func (m Model) executeCmdWithOperation(ctx context.Context, cmd app.Command, ope
 // handlePauseExitKey handles the Pause and Exit confirmation.
 func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
-	case msg.Code == 'y' || msg.Code == 'Y':
+	case IsEnter(msg):
 		m.stop = stopPauseAndExit
 		if m.runCancel != nil {
 			m.runCancel()
@@ -1640,7 +1676,7 @@ func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 		m.forceStop()
 		return m.quit()
-	case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
+	case msg.Code == tea.KeyEsc:
 		m.stop = stopIdle
 		m.page = m.prevPage
 		return m, nil
@@ -2512,10 +2548,18 @@ func (m Model) View() tea.View {
 // render is the pure screen renderer of the root model.
 func render(m Model) string {
 	if m.err != nil {
-		return fmt.Sprintf("cflow: %v\n\nuse /exit to exit", m.err)
+		base := fmt.Sprintf("cflow: %v\n\nuse /exit to exit", m.err)
+		if m.commandPalette.Open {
+			return overlayCommandPalette(base, RenderCommandPalette(m.commandPalette, m.width, m.height), m.width, m.height)
+		}
+		return base
 	}
 	if !m.ready {
-		return "cflow\n\nuse /exit to exit"
+		base := "cflow\n\nuse /exit to exit"
+		if m.commandPalette.Open {
+			return overlayCommandPalette(base, RenderCommandPalette(m.commandPalette, m.width, m.height), m.width, m.height)
+		}
+		return base
 	}
 	var b strings.Builder
 	switch m.page {
@@ -2559,7 +2603,7 @@ func render(m Model) string {
 		b.WriteString(renderCancel(m))
 		b.WriteString(m.hints())
 	case PagePauseExit:
-		b.WriteString(RenderPauseExit())
+		b.WriteString(renderPauseExit())
 	case PageMigration:
 		b.WriteString(renderMigration(m))
 		b.WriteString(m.hints())
@@ -2569,7 +2613,11 @@ func render(m Model) string {
 		// non-Workspace pages; this visual refresh is Workspace-only.
 		fmt.Fprintf(&b, "\nstatus: %s\n", m.status)
 	}
-	return b.String()
+	base := b.String()
+	if m.commandPalette.Open {
+		return overlayCommandPalette(base, RenderCommandPalette(m.commandPalette, m.width, m.height), m.width, m.height)
+	}
+	return base
 }
 
 // overlayWorkspaceStatus keeps transient command feedback in the Workspace's
@@ -2597,9 +2645,9 @@ func (m Model) hints() string {
 	case PageDiscussion:
 		return "\n↑/↓ action  Enter run  b workspace\n"
 	case PagePlanApproval:
-		return "\ng generate plan  k check plan  Enter/y confirm  /exit exit\n"
+		return "\ng generate plan  k check plan  Enter confirm  Esc back  / command\n"
 	case PageExecutionApproval:
-		return "\ns generate specs  w compile workflow  d dry run  Enter/y confirm  /exit exit\n"
+		return "\ns generate specs  w compile workflow  d dry run  Enter confirm  Esc back  / command\n"
 	case PageExecution:
 		// The hint is driven by the Runtime LegalActions: "r resume & run"
 		// only while the Runtime permits Resume (a PAUSED workflow); once the
@@ -2613,11 +2661,11 @@ func (m Model) hints() string {
 	case PageBlocked:
 		return blockedHints(m.workspace)
 	case PageTerminal:
-		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter/y confirm  /exit exit\n"
+		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter confirm  Esc back  / command\n"
 	case PageCreate:
 		return createHints(m)
 	case PageCancel:
-		return "\nEnter/y cancel (default no), n/esc back\n"
+		return "\nEnter confirm, Esc back\n"
 	case PagePauseExit:
 		return ""
 	case PageMigration:
@@ -2642,6 +2690,10 @@ func createHints(m Model) string {
 		return "\nEnter create, esc back to edit\n"
 	}
 	return "\ntype the workflow name; Enter review, esc cancel\n"
+}
+
+func renderPauseExit() string {
+	return "a workflow is running.\nPause and Exit? Enter confirm, Esc back (controlled stop waits for the runner to join; Ctrl+C remains available)\n"
 }
 
 func renderMigration(m Model) string {

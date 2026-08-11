@@ -449,12 +449,12 @@ func renderWorkspaceFooter(m WorkspaceViewModel, status string, width int) strin
 			parts = append(parts, workspaceTruncateText("status: "+workspaceSingleLine(status), remaining))
 		}
 	}
-	controls := []string{"Enter open", "Esc back", "↑↓ navigate"}
+	controls := []string{"Enter open", "Esc back", "↑↓ navigate", "Ctrl+C stop"}
 	switch {
 	case width < 20:
 		controls = nil
 	case width < 60:
-		controls = []string{"Enter", "Esc", "↑↓"}
+		controls = []string{"Enter", "Esc", "↑↓", "Ctrl+C"}
 	}
 	for _, control := range controls {
 		if footerPartsWidth(parts, control) <= width {

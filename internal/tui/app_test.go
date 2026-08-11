@@ -2469,6 +2469,119 @@ func TestModelQIsOrdinaryInput(t *testing.T) {
 	}
 }
 
+func TestSlashOpensOnlyOutsideTextInput(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageWorkspace
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	if !m.commandPalette.Open {
+		t.Fatal("slash did not open Command Palette")
+	}
+
+	m.page = PageCreate
+	m.commandPalette = NewCommandPalette()
+	m.createConfirm = false
+	m.createInput = ""
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	if m.commandPalette.Open || !strings.Contains(m.createInput, "/") {
+		t.Fatalf("slash was not literal in text input: palette=%+v input=%q", m.commandPalette, m.createInput)
+	}
+}
+
+func TestCommandPaletteEscRestoresPriorPageAndSelection(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageWorkflowMenu
+	m.selected = "wf-1"
+	m.workflowMenuIndex = 2
+	m.workflowMenuModel.Selected = 2
+	m.navigation = NavigationStack{Frames: []NavigationFrame{
+		{Layer: LayerHome, Page: PageWorkspace},
+		{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+	}}
+
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyDown})
+	if m.page != PageWorkflowMenu || m.workflowMenuIndex != 2 || m.workflowMenuModel.Selected != 2 {
+		t.Fatalf("palette key leaked into prior page: page=%v index=%d selected=%d", m.page, m.workflowMenuIndex, m.workflowMenuModel.Selected)
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
+	if m.commandPalette.Open || m.page != PageWorkflowMenu || m.selected != "wf-1" || m.workflowMenuIndex != 2 || m.workflowMenuModel.Selected != 2 {
+		t.Fatalf("palette Esc did not restore state: page=%v selected=%q index=%d menu=%d open=%v", m.page, m.selected, m.workflowMenuIndex, m.workflowMenuModel.Selected, m.commandPalette.Open)
+	}
+}
+
+func TestIdleExitCommandQuitsTUI(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageWorkflowMenu
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	got := updated.(Model)
+	if cmd == nil {
+		t.Fatal("idle /exit Enter did not return tea.Quit")
+	}
+	if got.commandPalette.Open {
+		t.Fatal("idle /exit left the command palette open")
+	}
+}
+
+func TestRunningExitWaitsForRunnerDoneAfterControlledPause(t *testing.T) {
+	ctrl := &recordingController{ctrl: &migrationController{}}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.page = PageExecution
+	m.prevPage = PageExecution
+	m.selected = "wf-1"
+	m.runnerWorkflow = "wf-1"
+	m.running = true
+	cancelled := false
+	m.runCancel = func() { cancelled = true }
+
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd != nil || m.page != PagePauseExit || m.prevPage != PageExecution || !m.running {
+		t.Fatalf("running /exit did not open pause preview: page=%v prev=%v running=%v cmd=%v", m.page, m.prevPage, m.running, cmd != nil)
+	}
+
+	updated, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd == nil || m.stop != stopPauseAndExit || !m.pauseCommandPending || !cancelled {
+		t.Fatalf("pause preview Enter did not request controlled stop: stop=%v pending=%v cancelled=%v cmd=%v", m.stop, m.pauseCommandPending, cancelled, cmd != nil)
+	}
+
+	updated, quit := m.Update(runnerDoneMsg{res: foreground.Result{Reason: foreground.StopCancelled}})
+	m = updated.(Model)
+	if quit != nil {
+		t.Fatal("runnerDoneMsg quit before PauseWorkflowCommand acknowledgement")
+	}
+	if m.running {
+		t.Fatal("runnerDoneMsg left runner active")
+	}
+	updated, quit = m.applyCommand(commandDoneMsg{
+		cmd:        app.PauseWorkflowCommand{Workflow: "wf-1"},
+		generation: m.commandState.pending,
+	})
+	if quit == nil {
+		t.Fatal("PauseWorkflowCommand acknowledgement did not quit after runner join")
+	}
+}
+
+func TestRunningExitPreviewUsesOnlyEnter(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PagePauseExit
+	m.prevPage = PageExecution
+	m.running = true
+	m.runnerWorkflow = "wf-1"
+	m.runCancel = func() {}
+
+	for _, key := range []rune{'q', 'y', 'n'} {
+		updated, cmd := m.Update(tea.KeyPressMsg{Code: key, Text: string(key)})
+		got := updated.(Model)
+		if cmd != nil || got.page != PagePauseExit || got.stop != stopIdle || !got.running {
+			t.Fatalf("%q acted as an exit confirmation: page=%v stop=%v running=%v cmd=%v", key, got.page, got.stop, got.running, cmd != nil)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task 6: Foreground Runner ownership
 // ---------------------------------------------------------------------------

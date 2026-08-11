@@ -32,6 +32,13 @@ func IsCtrlC(msg tea.KeyMsg) bool {
 	return false
 }
 
+// IsSlash reports the global command-palette opener. Text-input pages must
+// check their ownership before calling this helper.
+func IsSlash(msg tea.KeyMsg) bool {
+	p, ok := msg.(tea.KeyPressMsg)
+	return ok && (p.Text == "/" || p.Key().Code == '/')
+}
+
 // IsEnter reports whether a key press is Enter.
 func IsEnter(msg tea.KeyMsg) bool {
 	if p, ok := msg.(tea.KeyPressMsg); ok {
