@@ -359,9 +359,11 @@ func renderCompactLines(m WorkspaceViewModel) []string {
 		"STAGE    " + workspaceValueOr(strings.ToUpper(string(lc.Stage)), "UNKNOWN"),
 		"RUNTIME  " + workspaceValueOr(strings.ToUpper(string(lc.Runtime)), "UNKNOWN"),
 		workspaceTheme.Muted.Render("LIFECYCLE  " + compactProgress(lc.Stage)),
-		"",
-		workspaceTheme.Muted.Render("LEGAL ACTIONS"),
 	}
+	if lc.Blocked {
+		lines = append(lines, workspaceTheme.Attention.Render("! blocked · inspect findings"))
+	}
+	lines = append(lines, "", workspaceTheme.Muted.Render("LEGAL ACTIONS"))
 	if len(m.Actions) == 0 {
 		lines = append(lines, "none projected")
 	} else {

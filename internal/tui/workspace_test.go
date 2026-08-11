@@ -100,6 +100,17 @@ func TestRenderWorkspaceResponsiveBoundsAndStructure(t *testing.T) {
 	}
 }
 
+func TestRenderWorkspaceCompactPreservesBlockedFact(t *testing.T) {
+	m := sampleWorkspaceViewModel()
+	m.Lifecycle.Blocked = true
+	m.Lifecycle.Runtime = model.RuntimeRunning
+
+	got := RenderWorkspace(m, 80, 24)
+	if !strings.Contains(got, "blocked · inspect findings") {
+		t.Fatalf("compact render hides authoritative blocked fact:\n%s", got)
+	}
+}
+
 func TestRenderWorkspaceUsesAuthoritativeStageForLifecycleProgress(t *testing.T) {
 	m := longWorkspaceViewModel()
 	wide := RenderWorkspace(m, 120, 30)

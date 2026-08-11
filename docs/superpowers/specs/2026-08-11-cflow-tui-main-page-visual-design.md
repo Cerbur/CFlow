@@ -43,6 +43,11 @@ scope: TUI main workspace visual refresh
 
 现有 `WorkspaceModel` 语义上收敛为 `WorkspaceViewModel`。`MapWorkspace` 保持为纯函数，只把单次权威 `app.WorkspaceView` 映射为渲染所需数据：Project、Workflow 列表、当前选择、Lifecycle、Health 和 Runtime Legal Actions。
 
+### Workspace stale-selection recovery
+
+Workspace 的只读投影可能在两次刷新之间遇到已删除或已迁移的当前选择。此时根 Model 可以在 `PageWorkspace` 查询路径中，仅针对明确的“workflow 不存在”错误，以无选择的聚合 Workspace 查询重新获取投影；`MapWorkspace` 再把选择规范化为投影中的第一项（或空选择）。该恢复只修复 TUI 的陈旧选择，不执行 Command、不改变 Runtime/最终状态，也不扩展 `WorkspaceView` 的权威事实来源。
+
+
 ViewModel 不查询 Application、不执行 Command、不读 Git/SQLite/Provider，也不从状态字符串重新推导状态机。是否重命名导出类型由实现时根据兼容成本决定，但文件和职责边界必须清晰。
 
 ### View

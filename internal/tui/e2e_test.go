@@ -21,11 +21,16 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	xansi "github.com/charmbracelet/x/ansi"
 
 	"cflow.local/cflow/internal/app"
+	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/cli"
+	"cflow.local/cflow/internal/layout"
 	"cflow.local/cflow/internal/model"
 	"cflow.local/cflow/internal/observe"
+	"cflow.local/cflow/internal/platform"
+	"cflow.local/cflow/internal/security"
 )
 
 // syncBuffer is the thread-safe screen capture: the renderer writes
@@ -48,6 +53,23 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// visibleTerminalText removes terminal control sequences from the diff
+// renderer's append-only capture so semantic markers remain contiguous.
+func visibleTerminalText(s string) string {
+	return xansi.Strip(s)
+}
+
+func TestVisibleTerminalTextStripsInterleavedControlSequences(t *testing.T) {
+	got := visibleTerminalText("APPRO\x1b[2CE\x1b[0mD")
+	if got != "APPROED" {
+		t.Fatalf("visible terminal text = %q, want %q", got, "APPROED")
+	}
+	got = visibleTerminalText("APPROV\x1b[1;1HE\x1b[0mD")
+	if got != "APPROVED" {
+		t.Fatalf("interleaved control sequence was not removed: %q", got)
+	}
 }
 
 // fakeTerminal keys: plain text is written verbatim; enter is CR; tab is
@@ -98,11 +120,13 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		runDone <- err
 	}()
 
-	// waitOutput blocks until the rendered screen contains the marker.
+	// waitOutput blocks until the rendered screen contains the marker. The
+	// Bubble Tea diff renderer may place cursor/style control sequences between
+	// characters, so predicates always inspect the ANSI-stripped stream.
 	waitOutput := func(marker string) {
 		t.Helper()
 		deadline := time.Now().Add(120 * time.Second)
-		for !strings.Contains(screen.String(), marker) {
+		for !strings.Contains(visibleTerminalText(screen.String()), marker) {
 			if time.Now().After(deadline) {
 				t.Fatalf("timeout waiting for screen %q\n--- screen ---\n%s", marker, screen.String())
 			}
@@ -120,14 +144,14 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	// waitBuffer blocks until the screen buffer satisfies the predicate.
-	// The Bubble Tea diff renderer writes changed content verbatim, so
-	// the predicates target final-frame content that is never
-	// overwritten (new pages, loaded projections, changed values).
+	// waitBuffer blocks until the visible screen buffer satisfies the
+	// predicate. The Bubble Tea diff renderer writes cursor/style control
+	// sequences between changed fragments; stripping them makes semantic
+	// markers stable without changing the production renderer.
 	waitBuffer := func(label string, pred func(string) bool) {
 		t.Helper()
 		deadline := time.Now().Add(120 * time.Second)
-		for !pred(screen.String()) {
+		for !pred(visibleTerminalText(screen.String())) {
 			if time.Now().After(deadline) {
 				t.Fatalf("timeout waiting for screen %q\n--- screen ---\n%s", label, screen.String())
 			}
@@ -138,6 +162,26 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		if _, err := termOut.Write([]byte(s)); err != nil {
 			t.Fatalf("write keys: %v", err)
 		}
+	}
+	// The TUI deliberately runs each Application command in a background
+	// Bubble Tea command. A committed fact can be queryable slightly before
+	// that command releases the project-writer lock, so lifecycle steps use
+	// the real advisory lock as a test-only completion barrier rather than
+	// retrying mutating keys or relying on transient status text.
+	locks, err := platform.OpenLockSet(filepath.Join(fx.home, "locks"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectKey := app.ProjectFor(fx.root).Key
+	waitProjectWriterIdle := func(label string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		hold, err := locks.ProjectWriter(ctx, projectKey)
+		if err != nil {
+			t.Fatalf("waiting for %s: %v", label, err)
+		}
+		hold.Release()
 	}
 
 	// The initial workspace: the read-only load rendered the project.
@@ -153,6 +197,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("will not touch your files")
 	keys(keyEnter) // Enter only submits the name for the confirmation
 	keys("y")      // only an explicit y creates (the clean target carries no dirty flag)
+	waitProjectWriterIdle("workflow creation")
 	// The TUI processed the create (the workspace renders the workflow
 	// with the status line).
 	waitOutput("workflow created")
@@ -168,6 +213,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyEnter) // freeze the change set → handoff editor
 	waitOutput("optional handoff guidance (JSON)")
 	keys(keyEnter) // finish the discussion
+	waitProjectWriterIdle("discussion finish")
 	waitApp("discussion finished", func() bool {
 		return sessionCompleted(t, ref.a, wf)
 	})
@@ -176,9 +222,11 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyTab) // → plan approval
 	waitOutput("plan approval")
 	keys("g") // generate the plan
+	waitProjectWriterIdle("plan generation")
 	waitApp("plan generated", func() bool { return planRevision(t, ref.a, wf) >= 1 })
 	waitBuffer("plan hash rendered", func(s string) bool { return hexHash(s, "hash:") })
 	keys("k") // independent check
+	waitProjectWriterIdle("plan check")
 	waitApp("plan checked", func() bool {
 		return planStatus(t, ref.a, wf) == model.PlanChecked
 	})
@@ -190,6 +238,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		return strings.Contains(s, "CHECKED")
 	})
 	keys("y") // approve (explicit confirmation)
+	waitProjectWriterIdle("plan approval")
 	waitApp("plan approved", func() bool { return planStatus(t, ref.a, wf) == model.PlanApproved })
 	waitBuffer("plan approval rendered", func(s string) bool {
 		return strings.Contains(s, "APPROVED")
@@ -199,66 +248,60 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyTab) // → execution approval
 	waitOutput("execution approval")
 	keys("s") // generate the specs
+	waitProjectWriterIdle("spec generation")
 	waitApp("spec session completed", func() bool {
 		return sessionCompletedForPurpose(t, ref.a, wf, model.PurposeSpecGeneration)
 	})
 	waitApp("specs generated", func() bool { return workflowStage(t, ref.a, wf) == model.StageWorkflowGeneration })
-	// The authoritative spec facts can settle before Bubble Tea handles
-	// commandDoneMsg. Retry the bounded compile command until its own
-	// authoritative workflow hash is committed; this keeps the test from
-	// depending on the renderer's diff fragments as a command completion ack.
-	compileDeadline := time.Now().Add(120 * time.Second)
-	for {
-		keys("w") // compile the workflow
-		compiled := false
-		sub := time.Now().Add(5 * time.Second)
-		for !compiled && time.Now().Before(sub) {
-			compiled = executionPreview(t, ref.a, wf).WorkflowHash != ""
-			if !compiled {
-				time.Sleep(50 * time.Millisecond)
-			}
+	waitApp("spec artifacts ready", func() bool {
+		resolver := layout.Resolver{Home: fx.home, ProjectKey: app.ProjectFor(fx.root).Key}
+		store, err := artifact.NewWorkflow(resolver.WorkflowRoot(wf), wf, security.Registry{})
+		if err != nil {
+			return false
 		}
-		if compiled {
-			break
+		if _, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactSpec}); err != nil {
+			return false
 		}
-		if time.Now().After(compileDeadline) {
-			t.Fatalf("workflow compilation never completed\n--- screen ---\n%s", screen.String())
-		}
-	}
-	// The dry run requires the compiled workflow: wait until the
-	// workflow hash is recorded in the execution facts (the partial
-	// preview query succeeds once the compile committed) before pressing
-	// 'd' — a too-early dry run would fail and burn its preflight
-	// artifact revision.
+		_, err = store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
+		return err == nil
+	})
+	// The lock barrier above proves the command goroutine has returned before
+	// the next mutating key is sent; no retry is needed.
+	// The execution preview is intentionally incomplete until compilation has
+	// run, so the approval page is rendered as "no preview yet" here. Its
+	// compile action is still the deterministic TUI synchronization point; wait
+	// for that action before issuing the single mutating compile command.
+	waitBuffer("compile action rendered", func(s string) bool {
+		return strings.Contains(s, "w compile workflow")
+	})
+	keys("w") // compile the workflow
+	// The key is mutating, so wait for the page's command acknowledgement
+	// before using the project-writer lock as the completion barrier.
+	waitOutput("compiling the workflow…")
+	waitProjectWriterIdle("workflow compilation")
 	waitApp("workflow compiled", func() bool {
 		return executionPreview(t, ref.a, wf).WorkflowHash != ""
 	})
+	// The dry run requires the compiled workflow. The authoritative wait above
+	// is followed by the single mutating dry-run command.
 	keys("d") // execution dry run
+	waitProjectWriterIdle("execution dry run")
 	waitApp("dry run ready", func() bool {
 		return executionPreview(t, ref.a, wf).CommitPolicyHash != ""
 	})
-	// The Approval binds the exact displayed hashes; pressing 'y'
-	// before the reloaded preview rendered is refused harmlessly, so
-	// retry until the workflow opens into execution.
-	deadline := time.Now().Add(120 * time.Second)
-	for {
-		keys("y") // approve the execution (binds the frozen change set)
-		ready := false
-		sub := time.Now().Add(5 * time.Second)
-		for !ready && time.Now().Before(sub) {
-			st := statusOf(t, ref.a, wf)
-			ready = st.Runtime == model.RuntimeRunning && st.Stage == model.StageExecution
-			if !ready {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		if ready {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the execution approval never opened dispatch\n--- screen ---\n%s", screen.String())
-		}
-	}
+	// Wait for the refreshed approval page before sending the mutating
+	// confirmation. The commit-policy line is absent from the pre-dry-run
+	// page, so this cannot be satisfied by an earlier stale frame.
+	preview := executionPreview(t, ref.a, wf)
+	waitBuffer("execution preview rendered", func(s string) bool {
+		// The append-only diff-renderer capture cannot associate a changed
+		// value with its original line after cursor movement. The commit
+		// policy hash is absent before dry-run, so its rendered short hash is
+		// an unambiguous post-dry-run projection marker.
+		return strings.Contains(s, preview.CommitPolicyHash[:12])
+	})
+	keys("y") // approve the execution (binds the frozen change set)
+	waitProjectWriterIdle("execution approval")
 	waitApp("execution approved", func() bool {
 		return workflowRuntime(t, ref.a, wf) == model.RuntimeRunning &&
 			workflowStage(t, ref.a, wf) == model.StageExecution
@@ -282,26 +325,11 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitBuffer("decision panel rendered", func(s string) bool {
 		return strings.Contains(s, "decision required:")
 	})
-	// The adoption needs the decision panel state; pressing 'a' early
-	// is a no-op, so retry until the workspace is adopted.
-	adoptDeadline := time.Now().Add(120 * time.Second)
-	for {
-		keys("a") // adopt the workspace
-		ready := false
-		sub := time.Now().Add(5 * time.Second)
-		for !ready && time.Now().Before(sub) {
-			ready = workspaceAdopted(t, ref.a, wf)
-			if !ready {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		if ready {
-			break
-		}
-		if time.Now().After(adoptDeadline) {
-			t.Fatalf("the workspace adoption never completed\n--- screen ---\n%s", screen.String())
-		}
-	}
+	// The decision panel is rendered before the single mutating adoption
+	// command, avoiding duplicate adoption requests.
+	keys("a") // adopt the workspace
+	waitProjectWriterIdle("workspace adoption")
+	waitApp("workspace adopted", func() bool { return workspaceAdopted(t, ref.a, wf) })
 	keys("r") // run again
 	waitApp("workflow completed", func() bool { return workflowStage(t, ref.a, wf) == model.StageCompleted })
 
