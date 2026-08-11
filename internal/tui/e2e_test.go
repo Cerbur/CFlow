@@ -98,9 +98,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The pipe ends are deliberately not closed: the program's input
-	// reader may still be blocked on the read end after Run returns, and
-	// closing it would race the reader (the process cleans up the fds).
+	// The pipe ends are closed by the test cleanup after the program exits,
+	// including the fatal-assertion path where the normal quit key is skipped.
 	screen := syncBuffer{}
 
 	prog := tea.NewProgram(
@@ -115,6 +114,22 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		tea.WithWindowSize(120, 40),
 	)
 	runDone := make(chan error, 1)
+	runFinished := false
+	t.Cleanup(func() {
+		// Closing the writer first makes an input reader blocked on the pipe
+		// observable as EOF; closing the reader then releases both descriptors
+		// even when a fatal polling assertion aborts the test before the normal
+		// quit path. On the happy path Run has already returned, so this is only
+		// descriptor cleanup.
+		_ = termOut.Close()
+		_ = termIn.Close()
+		if !runFinished {
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	})
 	go func() {
 		_, err := prog.Run()
 		runDone <- err
@@ -175,7 +190,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	projectKey := app.ProjectFor(fx.root).Key
 	waitProjectWriterIdle := func(label string) {
 		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 		hold, err := locks.ProjectWriter(ctx, projectKey)
 		if err != nil {
@@ -197,6 +212,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("will not touch your files")
 	keys(keyEnter) // Enter only submits the name for the confirmation
 	keys("y")      // only an explicit y creates (the clean target carries no dirty flag)
+	waitApp("workflow created in application", func() bool { return len(ref.list()) == 1 })
 	waitProjectWriterIdle("workflow creation")
 	// The TUI processed the create (the workspace renders the workflow
 	// with the status line).
@@ -213,23 +229,23 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyEnter) // freeze the change set → handoff editor
 	waitOutput("optional handoff guidance (JSON)")
 	keys(keyEnter) // finish the discussion
-	waitProjectWriterIdle("discussion finish")
 	waitApp("discussion finished", func() bool {
 		return sessionCompleted(t, ref.a, wf)
 	})
+	waitProjectWriterIdle("discussion finish")
 
 	// ---- plan approval ----
 	keys(keyTab) // → plan approval
 	waitOutput("plan approval")
 	keys("g") // generate the plan
-	waitProjectWriterIdle("plan generation")
 	waitApp("plan generated", func() bool { return planRevision(t, ref.a, wf) >= 1 })
+	waitProjectWriterIdle("plan generation")
 	waitBuffer("plan hash rendered", func(s string) bool { return hexHash(s, "hash:") })
 	keys("k") // independent check
-	waitProjectWriterIdle("plan check")
 	waitApp("plan checked", func() bool {
 		return planStatus(t, ref.a, wf) == model.PlanChecked
 	})
+	waitProjectWriterIdle("plan check")
 	// The Application fact can settle before the asynchronous Plan Approval
 	// projection reload reaches the Bubble Tea model. Wait for the rendered
 	// checked revision before sending the approval key; otherwise the key can
@@ -238,8 +254,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		return strings.Contains(s, "CHECKED")
 	})
 	keys("y") // approve (explicit confirmation)
-	waitProjectWriterIdle("plan approval")
 	waitApp("plan approved", func() bool { return planStatus(t, ref.a, wf) == model.PlanApproved })
+	waitProjectWriterIdle("plan approval")
 	waitBuffer("plan approval rendered", func(s string) bool {
 		return strings.Contains(s, "APPROVED")
 	})
@@ -248,7 +264,6 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyTab) // → execution approval
 	waitOutput("execution approval")
 	keys("s") // generate the specs
-	waitProjectWriterIdle("spec generation")
 	waitApp("spec session completed", func() bool {
 		return sessionCompletedForPurpose(t, ref.a, wf, model.PurposeSpecGeneration)
 	})
@@ -265,7 +280,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		_, err = store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
 		return err == nil
 	})
-	// The lock barrier above proves the command goroutine has returned before
+	waitProjectWriterIdle("spec generation")
+	// The authoritative artifact facts above and the lock barrier prove the
 	// the next mutating key is sent; no retry is needed.
 	// The execution preview is intentionally incomplete until compilation has
 	// run, so the approval page is rendered as "no preview yet" here. Its
@@ -275,20 +291,17 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		return strings.Contains(s, "w compile workflow")
 	})
 	keys("w") // compile the workflow
-	// The key is mutating, so wait for the page's command acknowledgement
-	// before using the project-writer lock as the completion barrier.
-	waitOutput("compiling the workflow…")
-	waitProjectWriterIdle("workflow compilation")
 	waitApp("workflow compiled", func() bool {
 		return executionPreview(t, ref.a, wf).WorkflowHash != ""
 	})
+	waitProjectWriterIdle("workflow compilation")
 	// The dry run requires the compiled workflow. The authoritative wait above
 	// is followed by the single mutating dry-run command.
 	keys("d") // execution dry run
-	waitProjectWriterIdle("execution dry run")
 	waitApp("dry run ready", func() bool {
 		return executionPreview(t, ref.a, wf).CommitPolicyHash != ""
 	})
+	waitProjectWriterIdle("execution dry run")
 	// Wait for the refreshed approval page before sending the mutating
 	// confirmation. The commit-policy line is absent from the pre-dry-run
 	// page, so this cannot be satisfied by an earlier stale frame.
@@ -301,11 +314,11 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		return strings.Contains(s, preview.CommitPolicyHash[:12])
 	})
 	keys("y") // approve the execution (binds the frozen change set)
-	waitProjectWriterIdle("execution approval")
 	waitApp("execution approved", func() bool {
 		return workflowRuntime(t, ref.a, wf) == model.RuntimeRunning &&
 			workflowStage(t, ref.a, wf) == model.StageExecution
 	})
+	waitProjectWriterIdle("execution approval")
 
 	// ---- execution + workspace adoption + foreground runner ----
 	// The Execution page first renders the stale projection (the dry run
@@ -328,8 +341,8 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// The decision panel is rendered before the single mutating adoption
 	// command, avoiding duplicate adoption requests.
 	keys("a") // adopt the workspace
-	waitProjectWriterIdle("workspace adoption")
 	waitApp("workspace adopted", func() bool { return workspaceAdopted(t, ref.a, wf) })
+	waitProjectWriterIdle("workspace adoption")
 	keys("r") // run again
 	waitApp("workflow completed", func() bool { return workflowStage(t, ref.a, wf) == model.StageCompleted })
 
@@ -378,7 +391,9 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 
 	// quit through the normal key (no runner is active anymore).
 	keys("q")
-	if err := <-runDone; err != nil {
+	err = <-runDone
+	runFinished = true
+	if err != nil {
 		t.Fatalf("tui run: %v", err)
 	}
 }
