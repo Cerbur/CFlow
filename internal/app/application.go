@@ -268,6 +268,8 @@ func (a *Application) Query(ctx context.Context, q Query) (View, error) {
 		return a.queryReplacementPreview(ctx, qq)
 	case ReportQuery:
 		return a.queryReport(ctx, qq)
+	case WorkflowMenuQuery:
+		return a.queryWorkflowMenu(ctx, qq)
 	case LayoutMigrationPreviewQuery:
 		return a.queryMigrationPreview(ctx, qq)
 	case ProjectWorkspaceQuery:

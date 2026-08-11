@@ -147,6 +147,13 @@ type ReportQuery struct {
 	Build    observe.BuildInfo
 }
 
+// WorkflowMenuQuery projects the typed, authoritative menu for exactly
+// one Workflow. Unlike project-level queries, an empty Workflow is invalid:
+// the TUI must bind menu actions to the Workflow the user selected.
+type WorkflowMenuQuery struct {
+	Workflow model.WorkflowID
+}
+
 func (ListQuery) isQuery()               {}
 func (StatusQuery) isQuery()             {}
 func (InspectQuery) isQuery()            {}
@@ -158,6 +165,7 @@ func (PolicyConfirmationQuery) isQuery() {}
 func (CancelSummaryQuery) isQuery()      {}
 func (ReplacementPreviewQuery) isQuery() {}
 func (ReportQuery) isQuery()             {}
+func (WorkflowMenuQuery) isQuery()       {}
 
 // ---------------------------------------------------------------------------
 // View union: projection results
@@ -199,6 +207,81 @@ type WorkspaceView struct {
 	Lifecycle    *WorkflowLifecycleView
 	Health       HealthView
 	LegalActions []LegalAction
+}
+
+// MenuGroup is the stable Workflow Menu section order.
+type MenuGroup uint8
+
+const (
+	MenuGroupContinue MenuGroup = iota
+	MenuGroupView
+	MenuGroupControl
+)
+
+// MenuEntryKind distinguishes read-only routes from legal mutations.
+type MenuEntryKind uint8
+
+const (
+	MenuEntryReadonly MenuEntryKind = iota
+	MenuEntryAction
+)
+
+// MenuRoute is the closed set of Stage Workspaces a menu entry can open.
+type MenuRoute uint8
+
+const (
+	MenuRouteCurrentStage MenuRoute = iota
+	MenuRoutePlan
+	MenuRouteSpecs
+	MenuRouteCatalog
+	MenuRouteDAG
+	MenuRouteTaskGraph
+	MenuRouteLogs
+	MenuRouteReport
+	MenuRouteDiscussion
+	MenuRouteExecution
+	MenuRouteApply
+	MenuRouteCleanup
+	MenuRouteCancel
+	MenuRouteMigration
+)
+
+// MenuAction is the closed action reference carried by an action entry.
+// It is typed data only; it never contains argv or command text.
+type MenuAction uint8
+
+const (
+	MenuActionNone MenuAction = iota
+	MenuActionStartDiscussion
+	MenuActionContinueDiscussion
+	MenuActionResume
+	MenuActionStartRunner
+	MenuActionPause
+	MenuActionCancel
+	MenuActionApply
+	MenuActionCleanup
+	MenuActionMigrate
+	MenuActionInspectBlocked
+)
+
+// WorkflowMenuEntry is one bounded, typed Workflow Menu route or action.
+type WorkflowMenuEntry struct {
+	ID     string
+	Group  MenuGroup
+	Kind   MenuEntryKind
+	Label  string
+	Route  MenuRoute
+	Action MenuAction
+}
+
+// WorkflowMenuView is the authoritative menu projection for one Workflow.
+type WorkflowMenuView struct {
+	Workflow     model.WorkflowID
+	Name         string
+	Stage        model.WorkflowStage
+	Runtime      model.RuntimeStatus
+	Entries      []WorkflowMenuEntry
+	DefaultIndex int
 }
 
 // ProjectView is the project identity the workspace renders.
@@ -538,6 +621,7 @@ type LogsView struct {
 func (ListView) isView()               {}
 func (StatusView) isView()             {}
 func (WorkspaceView) isView()          {}
+func (WorkflowMenuView) isView()       {}
 func (InspectView) isView()            {}
 func (LogsView) isView()               {}
 func (DiscoveryView) isView()          {}
