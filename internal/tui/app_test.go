@@ -1439,8 +1439,8 @@ func TestModelLoadsRealWorkspaceView(t *testing.T) {
 	}
 }
 
-// TestModelNavigationReachesLifecyclePages: the lifecycle navigation
-// (left/right) reaches every lifecycle page and the render stays pure.
+// TestModelNavigationReachesLifecyclePages: Tab reaches every lifecycle page
+// and the render stays pure; Home left/right are inert.
 func TestModelNavigationReachesLifecyclePages(t *testing.T) {
 	fx := newTUIFixture(t)
 	ref := &appRef{fx: fx}
@@ -1654,6 +1654,27 @@ func TestModelCreateWorkspaceEscPopsNavigationHome(t *testing.T) {
 	}
 	if frame := m.navigation.Current(); frame.Layer != LayerHome || frame.Page != PageWorkspace {
 		t.Fatalf("Create Esc restored wrong Home frame: %+v", frame)
+	}
+}
+
+func TestModelCreatePreviewEscReturnsToEditing(t *testing.T) {
+	ctrl := &createController{dirty: false}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+
+	m = press(t, m, tea.KeyEnter, 0)
+	if m.page != PageCreate || !m.createConfirm || m.createInput != "calculator" {
+		t.Fatalf("Create name Enter = page %v confirm=%v input=%q", m.page, m.createConfirm, m.createInput)
+	}
+
+	m = press(t, m, tea.KeyEsc, 0)
+	if m.page != PageCreate || m.navigation.Current().Layer != LayerCreateWorkspace {
+		t.Fatalf("Create Preview Esc left Create: page=%v frame=%+v", m.page, m.navigation.Current())
+	}
+	if m.createConfirm || m.createInput != "calculator" {
+		t.Fatalf("Create Preview Esc did not restore editing: confirm=%v input=%q", m.createConfirm, m.createInput)
 	}
 }
 

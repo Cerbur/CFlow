@@ -1324,7 +1324,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	// non-typing Esc guard above. It still follows the NavigationStack: Esc
 	// leaves the nested Create frame and restores Home instead of assigning a
 	// page directly.
-	if msg.Code == tea.KeyEsc && m.page == PageCreate && m.navigation.Current().Page == PageCreate {
+	if msg.Code == tea.KeyEsc && !m.createConfirm && m.page == PageCreate && m.navigation.Current().Page == PageCreate {
 		m.createInput = ""
 		m.createConfirm = false
 		m.createDirty = nil

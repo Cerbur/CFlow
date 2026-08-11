@@ -102,3 +102,40 @@ GREEN after the fixes:
 - `go test ./internal/tui -run 'Workspace|Responsive|Layout|HomeRows|Navigation|HomeLeftRight|CreateWorkspaceEsc|ExistingRowHighlight' -count=1`
 
 All three completed successfully. The known old `TestTUIPlanToApplyAndCleanup` E2E was not run, consistent with the Task 4 gate constraint and prior report.
+
+## Fix Round 2
+
+Review feedback identified an Esc-state regression introduced by Fix Round 1: the stack-pop guard treated Create editing and Create Preview/confirmation as the same state.
+
+### Fix
+
+- Create Workspace Esc now branches by state:
+  - Initial empty/typing state (`createConfirm == false`) clears transient Create state, pops `LayerCreateWorkspace`, and restores the Home frame.
+  - Create Preview/confirmation (`createConfirm == true`) remains on `PageCreate`, clears `createConfirm`, and preserves `createInput` for editing. It does not pop the NavigationStack.
+- Refreshed `TestModelNavigationReachesLifecyclePages` to describe Tab-based lifecycle traversal and explicitly note that Home left/right is inert.
+
+### Regression Test
+
+Added `TestModelCreatePreviewEscReturnsToEditing`, covering:
+
+`New Workflow → Create Workspace → type calculator → Enter → Esc`
+
+The RED run was:
+
+```text
+go test ./internal/tui -run 'CreatePreviewEsc|CreateWorkspaceEsc' -count=1
+--- FAIL: TestModelCreatePreviewEscReturnsToEditing
+    Create Preview Esc left Create: page=0 frame={Layer:0 Page:0 ...}
+```
+
+After narrowing the stack-pop guard to `!m.createConfirm`, the same focused command passed. The existing `TestModelCreateWorkspaceEscPopsNavigationHome` also remained green, proving the two Esc paths stay distinct.
+
+### Fix Round 2 Verification
+
+```text
+go test ./internal/tui -run 'HomeLeftRight|CreateWorkspaceEsc|CreatePreviewEsc|ExistingRowHighlight|MapWorkspace|NewWorkflowRow|HomeRows|Workspace|Responsive|Layout|Navigation|CreateDirty|CreateClean|CreateMissingFacts' -count=1 -timeout=60s
+```
+
+Result: PASS (`cflow.local/cflow/internal/tui` 1.591s).
+
+`git diff --check` also passed. No full suite or old E2E was run, and Task 5 was not started.
