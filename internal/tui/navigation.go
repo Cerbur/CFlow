@@ -90,6 +90,17 @@ func (m Model) pushNavigation(frame NavigationFrame) Model {
 	return m
 }
 
+func (m Model) navigationIsNested() bool {
+	frame := m.navigation.Current()
+	return frame.Layer != LayerHome && frame.Page == m.page
+}
+
+func (m Model) resetNavigationHome() Model {
+	m.navigation = NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}}}
+	m.page = PageWorkspace
+	return m
+}
+
 func (m Model) popNavigation() (Model, bool) {
 	stack, ok := m.navigation.Pop()
 	if !ok {
@@ -138,12 +149,6 @@ func navigationFrameForMenuEntry(workflow model.WorkflowID, entry app.WorkflowMe
 		frame.Layer, frame.Page = LayerStageWorkspace, PageDiscussion
 	case app.MenuActionInspectBlocked:
 		frame.Layer, frame.Page = LayerStageWorkspace, PageBlocked
-	case app.MenuActionCancel:
-		frame.Page = PageCancel
-	case app.MenuActionMigrate:
-		frame.Page = PageMigration
-	case app.MenuActionApply, app.MenuActionCleanup:
-		frame.Page = PageTerminal
 	}
 	return frame
 }

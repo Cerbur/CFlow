@@ -1327,6 +1327,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m, _ = m.popNavigation()
 		return m, nil
 	}
+	if m.navigationIsNested() && msg.Code == tea.KeyTab {
+		return m, nil
+	}
 	// Tab cycles the lifecycle pages from any page (left/right keep
 	// their page-local meaning on the Approval/Execution/Terminal
 	// pages).
@@ -1334,10 +1337,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.moveNav(1)
 	}
 	if (msg.Code == 'b' || msg.Code == 'B') && !m.typingText() {
-		if m.page != PageWorkspace {
-			m.page = PageWorkspace
-		}
-		return m, nil
+		return m.resetNavigationHome(), nil
 	}
 	switch m.page {
 	case PagePauseExit:
@@ -1839,6 +1839,9 @@ func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 // target page's read-only projection (navigation is pure UI state
 // change; the projection is a Query, never a mutation).
 func (m Model) moveNav(delta int) (Model, tea.Cmd) {
+	if m.navigationIsNested() {
+		return m, nil
+	}
 	idx := 0
 	for i, p := range navPages {
 		if p == m.page {

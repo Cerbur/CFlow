@@ -431,8 +431,9 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// artifacts, evidence, report, database, and refs.
 	requireCleanupPreservation(t, fx, wf, preserved)
 
-	// quit through the normal key (no runner is active anymore).
-	keys("q")
+	// q is ordinary input. With no runner active, Ctrl+C twice is the
+	// supported controlled shutdown path.
+	keys(keyCtrlC + keyCtrlC)
 	err = <-runDone
 	runFinished = true
 	if err != nil {

@@ -2161,87 +2161,18 @@ func TestModelCtrlCExecutesControlledPause(t *testing.T) {
 	}
 }
 
-// TestModelQShowsPauseAndExit: q on an active Runner shows the Pause and
-// Exit confirmation instead of quitting directly; y pauses through the
-// typed command and quits after the pause completes.
-func TestModelQShowsPauseAndExit(t *testing.T) {
-	fx := newTUIFixture(t)
-	ref := &appRef{fx: fx, scripts: []string{planScript(fx.next("p"))}}
-	ctx := context.Background()
-	a, err := ref.open(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Execute(ctx, app.CreateWorkflowCommand{Name: "calculator", Provider: "fake", ConfirmDirty: true}); err != nil {
-		t.Fatal(err)
-	}
-	// The workflow must be RUNNING for the controlled pause to settle.
-	if _, err := a.Execute(ctx, app.GeneratePlanCommand{Workflow: ref.list()[0], Provider: "fake"}); err != nil {
-		t.Fatal(err)
-	}
-	rec := &recordingController{ctrl: a}
-	m := load(t, testModel(rec))
-	// An active Runner (the Execution page is live).
+// TestModelQIsOrdinaryInput: q does not enter the controlled-stop protocol,
+// even while a Foreground Runner is active. Ctrl+C owns controlled stop.
+func TestModelQIsOrdinaryInput(t *testing.T) {
+	m := newModel(Dependencies{})
 	m.running = true
 	m.page = PageExecution
+	m.selected = "wf-1"
 
-	// q shows the Pause and Exit confirmation; it never quits directly.
-	m2, cmd := m.Update(tea.KeyPressMsg{Code: KeyQuit})
-	if cmd != nil {
-		t.Fatal("q quit directly while a runner is active")
-	}
-	m2m := m2.(Model)
-	if m2m.page != PagePauseExit || m2m.stop != stopPauseAndExit {
-		t.Fatalf("q state = page %d stop %d, want pause-and-exit", m2m.page, m2m.stop)
-	}
-	if got := render(m2m); !strings.Contains(got, "Pause and Exit") {
-		t.Fatalf("pause-exit render = %q", got)
-	}
-
-	// n cancels the exit and returns to the page the user was on (the
-	// runner stays active).
-	m3, cmd := m2m.Update(tea.KeyPressMsg{Code: 'n'})
-	if cmd != nil || m3.(Model).page != PageExecution || m3.(Model).stop != stopIdle || !m3.(Model).running {
-		t.Fatalf("n did not cancel the pause-and-exit: page=%d stop=%d running=%v",
-			m3.(Model).page, m3.(Model).stop, m3.(Model).running)
-	}
-
-	// y pauses through the typed command; the exit completes when the
-	// pause finished.
-	m4, cmd := m2m.Update(tea.KeyPressMsg{Code: 'y'})
-	if cmd == nil {
-		t.Fatal("y produced no pause command")
-	}
-	// The pause command runs (the typed command executes the controlled
-	// pause).
-	msg := cmd()
-	if done, ok := msg.(commandDoneMsg); !ok || done.err != nil {
-		t.Fatalf("the pause command failed: %v", msg)
-	}
-	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
-		t.Fatalf("y did not execute the controlled pause: %v", rec.executed)
-	}
-	// The pause command only arms the exit; the runner completion is the
-	// join point that proves no process or event subscription remains.
-	m5, quitCmd := m4.(Model).Update(msg)
-	if quitCmd != nil {
-		t.Fatal("the pause-and-exit quit before runner completion")
-	}
-	m6, quitCmd := m5.(Model).Update(runnerDoneMsg{res: foreground.Result{Reason: foreground.StopCancelled}})
-	if quitCmd == nil {
-		t.Fatal("the pause-and-exit did not quit after runner completion")
-	}
-	if mm := m6.(Model); mm.running || mm.runCancel != nil || mm.eventCh != nil {
-		t.Fatalf("runner ownership remained after pause-and-exit: running=%v runCancel=%v eventCh=%v", mm.running, mm.runCancel != nil, mm.eventCh != nil)
-	}
-	// The same flow works through the first Ctrl+C path: q after the
-	// first Ctrl+C also shows the confirmation.
-	m7 := m
-	m7.stop = stopFirstCtrlC
-	m7.page = PageExecution
-	_, cmd = m7.Update(tea.KeyPressMsg{Code: KeyQuit})
-	if cmd != nil {
-		t.Fatal("q after the first Ctrl+C quit directly")
+	next, cmd := m.Update(tea.KeyPressMsg{Code: KeyQuit})
+	got := next.(Model)
+	if cmd != nil || got.page != PageExecution || got.stop != stopIdle || !got.running {
+		t.Fatalf("q changed controlled-stop state: page=%v stop=%v running=%v cmd=%v", got.page, got.stop, got.running, cmd != nil)
 	}
 }
 
@@ -2386,59 +2317,6 @@ func TestRunnerRunKeyRefusesDuplicate(t *testing.T) {
 	}
 	if ctrl.driveCalls != 0 {
 		t.Fatalf("duplicate r drove the runner again (drive calls = %d)", ctrl.driveCalls)
-	}
-}
-
-// TestModelPauseAndExitCancelsRunner: y on the Pause and Exit
-// confirmation cancels the REAL Runner (the run context is cancelled) so
-// the runner stops with StopCancelled — a quit never leaves a process.
-func TestModelPauseAndExitCancelsRunner(t *testing.T) {
-	ctrl := &blockingController{wait: make(chan struct{})}
-	rec := &recordingController{ctrl: ctrl}
-	m := load(t, testModel(rec))
-	m.selected = "wf-1"
-	m.page = PageExecution
-
-	m, runCmd := m.startRunner()
-	if !m.running || m.runCancel == nil {
-		t.Fatalf("runner did not start: running=%v runCancel=%v", m.running, m.runCancel == nil)
-	}
-	done := make(chan []tea.Msg, 1)
-	go func() {
-		done <- runBatchMessages(runCmd)
-	}()
-
-	// q shows the Pause and Exit confirmation instead of quitting directly.
-	m2, cmd := m.Update(tea.KeyPressMsg{Code: KeyQuit})
-	if cmd != nil {
-		t.Fatal("q quit directly while a runner is active")
-	}
-	m2m := m2.(Model)
-	if m2m.page != PagePauseExit || m2m.stop != stopPauseAndExit {
-		t.Fatalf("q state = page %d stop %d, want pause-and-exit", m2m.page, m2m.stop)
-	}
-
-	// y requests the controlled pause and cancels the real runner.
-	_, yCmd := m2m.Update(tea.KeyPressMsg{Code: 'y'})
-	if yCmd == nil {
-		t.Fatal("y produced no pause command")
-	}
-	if pauseMsg := yCmd(); pauseMsg == nil {
-		t.Fatal("the pause command produced no message")
-	}
-	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
-		t.Fatalf("y did not request the controlled pause: %v", rec.executed)
-	}
-
-	// The real runner stopped with StopCancelled (the run context was
-	// cancelled on the controlled-stop path).
-	select {
-	case msgs := <-done:
-		if !hasRunnerStopped(msgs, foreground.StopCancelled) {
-			t.Fatalf("the runner did not stop with StopCancelled: %#v", msgs)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the runner was not cancelled by the pause-and-exit")
 	}
 }
 
