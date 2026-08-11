@@ -2582,6 +2582,51 @@ func TestRunningExitPreviewUsesOnlyEnter(t *testing.T) {
 	}
 }
 
+func TestTask7RenderedCancelAndMigrationCopyDoesNotAdvertiseConfirmationKey(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ready, m.width, m.height = true, 100, 24
+
+	m.page = PageCancel
+	got := render(m)
+	for _, forbidden := range []string{"Enter confirm", "Enter to choose", "confirm: no", "y confirm", "n default", "[y/N]"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("Cancel surface advertises stale confirmation copy %q:\n%s", forbidden, got)
+		}
+	}
+
+	m.page = PageMigration
+	m.migrationConfirm = migrationConfirmPrepare
+	got = render(m)
+	for _, forbidden := range []string{"Enter confirm", "Enter to choose", "y confirm", "n default", "[y/N]"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("Migration surface advertises stale confirmation copy %q:\n%s", forbidden, got)
+		}
+	}
+}
+
+func TestRenderOpenCommandPaletteKeepsUnderlyingPageBounded(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ready, m.width, m.height = true, 100, 24
+	m.workspace = sampleWorkspaceViewModel()
+	m.commandPalette = NewCommandPalette()
+	m.commandPalette.Open = true
+	m.commandPalette.Input = "/"
+
+	got := render(m)
+	if !strings.Contains(got, "WORKSPACE") || !strings.Contains(got, "/exit") || !strings.Contains(got, "COMMAND PALETTE") {
+		t.Fatalf("open palette frame lost underlying page or palette:\n%s", got)
+	}
+	lines := strings.Split(got, "\n")
+	if len(lines) > m.height {
+		t.Fatalf("open palette frame has %d rows, want <= %d", len(lines), m.height)
+	}
+	for i, line := range lines {
+		if gotWidth := lipgloss.Width(line); gotWidth > m.width {
+			t.Fatalf("open palette line %d has width %d, want <= %d: %q", i, gotWidth, m.width, line)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task 6: Foreground Runner ownership
 // ---------------------------------------------------------------------------

@@ -70,3 +70,30 @@ supervisor waits. These failures are recorded as unresolved; the full suite is
 not reported as passing.
 
 No real Provider E2E, Self-Dogfood, remote push, or PR was performed.
+
+## Fix Round 1
+
+Addressed the independent review without entering Task 8:
+
+- Removed stale `y/Y/n/N`, `[y/N]`, and Enter-confirmation claims from the
+  Task 7-rendered Cancel and Migration surfaces.
+- Left `handleCancelKey` and `handleMigrationKey` unchanged; their broader
+  confirmation semantics remain Task 8 scope.
+- Added a direct root-render regression test proving an open palette preserves
+  underlying Workspace content, palette content, and viewport bounds.
+- Preserved Task 6 Create behavior, Home left/right inertness, and all Runner
+  stop behavior.
+
+TDD evidence: the new stale-copy test first failed on the old Cancel text
+(`confirm: no (Enter to choose; Enter alone never cancels)`), then passed after
+the copy-only fix.
+
+Focused verification:
+
+```text
+env GOCACHE=/private/tmp/cflow-go-cache go test ./internal/tui -run 'Test(NewCommandPaletteRegistersOnlyExit|CommandPaletteEnterSelectsExit|CommandPaletteEscClosesWithoutSelectionChange|RenderCommandPaletteIsCenteredAndBounded|SlashOpensOnlyOutsideTextInput|CommandPaletteEscRestoresPriorPageAndSelection|IdleExitCommandQuitsTUI|RunningExitWaitsForRunnerDoneAfterControlledPause|RunningExitPreviewUsesOnlyEnter|ModelQIsOrdinaryInput|Task7RenderedCancelAndMigrationCopyDoesNotAdvertiseConfirmationKey|RenderOpenCommandPaletteKeepsUnderlyingPageBounded|Create|Home|QuitClassificationDoesNotTreatQAsExit)$' -count=1
+ok   cflow.local/cflow/internal/tui  0.233s
+
+git diff --check
+PASS
+```

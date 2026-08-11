@@ -2665,11 +2665,11 @@ func (m Model) hints() string {
 	case PageCreate:
 		return createHints(m)
 	case PageCancel:
-		return "\nEnter confirm, Esc back\n"
+		return "\nEsc back  / command\n"
 	case PagePauseExit:
 		return ""
 	case PageMigration:
-		return "\np prepare  e execute  y confirm  Enter/n default no  Esc back\n"
+		return "\np review prepare  e review execute  Esc back  / command\n"
 	}
 	return ""
 }
@@ -2721,9 +2721,9 @@ func renderMigration(m Model) string {
 	}
 	switch m.migrationConfirm {
 	case migrationConfirmPrepare:
-		b.WriteString("\nPersist immutable manifest and recoverable intent? [y/N]\n")
+		b.WriteString("\nPending prepare action; Esc back.\n")
 	case migrationConfirmExecute:
-		b.WriteString("\nExecute the exact persisted migration intent? [y/N]\n")
+		b.WriteString("\nPending execute action; Esc back.\n")
 	}
 	return b.String()
 }
@@ -2786,7 +2786,7 @@ func renderCancel(m Model) string {
 			len(m.cancel.ActiveNodes), len(m.cancel.ActiveSessions), len(m.cancel.Worktrees))
 	}
 	b.WriteString("every artifact, session, worktree, branch, commit, and audit ref is preserved.\n")
-	b.WriteString("confirm: no (Enter to choose; Enter alone never cancels)\n")
+	b.WriteString("cancellation is controlled by the workflow action. Esc back.\n")
 	return b.String()
 }
 
