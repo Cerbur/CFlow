@@ -1,5 +1,6 @@
 # Controller and evidence state that must never be committed.
 .superpowers/
+.worktrees/
 test-artifacts/
 
 # macOS desktop metadata.
