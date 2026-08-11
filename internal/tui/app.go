@@ -62,7 +62,12 @@ func Run(ctx context.Context, deps Dependencies) error {
 	}
 	deps.Context = ctx
 	if deps.OperationLog == nil {
-		deps.OperationLog = deps.Err
+		// Structured operation diagnostics must never share the renderer's
+		// stderr stream: stderr is part of the terminal surface and would
+		// corrupt the full-screen TUI. The production entry point injects
+		// the managed .cflow log file; tests and embedders without a sink
+		// simply discard diagnostics.
+		deps.OperationLog = io.Discard
 	}
 	prog := deps.Program
 	if prog == nil {

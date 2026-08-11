@@ -1089,6 +1089,10 @@ func openAdapters(sup process.Supervisor, reg *agent.ProviderRegistry, providers
 
 // resolveHome resolves CFLOW_HOME: the environment variable wins, then
 // the default ~/.cflow.
+func ResolveHome() (string, error) {
+	return resolveHome()
+}
+
 func resolveHome() (string, error) {
 	home := os.Getenv("CFLOW_HOME")
 	if home == "" {
