@@ -82,4 +82,26 @@ The initial TDD RED run failed before compilation because the readonly model/ren
 
 Implementation commit: `b251a1e`.
 
-The report is part of the Task 9 handoff and is present at the required path. The repository ignores `.superpowers/`, so it is not staged; the implementation commit remains scoped to the seven Task 9 source/test files. Final `git status --short` is verified clean because the report path is ignored.
+## Fix Round 1
+
+Fix commit: `5479c66` (`fix: close task 9 readonly review findings`).
+
+Addressed `.superpowers/sdd/2026-08-12-cflow-tui-workspace-navigation-plan/task-9-review.md`:
+
+1. Updated `TestModelParentReturnRestoresWorkflowMenuIndexWithoutExecute` to consume the readonly Query command, assert it is a `StatusQuery`, assert `Execute` remains unused, then continue the Esc and menu-index restoration assertions.
+2. Classified Application-produced `Execution Preview` as `MenuEntryAction` with typed `MenuActionReviewExecution`, preserving the Task 8 Approval preview route. A malformed readonly entry for that route is bounded to the readonly unavailable state and cannot reach the mutation-capable Approval page.
+3. Made Specs/Catalog/DAG/Execution Preview availability depend on the existing authoritative `ExecutionPreviewQuery` resolving its artifact-backed view. Missing or unresolvable artifacts now omit those menu entries. Added a regression that removes the Spec artifact after complete-looking execution facts and verifies all four routes are omitted.
+
+Fix Round 1 focused verification passed:
+
+```text
+GOCACHE=/tmp/cflow-task9-fix1-gocache go test ./internal/tui -run 'Readonly|Evidence|MenuRoute|Navigation' -count=1
+ok   cflow.local/cflow/internal/tui  0.910s
+
+GOCACHE=/tmp/cflow-task9-fix1-gocache go test ./internal/app -run 'WorkflowMenu|Projection' -count=1
+ok   cflow.local/cflow/internal/app  8.620s
+```
+
+No full-suite command was run for Fix Round 1. Task 10 and Task 11 remain untouched.
+
+The report is part of the Task 9 handoff and is present at the required path. It is committed separately because `.superpowers/` is ignored by default; the report was explicitly force-added for the handoff.
