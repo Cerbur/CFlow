@@ -75,3 +75,30 @@ Task 4 explicitly removes the `n` create command. Updating `internal/tui/e2e_tes
 - No Runtime projection type or Application mapping was changed; `app.WorkspaceView` remains authoritative and unchanged.
 - No direct mutation is performed by Home row selection or route entry.
 - Task 5 was not started.
+
+## Fix Round 1
+
+Review feedback was applied without starting Task 5.
+
+### Fixes
+
+- Home `IsLeft` and `IsRight` are now inert. They no longer call `moveNav` or issue lifecycle projection queries.
+- Create Workspace Esc now uses the stack-aware navigation path even while the Create name input is active. It clears transient Create input state, pops the `LayerCreateWorkspace` frame, and restores the existing Home frame with synchronized `page` and `NavigationStack.Current()` values.
+- Added `WorkspaceViewModel.SelectedRow` as UI-only selection state. Home row highlighting updates immediately when an existing row is selected, while `Selected`, `Lifecycle`, and other projection facts remain unchanged until the authoritative query returns.
+- Updated the old lifecycle navigation test to remove its superseded Home left/right expectation; Tab remains covered as the lifecycle-page traversal mechanism.
+
+### Regression Tests
+
+RED was observed before the fixes:
+
+- `TestModelHomeLeftRightAreInert` failed because Home Right changed to a lifecycle page.
+- `TestModelCreateWorkspaceEscPopsNavigationHome` failed because Create Esc assigned `PageWorkspace` while leaving the Create frame on the stack.
+- `TestModelHomeExistingRowHighlightUpdatesBeforeProjection` initially failed to compile because `SelectedRow` did not exist; after adding the UI-only state, it verifies the old projection facts remain intact while the new row is highlighted.
+
+GREEN after the fixes:
+
+- `go test ./internal/tui -run 'HomeLeftRight|CreateWorkspaceEsc|ExistingRowHighlight' -count=1`
+- `go test ./internal/tui -run 'MapWorkspace|NewWorkflowRow|HomeRows|HomeLeftRight|CreateWorkspaceEsc|ExistingRowHighlight' -count=1`
+- `go test ./internal/tui -run 'Workspace|Responsive|Layout|HomeRows|Navigation|HomeLeftRight|CreateWorkspaceEsc|ExistingRowHighlight' -count=1`
+
+All three completed successfully. The known old `TestTUIPlanToApplyAndCleanup` E2E was not run, consistent with the Task 4 gate constraint and prior report.

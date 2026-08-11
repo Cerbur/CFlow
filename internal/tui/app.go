@@ -1320,6 +1320,17 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.status = "command in progress; waiting for refreshed facts"
 		return m, nil
 	}
+	// Create Workspace is a text input, so it bypasses the general
+	// non-typing Esc guard above. It still follows the NavigationStack: Esc
+	// leaves the nested Create frame and restores Home instead of assigning a
+	// page directly.
+	if msg.Code == tea.KeyEsc && m.page == PageCreate && m.navigation.Current().Page == PageCreate {
+		m.createInput = ""
+		m.createConfirm = false
+		m.createDirty = nil
+		m, _ = m.popNavigation()
+		return m, nil
+	}
 	if msg.Code == tea.KeyEsc && !m.typingText() && m.navigation.Current().Page == m.page {
 		if m.navigation.Current().Layer == LayerHome {
 			return m, nil
@@ -1683,10 +1694,6 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.moveSelection(-1)
 	case IsDown(msg):
 		return m.moveSelection(1)
-	case IsLeft(msg):
-		return m.moveNav(-1)
-	case IsRight(msg):
-		return m.moveNav(1)
 	case IsEnter(msg):
 		if m.selected == "" {
 			m = m.pushNavigation(NavigationFrame{Layer: LayerCreateWorkspace, Page: PageCreate})
@@ -1834,6 +1841,7 @@ func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 	row := m.workspace.Rows[idx]
 	if row.Kind == WorkflowRowNew {
 		m.selected = ""
+		m.workspace.SelectedRow = idx
 		m.workspace.Selected = WorkflowItem{}
 		m.workspace.Lifecycle = nil
 		m.workspace.Actions = nil
@@ -1841,6 +1849,7 @@ func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.selected = row.ID
+	m.workspace.SelectedRow = idx
 	m.resetSelectionState()
 	return m, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.selected})
 }

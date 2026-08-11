@@ -243,11 +243,10 @@ func renderWorkflowLines(m WorkspaceViewModel) []string {
 		workspaceTheme.Muted.Render("PROJECT") + "  " + workspaceValueOr(m.Project.Name, "(unnamed)"),
 		workspaceTheme.Muted.Render("workflows:"),
 	}
-	for _, row := range m.Rows {
+	for i, row := range m.Rows {
 		marker := "•"
 		lineStyle := workspaceTheme.Muted
-		if (row.Kind == WorkflowRowNew && m.Selected.ID == "") ||
-			(row.Kind == WorkflowRowExisting && row.ID == m.Selected.ID) {
+		if i == m.SelectedRow {
 			marker = "▸"
 			lineStyle = workspaceTheme.Selected
 		}
@@ -265,15 +264,14 @@ func renderWorkflowLines(m WorkspaceViewModel) []string {
 }
 
 func minimalWorkflowRows(m WorkspaceViewModel) string {
-	newMarker := "•"
-	if m.Selected.ID == "" {
-		newMarker = "▸"
+	if m.SelectedRow < 0 || m.SelectedRow >= len(m.Rows) {
+		return "• NEW WORKFLOW"
 	}
-	label := newMarker + " NEW WORKFLOW"
-	if m.Selected.ID != "" {
-		label += " · ▸ " + workflowLabel(m.Selected.Name, m.Selected.ID)
+	row := m.Rows[m.SelectedRow]
+	if row.Kind == WorkflowRowNew {
+		return "▸ NEW WORKFLOW"
 	}
-	return label
+	return "• NEW WORKFLOW · ▸ " + workflowLabel(row.Name, row.ID)
 }
 
 type lifecycleStep struct {

@@ -88,13 +88,17 @@ type PlanItem struct {
 type WorkspaceModel = WorkspaceViewModel
 
 type WorkspaceViewModel struct {
-	Project   app.ProjectView
-	Rows      []WorkflowRow
-	Selected  WorkflowItem
-	Workflows []WorkflowItem
-	Lifecycle *LifecycleItem
-	Health    app.HealthView
-	Actions   []Action
+	Project app.ProjectView
+	Rows    []WorkflowRow
+	// SelectedRow is UI-only Home selection state. It lets the renderer show
+	// an immediate highlight while an existing workflow's fresh projection is
+	// still loading, without fabricating or overwriting workflow facts.
+	SelectedRow int
+	Selected    WorkflowItem
+	Workflows   []WorkflowItem
+	Lifecycle   *LifecycleItem
+	Health      app.HealthView
+	Actions     []Action
 }
 
 // MapWorkspace maps the aggregate workspace projection to the renderable
@@ -130,9 +134,13 @@ func MapWorkspace(v app.WorkspaceView) WorkspaceViewModel {
 		projectedActions = legalActionsOf(v.LegalActions)
 	}
 	for _, w := range v.Workflows {
+		rowIndex := len(m.Rows)
 		m.Rows = append(m.Rows, WorkflowRow{
 			Kind: WorkflowRowExisting, ID: w.ID, Name: w.Name, Stage: w.Stage, Runtime: w.Runtime,
 		})
+		if w.ID == selected {
+			m.SelectedRow = rowIndex
+		}
 		item := WorkflowItem{
 			ID: w.ID, Name: w.Name, Stage: w.Stage, Runtime: w.Runtime,
 			Blocked: w.Runtime == model.RuntimeBlocked,

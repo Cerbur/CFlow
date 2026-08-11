@@ -1476,29 +1476,6 @@ func TestModelNavigationReachesLifecyclePages(t *testing.T) {
 			t.Fatalf("lifecycle page %d never reached", w)
 		}
 	}
-	// The workspace left/right arrows also move the lifecycle (the
-	// page-local arrows keep their meaning on the other pages).
-	m = press(t, m, tea.KeyEsc, 0)
-	if m.page != PageWorkspace {
-		t.Fatalf("esc did not return to the workspace: %d", m.page)
-	}
-	m = press(t, m, tea.KeyRight, 0)
-	if m.page != PageDiscussion {
-		t.Fatalf("after right: page = %d, want discussion", m.page)
-	}
-	m = press(t, m, tea.KeyRight, 0)
-	if m.page != PagePlanApproval {
-		t.Fatalf("after right: page = %d, want plan approval", m.page)
-	}
-	m = press(t, m, tea.KeyEsc, 0)
-	m = press(t, m, tea.KeyRight, 0)
-	if m.page != PageDiscussion {
-		t.Fatalf("after right: page = %d, want discussion", m.page)
-	}
-	m = press(t, m, tea.KeyLeft, 0)
-	if m.page != PageWorkspace {
-		t.Fatalf("after left: page = %d, want workspace", m.page)
-	}
 	// Navigation never executed a mutation.
 	for _, c := range rec.executed {
 		switch c.(type) {
@@ -1632,6 +1609,81 @@ func TestModelHomeNDoesNotOpenCreateWorkspace(t *testing.T) {
 	got := next.(Model)
 	if cmd != nil || got.page != PageWorkspace || got.navigation.Current().Layer != LayerHome {
 		t.Fatalf("n changed Home route: page=%v frame=%+v cmd=%v", got.page, got.navigation.Current(), cmd != nil)
+	}
+}
+
+func TestModelHomeLeftRightAreInert(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+	})
+
+	for _, key := range []rune{tea.KeyLeft, tea.KeyRight} {
+		next, cmd := m.Update(tea.KeyPressMsg{Code: key})
+		got := next.(Model)
+		if cmd != nil || got.page != PageWorkspace || got.navigation.Current().Page != PageWorkspace {
+			t.Fatalf("Home key %q changed navigation: page=%v frame=%+v command=%v", key, got.page, got.navigation.Current(), cmd != nil)
+		}
+		if got.selected != m.selected {
+			t.Fatalf("Home key %q changed selected workflow: got=%q want=%q", key, got.selected, m.selected)
+		}
+	}
+	if len(ctrl.queries) != 0 || ctrl.executes != 0 {
+		t.Fatalf("Home left/right touched Application: queries=%v executes=%d", ctrl.queries, ctrl.executes)
+	}
+}
+
+func TestModelCreateWorkspaceEscPopsNavigationHome(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.workspace = MapWorkspace(app.WorkspaceView{})
+
+	m = press(t, m, tea.KeyEnter, 0)
+	if m.page != PageCreate || m.navigation.Current().Layer != LayerCreateWorkspace {
+		t.Fatalf("New Workflow Enter = page %v frame %+v", m.page, m.navigation.Current())
+	}
+
+	m = press(t, m, tea.KeyEsc, 0)
+	if m.page != PageWorkspace || len(m.navigation.Frames) != 1 {
+		t.Fatalf("Create Esc did not pop to Home: page=%v stack=%+v", m.page, m.navigation)
+	}
+	if frame := m.navigation.Current(); frame.Layer != LayerHome || frame.Page != PageWorkspace {
+		t.Fatalf("Create Esc restored wrong Home frame: %+v", frame)
+	}
+}
+
+func TestModelHomeExistingRowHighlightUpdatesBeforeProjection(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-1"
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Selected: "wf-1",
+		Workflows: []app.WorkflowSummary{
+			{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused},
+			{ID: "wf-2", Name: "two", Runtime: model.RuntimeRunning},
+		},
+		Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimePaused}},
+	})
+	previousFacts := m.workspace.Selected
+
+	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	got := next.(Model)
+	if cmd == nil {
+		t.Fatal("existing row selection did not request the read-only projection")
+	}
+	if got.workspace.Selected.ID != previousFacts.ID || got.workspace.Lifecycle == nil || got.workspace.Lifecycle.ID != previousFacts.ID {
+		t.Fatalf("selection invented or discarded projection facts: selected=%+v lifecycle=%+v", got.workspace.Selected, got.workspace.Lifecycle)
+	}
+	if got.workspace.SelectedRow != 2 {
+		t.Fatalf("selected row = %d, want row 2 (New, wf-1, wf-2)", got.workspace.SelectedRow)
+	}
+	frame := visibleTerminalText(RenderWorkspace(got.workspace, 120, 45))
+	if !strings.Contains(frame, "▸ two (wf-2)") || strings.Contains(frame, "▸ one (wf-1)") {
+		t.Fatalf("Home row highlight did not update immediately:\n%s", frame)
 	}
 }
 
