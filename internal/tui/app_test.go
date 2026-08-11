@@ -7,7 +7,9 @@ package tui
 // controlled-stop protocol executes the real Pause and Force Stop.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -1640,10 +1642,11 @@ func TestModelPlanApprovalMapsToTypedCommand(t *testing.T) {
 	}
 }
 
-// TestModelPlanCheckWaitsForFreshProjection prevents a stale Plan Approval
-// projection from issuing CheckPlan while the GeneratePlan reload is still
-// in flight.
-func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
+// TestModelPlanCheckQueuesUntilFreshProjection prevents a stale Plan Approval
+// projection from issuing CheckPlan against old facts, while preserving the
+// user's explicit check request until the GeneratePlan acknowledgement
+// projection arrives.
+func TestModelPlanCheckQueuesUntilFreshProjection(t *testing.T) {
 	rec := &recordingController{ctrl: &migrationController{}}
 	m := newModel(Dependencies{})
 	m.ctrl = rec
@@ -1655,9 +1658,16 @@ func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
 		Runtime:  model.RuntimeRunning,
 	}
 
+	m.commandState = &commandState{
+		inFlight: true, generation: 1, pending: 1,
+		ackPage: PagePlanApproval, workflow: "wf-1",
+	}
 	// The command has completed, but its asynchronous projection reload has
 	// not been applied yet: this is the timing shown in the user report.
-	m, _ = m.applyCommand(commandDoneMsg{cmd: app.GeneratePlanCommand{}})
+	m, _ = m.applyCommand(commandDoneMsg{
+		cmd:        app.GeneratePlanCommand{Workflow: "wf-1"},
+		generation: 1,
+	})
 	m = press(t, m, 'k', 0)
 
 	for _, cmd := range rec.executed {
@@ -1665,8 +1675,155 @@ func TestModelPlanCheckWaitsForFreshProjection(t *testing.T) {
 			t.Fatalf("stale projection issued CheckPlanCommand: %v", rec.executed)
 		}
 	}
-	if !strings.Contains(m.status, "wait") {
-		t.Fatalf("status = %q, want a wait message", m.status)
+	if !m.pendingPlanCheck {
+		t.Fatal("stale check request was not queued")
+	}
+
+	m, cmd := m.applyProjection(projectionMsg{
+		page:              PagePlanApproval,
+		workflow:          "wf-1",
+		generation:        2,
+		commandGeneration: 1,
+		view: app.PlanView{
+			Workflow:   "wf-1",
+			Stage:      model.StagePlanCheck,
+			Runtime:    model.RuntimePaused,
+			PlanStatus: model.PlanDraft,
+			Revision:   1,
+			Hash:       "fresh-plan-hash",
+		},
+	})
+	if cmd == nil {
+		t.Fatal("fresh plan projection did not resume the queued check")
+	}
+	_ = cmd()
+	if !rec.hasExecuted(app.CheckPlanCommand{}) {
+		t.Fatalf("queued check did not execute: %v", rec.executed)
+	}
+}
+
+func TestPlanCheckOperationLogCorrelatesActionCommandAndProjection(t *testing.T) {
+	var log bytes.Buffer
+	rec := &recordingController{ctrl: &migrationController{}}
+	m := newModel(Dependencies{OperationLog: &log})
+	m.ctrl = rec
+	m.page = PagePlanApproval
+	m.selected = "wf-1"
+	m.plan = app.PlanView{
+		Workflow:   "wf-1",
+		Stage:      model.StagePlanCheck,
+		Runtime:    model.RuntimePaused,
+		PlanStatus: model.PlanDraft,
+		Revision:   1,
+		Hash:       "plan-hash",
+	}
+
+	m, cmd := m.handlePlanApprovalKey(tea.KeyPressMsg{Code: 'k'})
+	if cmd == nil {
+		t.Fatal("check key did not return a command")
+	}
+	raw := cmd()
+	msg, ok := raw.(commandDoneMsg)
+	if !ok {
+		t.Fatalf("command result = %T, want commandDoneMsg", raw)
+	}
+	m, _ = m.applyCommand(msg)
+	operationID := m.commandState.operationID
+	if operationID == "" {
+		t.Fatal("command did not carry an operation id")
+	}
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PagePlanApproval,
+		workflow:          "wf-1",
+		generation:        2,
+		commandGeneration: 1,
+		operationID:       operationID,
+		view: app.PlanView{
+			Workflow:   "wf-1",
+			Stage:      model.StagePlanCheck,
+			Runtime:    model.RuntimePaused,
+			PlanStatus: model.PlanChecked,
+			Revision:   1,
+			Hash:       "plan-hash",
+		},
+	})
+
+	var entries []operationLogEntry
+	for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry operationLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode operation log: %v", err)
+		}
+		entries = append(entries, entry)
+	}
+	wantKinds := []string{"user_action", "command_started", "command_result", "projection_applied"}
+	if len(entries) < len(wantKinds) {
+		t.Fatalf("operation entries = %+v, want at least %v", entries, wantKinds)
+	}
+	for i, want := range wantKinds {
+		if entries[i].Kind != want {
+			t.Fatalf("entry %d kind = %q, want %q; entries = %+v", i, entries[i].Kind, want, entries)
+		}
+		if entries[i].OperationID != operationID {
+			t.Fatalf("entry %d operation id = %q, want %q", i, entries[i].OperationID, operationID)
+		}
+	}
+	if entries[0].Action != "plan_check" {
+		t.Fatalf("user action = %q, want plan_check", entries[0].Action)
+	}
+	if entries[1].Command != "app.CheckPlanCommand" {
+		t.Fatalf("command = %q, want app.CheckPlanCommand", entries[1].Command)
+	}
+	if entries[2].Result != "ok" || entries[3].Result != "accepted" {
+		t.Fatalf("operation outcomes = %+v", entries[2:4])
+	}
+}
+
+func TestProjectionOperationLogCapturesQueryLifecycle(t *testing.T) {
+	var log bytes.Buffer
+	m := newModel(Dependencies{OperationLog: &log})
+	m.ctrl = &migrationController{}
+	m.selected = "wf-legacy"
+	m.commandState.operationID = "op-7"
+
+	msg := m.queryProjectionMsgAt(
+		PageWorkspace,
+		app.ProjectWorkspaceQuery{Selected: "wf-legacy"},
+		3,
+		0,
+	).(projectionMsg)
+	m, _ = m.applyProjection(msg)
+
+	var entries []operationLogEntry
+	for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry operationLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode operation log: %v", err)
+		}
+		entries = append(entries, entry)
+	}
+	wantKinds := []string{"query_started", "query_result", "projection_applied"}
+	if len(entries) != len(wantKinds) {
+		t.Fatalf("operation entries = %+v, want exactly %v", entries, wantKinds)
+	}
+	for i, want := range wantKinds {
+		if entries[i].Kind != want {
+			t.Fatalf("entry %d kind = %q, want %q; entries = %+v", i, entries[i].Kind, want, entries)
+		}
+		if entries[i].OperationID != "op-7" {
+			t.Fatalf("entry %d operation id = %q, want op-7", i, entries[i].OperationID)
+		}
+	}
+	if entries[0].Query != "app.ProjectWorkspaceQuery" ||
+		entries[1].Result != "ok" ||
+		entries[2].Result != "accepted" {
+		t.Fatalf("query lifecycle entries = %+v", entries)
 	}
 }
 

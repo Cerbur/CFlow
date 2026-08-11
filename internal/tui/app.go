@@ -35,7 +35,10 @@ type Dependencies struct {
 	In      io.Reader
 	Out     io.Writer
 	Err     io.Writer
-	Program *tea.Program // nil: the Run call creates the default program
+	// OperationLog receives bounded JSONL diagnostics for GUI/TUI debugging.
+	// It is never used as an authority for Runtime state.
+	OperationLog io.Writer
+	Program      *tea.Program // nil: the Run call creates the default program
 }
 
 // controller is the typed Runtime seam the TUI drives. The shared
@@ -58,6 +61,9 @@ func Run(ctx context.Context, deps Dependencies) error {
 		ctx = context.Background()
 	}
 	deps.Context = ctx
+	if deps.OperationLog == nil {
+		deps.OperationLog = deps.Err
+	}
 	prog := deps.Program
 	if prog == nil {
 		in := deps.In
@@ -130,6 +136,8 @@ type commandState struct {
 	workflow     model.WorkflowID
 	ackRetries   uint8
 	projectionID uint64 // monotonic read-only query sequence
+	operationSeq uint64
+	operationID  string
 }
 
 type contextDoneMsg struct{}
@@ -142,9 +150,10 @@ type Model struct {
 	ready  bool
 	err    error
 
-	deps Dependencies
-	ctx  context.Context
-	ctrl controller
+	deps  Dependencies
+	ctx   context.Context
+	ctrl  controller
+	trace *operationLogger
 
 	// page is the current screen.
 	page Page
@@ -200,7 +209,12 @@ type Model struct {
 	// The approval is issued only after the refreshed revision/hash is
 	// visible, so this never bypasses the stale-plan guard.
 	pendingPlanApproval bool
-	planCheckInFlight   bool
+	// pendingPlanCheck preserves an explicit check request while the
+	// GeneratePlan acknowledgement projection is still in flight. The
+	// request is issued only after a fresh revision/hash is visible.
+	pendingPlanCheck          bool
+	pendingPlanCheckOperation string
+	planCheckInFlight         bool
 
 	// Runner state: running is true while the Foreground Runner is
 	// active; runCancel is the runner's context; eventCh is the
@@ -260,6 +274,7 @@ type projectionMsg struct {
 	workflow          model.WorkflowID
 	generation        uint64 // unique read-only query sequence
 	commandGeneration uint64 // non-zero only for a command acknowledgement query
+	operationID       string
 	view              app.View
 	err               error
 }
@@ -273,10 +288,11 @@ type appLoadedMsg struct {
 
 // commandDoneMsg delivers the result of one typed Application Command.
 type commandDoneMsg struct {
-	cmd        app.Command
-	generation uint64
-	out        app.Outcome
-	err        error
+	cmd         app.Command
+	generation  uint64
+	operationID string
+	out         app.Outcome
+	err         error
 }
 
 // runnerEventMsg delivers one committed event of the Foreground Runner.
@@ -326,6 +342,7 @@ func newModel(deps Dependencies) Model {
 		ctx:          modelContext,
 		page:         PageWorkspace,
 		commandState: new(commandState),
+		trace:        newOperationLogger(deps.OperationLog),
 		discussion:   DiscussionPage{},
 		approval:     ApprovalModel{},
 		execution:    ExecutionModel{},
@@ -385,6 +402,19 @@ func (m Model) queryProjectionMsg(page Page, q app.Query) tea.Msg {
 
 func (m Model) queryProjectionMsgAt(page Page, q app.Query, generation, commandGeneration uint64) tea.Msg {
 	workflow := queryWorkflowID(q)
+	operationID := ""
+	if m.commandState != nil {
+		operationID = m.commandState.operationID
+	}
+	m.trace.write(operationLogEntry{
+		OperationID:       operationID,
+		Workflow:          string(workflow),
+		Page:              pageName(page),
+		Kind:              "query_started",
+		Query:             operationType(q),
+		Generation:        generation,
+		CommandGeneration: commandGeneration,
+	})
 	view, err := m.ctrl.Query(m.context(), q)
 	if err != nil && page == PageWorkspace {
 		// A workflow can disappear between two read-only projections. Retry the
@@ -397,11 +427,24 @@ func (m Model) queryProjectionMsgAt(page Page, q app.Query, generation, commandG
 			workflow = ""
 		}
 	}
+	m.trace.write(operationLogEntry{
+		OperationID:       operationID,
+		Workflow:          string(workflow),
+		Page:              pageName(page),
+		Kind:              "query_result",
+		Query:             operationType(q),
+		Generation:        generation,
+		CommandGeneration: commandGeneration,
+		View:              operationType(view),
+		Result:            operationResult(err),
+		ErrorCode:         operationErrorCode(err),
+	})
 	return projectionMsg{
 		page:              page,
 		workflow:          workflow,
 		generation:        generation,
 		commandGeneration: commandGeneration,
+		operationID:       operationID,
 		view:              view,
 		err:               err,
 	}
@@ -624,7 +667,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // classified lifecycle absence degrades to an empty state (the Execution
 // Approval preview before specs/workflow compilation and the dry run); real
 // projection errors remain visible and cannot acknowledge a command.
-func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
+func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
+	applied := false
+	defer func() {
+		kind := "projection_dropped"
+		status := "stale_or_blocked"
+		if applied {
+			kind = "projection_applied"
+			status = "accepted"
+		}
+		result.trace.write(operationLogEntry{
+			OperationID:       msg.operationID,
+			Workflow:          string(msg.workflow),
+			Page:              pageName(msg.page),
+			Kind:              kind,
+			Generation:        msg.generation,
+			CommandGeneration: msg.commandGeneration,
+			View:              operationType(msg.view),
+			Result:            status,
+			ErrorCode:         operationErrorCode(msg.err),
+		})
+	}()
 	// Execution Approval has a valid empty state before the specs, compiled
 	// workflow, and dry-run facts exist. Normalize only that exact expected
 	// absence into an empty view; all other projection errors remain errors and
@@ -779,9 +842,23 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 				m.pendingPlanApproval = false
 				m.planCheckInFlight = false
 				m.status = "approving the refreshed plan revision…"
+				applied = true
 				return m, m.executeCmd(app.ApprovePlanCommand{
 					Workflow: m.selected, Revision: v.Revision, Hash: v.Hash,
 				})
+			}
+			if m.pendingPlanCheck &&
+				!m.commandInFlight() &&
+				v.Stage == model.StagePlanCheck &&
+				v.Revision >= 1 && v.Hash != "" {
+				operationID := m.pendingPlanCheckOperation
+				m.pendingPlanCheck = false
+				m.pendingPlanCheckOperation = ""
+				m.status = "running the independent plan check…"
+				applied = true
+				return m, m.executeCmdWithOperation(m.context(), app.CheckPlanCommand{
+					Workflow: m.selected, Provider: m.discussionProvider(),
+				}, operationID)
 			}
 			if v.PlanStatus == model.PlanChecked {
 				m.planCheckInFlight = false
@@ -808,6 +885,7 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 			m.migration = v
 		}
 	}
+	applied = true
 	return m, nil
 }
 
@@ -954,6 +1032,8 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		if _, ok := msg.cmd.(app.CheckPlanCommand); ok {
 			m.planCheckInFlight = false
 			m.pendingPlanApproval = false
+			m.pendingPlanCheck = false
+			m.pendingPlanCheckOperation = ""
 		}
 		m.status = fmt.Sprintf("%v", msg.err)
 		if m.stop == stopPauseAndExit {
@@ -1076,6 +1156,8 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.status = "plan generation finished; refreshing plan projection…"
 		return m, m.reloadCmd()
 	case app.CheckPlanCommand:
+		m.pendingPlanCheck = false
+		m.pendingPlanCheckOperation = ""
 		m.planCheckInFlight = true
 		m.pendingPlanStatus = "plan checked"
 		m.status = "plan check finished; refreshing plan projection…"
@@ -1213,7 +1295,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m.quit()
 		}
 	}
-	if m.commandInFlight() && !m.typingText() && blocksWhileCommandInFlight(msg) {
+	if m.commandInFlight() && !m.typingText() &&
+		!(m.page == PagePlanApproval &&
+			(msg.Code == 'k' || msg.Code == 'K') &&
+			m.pendingPlanStatus == "plan generated") &&
+		blocksWhileCommandInFlight(msg) {
 		m.status = "command in progress; waiting for refreshed facts"
 		return m, nil
 	}
@@ -1351,6 +1437,8 @@ func (m *Model) resetSelectionState() {
 	m.createDirty = nil
 	m.pendingPlanStatus = ""
 	m.pendingPlanApproval = false
+	m.pendingPlanCheck = false
+	m.pendingPlanCheckOperation = ""
 	m.planCheckInFlight = false
 	m.migration = app.MigrationPreviewView{}
 	m.migrationConfirm = migrationConfirmNone
@@ -1392,16 +1480,37 @@ func (m Model) nextProjectionID() uint64 {
 	return m.commandState.projectionID
 }
 
+func (m Model) beginOperation(action string) string {
+	if m.commandState == nil {
+		return ""
+	}
+	m.commandState.operationSeq++
+	operationID := fmt.Sprintf("op-%d", m.commandState.operationSeq)
+	m.trace.write(operationLogEntry{
+		OperationID: operationID,
+		Workflow:    string(m.selected),
+		Page:        pageName(m.page),
+		Kind:        "user_action",
+		Action:      action,
+	})
+	return operationID
+}
+
 // executeCmd runs one typed Application Command and delivers its Outcome.
 func (m Model) executeCmd(cmd app.Command) tea.Cmd {
-	return m.executeCmdWithContext(m.context(), cmd)
+	return m.executeCmdWithOperation(m.context(), cmd, m.beginOperation("command."+operationType(cmd)))
 }
 
 func (m Model) executeCmdWithContext(ctx context.Context, cmd app.Command) tea.Cmd {
+	return m.executeCmdWithOperation(ctx, cmd, m.beginOperation("command."+operationType(cmd)))
+}
+
+func (m Model) executeCmdWithOperation(ctx context.Context, cmd app.Command, operationID string) tea.Cmd {
 	generation := uint64(0)
 	if m.commandState != nil {
 		m.commandState.ackPage = commandAckPage(m.page)
 		m.commandState.workflow = m.selected
+		m.commandState.operationID = operationID
 		m.commandState.generation++
 		generation = m.commandState.generation
 		m.commandState.pending = generation
@@ -1411,9 +1520,33 @@ func (m Model) executeCmdWithContext(ctx context.Context, cmd app.Command) tea.C
 		m.blockedAckPage = PageWorkspace
 		m.blockedWorkflow = ""
 	}
+	m.trace.write(operationLogEntry{
+		OperationID: operationID,
+		Workflow:    string(m.selected),
+		Page:        pageName(m.page),
+		Kind:        "command_started",
+		Command:     operationType(cmd),
+		Generation:  generation,
+	})
 	return func() tea.Msg {
 		out, err := m.ctrl.Execute(ctx, cmd)
-		return commandDoneMsg{cmd: cmd, generation: generation, out: out, err: err}
+		m.trace.write(operationLogEntry{
+			OperationID: operationID,
+			Workflow:    string(m.selected),
+			Page:        pageName(m.page),
+			Kind:        "command_result",
+			Command:     operationType(cmd),
+			Generation:  generation,
+			Result:      operationResult(err),
+			ErrorCode:   operationErrorCode(err),
+		})
+		return commandDoneMsg{
+			cmd:         cmd,
+			generation:  generation,
+			operationID: operationID,
+			out:         out,
+			err:         err,
+		}
 	}
 }
 
@@ -1884,19 +2017,34 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case msg.Code == 'g' || msg.Code == 'G':
 		m.planCheckInFlight = false
 		m.pendingPlanApproval = false
+		m.pendingPlanCheck = false
+		m.pendingPlanCheckOperation = ""
 		m.status = "generating a plan revision…"
-		return m, m.executeCmd(app.GeneratePlanCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		operationID := m.beginOperation("plan_generate")
+		return m, m.executeCmdWithOperation(m.context(), app.GeneratePlanCommand{
+			Workflow: m.selected, Provider: m.discussionProvider(),
+		}, operationID)
 	case msg.Code == 'k' || msg.Code == 'K':
 		// GeneratePlan settles before the asynchronous page projection
 		// reload is applied. Refuse a stale check request locally instead
 		// of sending CheckPlan against the still-visible PLAN_GENERATION
 		// stage.
 		if m.plan.Stage != model.StagePlanCheck || m.plan.Revision < 1 || m.plan.Hash == "" {
+			if m.pendingPlanStatus == "plan generated" ||
+				(m.commandState != nil && m.commandState.inFlight) {
+				m.pendingPlanCheck = true
+				m.pendingPlanCheckOperation = m.beginOperation("plan_check")
+				m.status = "plan check queued; waiting for refreshed PLAN_CHECK"
+				return m, nil
+			}
 			m.status = "plan projection is still refreshing; wait for PLAN_CHECK"
 			return m, nil
 		}
 		m.status = "running the independent plan check…"
-		return m, m.executeCmd(app.CheckPlanCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		operationID := m.beginOperation("plan_check")
+		return m, m.executeCmdWithOperation(m.context(), app.CheckPlanCommand{
+			Workflow: m.selected, Provider: m.discussionProvider(),
+		}, operationID)
 	case msg.Code == tea.KeyEsc || IsQuit(msg):
 		m.page = PageWorkspace
 		return m, nil

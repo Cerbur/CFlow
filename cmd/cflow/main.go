@@ -27,7 +27,10 @@ func run() int {
 		// The full-screen TUI is the default entry point on an
 		// interactive terminal; it never mutates a Workflow by itself.
 		RunTUI: func(ctx context.Context) error {
-			return tui.Run(ctx, tui.Dependencies{CLI: cli.Dependencies{Build: observe.Current()}})
+			return tui.Run(ctx, tui.Dependencies{
+				CLI:          cli.Dependencies{Build: observe.Current()},
+				OperationLog: os.Stderr,
+			})
 		},
 		IsTerminal: func() bool {
 			return isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
