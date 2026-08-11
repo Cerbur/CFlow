@@ -18,6 +18,19 @@
 - Wide is width ≥120 and height ≥28; Medium is width 88–119 or height <28; Compact is width <88; Minimal is too small for the Compact content.
 - Do not run real Codex/Claude E2E or Self-Dogfood, push, create a PR, or modify remotes.
 
+### Lifecycle synchronization follow-up (2026-08-11)
+
+The Workspace visual refresh exposed deterministic Bubble Tea lifecycle-test races. The
+follow-up changes in `internal/tui/app.go`, `internal/tui/app_test.go`, and
+`internal/tui/e2e_test.go` are intentionally limited to TUI-side command/projection
+acknowledgement, stale-result rejection, runner-join cleanup, and test barriers. They
+do not change Application/Runtime/Projection semantics, page hierarchy, key meanings,
+confirmation rules, or final-state authority. The Execution Approval
+`execution inputs are incomplete; no preview is available` result is treated only as
+that page's documented empty pre-dry-run state; other projection errors remain
+non-acknowledging failures. This addendum records the scope explicitly rather than
+silently treating lifecycle synchronization as a visual change.
+
 ## File Structure
 
 - Modify `internal/tui/app.go`: retain root state and route Workspace rendering through the new pure renderer; do not put styles or panel composition here.
@@ -66,19 +79,23 @@
 
 - [x] Run `go test ./internal/tui -run 'Workspace|Responsive|Layout|Navigation' -count=1`.
 - [x] Run `go test ./internal/tui ./internal/cli ./cmd/cflow -count=1`.
-- [x] Run `go test ./... -count=1`.
-- [x] Use an independent Reviewer context for specification compliance and a separate independent Reviewer context for code quality; record findings and evidence without changing other pages.
-- [x] Fix all Critical/Important findings, rerun affected and full tests, and obtain reviewer re-checks.
+- [ ] Run the full suite — blocked by the `internal/app` cleanup test-suite timeout; see Verification Evidence.
+- [x] Use independent Reviewer contexts for specification compliance and code quality; record findings and evidence without changing other pages.
+- [x] Fix all Critical/Important findings, rerun affected tests, and obtain reviewer re-checks.
 - [x] Inspect `git diff --check`, `git diff`, `git status --short`, and commit the completed implementation only after tests and reviews pass.
 - [x] Verify Git-visible clean state and report changed files, MVVM responsibilities, actual responsive behavior, test/review evidence, commit, and clean proof.
 
 
 ## Verification Evidence
 
-- Targeted: `go test ./internal/tui -run 'Workspace|Responsive|Layout|Navigation' -count=1` — passed on the current working tree.
+- Targeted presentation/regression tests: `go test ./internal/tui -run 'Workspace|Responsive|Layout|Navigation|VisibleTerminalText|Command' -count=1` — passed on the current working tree.
 - TUI/package gate: `go test ./internal/tui ./internal/cli ./cmd/cflow -count=1` — passed on the current working tree.
-- Lifecycle synchronization: `go test ./internal/tui -run '^TestTUIPlanToApplyAndCleanup$' -count=3 -v` — three consecutive passes after the test-only synchronization change. The test waits for authoritative Spec Generation completion, then waits for the rendered compile action before issuing one compile command; it does not retry mutating commands.
-- Full suite: `go test ./... -count=1` — passed; all packages completed successfully, including `internal/tui` and `tests/e2e`.
-- Review: independent specification and code-quality review findings were addressed in the current follow-up: Compact now preserves the authoritative Blocked fact, lifecycle waits strip ANSI diff-renderer controls, and mutating E2E commands are single-shot after deterministic UI/application barriers. Final re-review evidence must be refreshed against the final HEAD.
+- Lifecycle synchronization: `go test ./internal/tui -run '^TestTUIPlanToApplyAndCleanup$' -count=3 -v` — three consecutive passes after workspace-backed acknowledgement mapping, projection-final status markers, and the cleanup project-writer barrier. Mutating commands remain single-shot.
+- Full suite: `go test ./... -p 1 -count=1 -timeout=3m` — **failed by timeout** in `internal/app` while running `TestDriveOnceBlockedWorkflowNeedsUser` (the stack showed provider parsing, Git subprocess work, and many `database/sql` connection-opener goroutines). This is not evidence of a passing full suite and remains an external gate outside the touched TUI files.
+- Isolated timeout diagnosis: `go test ./internal/app -run '^TestCleanupRemovesExactScratchPath$' -count=1 -timeout=90s -v` — passed in 4.42s; the package-wide/full-suite timeout remains unresolved.
+- Focused race lifecycle run: `go test -race ./internal/tui -run '^TestTUIPlanToApplyAndCleanup$' -count=1 -timeout=4m` — passed after the command-generation, context-cancellation, and projection-boundary fixes; no race report emitted. The package gate `go test ./internal/tui ./internal/cli ./cmd/cflow -count=1` also passed.
+- Review status: independent specification and code-quality reviewers found no remaining Critical issues; the reported Important issues were fixed in the current tree (strict Workflow identity, Create mutation gating, bounded acknowledgement retry/recovery, quit/error refresh safety, and E2E barriers), then affected package/race/lifecycle tests were rerun successfully. The known full-suite timeout remains an external `internal/app` gate.
+- Latest lifecycle synchronization fixes: after Plan approval, the test waits for the refreshed `SPEC_GENERATION` stage marker rather than relying on a complete `APPROVED` fragment in the append-only diff-renderer capture; after Discussion completion and Apply staging, it waits for the corresponding TUI acknowledgement status before sending the next mutating key. These are test-only synchronization changes and do not change TUI semantics.
+- Latest TUI state-safety fixes: command acknowledgement now carries an explicit command generation, origin page, and Workflow binding; read-only queries have independent sequence IDs; expected-empty Execution Approval requires the exact Specs acknowledgement generation or confirmed SpecGeneration lifecycle; Runner stop/report messages are workflow-bound; workflow selection resets Execution/Terminal state; root cancellation now requests a normal joined Runner stop and `Run` waits on the Runner completion channel as a final safety net.
 - Width/height coverage: `160×45`, `120×30`, `100×24`, `80×24`, `60×18`, plus small-height `88×6`, `100×6`, `120×6` and root status heights `1`, `2`, `3`.
-- Delivery commits: `bfde5c0` (`feat: refresh workspace tui presentation`) and `e1f1f40` (`test: stabilize tui lifecycle synchronization`). The follow-up compact/ANSI/E2E hardening is pending its own commit and final clean-state verification.
+- Current delivery commits: `bfde5c0` (`feat: refresh workspace tui presentation`), `e1f1f40` (`test: stabilize tui lifecycle synchronization`), `977fa85` (`fix: harden compact blocked state and tui e2e synchronization`), `fcc3477` (`fix: finalize tui e2e synchronization cleanup`), and `f44a84b` (`fix: harden tui lifecycle synchronization`). Git-visible clean proof was obtained after `f44a84b`.

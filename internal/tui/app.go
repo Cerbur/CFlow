@@ -31,6 +31,7 @@ import (
 // Fake terminal; production uses the process's stdin/stdout).
 type Dependencies struct {
 	CLI     cli.Dependencies
+	Context context.Context
 	In      io.Reader
 	Out     io.Writer
 	Err     io.Writer
@@ -53,6 +54,10 @@ type controller interface {
 // Run is the top-level entry the bare `cflow` command calls on an
 // interactive terminal; it never mutates a Workflow by itself.
 func Run(ctx context.Context, deps Dependencies) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deps.Context = ctx
 	prog := deps.Program
 	if prog == nil {
 		in := deps.In
@@ -63,14 +68,32 @@ func Run(ctx context.Context, deps Dependencies) error {
 		if out == nil {
 			out = os.Stdout
 		}
+		// Cancellation is delivered to the Model as a normal message so an
+		// active Foreground Runner can unwind and join before Bubble Tea
+		// exits. tea.WithContext would stop the program underneath the Model
+		// and could strand the runner command goroutine.
 		prog = tea.NewProgram(newModel(deps), tea.WithInput(in), tea.WithOutput(out))
 	}
-	model, err := prog.Run()
-	if err != nil {
-		return err
+	model, runErr := prog.Run()
+	if m, ok := model.(Model); ok {
+		if runErr != nil && m.running {
+			// Bubble Tea may return an event-loop/renderer error before the
+			// normal runnerDoneMsg reaches Update. Cancel and join directly
+			// before propagating that error.
+			m.forceStop()
+		}
+		// A context-driven stop may return the last Model before the runner's
+		// command message is processed. The command owns this join channel;
+		// wait here as a final safety net against an unattached Runner.
+		if m.running && m.runnerDone != nil {
+			<-m.runnerDone
+		}
+		if m.err != nil {
+			return m.err
+		}
 	}
-	if m, ok := model.(Model); ok && m.err != nil {
-		return m.err
+	if runErr != nil {
+		return runErr
 	}
 	return nil
 }
@@ -99,6 +122,18 @@ var navPages = []Page{
 	PageExecution, PageBlocked, PageTerminal,
 }
 
+type commandState struct {
+	inFlight     bool
+	generation   uint64 // latest mutating command generation
+	pending      uint64 // mutating command awaiting acknowledgement
+	ackPage      Page   // projection page that owns the command's facts
+	workflow     model.WorkflowID
+	ackRetries   uint8
+	projectionID uint64 // monotonic read-only query sequence
+}
+
+type contextDoneMsg struct{}
+
 // Model is the root TUI model: the read-only workspace projection, the
 // lifecycle pages, the runner state, and the controlled-stop protocol.
 type Model struct {
@@ -108,6 +143,7 @@ type Model struct {
 	err    error
 
 	deps Dependencies
+	ctx  context.Context
 	ctrl controller
 
 	// page is the current screen.
@@ -121,6 +157,14 @@ type Model struct {
 	// workflow ("" until a session exists; the create page falls back
 	// to the first healthy provider).
 	provider string
+	// commandState is shared by Model copies so a mutating key cannot enqueue
+	// another Application command before the previous command's projection
+	// acknowledgement arrives.
+	commandState      *commandState
+	lastProjectionID  uint64
+	projectionBlocked bool
+	blockedAckPage    Page
+	blockedWorkflow   model.WorkflowID
 
 	discussion       DiscussionPage
 	plan             app.PlanView
@@ -128,6 +172,7 @@ type Model struct {
 	approval         ApprovalModel
 	execution        ExecutionModel
 	terminal         TerminalModel
+	reportRequestID  uint64
 	cancel           app.CancelSummaryView
 	migration        app.MigrationPreviewView
 	migrationConfirm migrationConfirmation
@@ -147,8 +192,9 @@ type Model struct {
 	// DiscoveryQuery projection loads.
 	createDirty *app.DiscoveryView
 	// status is the transient status line.
-	status            string
-	pendingPlanStatus string
+	status                  string
+	pendingProjectionStatus string
+	pendingPlanStatus       string
 	// pendingPlanApproval preserves an explicit user approval while the
 	// CheckPlan command's authoritative projection is still in flight.
 	// The approval is issued only after the refreshed revision/hash is
@@ -159,10 +205,12 @@ type Model struct {
 	// Runner state: running is true while the Foreground Runner is
 	// active; runCancel is the runner's context; eventCh is the
 	// committed-event subscription the Execution page consumes.
-	running   bool
-	runCancel context.CancelFunc
-	eventCh   <-chan model.Event
-	sink      *foreground.EventSink
+	running        bool
+	runCancel      context.CancelFunc
+	eventCh        <-chan model.Event
+	sink           *foreground.EventSink
+	runnerWorkflow model.WorkflowID
+	runnerID       uint64
 
 	// stop tracks the controlled-stop state (design §12.1): the first
 	// Ctrl+C requests the controlled Pause; the second is the Force
@@ -171,6 +219,13 @@ type Model struct {
 	stop stopState
 	// prevPage is the page the Pause and Exit prompt returns to.
 	prevPage Page
+	// quitAfterRunner keeps the TUI alive until the Foreground Runner has
+	// delivered runnerDoneMsg after a controlled or forced stop.
+	quitAfterRunner bool
+	runnerDone      chan struct{}
+	// pauseCommandPending keeps a requested controlled pause joined with the
+	// Runner completion. A stop is not complete until both facts arrive.
+	pauseCommandPending bool
 	// resumeThenRun is set when the Execution page requested the resume
 	// as the start of the Foreground Runner: the runner starts once the
 	// resume committed.
@@ -201,9 +256,12 @@ const (
 // projectionMsg delivers one page projection loaded through the
 // controller (a read-only Query; the page renders it).
 type projectionMsg struct {
-	page Page
-	view app.View
-	err  error
+	page              Page
+	workflow          model.WorkflowID
+	generation        uint64 // unique read-only query sequence
+	commandGeneration uint64 // non-zero only for a command acknowledgement query
+	view              app.View
+	err               error
 }
 
 // appLoadedMsg delivers the shared Application opened by the Init
@@ -215,21 +273,28 @@ type appLoadedMsg struct {
 
 // commandDoneMsg delivers the result of one typed Application Command.
 type commandDoneMsg struct {
-	cmd app.Command
-	out app.Outcome
-	err error
+	cmd        app.Command
+	generation uint64
+	out        app.Outcome
+	err        error
 }
 
 // runnerEventMsg delivers one committed event of the Foreground Runner.
-type runnerEventMsg struct{ ev model.Event }
+type runnerEventMsg struct {
+	ev       model.Event
+	workflow model.WorkflowID
+	runnerID uint64
+}
 
 // eventsClosedMsg ends the event pump (the runner finished).
 type eventsClosedMsg struct{}
 
 // runnerDoneMsg delivers the terminal result of the Foreground Runner.
 type runnerDoneMsg struct {
-	res foreground.Result
-	err error
+	res      foreground.Result
+	err      error
+	workflow model.WorkflowID
+	runnerID uint64
 }
 
 // nativeDoneMsg delivers the result of one Native Session Bridge turn.
@@ -241,8 +306,10 @@ type nativeDoneMsg struct {
 // reportLoadedMsg delivers the rendered Final Report of the Terminal
 // page.
 type reportLoadedMsg struct {
-	markdown string
-	err      error
+	markdown  string
+	err       error
+	workflow  model.WorkflowID
+	requestID uint64
 }
 
 // NewModel returns the initial root model.
@@ -250,14 +317,20 @@ func NewModel() Model { return newModel(Dependencies{}) }
 
 // newModel returns the initial root model with the given dependencies.
 func newModel(deps Dependencies) Model {
+	modelContext := deps.Context
+	if modelContext == nil {
+		modelContext = context.Background()
+	}
 	return Model{
-		deps:       deps,
-		page:       PageWorkspace,
-		discussion: DiscussionPage{},
-		approval:   ApprovalModel{},
-		execution:  ExecutionModel{},
-		terminal:   NewTerminalModel(),
-		sink:       foreground.NewEventSink(),
+		deps:         deps,
+		ctx:          modelContext,
+		page:         PageWorkspace,
+		commandState: new(commandState),
+		discussion:   DiscussionPage{},
+		approval:     ApprovalModel{},
+		execution:    ExecutionModel{},
+		terminal:     NewTerminalModel(),
+		sink:         foreground.NewEventSink(),
 	}
 }
 
@@ -268,43 +341,169 @@ func newModel(deps Dependencies) Model {
 func (m Model) Init() tea.Cmd {
 	if m.ctrl != nil {
 		// The tests inject the controller directly.
-		return func() tea.Msg { return appLoadedMsg{ctrl: m.ctrl} }
+		return tea.Batch(
+			func() tea.Msg { return appLoadedMsg{ctrl: m.ctrl} },
+			waitContext(m.context()),
+		)
 	}
-	return func() tea.Msg {
+	open := func() tea.Msg {
 		var (
 			a   *app.Application
 			err error
 		)
 		if m.deps.CLI.OpenApplication != nil {
-			a, err = m.deps.CLI.OpenApplication(context.Background())
+			a, err = m.deps.CLI.OpenApplication(m.context())
 		} else {
-			a, err = cli.OpenApplication(context.Background(), m.deps.CLI)
+			a, err = cli.OpenApplication(m.context(), m.deps.CLI)
 		}
 		if err != nil {
 			return appLoadedMsg{err: err}
 		}
 		return appLoadedMsg{ctrl: a}
 	}
+	return tea.Batch(open, waitContext(m.context()))
+}
+
+func waitContext(ctx context.Context) tea.Cmd {
+	if ctx.Done() == nil {
+		// context.Background/context.TODO can never be cancelled; do not
+		// create a permanently blocked command (especially in headless
+		// synchronous test drivers).
+		return nil
+	}
+	return func() tea.Msg {
+		<-ctx.Done()
+		return contextDoneMsg{}
+	}
 }
 
 // queryProjectionMsg runs one read-only Query of the given page and
 // returns the projection message.
 func (m Model) queryProjectionMsg(page Page, q app.Query) tea.Msg {
-	view, err := m.ctrl.Query(context.Background(), q)
+	return m.queryProjectionMsgAt(page, q, m.nextProjectionID(), 0)
+}
+
+func (m Model) queryProjectionMsgAt(page Page, q app.Query, generation, commandGeneration uint64) tea.Msg {
+	workflow := queryWorkflowID(q)
+	view, err := m.ctrl.Query(m.context(), q)
 	if err != nil && page == PageWorkspace {
 		// A workflow can disappear between two read-only projections. Retry the
 		// aggregate query without the stale selection so the Application can
 		// choose the first remaining workflow; this changes no Runtime state.
 		if workspaceQ, ok := q.(app.ProjectWorkspaceQuery); ok && workspaceQ.Selected != "" && isMissingWorkflowError(err) {
-			view, err = m.ctrl.Query(context.Background(), app.ProjectWorkspaceQuery{})
+			view, err = m.ctrl.Query(m.context(), app.ProjectWorkspaceQuery{})
+			// Keep the fallback projection unbound. Its selected Workflow is
+			// authoritative and applyProjection will normalize local selection.
+			workflow = ""
 		}
 	}
-	return projectionMsg{page: page, view: view, err: err}
+	return projectionMsg{
+		page:              page,
+		workflow:          workflow,
+		generation:        generation,
+		commandGeneration: commandGeneration,
+		view:              view,
+		err:               err,
+	}
+}
+
+// queryWorkflowID extracts the workflow binding carried by TUI projections.
+// Workspace queries with an empty selection are intentionally unbound because
+// they are the stale-selection recovery path that normalizes to the first
+// remaining workflow.
+func queryWorkflowID(q app.Query) model.WorkflowID {
+	switch q := q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return q.Selected
+	case app.DiscussionReturnQuery:
+		return q.Workflow
+	case app.PlanQuery:
+		return q.Workflow
+	case app.ExecutionPreviewQuery:
+		return q.Workflow
+	case app.CancelSummaryQuery:
+		return q.Workflow
+	case app.LayoutMigrationPreviewQuery:
+		return q.Workflow
+	default:
+		return ""
+	}
 }
 
 func isMissingWorkflowError(err error) bool {
 	code, ok := model.CodeOf(err)
 	return ok && code == model.CodeInvalidInput && strings.Contains(err.Error(), "no such workflow:")
+}
+
+// isExpectedEmptyProjectionError identifies a read-only lifecycle projection
+// that is intentionally absent until a later lifecycle step has produced its
+// facts. It is deliberately narrower than CodeInvalidInput: a real query
+// failure must keep the mutating-command gate closed, while the execution
+// approval page is allowed to render an empty preview before specs/workflow
+// compilation and the dry run exist.
+func (m Model) isExpectedEmptyProjectionError(page Page, workflow model.WorkflowID, commandGeneration uint64, err error) bool {
+	if page != PageExecutionApproval || workflow == "" || err == nil {
+		return false
+	}
+	code, ok := model.CodeOf(err)
+	if !ok || code != model.CodeInvalidInput ||
+		!strings.Contains(err.Error(), "execution inputs are incomplete; no preview is available") {
+		return false
+	}
+	// Before Specs are generated, Execution Approval has a valid empty state.
+	// Once a command is waiting for a compiled workflow or dry-run preview, the
+	// same error is a failed acknowledgement and must remain blocking. When a
+	// Specs command has just completed, its pending status is the explicit
+	// command/lifecycle evidence that this empty state is expected.
+	if m.pendingProjectionStatus == "specs generated" {
+		if m.workspace.Lifecycle != nil && workflow != "" && m.workspace.Lifecycle.ID != workflow {
+			return false
+		}
+		// While the command is still in flight, only its origin-page
+		// acknowledgement may normalize the empty preview. A normal
+		// navigation query must not borrow the pending Specs status.
+		if m.commandState != nil && m.commandState.inFlight {
+			return m.commandState.ackPage == page && commandGeneration == m.commandState.pending
+		}
+		// Once the command has completed, the workspace lifecycle fact is
+		// the authority for the intentionally empty pre-compile state.
+		return m.workspace.Lifecycle != nil && m.workspace.Lifecycle.Stage == model.StageSpecGeneration
+	}
+	if m.commandState != nil && m.commandState.inFlight {
+		return false
+	}
+	if m.workspace.Lifecycle == nil || m.workspace.Lifecycle.ID != workflow || m.workspace.Lifecycle.Stage != model.StageSpecGeneration {
+		return false
+	}
+	return true
+}
+
+func projectionViewMatches(page Page, view app.View) bool {
+	switch page {
+	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
+		_, ok := view.(app.WorkspaceView)
+		return ok
+	case PageDiscussion:
+		_, ok := view.(app.DiscussionReturnView)
+		return ok
+	case PagePlanApproval:
+		_, ok := view.(app.PlanView)
+		return ok
+	case PageExecutionApproval:
+		_, ok := view.(app.ExecutionPreviewView)
+		return ok
+	case PageCreate:
+		_, ok := view.(app.DiscoveryView)
+		return ok
+	case PageCancel:
+		_, ok := view.(app.CancelSummaryView)
+		return ok
+	case PageMigration:
+		_, ok := view.(app.MigrationPreviewView)
+		return ok
+	default:
+		return false
+	}
 }
 
 // Update handles one message.
@@ -321,17 +520,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.ctrl = msg.ctrl
-		return m, func() tea.Msg {
-			return m.queryProjectionMsg(PageWorkspace, app.ProjectWorkspaceQuery{})
+		return m, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{})
+	case contextDoneMsg:
+		// Keep Bubble Tea alive until the Foreground Runner reports its
+		// terminal result. Context cancellation is a stop request, not an
+		// excuse to abandon the Runner goroutine or its event subscription.
+		if m.running {
+			m.quitAfterRunner = true
+			m.pauseCommandPending = true
+			workflow := m.activeRunnerWorkflow()
+			if m.runCancel != nil {
+				m.runCancel()
+			}
+			if workflow != "" {
+				// The root context is already cancelled. Use a detached command
+				// context so the controlled-stop intent can still be persisted.
+				return m, m.executeCmdWithContext(context.WithoutCancel(m.context()), app.PauseWorkflowCommand{Workflow: workflow})
+			}
+			m.forceStop()
+			return m, nil
 		}
+		return m, tea.Quit
 	case projectionMsg:
 		return m.applyProjection(msg)
 	case commandDoneMsg:
 		return m.applyCommand(msg)
 	case runnerEventMsg:
+		if msg.runnerID != 0 && msg.runnerID != m.runnerID {
+			return m, nil
+		}
+		if msg.workflow != "" && m.runnerWorkflow != "" && msg.workflow != m.runnerWorkflow {
+			return m, nil
+		}
 		m.execution = m.execution.OnEvent(msg.ev)
 		if m.running {
-			return m, m.pumpEvents()
+			return m, m.pumpEvents(m.runnerWorkflow, m.runnerID)
 		}
 		// The runner is no longer active (a terminal path already cleared
 		// running/eventCh): apply the in-flight event but never re-pump —
@@ -341,6 +564,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case eventsClosedMsg:
 		return m, nil
 	case runnerDoneMsg:
+		if msg.runnerID != 0 && msg.runnerID != m.runnerID {
+			return m, nil
+		}
+		if msg.workflow != "" && m.runnerWorkflow != "" && msg.workflow != m.runnerWorkflow {
+			return m, nil
+		}
 		return m.applyRunnerDone(msg)
 	case nativeDoneMsg:
 		if msg.err != nil {
@@ -359,6 +588,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ProviderSession: agent.ProviderSessionID(msg.result.ProviderSession),
 		})
 	case reportLoadedMsg:
+		if msg.requestID != 0 && msg.requestID != m.reportRequestID {
+			return m, nil
+		}
+		if msg.workflow != "" && msg.workflow != m.selected {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.status = "report: " + msg.err.Error()
 		} else {
@@ -370,21 +605,63 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	case error:
 		m.err = msg
-		// A renderer failure never leaves a background runner: clear the
-		// ownership state (design §16: the Runtime is unchanged; the user
-		// can recover through the Headless CLI).
-		m.clearRunner()
+		// A renderer failure must still join the Foreground Runner before the
+		// TUI exits. Cancellation requests the unwind, while runnerDoneMsg
+		// remains the only proof that the goroutine and event subscription are
+		// gone (design §16).
+		if m.running {
+			m.quitAfterRunner = true
+			if m.runCancel != nil {
+				m.runCancel()
+			}
+		}
 		return m, nil
 	}
 	return m, nil
 }
 
-// applyProjection stores one loaded page projection. A projection
-// error on a lifecycle page degrades to the page's empty state (e.g.,
-// the Execution Approval preview does not exist before the specs and
-// the dry run); only the workspace load failure is fatal.
+// applyProjection stores one loaded page projection. Only a narrowly
+// classified lifecycle absence degrades to an empty state (the Execution
+// Approval preview before specs/workflow compilation and the dry run); real
+// projection errors remain visible and cannot acknowledge a command.
 func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
+	// Execution Approval has a valid empty state before the specs, compiled
+	// workflow, and dry-run facts exist. Normalize only that exact expected
+	// absence into an empty view; all other projection errors remain errors and
+	// must not acknowledge a completed command.
+	if m.isExpectedEmptyProjectionError(msg.page, msg.workflow, msg.commandGeneration, msg.err) {
+		msg.err = nil
+		msg.view = app.ExecutionPreviewView{Workflow: msg.workflow}
+	}
+	acknowledgesCommand := m.commandState != nil &&
+		m.commandState.inFlight &&
+		msg.commandGeneration == m.commandState.pending &&
+		msg.page == m.commandState.ackPage &&
+		((msg.page == PageWorkspace && msg.workflow == "" && m.commandState.workflow == "") ||
+			(msg.workflow != "" && m.commandState.workflow != "" && msg.workflow == m.commandState.workflow))
+	// A query can finish after navigation or selection changed. Drop a
+	// workflow-bound result that no longer belongs to the root selection; the
+	// workspace fallback remains unbound and is allowed to normalize selection.
+	if msg.generation != 0 && msg.generation < m.lastProjectionID && !acknowledgesCommand {
+		return m, nil
+	}
+	if msg.workflow != "" && m.selected != "" && msg.workflow != m.selected && !acknowledgesCommand {
+		return m, nil
+	}
+	if msg.page != PageWorkspace && msg.page != PageBlocked && m.page != msg.page && !acknowledgesCommand {
+		return m, nil
+	}
+	if m.commandState != nil && m.commandState.inFlight &&
+		msg.commandGeneration != 0 && msg.commandGeneration != m.commandState.pending {
+		return m, nil
+	}
+	// A failed refresh is not an acknowledgement: the command gate remains
+	// closed so stale legal actions cannot be issued against old facts. A
+	// later matching successful projection can still release the gate.
 	if msg.err != nil {
+		if acknowledgesCommand {
+			return m.retryOrBlockCommandAcknowledgement(msg.page)
+		}
 		if msg.page == PageWorkspace {
 			m.err = msg.err
 			return m, nil
@@ -392,13 +669,65 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 		m.status = msg.err.Error()
 		return m, nil
 	}
+	if acknowledgesCommand && !projectionViewMatches(msg.page, msg.view) {
+		// A nil or wrong-typed successful query is not evidence that the
+		// command's facts were refreshed. Keep the gate closed until the
+		// expected projection type arrives.
+		return m.retryOrBlockCommandAcknowledgement(msg.page)
+	}
+	if msg.commandGeneration != 0 && !acknowledgesCommand {
+		return m, nil
+	}
+	if acknowledgesCommand && msg.workflow != "" && m.selected != "" && msg.workflow != m.selected {
+		// The command completed for a workflow that is no longer selected.
+		// Release the gate without publishing its status into the new
+		// workflow's UI or applying the old projection to it.
+		m.commandState.inFlight = false
+		m.pendingProjectionStatus = ""
+		if msg.generation > m.lastProjectionID {
+			m.lastProjectionID = msg.generation
+		}
+		return m, nil
+	}
+	if acknowledgesCommand {
+		m.commandState.inFlight = false
+		if m.pendingProjectionStatus != "" {
+			m.status = m.pendingProjectionStatus
+			m.pendingProjectionStatus = ""
+		}
+	}
+	if msg.page != PageWorkspace && msg.page != PageBlocked && m.page != msg.page {
+		// The command's page projection is still a valid completion
+		// acknowledgement even if the user navigated away before it arrived;
+		// do not overwrite the page that is now visible.
+		if msg.generation > m.lastProjectionID {
+			m.lastProjectionID = msg.generation
+		}
+		return m, nil
+	}
+	if msg.generation > m.lastProjectionID {
+		m.lastProjectionID = msg.generation
+	}
+	if msg.page == PageWorkspace && msg.commandGeneration == 0 && m.commandState != nil && !m.commandState.inFlight {
+		if !m.projectionBlocked || (m.blockedAckPage == PageWorkspace && msg.workflow == m.blockedWorkflow) {
+			m.projectionBlocked = false
+		}
+	}
+	if m.projectionBlocked && msg.commandGeneration == 0 && msg.page == m.blockedAckPage &&
+		msg.workflow != "" && msg.workflow == m.blockedWorkflow {
+		m.projectionBlocked = false
+	}
 	switch msg.page {
 	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
 		if v, ok := msg.view.(app.WorkspaceView); ok {
+			previousSelected := m.selected
 			m.workspace = MapWorkspace(v)
 			// Keep command routing aligned with the normalized ViewModel
 			// selection when a projection refers to a workflow that disappeared.
 			m.selected = m.workspace.Selected.ID
+			if previousSelected != m.selected {
+				m.resetSelectionState()
+			}
 			if m.provider == "" {
 				m.provider = preferredProvider(v.Health.Providers)
 			}
@@ -482,41 +811,146 @@ func (m Model) applyProjection(msg projectionMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
+// retryOrBlockCommandAcknowledgement gives a failed command projection a
+// bounded recovery path. After the bound, mutation stays disabled until a
+// successful workspace projection rebuilds fresh facts; this avoids both a
+// permanent in-flight wedge and issuing a new command from stale facts.
+func (m Model) retryOrBlockCommandAcknowledgement(page Page) (Model, tea.Cmd) {
+	if m.commandState == nil {
+		return m, nil
+	}
+	if m.commandState.ackRetries < 3 {
+		m.commandState.ackRetries++
+		workflow := m.commandState.workflow
+		if page == PageWorkspace {
+			return m, m.commandQueryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: workflow}, m.commandState.pending)
+		}
+		if q, ok := pageQuery(page, workflow); ok {
+			return m, m.commandQueryCmd(page, q, m.commandState.pending)
+		}
+	}
+	m.commandState.inFlight = false
+	m.projectionBlocked = true
+	m.blockedAckPage = m.commandState.ackPage
+	m.blockedWorkflow = m.commandState.workflow
+	m.pendingProjectionStatus = ""
+	m.status = "projection refresh failed; refreshing facts…"
+	return m, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.commandState.workflow})
+}
+
 // reloadCmd reloads the workspace projection and the current page's
 // projection after one command changed the Runtime facts.
+func commandAckPage(page Page) Page {
+	// Execution, Blocked, and Terminal render facts from the Workspace
+	// projection. Their commands must therefore be acknowledged by that
+	// projection rather than by a page query that reloadCmd does not issue.
+	switch page {
+	case PageCreate, PagePauseExit, PageExecution, PageBlocked, PageTerminal:
+		return PageWorkspace
+	default:
+		return page
+	}
+}
+
 func (m Model) reloadCmd() tea.Cmd {
 	var cmds []tea.Cmd
-	cmds = append(cmds, func() tea.Msg {
-		return m.queryProjectionMsg(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.selected})
-	})
-	switch m.page {
-	case PageDiscussion:
-		cmds = append(cmds, func() tea.Msg {
-			return m.queryProjectionMsg(PageDiscussion, app.DiscussionReturnQuery{Workflow: m.selected})
-		})
-	case PagePlanApproval:
-		cmds = append(cmds, func() tea.Msg {
-			return m.queryProjectionMsg(PagePlanApproval, app.PlanQuery{Workflow: m.selected})
-		})
-	case PageExecutionApproval:
-		cmds = append(cmds, func() tea.Msg {
-			return m.queryProjectionMsg(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected})
-		})
-	case PageCancel:
-		cmds = append(cmds, func() tea.Msg {
-			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
-		})
-	case PageMigration:
-		cmds = append(cmds, func() tea.Msg {
-			return m.queryProjectionMsg(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
-		})
+	workspaceWorkflow := m.selected
+	if m.commandState != nil && (m.commandState.inFlight || m.projectionBlocked) && m.commandState.ackPage == PageWorkspace {
+		workspaceWorkflow = m.commandState.workflow
+		if m.commandState.inFlight {
+			cmds = append(cmds, m.commandQueryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: workspaceWorkflow}, m.commandState.pending))
+		} else {
+			cmds = append(cmds, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: workspaceWorkflow}))
+		}
+	} else {
+		cmds = append(cmds, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: workspaceWorkflow}))
+	}
+	if q, ok := pageQuery(m.page, m.selected); ok {
+		cmds = append(cmds, m.reloadQueryCmd(m.page, q))
+	}
+	// Navigation is allowed while a mutation is in flight. If it moved away
+	// from the command's origin page, reload that page as an explicit command
+	// acknowledgement as well; the current page's ordinary query cannot
+	// release the mutation gate.
+	if m.commandState != nil && (m.commandState.inFlight || m.projectionBlocked) &&
+		m.commandState.ackPage != PageWorkspace && m.page != m.commandState.ackPage {
+		if q, ok := pageQuery(m.commandState.ackPage, m.commandState.workflow); ok {
+			if m.commandState.inFlight {
+				cmds = append(cmds, m.commandQueryCmd(m.commandState.ackPage, q, m.commandState.pending))
+			} else {
+				cmds = append(cmds, m.queryCmd(m.commandState.ackPage, q))
+			}
+		}
 	}
 	return tea.Batch(cmds...)
 }
 
+func pageQuery(page Page, workflow model.WorkflowID) (app.Query, bool) {
+	switch page {
+	case PageDiscussion:
+		return app.DiscussionReturnQuery{Workflow: workflow}, true
+	case PagePlanApproval:
+		return app.PlanQuery{Workflow: workflow}, true
+	case PageExecutionApproval:
+		return app.ExecutionPreviewQuery{Workflow: workflow}, true
+	case PageCancel:
+		return app.CancelSummaryQuery{Workflow: workflow}, true
+	case PageMigration:
+		return app.LayoutMigrationPreviewQuery{Workflow: workflow}, true
+	default:
+		return nil, false
+	}
+}
+
+func (m Model) reloadQueryCmd(page Page, q app.Query) tea.Cmd {
+	if m.commandState != nil && m.commandState.inFlight && page == m.commandState.ackPage {
+		return m.commandQueryCmd(page, q, m.commandState.pending)
+	}
+	return m.queryCmd(page, q)
+}
+
+func (m *Model) awaitProjectionStatus(status string) {
+	m.pendingProjectionStatus = status
+	m.status = "refreshing updated facts…"
+}
+
 // applyCommand handles one finished typed Application Command.
 func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
+	if m.commandState != nil && msg.generation != m.commandState.pending {
+		// A stop command may legitimately overtake an older mutating command.
+		// Its completion still settles the stop join, but must not apply stale
+		// outcome handling or clear the newer command's gate.
+		if _, ok := msg.cmd.(app.PauseWorkflowCommand); ok {
+			m.pauseCommandPending = false
+			if m.quitAfterRunner {
+				// A forced stop can finish the Runner before the controlled
+				// Pause command reports its failure. Preserve the second-Ctrl+C
+				// quit request and join whichever side is still unwinding.
+				return m.quit()
+			}
+		}
+		if _, ok := msg.cmd.(app.ResumeWorkflowCommand); ok {
+			m.resumeThenRun = false
+		}
+		return m, nil
+	}
 	if msg.err != nil {
+		if m.commandState != nil {
+			m.commandState.inFlight = false
+			m.projectionBlocked = true
+			m.blockedAckPage = m.commandState.ackPage
+			m.blockedWorkflow = m.commandState.workflow
+		}
+		m.pendingProjectionStatus = ""
+		if _, ok := msg.cmd.(app.PauseWorkflowCommand); ok {
+			m.pauseCommandPending = false
+			if m.quitAfterRunner {
+				// A forced stop can finish the Runner before the controlled
+				// Pause command reports its failure. Preserve the second-Ctrl+C
+				// quit request and join whichever side is still unwinding.
+				return m.quit()
+			}
+		}
 		if _, ok := msg.cmd.(app.CheckPlanCommand); ok {
 			m.planCheckInFlight = false
 			m.pendingPlanApproval = false
@@ -528,7 +962,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			m.forceStop()
 			return m.quit()
 		}
-		if _, ok := msg.cmd.(app.ResumeWorkflowCommand); ok && m.resumeThenRun {
+		if resume, ok := msg.cmd.(app.ResumeWorkflowCommand); ok && m.resumeThenRun {
 			// The Execution page requested the resume as the run start but
 			// the Runtime rejected it (the stale projection can still show
 			// Resume right after an execution approval while the workflow is
@@ -538,56 +972,70 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			// the pending resume-then-run would stay dangling and a later
 			// successful resume would double-start the runner.
 			m.resumeThenRun = false
-			return m.startRunner()
+			if resume.Workflow == m.selected {
+				m.projectionBlocked = false
+				return m.startRunner()
+			}
+			return m, nil
 		}
-		return m, nil
+		return m, m.reloadCmd()
 	}
 	switch msg.cmd.(type) {
 	case app.CreateWorkflowCommand:
 		m.selected = msg.out.Workflow
-		m.status = "workflow created"
+		if m.commandState != nil && msg.out.Workflow != "" {
+			// Creation changes the selected Workflow identity. Bind the
+			// acknowledgement refresh to the newly created aggregate rather
+			// than the pre-existing selection captured at key time.
+			m.commandState.workflow = msg.out.Workflow
+		}
+		m.awaitProjectionStatus("workflow created")
 		m.page = PageWorkspace
 		m.createDirty = nil
 		m.createConfirm = false
 		return m, m.reloadCmd()
 	case app.PauseWorkflowCommand:
-		if m.stop == stopPauseAndExit {
-			// The Pause and Exit confirmation: the pause completed, so
-			// no background process is left; finish the exit.
+		m.pauseCommandPending = false
+		if m.stop == stopPauseAndExit || m.quitAfterRunner {
+			// The pause command and Runner completion are both required before
+			// exiting. quit() joins the Runner when it is still unwinding.
 			return m.quit()
 		}
 		m.status = "workflow paused (controlled stop)"
 		m.pendingDecision = ""
 		return m, m.reloadCmd()
 	case app.ResumeWorkflowCommand:
-		m.status = "workflow resumed"
+		resume := msg.cmd.(app.ResumeWorkflowCommand)
+		m.awaitProjectionStatus("workflow resumed")
 		m.pendingDecision = ""
 		if m.resumeThenRun {
 			// The Execution page requested the resume as the run start.
 			m.resumeThenRun = false
-			m, run := m.startRunner()
-			return m, tea.Batch(m.reloadCmd(), run)
+			if resume.Workflow == m.selected {
+				m, run := m.startRunner()
+				return m, tea.Batch(m.reloadCmd(), run)
+			}
 		}
 		return m, m.reloadCmd()
 	case app.CancelWorkflowCommand:
-		m.status = "workflow cancelled"
+		m.awaitProjectionStatus("workflow cancelled")
 		m.page = PageWorkspace
 		return m, m.reloadCmd()
 	case app.AdoptWorkspaceCommand:
-		m.status = "workspace adopted"
+		m.awaitProjectionStatus("workspace adopted")
 		m.pendingDecision = ""
 		return m, m.reloadCmd()
 	case app.PrepareNativeDiscussionCommand:
 		if msg.out.Native != nil {
 			m.status = "starting the native discussion terminal…"
-			return m, newNativeExecCmd(msg.out.Native)
+			return m, newNativeExecCmd(m.context(), msg.out.Native)
 		}
 		m.status = "native discussion prepared"
 		return m, m.reloadCmd()
 	case app.ContinueNativeDiscussionCommand:
 		if msg.out.Native != nil {
 			m.status = "continuing the native discussion terminal…"
-			return m, newNativeExecCmd(msg.out.Native)
+			return m, newNativeExecCmd(m.context(), msg.out.Native)
 		}
 		// The outcome carried no Bridge request (a re-armed Session without
 		// recoverable binding facts): fall back to the plain projection reload
@@ -596,7 +1044,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 	case app.SwitchAgentCommand:
 		if msg.out.Native != nil {
 			m.status = "starting the switched native discussion terminal…"
-			return m, newNativeExecCmd(msg.out.Native)
+			return m, newNativeExecCmd(m.context(), msg.out.Native)
 		}
 		return m, m.reloadCmd()
 	case app.FreezeDiscussionCommand:
@@ -614,7 +1062,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 	case app.FinishDiscussionCommand:
 		m.discussion.Editing = false
 		m.discussion.Handoff = ""
-		m.status = "discussion finished"
+		m.awaitProjectionStatus("discussion finished")
 		return m, m.reloadCmd()
 	case app.GeneratePlanCommand:
 		m.planCheckInFlight = false
@@ -637,26 +1085,26 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.status = "plan approval finished; refreshing plan projection…"
 		return m, m.reloadCmd()
 	case app.GenerateSpecsCommand:
-		m.status = "specs generated"
+		m.awaitProjectionStatus("specs generated")
 		return m, m.reloadCmd()
 	case app.CompileWorkflowCommand:
-		m.status = "workflow compiled"
+		m.awaitProjectionStatus("workflow compiled")
 		return m, m.reloadCmd()
 	case app.ExecutionDryRunCommand:
-		m.status = "execution dry run complete"
+		m.awaitProjectionStatus("execution dry run complete")
 		return m, m.reloadCmd()
 	case app.ApproveExecutionCommand:
-		m.status = "execution approved"
+		m.awaitProjectionStatus("execution approved")
 		m.page = PageExecution
 		return m, m.reloadCmd()
 	case app.PrepareApplyCommand:
 		if msg.out.Apply != nil {
 			m.terminal.ApplyPreview = renderApplyAttempt(*msg.out.Apply)
-			m.status = "apply staged (preview ready)"
+			m.awaitProjectionStatus("apply staged (preview ready)")
 		}
 		return m, m.reloadCmd()
 	case app.ExecuteApplyCommand:
-		m.status = "apply delivered to the target branch"
+		m.awaitProjectionStatus("apply delivered to the target branch")
 		m.terminal.Confirmed = false
 		m.terminal.Yes = false
 		return m, m.reloadCmd()
@@ -665,11 +1113,11 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			m.terminal.CleanupPreview = renderCleanupAttempt(*msg.out.Cleanup)
 			ref := msg.out.Cleanup.Manifest
 			m.terminal.cleanupRef = &ref
-			m.status = "cleanup dry run manifest ready"
+			m.awaitProjectionStatus("cleanup dry run manifest ready")
 		}
 		return m, m.reloadCmd()
 	case app.ExecuteCleanupCommand:
-		m.status = "cleanup executed"
+		m.awaitProjectionStatus("cleanup executed")
 		m.terminal.Confirmed = false
 		m.terminal.Yes = false
 		return m, m.reloadCmd()
@@ -679,7 +1127,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		return m, m.reloadCmd()
 	case app.ExecuteLayoutMigrationCommand:
 		m.migrationConfirm = migrationConfirmNone
-		m.status = "legacy layout migrated"
+		m.awaitProjectionStatus("legacy layout migrated")
 		m.page = PageWorkspace
 		return m, m.reloadCmd()
 	}
@@ -694,8 +1142,18 @@ func (m Model) applyRunnerDone(msg runnerDoneMsg) (Model, tea.Cmd) {
 	m.running = false
 	m.runCancel = nil
 	m.eventCh = nil
+	// stopPauseAndExit means the confirmation page is visible; it becomes an
+	// actual exit request only after its y action arms the pause command. This
+	// avoids quitting merely because a Runner reaches a terminal result while
+	// the user is still deciding.
+	requestedQuit := m.quitAfterRunner || (m.stop == stopPauseAndExit && m.pauseCommandPending)
 	if msg.err != nil {
 		m.err = msg.err
+		if requestedQuit && !m.pauseCommandPending {
+			m.quitAfterRunner = false
+			m.stop = stopIdle
+			return m, tea.Quit
+		}
 		return m, nil
 	}
 	switch msg.res.Reason {
@@ -709,10 +1167,19 @@ func (m Model) applyRunnerDone(msg runnerDoneMsg) (Model, tea.Cmd) {
 		m.status = "runner: " + string(msg.res.Reason)
 		m.pendingDecision = ""
 	}
-	if m.stop == stopPauseAndExit {
-		// The runner is gone; finish the requested exit.
+	if requestedQuit {
+		if m.pauseCommandPending {
+			// Keep quitAfterRunner set for the second-Ctrl+C path; the pause
+			// completion will perform the final quit. stopPauseAndExit is
+			// likewise retained until its confirmation command completes.
+			return m, nil
+		}
+		// The runner and the requested pause are both complete.
+		m.quitAfterRunner = false
+		m.stop = stopIdle
 		return m, tea.Quit
 	}
+	m.quitAfterRunner = false
 	return m, m.reloadCmd()
 }
 
@@ -726,7 +1193,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		case stopIdle:
 			m.stop = stopFirstCtrlC
 			var cmds []tea.Cmd
-			if m.selected != "" {
+			workflow := m.activeRunnerWorkflow()
+			if workflow != "" {
 				// The first Ctrl+C requests the controlled Pause: the
 				// typed command closes dispatch and stops the managed
 				// processes, and the run context is cancelled so the real
@@ -734,7 +1202,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 				if m.runCancel != nil {
 					m.runCancel()
 				}
-				cmds = append(cmds, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected}))
+				m.pauseCommandPending = true
+				cmds = append(cmds, m.executeCmd(app.PauseWorkflowCommand{Workflow: workflow}))
 			}
 			return m, tea.Batch(cmds...)
 		default:
@@ -744,11 +1213,25 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m.quit()
 		}
 	}
+	if m.commandInFlight() && !m.typingText() && blocksWhileCommandInFlight(msg) {
+		m.status = "command in progress; waiting for refreshed facts"
+		return m, nil
+	}
+	if m.commandInFlight() && IsQuit(msg) && !m.typingText() {
+		m.status = "command in progress; waiting for refreshed facts"
+		return m, nil
+	}
 	// Tab cycles the lifecycle pages from any page (left/right keep
 	// their page-local meaning on the Approval/Execution/Terminal
 	// pages).
 	if msg.Code == tea.KeyTab {
 		return m.moveNav(1)
+	}
+	if (msg.Code == 'b' || msg.Code == 'B') && !m.typingText() {
+		if m.page != PageWorkspace {
+			m.page = PageWorkspace
+		}
+		return m, nil
 	}
 	// q is the quit key ONLY outside the text inputs (the create form
 	// and the handoff editor): inside them 'q' is a typed character.
@@ -804,11 +1287,18 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 func (m Model) typingText() bool {
 	switch m.page {
 	case PageCreate:
-		return true
+		return !m.commandInFlight()
 	case PageDiscussion:
 		return m.discussion.Editing
 	}
 	return false
+}
+
+func (m Model) activeRunnerWorkflow() model.WorkflowID {
+	if (m.running || m.pauseCommandPending || m.quitAfterRunner) && m.runnerWorkflow != "" {
+		return m.runnerWorkflow
+	}
+	return m.selected
 }
 
 // forceStop cancels the Runner and escalates the running controlled stop
@@ -836,19 +1326,94 @@ func (m *Model) clearRunner() {
 	m.eventCh = nil
 }
 
-// quit cleans the Foreground Runner ownership state and returns the quit
-// command (design §12.1): a quit never leaves an active Runner running or
-// a dangling event subscription.
+// quit requests TUI exit. If a Foreground Runner is active, Bubble Tea must
+// remain alive until runnerDoneMsg proves its goroutine and event subscription
+// have unwound; cancellation alone is not a join.
 func (m Model) quit() (Model, tea.Cmd) {
+	if m.running {
+		m.quitAfterRunner = true
+		return m, nil
+	}
 	m.clearRunner()
 	return m, tea.Quit
 }
 
+// resetSelectionState clears UI facts that are bound to the selected workflow.
+// It is shared by explicit navigation and stale-selection recovery.
+func (m *Model) resetSelectionState() {
+	m.provider = ""
+	m.discussion = DiscussionPage{}
+	m.approval = ApprovalModel{}
+	m.plan = app.PlanView{}
+	m.preview = app.ExecutionPreviewView{}
+	m.execution = NewExecutionModel("")
+	m.terminal = NewTerminalModel()
+	m.createDirty = nil
+	m.pendingPlanStatus = ""
+	m.pendingPlanApproval = false
+	m.planCheckInFlight = false
+	m.migration = app.MigrationPreviewView{}
+	m.migrationConfirm = migrationConfirmNone
+	m.pendingDecision = ""
+	m.pendingProjectionStatus = ""
+	m.resumeThenRun = false
+	m.projectionBlocked = false
+	m.blockedAckPage = PageWorkspace
+	m.blockedWorkflow = ""
+}
+
+func (m Model) commandInFlight() bool {
+	return m.commandState != nil && (m.commandState.inFlight || m.projectionBlocked)
+}
+
+func (m Model) context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
+}
+
+func blocksWhileCommandInFlight(msg tea.KeyPressMsg) bool {
+	// Navigation is read-only and remains available while the command's
+	// refreshed projection is in flight. Mutating page actions stay gated so a
+	// key cannot issue a second Application command against stale facts.
+	switch msg.Code {
+	case tea.KeyTab, tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight, tea.KeyEsc, 'b', 'B':
+		return false
+	}
+	return !IsQuit(msg) && !IsCtrlC(msg)
+}
+
+func (m Model) nextProjectionID() uint64 {
+	if m.commandState == nil {
+		return 0
+	}
+	m.commandState.projectionID++
+	return m.commandState.projectionID
+}
+
 // executeCmd runs one typed Application Command and delivers its Outcome.
 func (m Model) executeCmd(cmd app.Command) tea.Cmd {
+	return m.executeCmdWithContext(m.context(), cmd)
+}
+
+func (m Model) executeCmdWithContext(ctx context.Context, cmd app.Command) tea.Cmd {
+	generation := uint64(0)
+	if m.commandState != nil {
+		m.commandState.ackPage = commandAckPage(m.page)
+		m.commandState.workflow = m.selected
+		m.commandState.generation++
+		generation = m.commandState.generation
+		m.commandState.pending = generation
+		m.commandState.inFlight = true
+		m.commandState.ackRetries = 0
+		m.projectionBlocked = false
+		m.blockedAckPage = PageWorkspace
+		m.blockedWorkflow = ""
+	}
 	return func() tea.Msg {
-		out, err := m.ctrl.Execute(context.Background(), cmd)
-		return commandDoneMsg{cmd: cmd, out: out, err: err}
+		out, err := m.ctrl.Execute(ctx, cmd)
+		return commandDoneMsg{cmd: cmd, generation: generation, out: out, err: err}
 	}
 }
 
@@ -864,8 +1429,10 @@ func (m Model) handlePauseExitKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		if m.runCancel != nil {
 			m.runCancel()
 		}
-		if m.selected != "" {
-			return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
+		workflow := m.activeRunnerWorkflow()
+		if workflow != "" {
+			m.pauseCommandPending = true
+			return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: workflow})
 		}
 		m.forceStop()
 		return m.quit()
@@ -1011,9 +1578,7 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.page = PageCancel
-		return m, func() tea.Msg {
-			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
-		}
+		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 	case msg.Code == 'm' || msg.Code == 'M':
 		if m.selected == "" || !hasAction(m.workspace.Actions, ActionMigrate) {
 			m.status = "layout migration is not a legal action"
@@ -1106,6 +1671,10 @@ func (m Model) handleMigrationKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 // moveSelection moves the workflow selection by one row and reloads the
 // workspace projection (navigation is a read-only UI state change).
 func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
+	if m.running {
+		m.status = "stop the active runner before changing workflow"
+		return m, nil
+	}
 	if len(m.workspace.Workflows) == 0 {
 		return m, nil
 	}
@@ -1123,14 +1692,8 @@ func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 		idx = 0
 	}
 	m.selected = m.workspace.Workflows[idx].ID
-	m.provider = ""
-	m.discussion = DiscussionPage{}
-	m.plan = app.PlanView{}
-	m.preview = app.ExecutionPreviewView{}
-	m.pendingDecision = ""
-	return m, func() tea.Msg {
-		return m.queryProjectionMsg(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.selected})
-	}
+	m.resetSelectionState()
+	return m, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.selected})
 }
 
 // moveNav moves the lifecycle navigation by one page and loads the
@@ -1162,8 +1725,17 @@ func (m Model) moveNav(delta int) (Model, tea.Cmd) {
 
 // queryCmd loads one page projection through a read-only Query.
 func (m Model) queryCmd(page Page, q app.Query) tea.Cmd {
+	return m.queryCmdWithCommandGeneration(page, q, 0)
+}
+
+func (m Model) commandQueryCmd(page Page, q app.Query, commandGeneration uint64) tea.Cmd {
+	return m.queryCmdWithCommandGeneration(page, q, commandGeneration)
+}
+
+func (m Model) queryCmdWithCommandGeneration(page Page, q app.Query, commandGeneration uint64) tea.Cmd {
+	generation := m.nextProjectionID()
 	return func() tea.Msg {
-		return m.queryProjectionMsg(page, q)
+		return m.queryProjectionMsgAt(page, q, generation, commandGeneration)
 	}
 }
 
@@ -1226,9 +1798,7 @@ func (m Model) activateDiscussionAction() (Model, tea.Cmd) {
 		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
 	case ReturnCancel:
 		m.page = PageCancel
-		return m, func() tea.Msg {
-			return m.queryProjectionMsg(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
-		}
+		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 	}
 	return m, nil
 }
@@ -1483,15 +2053,18 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
 	case msg.Code == 'r' || msg.Code == 'R':
 		m.status = "rendering the final report…"
+		workflow := m.selected
+		m.reportRequestID++
+		requestID := m.reportRequestID
 		return m, func() tea.Msg {
-			view, err := m.ctrl.Query(context.Background(), app.ReportQuery{Workflow: m.selected, Build: m.deps.CLI.Build})
+			view, err := m.ctrl.Query(m.context(), app.ReportQuery{Workflow: workflow, Build: m.deps.CLI.Build})
 			if err != nil {
-				return reportLoadedMsg{err: err}
+				return reportLoadedMsg{workflow: workflow, requestID: requestID, err: err}
 			}
 			if rv, ok := view.(app.ReportView); ok {
-				return reportLoadedMsg{markdown: rv.Markdown}
+				return reportLoadedMsg{workflow: workflow, requestID: requestID, markdown: rv.Markdown}
 			}
-			return reportLoadedMsg{err: fmt.Errorf("unexpected report projection")}
+			return reportLoadedMsg{workflow: workflow, requestID: requestID, err: fmt.Errorf("unexpected report projection")}
 		}
 	case msg.Code == 'p' || msg.Code == 'P':
 		m.status = "staging the apply…"
@@ -1585,27 +2158,36 @@ func (m Model) startRunner() (Model, tea.Cmd) {
 	if m.selected == "" {
 		return m, nil
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	workflow := m.selected
+	ctx, cancel := context.WithCancel(m.context())
 	ch, id := m.sink.Subscribe()
+	m.runnerID++
+	runnerID := m.runnerID
+	runnerDone := make(chan struct{})
+	m.runnerWorkflow = workflow
+	m.runnerDone = runnerDone
 	m.runCancel = cancel
 	m.running = true
 	m.eventCh = ch
 	return m, tea.Batch(
 		func() tea.Msg {
-			defer m.sink.Unsubscribe(id)
+			defer func() {
+				m.sink.Unsubscribe(id)
+				close(runnerDone)
+			}()
 			r := &foreground.Runner{
 				Driver: m.ctrl,
 				OnEvent: func(ev model.Event) {
 					m.sink.Publish(ev)
 				},
 			}
-			res, err := r.Run(ctx, m.selected)
+			res, err := r.Run(ctx, workflow)
 			if err != nil {
-				return runnerDoneMsg{err: err}
+				return runnerDoneMsg{err: err, workflow: workflow, runnerID: runnerID}
 			}
-			return runnerDoneMsg{res: res}
+			return runnerDoneMsg{res: res, workflow: workflow, runnerID: runnerID}
 		},
-		m.pumpEvents(),
+		m.pumpEvents(workflow, runnerID),
 	)
 }
 
@@ -1615,7 +2197,7 @@ func (m Model) startRunner() (Model, tea.Cmd) {
 // different goroutines with no happens-before edge): a cleared channel
 // must end the pump with eventsClosedMsg instead of blocking forever on
 // a nil channel (a leaked goroutine).
-func (m Model) pumpEvents() tea.Cmd {
+func (m Model) pumpEvents(workflow model.WorkflowID, runnerID uint64) tea.Cmd {
 	ch := m.eventCh
 	return func() tea.Msg {
 		if ch == nil {
@@ -1625,7 +2207,7 @@ func (m Model) pumpEvents() tea.Cmd {
 		if !ok {
 			return eventsClosedMsg{}
 		}
-		return runnerEventMsg{ev: ev}
+		return runnerEventMsg{ev: ev, workflow: workflow, runnerID: runnerID}
 	}
 }
 
@@ -1638,13 +2220,14 @@ func (m Model) pumpEvents() tea.Cmd {
 // renderer, attaches the terminal streams, runs the supervised
 // interactive process, and restores the renderer when the turn ends.
 type nativeExec struct {
+	ctx    context.Context
 	req    native.Request
 	result *native.Result
 	err    error
 }
 
 func (c *nativeExec) Run() error {
-	result, err := (native.Bridge{}).Run(context.Background(), c.req)
+	result, err := (native.Bridge{}).Run(c.ctx, c.req)
 	c.result = &result
 	c.err = err
 	return err
@@ -1656,8 +2239,9 @@ func (c *nativeExec) SetStderr(w io.Writer) { c.req.Terminal.Err = w }
 
 // newNativeExecCmd builds the blocking-exec adapter of one prepared
 // native discussion turn.
-func newNativeExecCmd(req *app.NativeBridgeRequest) tea.Cmd {
+func newNativeExecCmd(ctx context.Context, req *app.NativeBridgeRequest) tea.Cmd {
 	cmd := &nativeExec{
+		ctx: ctx,
 		req: native.Request{
 			Workflow:        req.Workflow,
 			Session:         req.Session,
@@ -1699,10 +2283,11 @@ func render(m Model) string {
 	var b strings.Builder
 	switch m.page {
 	case PageWorkspace:
-		// Workspace owns a single footer row that combines projected key hints
-		// with the root's transient status. Other pages retain their existing
-		// status rendering below.
-		b.WriteString(renderWorkspaceWithStatus(m.workspace, m.status, m.width, m.height))
+		// The Workspace View receives only its mapped facts and dimensions. The
+		// root-owned transient status is an ephemeral overlay on the already
+		// rendered footer, not an authoritative WorkspaceViewModel field.
+		workspace := RenderWorkspace(m.workspace, m.width, m.height)
+		b.WriteString(overlayWorkspaceStatus(workspace, m.workspace, m.status, m.width))
 	case PageDiscussion:
 		b.WriteString(RenderDiscussionReturn(m.discussion))
 		b.WriteString(m.hints())
@@ -1742,6 +2327,22 @@ func render(m Model) string {
 		fmt.Fprintf(&b, "\nstatus: %s\n", m.status)
 	}
 	return b.String()
+}
+
+// overlayWorkspaceStatus keeps transient command feedback in the Workspace's
+// single footer row without widening the pure RenderWorkspace input contract.
+// Replacing the already-bounded final line preserves the original height and
+// avoids adding a second status row.
+func overlayWorkspaceStatus(frame string, workspace WorkspaceViewModel, status string, width int) string {
+	if status == "" {
+		return frame
+	}
+	lines := strings.Split(frame, "\n")
+	if len(lines) == 0 {
+		return frame
+	}
+	lines[len(lines)-1] = renderWorkspaceFooter(workspace, status, width)
+	return strings.Join(lines, "\n")
 }
 
 // hints is the key hint footer of the current page. The workflow-action

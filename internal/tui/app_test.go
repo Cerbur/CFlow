@@ -86,6 +86,436 @@ func TestApplyProjectionNormalizesStaleWorkspaceSelection(t *testing.T) {
 	}
 }
 
+func TestCommandStatusWaitsForProjectionAcknowledgement(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 1, pending: 1, ackPage: PageExecutionApproval, workflow: "wf-1"}
+
+	m, _ = m.applyCommand(commandDoneMsg{
+		cmd:        app.GenerateSpecsCommand{Workflow: "wf-1"},
+		generation: 1,
+	})
+	if m.status == "specs generated" || m.pendingProjectionStatus != "specs generated" {
+		t.Fatalf("command completion claimed final status before projection: status=%q pending=%q", m.status, m.pendingProjectionStatus)
+	}
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageExecutionApproval,
+		workflow:          "wf-1",
+		generation:        1,
+		commandGeneration: 1,
+		view:              app.ExecutionPreviewView{Workflow: "wf-1"},
+	})
+	if m.status != "specs generated" || m.pendingProjectionStatus != "" {
+		t.Fatalf("projection acknowledgement did not publish final status: status=%q pending=%q", m.status, m.pendingProjectionStatus)
+	}
+}
+
+func TestNavigationProjectionDoesNotAcknowledgeCommand(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageWorkspace
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 3, pending: 3, ackPage: PageWorkspace, workflow: "wf-2"}
+	m.pendingProjectionStatus = "command complete"
+
+	// This is an ordinary navigation query issued while the mutation is in
+	// flight. It shares the command generation but is not the command's
+	// acknowledgement query.
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageWorkspace,
+		workflow:          "wf-1",
+		generation:        11,
+		commandGeneration: 0,
+		view: app.WorkspaceView{
+			Selected:  "wf-1",
+			Workflows: []app.WorkflowSummary{{ID: "wf-1"}},
+		},
+	})
+	if !m.commandState.inFlight {
+		t.Fatal("ordinary navigation projection acknowledged the command")
+	}
+	if m.status == "command complete" {
+		t.Fatal("ordinary navigation projection published the command status")
+	}
+}
+
+func TestCommandAcknowledgementRequiresBoundWorkflow(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageWorkspace
+	m.selected = "wf-2"
+	m.commandState = &commandState{
+		inFlight: true, generation: 4, pending: 4, ackPage: PageWorkspace, workflow: "wf-1",
+	}
+	m.pendingProjectionStatus = "command complete"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageWorkspace,
+		workflow:          "wf-2",
+		generation:        14,
+		commandGeneration: 4,
+		view:              app.WorkspaceView{Selected: "wf-2", Workflows: []app.WorkflowSummary{{ID: "wf-2"}}},
+	})
+	if !m.commandState.inFlight {
+		t.Fatal("different-workflow projection acknowledged the command")
+	}
+	if m.status == "command complete" {
+		t.Fatal("different-workflow projection published the command status")
+	}
+}
+
+func TestCommandAcknowledgementRetainsOriginPageAcrossNavigation(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	_ = m.executeCmd(app.GenerateSpecsCommand{Workflow: "wf-1"})
+	m.page = PagePlanApproval
+	_ = m.reloadCmd()
+	if got, want := m.commandState.ackPage, PageExecutionApproval; got != want {
+		t.Fatalf("ack page changed after navigation: got %v, want %v", got, want)
+	}
+}
+
+func TestProjectionSequenceRejectsOutOfOrderQuery(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PagePlanApproval
+	m.selected = "wf-1"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:       PagePlanApproval,
+		workflow:   "wf-1",
+		generation: 12,
+		view:       app.PlanView{Workflow: "wf-1", Revision: 2, Hash: "new"},
+	})
+	m, _ = m.applyProjection(projectionMsg{
+		page:       PagePlanApproval,
+		workflow:   "wf-1",
+		generation: 11,
+		view:       app.PlanView{Workflow: "wf-1", Revision: 1, Hash: "old"},
+	})
+	if m.plan.Revision != 2 || m.plan.Hash != "new" {
+		t.Fatalf("older projection replaced newer state: %+v", m.plan)
+	}
+}
+
+func TestProjectionErrorDoesNotAcknowledgeCommand(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 4, pending: 4, ackPage: PageWorkspace}
+	m.pendingProjectionStatus = "command complete"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:       PageWorkspace,
+		workflow:   "wf-1",
+		generation: 4,
+		err:        model.InvalidInputFault("workspace projection unavailable"),
+	})
+	if !m.commandState.inFlight {
+		t.Fatal("projection error incorrectly acknowledged the command")
+	}
+	if m.pendingProjectionStatus != "command complete" {
+		t.Fatalf("projection error discarded pending status: %q", m.pendingProjectionStatus)
+	}
+}
+
+func TestMalformedProjectionDoesNotAcknowledgeCommand(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageWorkspace
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 10, pending: 10, ackPage: PageWorkspace}
+	m.pendingProjectionStatus = "command complete"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageWorkspace,
+		workflow:          "wf-1",
+		generation:        10,
+		commandGeneration: 10,
+	})
+	if !m.commandState.inFlight {
+		t.Fatal("malformed projection acknowledged the command")
+	}
+	if m.pendingProjectionStatus != "command complete" {
+		t.Fatalf("pending status = %q, want command complete", m.pendingProjectionStatus)
+	}
+}
+
+func TestResetSelectionStateClearsWorkflowBoundPages(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.terminal.Report = "old report"
+	m.terminal.ApplyPreview = "old apply"
+	m.terminal.CleanupPreview = "old cleanup"
+	m.execution = NewExecutionModel("wf-old")
+	m.execution.Log = []string{"old event"}
+	m.resetSelectionState()
+	if m.terminal.Report != "" || m.terminal.ApplyPreview != "" || m.terminal.CleanupPreview != "" {
+		t.Fatalf("terminal state survived selection reset: %+v", m.terminal)
+	}
+	if m.execution.Workflow != "" || len(m.execution.Log) != 0 {
+		t.Fatalf("execution state survived selection reset: %+v", m.execution)
+	}
+}
+
+func TestRunnerStopUsesBoundWorkflow(t *testing.T) {
+	rec := &recordingController{ctrl: &migrationController{}}
+	m := newModel(Dependencies{})
+	m.ctrl = rec
+	m.running = true
+	m.runnerWorkflow = "wf-running"
+	m.selected = "wf-selected"
+	m.runCancel = func() {}
+	m.page = PageExecution
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: KeyCtrlCRune, Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatal("controlled stop produced no pause command")
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, nested := range batch {
+			if nested != nil {
+				msg = nested()
+				break
+			}
+		}
+	}
+	if _, ok := msg.(commandDoneMsg); !ok {
+		t.Fatalf("pause command result = %T, want commandDoneMsg (updated=%+v)", msg, updated)
+	}
+	if len(rec.executed) != 1 {
+		t.Fatalf("executed commands = %v, want one pause", rec.executed)
+	}
+	pause, ok := rec.executed[0].(app.PauseWorkflowCommand)
+	if !ok || pause.Workflow != "wf-running" {
+		t.Fatalf("pause command = %#v, want wf-running", rec.executed[0])
+	}
+}
+
+func TestStaleReportDoesNotOverwriteSelectedWorkflow(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-new"
+	m.terminal.Report = "new report"
+	m, _ = func() (Model, tea.Cmd) {
+		updated, cmd := m.Update(reportLoadedMsg{workflow: "wf-old", markdown: "old report"})
+		return updated.(Model), cmd
+	}()
+	if m.terminal.Report != "new report" {
+		t.Fatalf("stale report overwrote selected workflow: %q", m.terminal.Report)
+	}
+}
+
+func TestUnexpectedExecutionProjectionErrorDoesNotAcknowledgeCommand(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 6, pending: 6, ackPage: PageExecutionApproval}
+	m.pendingProjectionStatus = "workflow compiled"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:       PageExecutionApproval,
+		workflow:   "wf-1",
+		generation: 6,
+		err:        model.InvalidInputFault("execution inputs are incomplete; generate specs and compile the workflow first"),
+	})
+	if !m.commandState.inFlight {
+		t.Fatal("unexpected execution projection error acknowledged the command")
+	}
+	if m.pendingProjectionStatus != "workflow compiled" {
+		t.Fatalf("pending status = %q, want workflow compiled", m.pendingProjectionStatus)
+	}
+}
+
+func TestExpectedEmptyExecutionProjectionAcknowledgesCommand(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	m.workspace.Lifecycle = &LifecycleItem{ID: "wf-1", Stage: model.StageSpecGeneration}
+	m.commandState = &commandState{inFlight: true, generation: 5, pending: 5, ackPage: PageExecutionApproval, workflow: "wf-1"}
+	m.pendingProjectionStatus = "specs generated"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageExecutionApproval,
+		workflow:          "wf-1",
+		generation:        5,
+		commandGeneration: 5,
+		err:               model.InvalidInputFault("execution inputs are incomplete; no preview is available"),
+	})
+	if m.commandState.inFlight {
+		t.Fatal("expected-empty execution projection did not acknowledge the command")
+	}
+	if m.status != "specs generated" || m.pendingProjectionStatus != "" {
+		t.Fatalf("status = %q, pending = %q; want acknowledged status", m.status, m.pendingProjectionStatus)
+	}
+	if m.preview.Workflow != "wf-1" {
+		t.Fatalf("preview workflow = %q, want wf-1", m.preview.Workflow)
+	}
+	if m.preview.PlanHash != "" || len(m.preview.SpecHashes) != 0 {
+		t.Fatalf("expected empty preview, got %+v", m.preview)
+	}
+}
+
+func TestExpectedEmptyExecutionProjectionDoesNotAcknowledgeCompile(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 8, pending: 8, ackPage: PageExecutionApproval, workflow: "wf-1"}
+	m.pendingProjectionStatus = "workflow compiled"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageExecutionApproval,
+		workflow:          "wf-1",
+		generation:        8,
+		commandGeneration: 8,
+		err:               model.InvalidInputFault("execution inputs are incomplete; no preview is available"),
+	})
+	if !m.commandState.inFlight {
+		t.Fatal("compile projection's missing preview was incorrectly treated as expected-empty")
+	}
+	if m.pendingProjectionStatus != "workflow compiled" {
+		t.Fatalf("pending status = %q, want workflow compiled", m.pendingProjectionStatus)
+	}
+}
+
+func TestExpectedEmptyExecutionProjectionRequiresSpecStageWhenIdle(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	m.workspace.Lifecycle = &LifecycleItem{ID: "wf-1", Stage: model.StageWorkflowGeneration}
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:       PageExecutionApproval,
+		workflow:   "wf-1",
+		generation: 2,
+		err:        model.InvalidInputFault("execution inputs are incomplete; no preview is available"),
+	})
+	if m.preview.Workflow != "" {
+		t.Fatalf("late empty preview was normalized outside spec stage: %+v", m.preview)
+	}
+}
+
+func TestGenerateSpecsAcknowledgesBoundExpectedEmptyProjection(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ctrl = &expectedEmptyPreviewController{}
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+
+	command := m.executeCmd(app.GenerateSpecsCommand{Workflow: "wf-1"})
+	done, ok := command().(commandDoneMsg)
+	if !ok {
+		t.Fatal("GenerateSpecs command did not return commandDoneMsg")
+	}
+	m, reload := m.applyCommand(done)
+	m = runCmds(t, m, reload)
+	if m.commandState.inFlight {
+		t.Fatal("expected-empty projection left the GenerateSpecs command in flight")
+	}
+	if m.status != "specs generated" {
+		t.Fatalf("status = %q, want specs generated", m.status)
+	}
+}
+
+func TestExpectedEmptySpecsStatusDoesNotNormalizeNavigationProjection(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecutionApproval
+	m.selected = "wf-1"
+	m.commandState = &commandState{
+		inFlight: true,
+		pending:  7,
+		ackPage:  PageDiscussion,
+		workflow: "wf-1",
+	}
+	m.pendingProjectionStatus = "specs generated"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:       PageExecutionApproval,
+		workflow:   "wf-1",
+		generation: 8,
+		err:        model.InvalidInputFault("execution inputs are incomplete; no preview is available"),
+	})
+	if m.preview.Workflow != "" {
+		t.Fatalf("navigation projection borrowed pending Specs status: %+v", m.preview)
+	}
+	if m.status == "specs generated" {
+		t.Fatalf("navigation projection published pending Specs status: %q", m.status)
+	}
+}
+
+func TestCommandAcknowledgementSurvivesSelectionNavigation(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-2"
+	m.commandState = &commandState{inFlight: true, generation: 3, pending: 3, ackPage: PageWorkspace, workflow: "wf-1"}
+	m.pendingProjectionStatus = "command complete"
+	m.workspace.Selected.ID = "wf-2"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageWorkspace,
+		workflow:          "wf-1",
+		generation:        3,
+		commandGeneration: 3,
+		view: app.WorkspaceView{
+			Selected:  "wf-1",
+			Workflows: []app.WorkflowSummary{{ID: "wf-1"}},
+		},
+	})
+	if m.commandState.inFlight {
+		t.Fatal("stale command projection left the command gate in flight")
+	}
+	if m.selected != "wf-2" || m.workspace.Selected.ID != "wf-2" {
+		t.Fatalf("stale command projection overwrote selection: selected=%q workspace=%q", m.selected, m.workspace.Selected.ID)
+	}
+	if m.status == "command complete" {
+		t.Fatalf("stale command projection published old-workflow status: %q", m.status)
+	}
+}
+
+func TestWorkspaceProjectionAcknowledgesWorkspaceBackedPageCommand(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.page = PageExecution
+	m.selected = "wf-1"
+	m.commandState = &commandState{inFlight: true, generation: 7, pending: 7, workflow: "wf-1"}
+	m.reloadCmd()
+	if got, want := m.commandState.ackPage, PageWorkspace; got != want {
+		t.Fatalf("ack page = %v, want %v for workspace-backed execution page", got, want)
+	}
+
+	m, _ = m.applyProjection(projectionMsg{
+		page:              PageWorkspace,
+		workflow:          "wf-1",
+		generation:        7,
+		commandGeneration: 7,
+		view: app.WorkspaceView{
+			Selected:  "wf-1",
+			Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePaused}},
+		},
+	})
+	if m.commandState.inFlight {
+		t.Fatal("workspace projection did not acknowledge the command")
+	}
+}
+
+func TestApplyProjectionStaleSelectionClearsBoundState(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-removed"
+	m.provider = "claude"
+	m.discussion.Provider = "claude"
+	m.plan = app.PlanView{Workflow: "wf-removed", Revision: 2}
+	m.preview = app.ExecutionPreviewView{Workflow: "wf-removed", WorkflowHash: "old"}
+	m.pendingDecision = "adopt workspace"
+
+	m, _ = m.applyProjection(projectionMsg{
+		page: PageWorkspace,
+		view: app.WorkspaceView{
+			Selected:  "wf-1",
+			Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimePaused}},
+			Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimePaused}},
+		},
+	})
+	if m.selected != "wf-1" || m.provider == "claude" || m.discussion.Provider != "" ||
+		m.plan.Workflow != "" || m.preview.Workflow != "" || m.pendingDecision != "" {
+		t.Fatalf("stale selection state survived recovery: selected=%q provider=%q discussion=%q plan=%+v preview=%+v decision=%q",
+			m.selected, m.provider, m.discussion.Provider, m.plan, m.preview, m.pendingDecision)
+	}
+}
+
 func TestWorkspaceStatusStaysInsideViewport(t *testing.T) {
 	m := newModel(Dependencies{})
 	m.ready = true
@@ -234,6 +664,30 @@ type recordingController struct {
 }
 
 type migrationController struct{ executed []app.Command }
+
+type expectedEmptyPreviewController struct{}
+
+func (*expectedEmptyPreviewController) Execute(context.Context, app.Command) (app.Outcome, error) {
+	return app.Outcome{Workflow: "wf-1"}, nil
+}
+func (*expectedEmptyPreviewController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q := q.(type) {
+	case app.ProjectWorkspaceQuery:
+		return app.WorkspaceView{
+			Selected:  q.Selected,
+			Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeRunning, Stage: model.StageSpecGeneration}},
+			Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Stage: model.StageSpecGeneration}},
+		}, nil
+	case app.ExecutionPreviewQuery:
+		return nil, model.InvalidInputFault("execution inputs are incomplete; no preview is available")
+	default:
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+}
+func (*expectedEmptyPreviewController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+func (*expectedEmptyPreviewController) EscalateStop() {}
 
 func (m *migrationController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
 	m.executed = append(m.executed, cmd)
@@ -1610,12 +2064,19 @@ func TestModelQShowsPauseAndExit(t *testing.T) {
 	if !rec.hasExecuted(app.PauseWorkflowCommand{}) {
 		t.Fatalf("y did not execute the controlled pause: %v", rec.executed)
 	}
-	// The pause completion finishes the exit (no runner is left behind).
+	// The pause command only arms the exit; the runner completion is the
+	// join point that proves no process or event subscription remains.
 	m5, quitCmd := m4.(Model).Update(msg)
-	if quitCmd == nil {
-		t.Fatal("the pause-and-exit did not quit after the pause completed")
+	if quitCmd != nil {
+		t.Fatal("the pause-and-exit quit before runner completion")
 	}
-	_ = m5
+	m6, quitCmd := m5.(Model).Update(runnerDoneMsg{res: foreground.Result{Reason: foreground.StopCancelled}})
+	if quitCmd == nil {
+		t.Fatal("the pause-and-exit did not quit after runner completion")
+	}
+	if mm := m6.(Model); mm.running || mm.runCancel != nil || mm.eventCh != nil {
+		t.Fatalf("runner ownership remained after pause-and-exit: running=%v runCancel=%v eventCh=%v", mm.running, mm.runCancel != nil, mm.eventCh != nil)
+	}
 	// The same flow works through the first Ctrl+C path: q after the
 	// first Ctrl+C also shows the confirmation.
 	m7 := m
@@ -1862,8 +2323,8 @@ func TestModelCtrlCCancelsRunnerOnPause(t *testing.T) {
 }
 
 // TestModelCtrlCSecondForceStopCleansUp: the second Ctrl+C escalates the
-// controlled stop to the force-kill phase (EscalateStop), quits, and
-// cleans the runner ownership state.
+// controlled stop to the force-kill phase (EscalateStop), then quits only
+// after runnerDoneMsg proves the runner ownership is cleaned up.
 func TestModelCtrlCSecondForceStopCleansUp(t *testing.T) {
 	ctrl := &executionController{runtime: model.RuntimeRunning}
 	rec := &recordingController{ctrl: ctrl}
@@ -1879,13 +2340,34 @@ func TestModelCtrlCSecondForceStopCleansUp(t *testing.T) {
 	if rec.escalated != 1 {
 		t.Fatalf("the second Ctrl+C did not escalate: %d", rec.escalated)
 	}
-	if quitCmd == nil {
-		t.Fatal("the second Ctrl+C did not quit")
+	if quitCmd != nil {
+		t.Fatal("the second Ctrl+C quit before runner completion")
 	}
-	mm := m3.(Model)
+	m4, quitCmd := m3.(Model).Update(runnerDoneMsg{res: foreground.Result{Reason: foreground.StopCancelled}})
+	if quitCmd == nil {
+		t.Fatal("the second Ctrl+C did not quit after runner completion")
+	}
+	mm := m4.(Model)
 	if mm.running || mm.runCancel != nil || mm.eventCh != nil {
 		t.Fatalf("the second Ctrl+C left runner ownership: running=%v runCancel=%v eventCh=%v",
 			mm.running, mm.runCancel != nil, mm.eventCh != nil)
+	}
+}
+
+func TestPauseFailureAfterForceStopStillQuits(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.stop = stopFirstCtrlC
+	m.quitAfterRunner = true
+	m.pauseCommandPending = true
+	m.commandState = &commandState{inFlight: true, generation: 9, pending: 9, ackPage: PageWorkspace}
+
+	_, quitCmd := m.applyCommand(commandDoneMsg{
+		cmd:        app.PauseWorkflowCommand{Workflow: "wf-1"},
+		generation: 9,
+		err:        model.InvalidInputFault("pause failed"),
+	})
+	if quitCmd == nil {
+		t.Fatal("pause failure after force stop did not complete the pending quit")
 	}
 }
 
@@ -1905,10 +2387,9 @@ func TestRunnerDoneClearsEventChannel(t *testing.T) {
 	}
 }
 
-// TestRunnerRendererErrorClearsOwnership: a renderer failure (an error
-// message) never leaves a background Runner — the ownership state is
-// cleared (design §16: the Runtime is unchanged; the user recovers
-// through the Headless CLI).
+// TestRunnerRendererErrorJoinsRunner: a renderer failure (an error message)
+// requests cancellation but keeps Runner ownership until runnerDoneMsg proves
+// the goroutine and event subscription have unwound (design §16).
 func TestRunnerRendererErrorClearsOwnership(t *testing.T) {
 	ctrl := &executionController{runtime: model.RuntimeRunning}
 	m := load(t, testModel(&recordingController{ctrl: ctrl}))
@@ -1916,9 +2397,40 @@ func TestRunnerRendererErrorClearsOwnership(t *testing.T) {
 
 	m, _ = m.startRunner()
 	m2 := step(t, m, model.InvalidInputFault("renderer exploded"))
-	if m2.running || m2.runCancel != nil || m2.eventCh != nil {
-		t.Fatalf("renderer error left runner ownership: running=%v runCancel=%v eventCh=%v",
-			m2.running, m2.runCancel != nil, m2.eventCh != nil)
+	if !m2.running || m2.runCancel == nil || m2.eventCh == nil || !m2.quitAfterRunner {
+		t.Fatalf("renderer error did not preserve runner join: running=%v runCancel=%v eventCh=%v quitAfterRunner=%v",
+			m2.running, m2.runCancel != nil, m2.eventCh != nil, m2.quitAfterRunner)
+	}
+	m3, cmd := m2.Update(runnerDoneMsg{res: foreground.Result{Reason: foreground.StopCancelled}})
+	if cmd == nil {
+		t.Fatal("renderer error did not quit after runner completion")
+	}
+	if m3.(Model).running || m3.(Model).runCancel != nil || m3.(Model).eventCh != nil {
+		t.Fatal("runner ownership survived renderer-error completion")
+	}
+}
+
+func TestRunnerDoneWaitsForPauseCommand(t *testing.T) {
+	m := testModel(&recordingController{ctrl: &executionController{runtime: model.RuntimeRunning}})
+	m.selected = "wf-1"
+	m.running = true
+	m.stop = stopPauseAndExit
+	m.pauseCommandPending = true
+
+	m2, cmd := m.applyRunnerDone(runnerDoneMsg{res: foreground.Result{Reason: foreground.StopCancelled}})
+	if cmd != nil {
+		t.Fatal("runner completion quit before the pause command completed")
+	}
+	if m2.running || !m2.pauseCommandPending || m2.stop != stopPauseAndExit {
+		t.Fatalf("runner completion lost the pause join: running=%v pausePending=%v stop=%v", m2.running, m2.pauseCommandPending, m2.stop)
+	}
+
+	m3, cmd := m2.applyCommand(commandDoneMsg{cmd: app.PauseWorkflowCommand{Workflow: "wf-1"}})
+	if cmd == nil {
+		t.Fatal("pause completion did not finish the pending exit")
+	}
+	if m3.stop != stopPauseAndExit || m3.pauseCommandPending {
+		t.Fatalf("pause completion corrupted stop state: stop=%v pausePending=%v", m3.stop, m3.pauseCommandPending)
 	}
 }
 
@@ -1933,7 +2445,7 @@ func TestPumpEventsNilChannel(t *testing.T) {
 	m := testModel(&recordingController{ctrl: ctrl})
 	m.eventCh = nil
 
-	cmd := m.pumpEvents()
+	cmd := m.pumpEvents("", 0)
 	if cmd == nil {
 		t.Fatal("pumpEvents returned a nil command")
 	}

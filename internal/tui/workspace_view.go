@@ -22,13 +22,10 @@ const (
 )
 
 // RenderWorkspace renders the main workbench within the requested viewport.
+// It is a pure View function: only the mapped ViewModel and terminal
+// dimensions affect its output. Root-owned transient status is overlaid by
+// app.go without becoming a WorkspaceViewModel field.
 func RenderWorkspace(m WorkspaceViewModel, width, height int) string {
-	return renderWorkspaceWithStatus(m, "", width, height)
-}
-
-// renderWorkspaceWithStatus keeps the root model's transient status in the
-// Workspace footer without adding it to the authoritative ViewModel.
-func renderWorkspaceWithStatus(m WorkspaceViewModel, status string, width, height int) string {
 	if width <= 0 {
 		width = 80
 	}
@@ -38,13 +35,13 @@ func renderWorkspaceWithStatus(m WorkspaceViewModel, status string, width, heigh
 
 	switch workspaceLayoutFor(width, height) {
 	case layoutWide:
-		return renderWideWorkspace(m, status, width, height)
+		return renderWideWorkspace(m, width, height)
 	case layoutMedium:
-		return renderMediumWorkspace(m, status, width, height)
+		return renderMediumWorkspace(m, width, height)
 	case layoutCompact:
-		return renderCompactWorkspace(m, status, width, height)
+		return renderCompactWorkspace(m, width, height)
 	default:
-		return renderMinimalWorkspace(m, status, width, height)
+		return renderMinimalWorkspace(m, width, height)
 	}
 }
 
@@ -69,9 +66,9 @@ func workspaceLayoutFor(width, height int) workspaceLayout {
 	return layoutMinimal
 }
 
-func renderWideWorkspace(m WorkspaceViewModel, status string, width, height int) string {
+func renderWideWorkspace(m WorkspaceViewModel, width, height int) string {
 	header := renderWorkspaceHeaderLines(m, width)
-	footer := renderWorkspaceFooter(m, status, width)
+	footer := renderWorkspaceFooter(m, "", width)
 	bodyHeight := max(4, height-len(header)-1)
 
 	available := width - 2*2 // two two-cell column gaps
@@ -79,7 +76,7 @@ func renderWideWorkspace(m WorkspaceViewModel, status string, width, height int)
 	rightWidth := clamp(28, available/4, 36)
 	middleWidth := available - leftWidth - rightWidth
 	if middleWidth < 32 {
-		return renderMediumWorkspace(m, status, width, height)
+		return renderMediumWorkspace(m, width, height)
 	}
 
 	left := workspacePanelWithHeight("WORKFLOWS", renderWorkflowLines(m), leftWidth, bodyHeight)
@@ -88,16 +85,16 @@ func renderWideWorkspace(m WorkspaceViewModel, status string, width, height int)
 	return joinWorkspaceSections(header, joinWorkspaceColumns([]string{left, middle, right}, []int{leftWidth, middleWidth, rightWidth}), footer, width, height)
 }
 
-func renderMediumWorkspace(m WorkspaceViewModel, status string, width, height int) string {
+func renderMediumWorkspace(m WorkspaceViewModel, width, height int) string {
 	header := renderWorkspaceHeaderLines(m, width)
-	footer := renderWorkspaceFooter(m, status, width)
+	footer := renderWorkspaceFooter(m, "", width)
 	bodyHeight := max(4, height-len(header)-1)
 
 	available := width - 2 // one two-cell column gap
 	leftWidth := clamp(24, available/3, 34)
 	mainWidth := available - leftWidth
 	if mainWidth < 32 {
-		return renderCompactWorkspace(m, status, width, height)
+		return renderCompactWorkspace(m, width, height)
 	}
 
 	left := workspacePanelWithHeight("WORKFLOWS", renderWorkflowLines(m), leftWidth, bodyHeight)
@@ -157,15 +154,15 @@ func mediumSummaryLines(lc *LifecycleItem, health app.HealthView) []string {
 	return lines
 }
 
-func renderCompactWorkspace(m WorkspaceViewModel, status string, width, height int) string {
+func renderCompactWorkspace(m WorkspaceViewModel, width, height int) string {
 	header := renderWorkspaceHeaderLines(m, width)
-	footer := renderWorkspaceFooter(m, status, width)
+	footer := renderWorkspaceFooter(m, "", width)
 	bodyHeight := max(4, height-len(header)-1)
 	body := workspacePanelWithHeight("WORKSPACE", renderCompactLines(m), width, bodyHeight)
 	return joinWorkspaceSections(header, body, footer, width, height)
 }
 
-func renderMinimalWorkspace(m WorkspaceViewModel, status string, width, height int) string {
+func renderMinimalWorkspace(m WorkspaceViewModel, width, height int) string {
 	workflow := "no workflow selected"
 	stage := "stage unavailable"
 	runtime := "runtime unavailable"
@@ -177,7 +174,7 @@ func renderMinimalWorkspace(m WorkspaceViewModel, status string, width, height i
 	lines := []string{
 		workspaceTheme.Brand.Render("CFLOW") + " · " + workflow,
 		stage + " · " + runtime,
-		renderWorkspaceFooter(m, status, width),
+		renderWorkspaceFooter(m, "", width),
 	}
 	return boundWorkspaceLines(lines, width, height, true)
 }

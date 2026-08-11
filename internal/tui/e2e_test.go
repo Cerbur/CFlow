@@ -116,19 +116,23 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	runDone := make(chan error, 1)
 	runFinished := false
 	t.Cleanup(func() {
-		// Closing the writer first makes an input reader blocked on the pipe
-		// observable as EOF; closing the reader then releases both descriptors
-		// even when a fatal polling assertion aborts the test before the normal
-		// quit path. On the happy path Run has already returned, so this is only
-		// descriptor cleanup.
-		_ = termOut.Close()
-		_ = termIn.Close()
 		if !runFinished {
+			// Fatal polling assertions skip the normal q path. Kill the
+			// Bubble Tea program explicitly, then wait for Run to return
+			// before releasing the pipe descriptors. This prevents a failed
+			// test from leaving the input reader or renderer goroutine alive.
+			prog.Kill()
 			select {
 			case <-runDone:
+				runFinished = true
 			case <-time.After(5 * time.Second):
+				t.Errorf("tui program did not stop during test cleanup")
 			}
 		}
+		// Closing the writer first makes an input reader blocked on the pipe
+		// observable as EOF; closing the reader then releases both descriptors.
+		_ = termOut.Close()
+		_ = termIn.Close()
 	})
 	go func() {
 		_, err := prog.Run()
@@ -149,11 +153,12 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		}
 	}
 	// waitApp blocks until the app predicate holds.
-	waitApp := func(label string, cond func() bool) {
+	waitApp := func(label string, cond func(context.Context) bool) {
 		t.Helper()
-		deadline := time.Now().Add(120 * time.Second)
-		for !cond() {
-			if time.Now().After(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		for !cond(ctx) {
+			if ctx.Err() != nil {
 				t.Fatalf("timeout waiting for app %q\n--- screen ---\n%s", label, screen.String())
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -212,13 +217,19 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitOutput("will not touch your files")
 	keys(keyEnter) // Enter only submits the name for the confirmation
 	keys("y")      // only an explicit y creates (the clean target carries no dirty flag)
-	waitApp("workflow created in application", func() bool { return len(ref.list()) == 1 })
+	waitApp("workflow created in application", func(ctx context.Context) bool { return len(ref.listContext(ctx)) == 1 })
 	waitProjectWriterIdle("workflow creation")
 	// The TUI processed the create (the workspace renders the workflow
 	// with the status line).
 	waitOutput("workflow created")
 	waitOutput("REQUIREMENT_DISCUSSION")
-	wf := ref.list()[0]
+	factCtx, factCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	wfIDs := ref.listContext(factCtx)
+	factCancel()
+	if len(wfIDs) != 1 {
+		t.Fatalf("workflow list after creation = %v", wfIDs)
+	}
+	wf := wfIDs[0]
 
 	// ---- native discussion ----
 	keys(keyRight) // → discussion (the workspace arrows navigate)
@@ -229,21 +240,22 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyEnter) // freeze the change set → handoff editor
 	waitOutput("optional handoff guidance (JSON)")
 	keys(keyEnter) // finish the discussion
-	waitApp("discussion finished", func() bool {
-		return sessionCompleted(t, ref.a, wf)
+	waitApp("discussion finished", func(ctx context.Context) bool {
+		return sessionCompleted(ctx, t, ref.a, wf)
 	})
 	waitProjectWriterIdle("discussion finish")
+	waitOutput("discussion finished")
 
 	// ---- plan approval ----
 	keys(keyTab) // → plan approval
 	waitOutput("plan approval")
 	keys("g") // generate the plan
-	waitApp("plan generated", func() bool { return planRevision(t, ref.a, wf) >= 1 })
+	waitApp("plan generated", func(ctx context.Context) bool { return planRevision(ctx, t, ref.a, wf) >= 1 })
 	waitProjectWriterIdle("plan generation")
 	waitBuffer("plan hash rendered", func(s string) bool { return hexHash(s, "hash:") })
 	keys("k") // independent check
-	waitApp("plan checked", func() bool {
-		return planStatus(t, ref.a, wf) == model.PlanChecked
+	waitApp("plan checked", func(ctx context.Context) bool {
+		return planStatus(ctx, t, ref.a, wf) == model.PlanChecked
 	})
 	waitProjectWriterIdle("plan check")
 	// The Application fact can settle before the asynchronous Plan Approval
@@ -254,58 +266,68 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		return strings.Contains(s, "CHECKED")
 	})
 	keys("y") // approve (explicit confirmation)
-	waitApp("plan approved", func() bool { return planStatus(t, ref.a, wf) == model.PlanApproved })
+	waitApp("plan approved", func(ctx context.Context) bool { return planStatus(ctx, t, ref.a, wf) == model.PlanApproved })
 	waitProjectWriterIdle("plan approval")
-	waitBuffer("plan approval rendered", func(s string) bool {
-		return strings.Contains(s, "APPROVED")
+	// After approval the plan page advances to the next lifecycle stage. The
+	// diff renderer may split or overwrite the APPROVED status text in its
+	// append-only capture, so use the stage transition as the stable marker
+	// that the refreshed Plan projection has arrived.
+	waitBuffer("plan approval advanced", func(s string) bool {
+		return strings.Contains(s, "SPEC_GENERATION")
 	})
 
 	// ---- execution approval ----
 	keys(keyTab) // → execution approval
 	waitOutput("execution approval")
 	keys("s") // generate the specs
-	waitApp("spec session completed", func() bool {
-		return sessionCompletedForPurpose(t, ref.a, wf, model.PurposeSpecGeneration)
+	waitApp("spec session completed", func(ctx context.Context) bool {
+		return sessionCompletedForPurpose(ctx, t, ref.a, wf, model.PurposeSpecGeneration)
 	})
-	waitApp("specs generated", func() bool { return workflowStage(t, ref.a, wf) == model.StageWorkflowGeneration })
-	waitApp("spec artifacts ready", func() bool {
+	waitApp("specs generated", func(ctx context.Context) bool {
+		return workflowStage(ctx, t, ref.a, wf) == model.StageWorkflowGeneration
+	})
+	waitOutput("specs generated")
+	waitApp("spec artifacts ready", func(ctx context.Context) bool {
 		resolver := layout.Resolver{Home: fx.home, ProjectKey: app.ProjectFor(fx.root).Key}
 		store, err := artifact.NewWorkflow(resolver.WorkflowRoot(wf), wf, security.Registry{})
 		if err != nil {
 			return false
 		}
-		if _, err := store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactSpec}); err != nil {
+		if _, err := store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactSpec}); err != nil {
 			return false
 		}
-		_, err = store.Resolve(context.Background(), artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
+		_, err = store.Resolve(ctx, artifact.ResolveRequest{WorkflowID: wf, Type: model.ArtifactCatalog})
 		return err == nil
 	})
 	waitProjectWriterIdle("spec generation")
 	// The authoritative artifact facts above and the lock barrier prove the
-	// the next mutating key is sent; no retry is needed.
-	// The execution preview is intentionally incomplete until compilation has
-	// run, so the approval page is rendered as "no preview yet" here. Its
-	// compile action is still the deterministic TUI synchronization point; wait
-	// for that action before issuing the single mutating compile command.
-	waitBuffer("compile action rendered", func(s string) bool {
-		return strings.Contains(s, "w compile workflow")
-	})
+	// previous command settled; no retry is needed. The execution approval
+	// page remains active while compilation is requested, so send the single
+	// mutating compile command directly rather than waiting on a transient
+	// footer fragment that may already exist in the append-only capture.
 	keys("w") // compile the workflow
-	waitApp("workflow compiled", func() bool {
-		return executionPreview(t, ref.a, wf).WorkflowHash != ""
+	waitApp("workflow compiled", func(ctx context.Context) bool {
+		return executionPreview(ctx, t, ref.a, wf).WorkflowHash != ""
 	})
+	waitOutput("workflow compiled")
 	waitProjectWriterIdle("workflow compilation")
 	// The dry run requires the compiled workflow. The authoritative wait above
 	// is followed by the single mutating dry-run command.
 	keys("d") // execution dry run
-	waitApp("dry run ready", func() bool {
-		return executionPreview(t, ref.a, wf).CommitPolicyHash != ""
+	waitApp("dry run ready", func(ctx context.Context) bool {
+		return executionPreview(ctx, t, ref.a, wf).CommitPolicyHash != ""
 	})
+	waitOutput("execution dry run complete")
 	waitProjectWriterIdle("execution dry run")
 	// Wait for the refreshed approval page before sending the mutating
 	// confirmation. The commit-policy line is absent from the pre-dry-run
 	// page, so this cannot be satisfied by an earlier stale frame.
-	preview := executionPreview(t, ref.a, wf)
+	previewCtx, previewCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	preview := executionPreview(previewCtx, t, ref.a, wf)
+	previewCancel()
+	if len(preview.CommitPolicyHash) < 12 {
+		t.Fatalf("dry-run commit policy hash = %q, want at least 12 characters", preview.CommitPolicyHash)
+	}
 	waitBuffer("execution preview rendered", func(s string) bool {
 		// The append-only diff-renderer capture cannot associate a changed
 		// value with its original line after cursor movement. The commit
@@ -314,11 +336,16 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 		return strings.Contains(s, preview.CommitPolicyHash[:12])
 	})
 	keys("y") // approve the execution (binds the frozen change set)
-	waitApp("execution approved", func() bool {
-		return workflowRuntime(t, ref.a, wf) == model.RuntimeRunning &&
-			workflowStage(t, ref.a, wf) == model.StageExecution
+	waitApp("execution approved", func(ctx context.Context) bool {
+		return workflowRuntime(ctx, t, ref.a, wf) == model.RuntimeRunning &&
+			workflowStage(ctx, t, ref.a, wf) == model.StageExecution
 	})
 	waitProjectWriterIdle("execution approval")
+	// The authoritative DB facts can settle before the TUI applies the
+	// workspace acknowledgement. This status is emitted only by that
+	// projection acknowledgement, so it prevents a stale "start the run"
+	// hint from accepting the next key under -race.
+	waitOutput("execution approved")
 
 	// ---- execution + workspace adoption + foreground runner ----
 	// The Execution page first renders the stale projection (the dry run
@@ -341,15 +368,24 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	// The decision panel is rendered before the single mutating adoption
 	// command, avoiding duplicate adoption requests.
 	keys("a") // adopt the workspace
-	waitApp("workspace adopted", func() bool { return workspaceAdopted(t, ref.a, wf) })
+	waitApp("workspace adopted", func(ctx context.Context) bool { return workspaceAdopted(ctx, t, ref.a, wf) })
 	waitProjectWriterIdle("workspace adoption")
+	// commandDoneMsg clears the decision and triggers the projection reload;
+	// wait for its unique status acknowledgement before issuing the next key.
+	waitOutput("workspace adopted")
 	keys("r") // run again
-	waitApp("workflow completed", func() bool { return workflowStage(t, ref.a, wf) == model.StageCompleted })
+	waitApp("workflow completed", func(ctx context.Context) bool { return workflowStage(ctx, t, ref.a, wf) == model.StageCompleted })
+	// The DB stage can settle before runnerDoneMsg reaches the Bubble Tea
+	// model. This acknowledgement proves m.running is cleared before the
+	// test navigates and later quits.
+	waitOutput("runner: terminal")
 
 	// ---- final report ----
 	keys(keyTab) // → blocked
 	keys(keyTab) // → terminal
-	waitOutput("terminal")
+	// The terminal page has a unique section marker; the generic word
+	// "terminal" is already present in the preceding runner status.
+	waitOutput(">report")
 	keys("r") // render the final report
 	waitBuffer("final report rendered", func(s string) bool {
 		return strings.Contains(s, "# CFlow Execution Report")
@@ -361,13 +397,15 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	waitBuffer("apply preview rendered", func(s string) bool {
 		return strings.Contains(s, "AWAITING_CONFIRMATION")
 	})
+	waitOutput("apply staged (preview ready)")
 	// The explicit delivery: Enter alone must not deliver; y delivers.
 	keys(keyEnter)
-	waitApp("apply not delivered by enter", func() bool {
-		return applyStatus(t, ref.a, wf) == model.ApplyAwaitingConfirmation
+	waitApp("apply not delivered by enter", func(ctx context.Context) bool {
+		return applyStatus(ctx, t, ref.a, wf) == model.ApplyAwaitingConfirmation
 	})
 	keys("y")
-	waitApp("apply delivered", func() bool { return applyStatus(t, ref.a, wf) == model.ApplySucceeded })
+	waitApp("apply delivered", func(ctx context.Context) bool { return applyStatus(ctx, t, ref.a, wf) == model.ApplySucceeded })
+	waitOutput("apply delivered")
 
 	// The Target Working Tree: HEAD, Index, and files are synchronized
 	// with the delivered Apply head.
@@ -381,9 +419,13 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	keys(keyRight) // → cleanup section
 	keys("c")      // cleanup dry run
 	waitOutput("cleanup dry run manifest ready")
-	waitApp("cleanup manifest", func() bool { return cleanupStatus(t, ref.a, wf) != "" })
+	waitApp("cleanup manifest", func(ctx context.Context) bool { return cleanupStatus(ctx, t, ref.a, wf) != "" })
+	waitProjectWriterIdle("cleanup dry run")
 	keys("y") // execute the bound manifest
-	waitApp("cleanup executed", func() bool { return cleanupStatus(t, ref.a, wf) == model.CleanupStatusSucceeded })
+	waitApp("cleanup executed", func(ctx context.Context) bool {
+		return cleanupStatus(ctx, t, ref.a, wf) == model.CleanupStatusSucceeded
+	})
+	waitOutput("cleanup executed")
 
 	// The Cleanup deleted exactly the code directories and preserved the
 	// artifacts, evidence, report, database, and refs.
@@ -426,7 +468,11 @@ func hexHash(s, prefix string) bool {
 // ---------------------------------------------------------------------------
 
 func (r *appRef) list() []model.WorkflowID {
-	view, err := r.a.Query(context.Background(), app.ListQuery{})
+	return r.listContext(context.Background())
+}
+
+func (r *appRef) listContext(ctx context.Context) []model.WorkflowID {
+	view, err := r.a.Query(ctx, app.ListQuery{})
 	if err != nil {
 		return nil
 	}
@@ -437,28 +483,28 @@ func (r *appRef) list() []model.WorkflowID {
 	return ids
 }
 
-func statusOf(t *testing.T, a *app.Application, wf model.WorkflowID) app.StatusView {
+func statusOf(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) app.StatusView {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.StatusQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.StatusQuery{Workflow: wf})
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
 	return view.(app.StatusView)
 }
 
-func workflowStage(t *testing.T, a *app.Application, wf model.WorkflowID) model.WorkflowStage {
+func workflowStage(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) model.WorkflowStage {
 	t.Helper()
-	return statusOf(t, a, wf).Stage
+	return statusOf(ctx, t, a, wf).Stage
 }
 
-func workflowRuntime(t *testing.T, a *app.Application, wf model.WorkflowID) model.RuntimeStatus {
+func workflowRuntime(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) model.RuntimeStatus {
 	t.Helper()
-	return statusOf(t, a, wf).Runtime
+	return statusOf(ctx, t, a, wf).Runtime
 }
 
-func sessionCompleted(t *testing.T, a *app.Application, wf model.WorkflowID) bool {
+func sessionCompleted(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) bool {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.InspectQuery{Workflow: wf})
 	if err != nil {
 		return false
 	}
@@ -469,9 +515,9 @@ func sessionCompleted(t *testing.T, a *app.Application, wf model.WorkflowID) boo
 	return sessions[len(sessions)-1].Status == model.SessionCompleted
 }
 
-func sessionCompletedForPurpose(t *testing.T, a *app.Application, wf model.WorkflowID, purpose model.AgentPurpose) bool {
+func sessionCompletedForPurpose(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID, purpose model.AgentPurpose) bool {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.InspectQuery{Workflow: wf})
 	if err != nil {
 		return false
 	}
@@ -484,36 +530,36 @@ func sessionCompletedForPurpose(t *testing.T, a *app.Application, wf model.Workf
 	return false
 }
 
-func planRevision(t *testing.T, a *app.Application, wf model.WorkflowID) int {
+func planRevision(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) int {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.PlanQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.PlanQuery{Workflow: wf})
 	if err != nil {
 		return 0
 	}
 	return view.(app.PlanView).Revision
 }
 
-func planStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.PlanStatus {
+func planStatus(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) model.PlanStatus {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.PlanQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.PlanQuery{Workflow: wf})
 	if err != nil {
 		return ""
 	}
 	return view.(app.PlanView).PlanStatus
 }
 
-func executionPreview(t *testing.T, a *app.Application, wf model.WorkflowID) app.ExecutionPreviewView {
+func executionPreview(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) app.ExecutionPreviewView {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.ExecutionPreviewQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.ExecutionPreviewQuery{Workflow: wf})
 	if err != nil {
 		return app.ExecutionPreviewView{}
 	}
 	return view.(app.ExecutionPreviewView)
 }
 
-func workspaceAdopted(t *testing.T, a *app.Application, wf model.WorkflowID) bool {
+func workspaceAdopted(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) bool {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.ProjectWorkspaceQuery{Selected: wf})
+	view, err := a.Query(ctx, app.ProjectWorkspaceQuery{Selected: wf})
 	if err != nil {
 		return false
 	}
@@ -521,9 +567,9 @@ func workspaceAdopted(t *testing.T, a *app.Application, wf model.WorkflowID) boo
 	return lc != nil && lc.Adopted
 }
 
-func applyStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.ApplyStatus {
+func applyStatus(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) model.ApplyStatus {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.InspectQuery{Workflow: wf})
 	if err != nil {
 		return ""
 	}
@@ -534,9 +580,9 @@ func applyStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.Ap
 	return attempts[len(attempts)-1].Status
 }
 
-func cleanupStatus(t *testing.T, a *app.Application, wf model.WorkflowID) model.CleanupStatus {
+func cleanupStatus(ctx context.Context, t *testing.T, a *app.Application, wf model.WorkflowID) model.CleanupStatus {
 	t.Helper()
-	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	view, err := a.Query(ctx, app.InspectQuery{Workflow: wf})
 	if err != nil {
 		return ""
 	}
@@ -565,7 +611,9 @@ func requireAppliedWorkingTree(t *testing.T, fx *tuiFixture, a *app.Application,
 		t.Fatal("target working tree has no HEAD after the apply")
 	}
 	// The delivered head is the exact staging head the Apply recorded.
-	view, err := a.Query(context.Background(), app.InspectQuery{Workflow: wf})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	view, err := a.Query(ctx, app.InspectQuery{Workflow: wf})
 	if err != nil {
 		t.Fatal(err)
 	}
