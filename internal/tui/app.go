@@ -114,6 +114,10 @@ type Page int
 
 const (
 	PageWorkspace Page = iota
+	PageWorkflowMenu
+	PageReadonlyWorkspace
+	PageActionPreview
+	PageCreatePreview
 	PageDiscussion
 	PagePlanApproval
 	PageExecutionApproval
@@ -162,6 +166,13 @@ type Model struct {
 
 	// page is the current screen.
 	page Page
+	// navigation is UI-only. Runtime lifecycle state remains authoritative in
+	// Application projections and is never inferred from these frames.
+	navigation NavigationStack
+	// workflowMenu is the authoritative Task 2 projection currently bound to
+	// the selected Workflow. Task 5 adds its dedicated render model/query flow.
+	workflowMenu      app.WorkflowMenuView
+	workflowMenuIndex int
 
 	// selected is the workflow the workspace focuses.
 	selected model.WorkflowID
@@ -233,8 +244,8 @@ type Model struct {
 
 	// stop tracks the controlled-stop state (design §12.1): the first
 	// Ctrl+C requests the controlled Pause; the second is the Force
-	// Stop of an active Runner; q on an active Runner shows the Pause
-	// and Exit confirmation instead of quitting directly.
+	// Stop of an active Runner. Process exit remains controlled by Ctrl+C;
+	// Task 7 adds the /exit UI entry point.
 	stop stopState
 	// prevPage is the page the Pause and Exit prompt returns to.
 	prevPage Page
@@ -346,6 +357,7 @@ func newModel(deps Dependencies) Model {
 		deps:         deps,
 		ctx:          modelContext,
 		page:         PageWorkspace,
+		navigation:   NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}}},
 		commandState: new(commandState),
 		trace:        newOperationLogger(deps.OperationLog),
 		discussion:   DiscussionPage{},
@@ -1273,8 +1285,8 @@ func (m Model) applyRunnerDone(msg runnerDoneMsg) (Model, tea.Cmd) {
 // handleKey routes one key press through the controlled-stop protocol and
 // the active page.
 func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
-	// The controlled-stop protocol owns q and Ctrl+C globally (design
-	// §12.1): a page can never quit directly while a Runner is active.
+	// Ctrl+C retains the controlled-stop protocol globally. Task 7 adds the
+	// only normal exit path through /exit.
 	if IsCtrlC(msg) {
 		switch m.stop {
 		case stopIdle:
@@ -1308,8 +1320,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.status = "command in progress; waiting for refreshed facts"
 		return m, nil
 	}
-	if m.commandInFlight() && IsQuit(msg) && !m.typingText() {
-		m.status = "command in progress; waiting for refreshed facts"
+	if msg.Code == tea.KeyEsc && !m.typingText() && m.navigation.Current().Page == m.page {
+		if m.navigation.Current().Layer == LayerHome {
+			return m, nil
+		}
+		m, _ = m.popNavigation()
 		return m, nil
 	}
 	// Tab cycles the lifecycle pages from any page (left/right keep
@@ -1324,28 +1339,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	// q is the quit key ONLY outside the text inputs (the create form
-	// and the handoff editor): inside them 'q' is a typed character.
-	if IsQuit(msg) && !m.typingText() {
-		switch m.stop {
-		case stopIdle:
-			if m.running {
-				// An active Runner: q shows Pause and Exit instead of
-				// quitting directly (processes never orphan).
-				m.prevPage = m.page
-				m.stop = stopPauseAndExit
-				m.page = PagePauseExit
-				return m, nil
-			}
-			return m, tea.Quit
-		default:
-			// Already in the stop protocol: q cancels it and returns to
-			// the page the user was on.
-			m.stop = stopIdle
-			m.page = m.prevPage
-			return m, nil
-		}
-	}
 	switch m.page {
 	case PagePauseExit:
 		return m.handlePauseExitKey(msg)
@@ -1357,6 +1350,13 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleMigrationKey(msg)
 	case PageWorkspace:
 		return m.handleWorkspaceKey(msg)
+	case PageWorkflowMenu:
+		if IsEnter(msg) {
+			return m.enterSelectedWorkflowMenuRoute(), nil
+		}
+		return m, nil
+	case PageReadonlyWorkspace, PageActionPreview, PageCreatePreview:
+		return m, nil
 	case PageDiscussion:
 		return m.handleDiscussionKey(msg)
 	case PagePlanApproval:
@@ -1373,8 +1373,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// typingText reports whether the active page is a text input ('q' is a
-// typed character there, never the quit key).
+// typingText reports whether the active page is a text input.
 func (m Model) typingText() bool {
 	switch m.page {
 	case PageCreate:
@@ -1474,7 +1473,7 @@ func blocksWhileCommandInFlight(msg tea.KeyPressMsg) bool {
 	case tea.KeyTab, tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight, tea.KeyEsc, 'b', 'B':
 		return false
 	}
-	return !IsQuit(msg) && !IsCtrlC(msg)
+	return !IsCtrlC(msg)
 }
 
 func (m Model) nextProjectionID() uint64 {
@@ -1687,6 +1686,8 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.moveNav(-1)
 	case IsRight(msg):
 		return m.moveNav(1)
+	case IsEnter(msg):
+		return m.enterWorkflowMenu(), nil
 	case msg.Code == 'n' || msg.Code == 'N':
 		// Opening the Create page is a read-only step: it queries the
 		// target's Git facts (dirty state, fingerprint, isolation) that the
@@ -1883,7 +1884,7 @@ func (m Model) handleDiscussionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleHandoffKey(msg)
 	}
 	switch {
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	case IsLeft(msg):
@@ -2050,7 +2051,7 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, m.executeCmdWithOperation(m.context(), app.CheckPlanCommand{
 			Workflow: m.selected, Provider: m.discussionProvider(),
 		}, operationID)
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	}
@@ -2097,7 +2098,7 @@ func (m Model) handleExecutionApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) 
 	case msg.Code == 'd' || msg.Code == 'D':
 		m.status = "running the execution dry run…"
 		return m, m.executeCmd(app.ExecutionDryRunCommand{Workflow: m.selected})
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	}
@@ -2161,7 +2162,7 @@ func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.executeCmd(app.AdoptWorkspaceCommand{Workflow: m.selected})
 		}
 		return m, nil
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	}
@@ -2183,7 +2184,7 @@ func (m Model) handleBlockedKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 		m.status = "resuming…"
 		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	case IsLeft(msg):
@@ -2225,7 +2226,7 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case msg.Code == 'c' || msg.Code == 'C':
 		m.status = "producing the cleanup dry run manifest…"
 		return m, m.executeCmd(app.DryRunCommand{Workflow: m.selected})
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	}
@@ -2278,7 +2279,7 @@ func (m Model) handleCancelKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	switch {
-	case msg.Code == tea.KeyEsc || IsQuit(msg):
+	case msg.Code == tea.KeyEsc:
 		m.page = PageWorkspace
 		return m, nil
 	case msg.Code == 'y' || msg.Code == 'Y':
@@ -2428,10 +2429,10 @@ func (m Model) View() tea.View {
 // render is the pure screen renderer of the root model.
 func render(m Model) string {
 	if m.err != nil {
-		return fmt.Sprintf("cflow: %v\n\npress q to quit", m.err)
+		return fmt.Sprintf("cflow: %v\n\nuse /exit to exit", m.err)
 	}
 	if !m.ready {
-		return "cflow\n\npress q to quit"
+		return "cflow\n\nuse /exit to exit"
 	}
 	var b strings.Builder
 	switch m.page {
@@ -2507,9 +2508,9 @@ func (m Model) hints() string {
 	case PageDiscussion:
 		return "\n↑/↓ action  Enter run  b workspace\n"
 	case PagePlanApproval:
-		return "\ng generate plan  k check plan  Enter/y confirm  q quit\n"
+		return "\ng generate plan  k check plan  Enter/y confirm  /exit exit\n"
 	case PageExecutionApproval:
-		return "\ns generate specs  w compile workflow  d dry run  Enter/y confirm  q quit\n"
+		return "\ns generate specs  w compile workflow  d dry run  Enter/y confirm  /exit exit\n"
 	case PageExecution:
 		// The hint is driven by the Runtime LegalActions: "r resume & run"
 		// only while the Runtime permits Resume (a PAUSED workflow); once the
@@ -2523,7 +2524,7 @@ func (m Model) hints() string {
 	case PageBlocked:
 		return blockedHints(m.workspace)
 	case PageTerminal:
-		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter/y confirm  q quit\n"
+		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter/y confirm  /exit exit\n"
 	case PageCreate:
 		return createHints(m)
 	case PageCancel:

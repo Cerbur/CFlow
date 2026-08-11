@@ -9,8 +9,8 @@ import tea "charm.land/bubbletea/v2"
 // Key bindings (design §6.1: navigation only updates UI selection; the
 // mutation commands and confirmations are typed and explicit).
 const (
-	// KeyQuit is the normal quit key (q). On an active Runner the TUI
-	// shows "Pause and Exit" instead of quitting directly (Task 14).
+	// KeyQuit is retained as the rune used by older callers and fixtures.
+	// It is not an exit classification: q is ordinary input.
 	KeyQuit rune = 'q'
 	// KeyCtrlCRune is the Ctrl+C key rune (the first Ctrl+C requests the
 	// controlled Pause; the second is the Force Stop of an active Runner).
@@ -20,13 +20,9 @@ const (
 // KeyPress is one typed key press message.
 type KeyPress tea.KeyPressMsg
 
-// IsQuit reports whether a key press is the normal quit key.
-func IsQuit(msg tea.KeyMsg) bool {
-	if p, ok := msg.(tea.KeyPressMsg); ok {
-		return p.Key().Code == KeyQuit && p.Key().Mod == 0
-	}
-	return false
-}
+// IsQuit always reports false. Normal exit is routed by the bounded /exit
+// command palette (Task 7), while Ctrl+C retains controlled-stop semantics.
+func IsQuit(tea.KeyMsg) bool { return false }
 
 // IsCtrlC reports whether a key press is Ctrl+C.
 func IsCtrlC(msg tea.KeyMsg) bool {
