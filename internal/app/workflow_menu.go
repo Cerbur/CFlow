@@ -133,15 +133,48 @@ func (a *Application) workflowMenuHasFinalReport(ctx context.Context, wf model.W
 	if ref.Revision < 1 || ref.Hash == "" {
 		return false, nil
 	}
-	// Commit preflight evidence uses ArtifactReport too. Completion writes a
-	// successor revision, so a preflight ref alone must never become the
-	// user-facing Final Report route.
-	if facts := st.Workflow.ExecutionFacts; facts != nil && facts.PreflightRevision > 0 {
-		if ref.Revision <= facts.PreflightRevision || ref.Hash == facts.CommitPolicyHash {
-			return false, nil
+	// Commit preflight evidence and the completion report share
+	// ArtifactReport revisions. A later Apply preflight may therefore be the
+	// latest revision even though an earlier immutable completion report
+	// still exists. Enumerate verified revisions and exclude every preflight
+	// revision represented by the authoritative aggregate.
+	preflights := workflowMenuPreflightRevisions(st)
+	for revision := ref.Revision; revision >= 1; revision-- {
+		if _, isPreflight := preflights[revision]; isPreflight {
+			continue
+		}
+		candidate, err := artifacts.Resolve(ctx, artifact.ResolveRequest{
+			WorkflowID: wf, Type: model.ArtifactReport, Revision: revision,
+		})
+		if err != nil {
+			if artifact.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		if candidate.Hash != "" {
+			return true, nil
 		}
 	}
-	return true, nil
+	return false, nil
+}
+
+func workflowMenuPreflightRevisions(st model.State) map[int]struct{} {
+	revisions := make(map[int]struct{})
+	if facts := st.Workflow.ExecutionFacts; facts != nil && facts.PreflightRevision > 0 {
+		revisions[facts.PreflightRevision] = struct{}{}
+	}
+	for _, approval := range st.Approvals {
+		if approval.PreflightRevision > 0 {
+			revisions[approval.PreflightRevision] = struct{}{}
+		}
+	}
+	for _, attempt := range st.ApplyAttempts {
+		if attempt.Preflight.Revision > 0 {
+			revisions[attempt.Preflight.Revision] = struct{}{}
+		}
+	}
+	return revisions
 }
 
 // workflowMenuActions translates only entries already admitted by
