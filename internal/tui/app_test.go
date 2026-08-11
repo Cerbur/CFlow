@@ -1219,6 +1219,55 @@ func TestCreatePreviewEnterExecutes(t *testing.T) {
 	}
 }
 
+func TestCreatePreviewCleanDiscoveryUsesFalseConfirmDirty(t *testing.T) {
+	ctrl := &createController{dirty: false}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+
+	m = press(t, m, tea.KeyEnter, 0)
+	if !m.createConfirm {
+		t.Fatal("name Enter did not open Create Preview")
+	}
+	m = press(t, m, tea.KeyEnter, 0)
+
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("clean preview Enter executed %d commands: %v", len(ctrl.executed), ctrl.executed)
+	}
+	cc, ok := ctrl.executed[0].(app.CreateWorkflowCommand)
+	if !ok {
+		t.Fatalf("create command type = %T", ctrl.executed[0])
+	}
+	if cc.ConfirmDirty {
+		t.Fatalf("clean DiscoveryView created with ConfirmDirty=true: %+v", cc)
+	}
+}
+
+func TestCreatePreviewMissingDiscoveryFactsFailsClosed(t *testing.T) {
+	ctrl := &createController{discoveryErr: model.InvalidInputFault("discovery failed")}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m = load(t, m)
+	m = createPage(t, m, "calculator")
+
+	m = press(t, m, tea.KeyEnter, 0)
+	if !m.createConfirm {
+		t.Fatal("name Enter did not open Create Preview")
+	}
+	if m.createDirty != nil {
+		t.Fatalf("unavailable Discovery facts unexpectedly loaded: %+v", m.createDirty)
+	}
+	m = press(t, m, tea.KeyEnter, 0)
+
+	if len(ctrl.executed) != 0 {
+		t.Fatalf("missing Discovery facts issued CreateWorkflowCommand: %v", ctrl.executed)
+	}
+	if !strings.Contains(m.status, "target facts unavailable") {
+		t.Fatalf("missing Discovery facts status = %q", m.status)
+	}
+}
+
 func TestCreatePreviewYNAQDoNotConfirm(t *testing.T) {
 	ctrl := &createController{}
 	m := newModel(Dependencies{})

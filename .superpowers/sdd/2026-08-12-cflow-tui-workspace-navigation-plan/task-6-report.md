@@ -86,3 +86,34 @@ and no test session remained available to poll.
 
 This report and the scoped implementation changes are included in the Task 6
 commit created immediately after this report was written.
+
+## Fix Round 1
+
+Reviewer P2 coverage was restored without changing production behavior:
+
+- Added `TestCreatePreviewCleanDiscoveryUsesFalseConfirmDirty`, which drives
+  the Enter-only Create Workspace → Create Preview → Create path using a clean
+  `DiscoveryView` and asserts `CreateWorkflowCommand.ConfirmDirty == false`.
+- Added `TestCreatePreviewMissingDiscoveryFactsFailsClosed`, which drives the
+  same Enter-only path with unavailable Discovery facts, asserts
+  `createDirty == nil`, verifies that no `CreateWorkflowCommand` is issued,
+  and checks that the status exposes `target facts unavailable`.
+- No y/n confirmation behavior was added or restored; Task 7 was not started.
+
+Fix Round 1 verification:
+
+```text
+env GOCACHE=/private/tmp/cflow-go-cache go test ./internal/tui -run 'Create|NewWorkflow|WorkflowMenuAfterCreate|Navigation|Home|Quit' -count=1
+PASS
+
+env GOCACHE=/private/tmp/cflow-go-cache go test ./internal/tui -run 'TestCreatePreviewCleanDiscoveryUsesFalseConfirmDirty|TestCreatePreviewMissingDiscoveryFactsFailsClosed' -count=1
+ok   cflow.local/cflow/internal/tui  0.280s
+
+git diff --check
+PASS
+```
+
+The additional unfiltered `go test ./internal/tui -count=1` started after the
+focused navigation run but produced no output for the bounded wait window and
+was stopped with Ctrl-C to avoid waiting indefinitely. No repository-wide test
+was started in Fix Round 1.
