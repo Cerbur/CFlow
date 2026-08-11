@@ -1,5 +1,7 @@
 # CFlow TUI Main Workspace Visual Refresh Implementation Plan
 
+> **2026-08-12 已确认变更**：TUI 主入口采用 Home → Workflow Menu → 动态 Stage Workspace 层级；Enter 进入或确认，Esc 返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Rebuild only the default TUI Workspace page as a width/height-safe, Lip Gloss v2 styled workflow workbench while preserving the existing Runtime projection, command semantics, navigation, and all other pages.

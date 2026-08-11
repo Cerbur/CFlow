@@ -8,6 +8,8 @@ CFlow 是一个 local-first 的 Coding Agent Workflow CLI，负责从 Plan 到 D
 
 > **2026-08-07 已确认变更**：全屏 TUI 成为默认主入口；Native Discussion、聚合 Workflow 目录、唯一 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup 取代旧的 line-oriented Demo 交互决策。权威规格见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`，任务顺序见 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md`。旧决策（"Demo 不使用全屏 TUI"等）标记为 `Superseded`，仅作历史背景；其安全不变量全部保留。
 
+> **2026-08-12 已确认变更**：TUI 主入口采用 Home → Workflow Menu → 动态 Stage Workspace 层级；Enter 进入或确认，Esc 返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
+
 项目当前处于**TUI 工作流实现阶段**。此前已确认的 PRD v0.2、Demo 技术设计 v0.1 和实现 Plan v0.1（line-oriented Demo）构成历史基线；实现必须严格遵循 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md` 的 Task 1–16 顺序与如下 Gate：
 
 - 每个 Task 使用新的 Implementer 上下文，完成后必须经过独立的规格符合性和代码质量审查。

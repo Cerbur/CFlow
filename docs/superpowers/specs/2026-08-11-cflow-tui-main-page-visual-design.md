@@ -8,6 +8,8 @@ scope: TUI main workspace visual refresh
 
 # CFlow TUI 主页面视觉与 MVVM 设计
 
+> **2026-08-12 已确认变更**：TUI 主入口采用 Home → Workflow Menu → 动态 Stage Workspace 层级；Enter 进入或确认，Esc 返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
+
 ## 1. 目标
 
 本设计只优化 Bubble Tea 默认入口的主 Workspace 页面，使它成为克制、专业、可扫描的 Workflow 工作台。主页面优先回答：当前选中的 Workflow 处于哪个阶段，以及 Runtime 当前允许哪些动作。
