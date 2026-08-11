@@ -71,26 +71,25 @@ func (a *Application) workflowMenuReadonlyEntries(ctx context.Context, wf model.
 		})
 	}
 	if facts := st.Workflow.ExecutionFacts; facts != nil {
-		if facts.SpecRevision > 0 && len(facts.SpecHashes) > 0 {
+		// Specs, Catalog, and DAG all reuse the existing bounded
+		// ExecutionPreviewQuery in the TUI. Expose them only when that query's
+		// complete authority precondition is present; partial hash facts do not
+		// justify inventing an artifact view.
+		previewFacts := facts.PlanHash != "" && len(facts.SpecHashes) > 0 &&
+			facts.CatalogHash != "" && facts.WorkflowHash != ""
+		if previewFacts {
 			entries = append(entries, WorkflowMenuEntry{
 				ID: "specs", Group: MenuGroupView, Kind: MenuEntryReadonly,
 				Label: "Specs", Route: MenuRouteSpecs,
 			})
-		}
-		if facts.CatalogRevision > 0 && facts.CatalogHash != "" {
 			entries = append(entries, WorkflowMenuEntry{
 				ID: "catalog", Group: MenuGroupView, Kind: MenuEntryReadonly,
 				Label: "Verification Catalog", Route: MenuRouteCatalog,
 			})
-		}
-		if facts.WorkflowRevision > 0 && facts.WorkflowHash != "" {
 			entries = append(entries, WorkflowMenuEntry{
 				ID: "workflow-dag", Group: MenuGroupView, Kind: MenuEntryReadonly,
 				Label: "Workflow DAG", Route: MenuRouteDAG,
 			})
-		}
-		if facts.PlanHash != "" && len(facts.SpecHashes) > 0 &&
-			facts.CatalogHash != "" && facts.WorkflowHash != "" {
 			entries = append(entries, WorkflowMenuEntry{
 				ID: "execution-preview", Group: MenuGroupView, Kind: MenuEntryReadonly,
 				Label: "Execution Preview", Route: MenuRouteExecutionApproval,

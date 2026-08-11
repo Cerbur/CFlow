@@ -207,15 +207,11 @@ func (m Model) routeWorkflowMenuItem(item MenuItem) (Model, tea.Cmd) {
 	}
 
 	switch item.Route {
-	case app.MenuRoutePlan:
-		m.approval = ApprovalModel{Plan: m.plan}
-		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PagePlanApproval, Workflow: m.selected, Index: item.SourceIndex})
-		return m, m.queryCmd(PagePlanApproval, app.PlanQuery{Workflow: m.selected})
 	case app.MenuRouteExecutionApproval:
 		m.approval = ApprovalModel{Preview: m.preview}
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecutionApproval, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected})
-	case app.MenuRouteExecution, app.MenuRouteTaskGraph:
+	case app.MenuRouteExecution:
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageExecution, app.ProjectWorkspaceQuery{Selected: m.selected})
 	case app.MenuRouteDiscussion:
@@ -230,21 +226,34 @@ func (m Model) routeWorkflowMenuItem(item MenuItem) (Model, tea.Cmd) {
 		m.migration = app.MigrationPreviewView{}
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageMigration, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
-	case app.MenuRouteReport, app.MenuRouteApply, app.MenuRouteCleanup:
+	case app.MenuRouteApply, app.MenuRouteCleanup:
 		m.terminal = NewTerminalModel()
 		switch item.Route {
 		case app.MenuRouteApply:
 			m.terminal.Section = SectionApply
 		case app.MenuRouteCleanup:
 			m.terminal.Section = SectionCleanup
-		default:
-			m.terminal.Section = SectionReport
 		}
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageTerminal, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageTerminal, app.ProjectWorkspaceQuery{Selected: m.selected})
-	case app.MenuRouteCurrentStage, app.MenuRouteSpecs, app.MenuRouteCatalog, app.MenuRouteDAG, app.MenuRouteLogs:
+	case app.MenuRouteCurrentStage, app.MenuRoutePlan, app.MenuRouteSpecs, app.MenuRouteCatalog,
+		app.MenuRouteDAG, app.MenuRouteTaskGraph, app.MenuRouteLogs, app.MenuRouteReport:
+		m.readonly = ReadonlyWorkspaceModel{
+			Workflow: m.selected,
+			Name:     valueOr(m.workflowMenuModel.Name, string(m.selected)),
+			Stage:    m.workflowMenuModel.Stage,
+			Runtime:  m.workflowMenuModel.Runtime,
+			Route:    item.Route,
+			Label:    item.Label,
+		}
 		m = m.pushNavigation(NavigationFrame{Layer: LayerReadonlyWorkspace, Page: PageReadonlyWorkspace, Workflow: m.selected, Index: item.SourceIndex})
-		return m, nil
+		query, ok := readonlyQueryForRoute(item.Route, m.selected, m.deps.CLI.Build)
+		if !ok {
+			m.readonly.Loaded = true
+			m.readonly.Error = "no authoritative query is available"
+			return m, nil
+		}
+		return m, m.queryCmd(PageReadonlyWorkspace, query)
 	}
 	m = m.pushNavigation(NavigationFrame{LayerReadonlyWorkspace, PageReadonlyWorkspace, m.selected, item.SourceIndex})
 	return m, nil
@@ -258,13 +267,5 @@ func renderWorkflowActionPreview(menu WorkflowMenuModel, item MenuItem) string {
 		fmt.Fprintf(&b, "selected action: %s\n", item.Label)
 	}
 	b.WriteString("\nNo mutation has been issued.\nEnter is reserved for the later action confirmation.\n\n↑↓ select  Enter confirm  Esc back  / commands")
-	return b.String()
-}
-
-func renderReadonlyWorkspace(menu WorkflowMenuModel) string {
-	var b strings.Builder
-	b.WriteString("WORKSPACE\n\n")
-	fmt.Fprintf(&b, "workflow: %s\nstage: %s\nruntime: %s\n\n", valueOr(menu.Name, string(menu.Workflow)), menu.Stage, menu.Runtime)
-	b.WriteString("read-only route\n\nEsc back  / commands")
 	return b.String()
 }

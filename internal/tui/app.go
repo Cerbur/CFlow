@@ -170,6 +170,9 @@ type Model struct {
 	workflowMenuIndex       int
 	workflowMenuError       string
 	workflowMenuPreviewItem MenuItem
+	// readonly is the bounded, query-backed workspace for the selected menu
+	// route. It contains no command or Runtime authority.
+	readonly ReadonlyWorkspaceModel
 
 	// selected is the workflow the workspace focuses.
 	selected model.WorkflowID
@@ -487,7 +490,15 @@ func queryWorkflowID(q app.Query) model.WorkflowID {
 		return q.Workflow
 	case app.PlanQuery:
 		return q.Workflow
+	case app.StatusQuery:
+		return q.Workflow
+	case app.InspectQuery:
+		return q.Workflow
+	case app.LogsQuery:
+		return q.Workflow
 	case app.ExecutionPreviewQuery:
+		return q.Workflow
+	case app.ReportQuery:
 		return q.Workflow
 	case app.CancelSummaryQuery:
 		return q.Workflow
@@ -556,6 +567,8 @@ func projectionViewMatches(page Page, view app.View) bool {
 	case PageWorkflowMenu:
 		_, ok := view.(app.WorkflowMenuView)
 		return ok
+	case PageReadonlyWorkspace:
+		return true
 	case PageDiscussion:
 		_, ok := view.(app.DiscussionReturnView)
 		return ok
@@ -767,6 +780,12 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
+		if msg.page == PageReadonlyWorkspace {
+			m.readonly.Loaded = true
+			m.readonly.Error = msg.err.Error()
+			m.status = ""
+			return m, nil
+		}
 		m.status = msg.err.Error()
 		return m, nil
 	}
@@ -825,6 +844,10 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 			m.workflowMenuModel = MapWorkflowMenu(v)
 			m.workflowMenuIndex = m.workflowMenuModel.Selected
 			m.workflowMenuError = ""
+		}
+	case PageReadonlyWorkspace:
+		if readonlyProjectionMatches(m.readonly.Route, msg.view) {
+			m.readonly = MapReadonlyWorkspace(m.workflowMenuModel, m.readonly.Route, msg.view)
 		}
 	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
 		if v, ok := msg.view.(app.WorkspaceView); ok {
@@ -1447,7 +1470,15 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m.routeWorkflowMenuItem(item)
 		}
 		return m, nil
-	case PageReadonlyWorkspace, PageActionPreview, PageCreatePreview:
+	case PageReadonlyWorkspace:
+		switch {
+		case IsUp(msg):
+			return moveReadonlySelection(m, -1), nil
+		case IsDown(msg):
+			return moveReadonlySelection(m, 1), nil
+		}
+		return m, nil
+	case PageActionPreview, PageCreatePreview:
 		if m.page == PageActionPreview {
 			return m.handleActionPreviewKey(msg)
 		}
@@ -1543,6 +1574,7 @@ func (m *Model) resetSelectionState() {
 	m.approval = ApprovalModel{}
 	m.plan = app.PlanView{}
 	m.preview = app.ExecutionPreviewView{}
+	m.readonly = ReadonlyWorkspaceModel{}
 	m.execution = NewExecutionModel("")
 	m.terminal = NewTerminalModel()
 	m.createDirty = nil
@@ -2559,7 +2591,7 @@ func render(m Model) string {
 	case PageWorkflowMenu:
 		b.WriteString(RenderWorkflowMenuState(m.workflowMenuModel, m.workflowMenuError))
 	case PageReadonlyWorkspace:
-		b.WriteString(renderReadonlyWorkspace(m.workflowMenuModel))
+		b.WriteString(RenderReadonlyWorkspace(m.readonly, m.width, m.height))
 	case PageActionPreview:
 		b.WriteString(renderWorkflowActionPreview(m.workflowMenuModel, m.workflowMenuPreviewItem))
 	case PageDiscussion:

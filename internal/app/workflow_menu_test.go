@@ -8,6 +8,7 @@ import (
 
 	"cflow.local/cflow/internal/artifact"
 	"cflow.local/cflow/internal/model"
+	"cflow.local/cflow/internal/store"
 )
 
 func queryWorkflowMenu(t *testing.T, a *Application, wf model.WorkflowID) WorkflowMenuView {
@@ -443,6 +444,31 @@ func TestMenuProjectionExecutionFactsGateReadonlyRoutes(t *testing.T) {
 		entry, ok := menuEntry(menu, id)
 		if !ok || entry.Kind != MenuEntryReadonly || entry.Group != MenuGroupView {
 			t.Fatalf("readonly fact %q = %+v, present = %v; menu = %+v", id, entry, ok, menu.Entries)
+		}
+	}
+}
+
+func TestMenuProjectionOmitsArtifactRoutesWithoutCompletePreviewFacts(t *testing.T) {
+	fx := newPlanningFixture(t)
+	wf, err := fx.create("menu-incomplete-preview", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial := store.StoreView{State: model.State{Workflow: model.Workflow{
+		ID: wf,
+		ExecutionFacts: &model.ExecutionFacts{
+			SpecHashes:  []string{"spec-hash"},
+			CatalogHash: "catalog-hash",
+		},
+	}}}
+	entries, err := fx.app().workflowMenuReadonlyEntries(context.Background(), wf, partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		switch entry.Route {
+		case MenuRouteSpecs, MenuRouteCatalog, MenuRouteDAG:
+			t.Fatalf("partial execution facts exposed unsupported artifact route: %+v", entry)
 		}
 	}
 }

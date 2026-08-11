@@ -158,11 +158,11 @@ func TestWorkflowMenuRoutesTask8StageEntriesToTypedPages(t *testing.T) {
 		queryCheck func(t *testing.T, queries []app.Query)
 	}{
 		{name: "execution preview", route: app.MenuRouteExecutionApproval, page: PageExecutionApproval, queryCheck: wantQuery[app.ExecutionPreviewQuery]},
-		{name: "task graph", route: app.MenuRouteTaskGraph, page: PageExecution, queryCheck: wantWorkspaceQuery},
-		{name: "report", route: app.MenuRouteReport, page: PageTerminal, section: SectionReport, queryCheck: wantWorkspaceQuery},
+		{name: "task graph", route: app.MenuRouteTaskGraph, page: PageReadonlyWorkspace, queryCheck: wantQuery[app.InspectQuery]},
+		{name: "report", route: app.MenuRouteReport, page: PageReadonlyWorkspace, queryCheck: wantQuery[app.ReportQuery]},
 		{name: "apply", route: app.MenuRouteApply, page: PageTerminal, section: SectionApply, queryCheck: wantWorkspaceQuery},
 		{name: "cleanup", route: app.MenuRouteCleanup, page: PageTerminal, section: SectionCleanup, queryCheck: wantWorkspaceQuery},
-		{name: "plan evidence", route: app.MenuRoutePlan, page: PagePlanApproval, queryCheck: wantQuery[app.PlanQuery]},
+		{name: "plan evidence", route: app.MenuRoutePlan, page: PageReadonlyWorkspace, queryCheck: wantQuery[app.PlanQuery]},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
