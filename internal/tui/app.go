@@ -1251,7 +1251,6 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.awaitProjectionStatus("apply delivered to the target branch")
 		m.terminal.Confirmed = false
 		m.terminal.Previewed = false
-		m.terminal.Yes = false
 		return m, m.reloadCmd()
 	case app.DryRunCommand:
 		if msg.out.Cleanup != nil {
@@ -1265,7 +1264,6 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.awaitProjectionStatus("cleanup executed")
 		m.terminal.Confirmed = false
 		m.terminal.Previewed = false
-		m.terminal.Yes = false
 		return m, m.reloadCmd()
 	case app.PrepareLayoutMigrationCommand:
 		m.migrationConfirm = migrationConfirmNone
@@ -1290,7 +1288,7 @@ func (m Model) applyRunnerDone(msg runnerDoneMsg) (Model, tea.Cmd) {
 	m.runCancel = nil
 	m.eventCh = nil
 	// stopPauseAndExit means the confirmation page is visible; it becomes an
-	// actual exit request only after its y action arms the pause command. This
+	// actual exit request only after its Enter action arms the pause command. This
 	// avoids quitting merely because a Runner reaches a terminal result while
 	// the user is still deciding.
 	requestedQuit := m.quitAfterRunner || (m.stop == stopPauseAndExit && m.pauseCommandPending)
@@ -2157,13 +2155,11 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.planCheckInFlight || m.pendingPlanStatus == "plan checked" {
 				m.pendingPlanApproval = true
 				m.approval.Confirmed = false
-				m.approval.Yes = false
 				m.status = "plan approval queued; waiting for refreshed PLAN_CHECK"
 				return m, nil
 			}
 			m.status = "no plan revision to approve"
 			m.approval.Confirmed = false
-			m.approval.Yes = false
 			return m, nil
 		}
 		m.approval.Confirmed = false
@@ -2207,7 +2203,6 @@ func (m Model) handleExecutionApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) 
 			m.preview.CommitPolicyHash == "" {
 			m.status = "no complete execution preview to approve; run the dry run first"
 			m.approval.Confirmed = false
-			m.approval.Yes = false
 			return m, nil
 		}
 		m.approval.Confirmed = false
@@ -2285,8 +2280,8 @@ func (m Model) handleBlockedKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 
 // handleTerminalKey handles the Terminal page (Report/Apply/Cleanup):
 // 'r' renders the Final Report, 'p' stages the Apply, 'c' produces the
-// Cleanup Dry Run Manifest, and the explicit confirmations (Enter alone
-// never delivers or deletes) execute the Apply and the Cleanup.
+// Cleanup Dry Run Manifest, and the second Enter after the current section's
+// preview executes the Apply or Cleanup command.
 func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.selected == "" {
 		m.status = "no workflow selected"
@@ -2324,7 +2319,6 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.terminal.ApplyPreview == "" {
 				m.status = "no staged apply to deliver; stage it first"
 				m.terminal.Confirmed = false
-				m.terminal.Yes = false
 				return m, nil
 			}
 			m.terminal.Confirmed = false
@@ -2335,7 +2329,6 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.terminal.CleanupPreview == "" {
 				m.status = "no cleanup manifest to execute; produce the dry run first"
 				m.terminal.Confirmed = false
-				m.terminal.Yes = false
 				return m, nil
 			}
 			m.terminal.Confirmed = false

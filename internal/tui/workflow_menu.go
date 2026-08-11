@@ -206,28 +206,45 @@ func (m Model) routeWorkflowMenuItem(item MenuItem) (Model, tea.Cmd) {
 		return m, m.queryCmd(PageBlocked, app.ProjectWorkspaceQuery{Selected: m.selected})
 	}
 
-	if item.Route == app.MenuRouteExecution {
-		m = m.pushNavigation(NavigationFrame{LayerStageWorkspace, PageExecution, m.selected, item.SourceIndex})
+	switch item.Route {
+	case app.MenuRoutePlan:
+		m.approval = ApprovalModel{Plan: m.plan}
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PagePlanApproval, Workflow: m.selected, Index: item.SourceIndex})
+		return m, m.queryCmd(PagePlanApproval, app.PlanQuery{Workflow: m.selected})
+	case app.MenuRouteExecutionApproval:
+		m.approval = ApprovalModel{Preview: m.preview}
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecutionApproval, Workflow: m.selected, Index: item.SourceIndex})
+		return m, m.queryCmd(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected})
+	case app.MenuRouteExecution, app.MenuRouteTaskGraph:
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageExecution, app.ProjectWorkspaceQuery{Selected: m.selected})
-	}
-	if item.Route == app.MenuRouteDiscussion {
+	case app.MenuRouteDiscussion:
 		m.discussion = DiscussionPage{}
-		m = m.pushNavigation(NavigationFrame{LayerStageWorkspace, PageDiscussion, m.selected, item.SourceIndex})
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageDiscussion, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageDiscussion, app.DiscussionReturnQuery{Workflow: m.selected})
-	}
-	if item.Route == app.MenuRouteCancel {
+	case app.MenuRouteCancel:
 		m.cancel = app.CancelSummaryView{}
-		m = m.pushNavigation(NavigationFrame{LayerStageWorkspace, PageCancel, m.selected, item.SourceIndex})
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageCancel, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
-	}
-	if item.Route == app.MenuRouteMigration {
+	case app.MenuRouteMigration:
 		m.migration = app.MigrationPreviewView{}
-		m = m.pushNavigation(NavigationFrame{LayerStageWorkspace, PageMigration, m.selected, item.SourceIndex})
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageMigration, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
-	}
-	if item.Route == app.MenuRouteApply || item.Route == app.MenuRouteCleanup {
-		m = m.pushNavigation(NavigationFrame{LayerStageWorkspace, PageTerminal, m.selected, item.SourceIndex})
+	case app.MenuRouteReport, app.MenuRouteApply, app.MenuRouteCleanup:
+		m.terminal = NewTerminalModel()
+		switch item.Route {
+		case app.MenuRouteApply:
+			m.terminal.Section = SectionApply
+		case app.MenuRouteCleanup:
+			m.terminal.Section = SectionCleanup
+		default:
+			m.terminal.Section = SectionReport
+		}
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageTerminal, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageTerminal, app.ProjectWorkspaceQuery{Selected: m.selected})
+	case app.MenuRouteCurrentStage, app.MenuRouteSpecs, app.MenuRouteCatalog, app.MenuRouteDAG, app.MenuRouteLogs:
+		m = m.pushNavigation(NavigationFrame{Layer: LayerReadonlyWorkspace, Page: PageReadonlyWorkspace, Workflow: m.selected, Index: item.SourceIndex})
+		return m, nil
 	}
 	m = m.pushNavigation(NavigationFrame{LayerReadonlyWorkspace, PageReadonlyWorkspace, m.selected, item.SourceIndex})
 	return m, nil

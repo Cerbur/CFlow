@@ -2,10 +2,10 @@ package tui
 
 // The Approval pages (design §6.2, TUI task 14): the Plan Approval and
 // the Execution Approval preview tabs (Plan/Spec/DAG/Diff) with the
-// fixed Hash/Scope/Route/Budget/Git Policy Inspector. Every
-// confirmation defaults to NO: Enter alone never approves; the user must
-// explicitly select Yes. The quit keys belong to the root Model's
-// controlled-stop protocol; a page never quits by itself.
+// fixed Hash/Scope/Route/Budget/Git Policy Inspector. Enter first enters
+// the exact facts preview and Enter again issues the typed approval command.
+// The quit keys belong to the root Model's controlled-stop protocol; a page
+// never quits by itself.
 
 import (
 	"fmt"
@@ -34,7 +34,6 @@ type ApprovalModel struct {
 	Tab       ApprovalTab
 	Previewed bool // the exact facts preview has been entered
 	Confirmed bool // a second Enter requested execution; transient UI state
-	Yes       bool // retained for compatibility; y/n never changes it
 }
 
 // NewApprovalModel maps the execution preview into the page.

@@ -2,8 +2,8 @@ package tui
 
 // The Terminal page (design §6.2, TUI task 14): the Final Report, the
 // protected Apply Preview/Execute, and the Cleanup Dry Run/Manifest
-// Confirmation. Every confirmation defaults to NO; Enter alone never
-// executes a delivery or a cleanup.
+// flow. Each section requires Enter to preview its current facts and a
+// second Enter to execute the typed command.
 
 import (
 	"fmt"
@@ -35,12 +35,11 @@ type TerminalModel struct {
 	// cleanupRef is the exact Manifest Ref of the produced Cleanup Dry
 	// Run the explicit execution binds ("" until a manifest exists).
 	cleanupRef *model.ArtifactRef
-	// Previewed is true after the first Enter has displayed the exact preview.
+	// Previewed is true after the first Enter has displayed the exact preview
+	// for the current section. Section changes invalidate it.
 	Previewed bool
 	// Confirmed is a transient second-Enter execution request.
 	Confirmed bool
-	// Yes is retained for compatibility; y/n never changes it.
-	Yes bool
 }
 
 // NewTerminalModel returns the empty Terminal page.
@@ -59,10 +58,14 @@ func (m TerminalModel) Update(msg tea.Msg) (TerminalModel, tea.Cmd) {
 		case IsLeft(msg):
 			if m.Section > SectionReport {
 				m.Section--
+				m.Previewed = false
+				m.Confirmed = false
 			}
 		case IsRight(msg):
 			if m.Section < SectionCleanup {
 				m.Section++
+				m.Previewed = false
+				m.Confirmed = false
 			}
 		case IsEnter(msg):
 			if !m.Previewed {

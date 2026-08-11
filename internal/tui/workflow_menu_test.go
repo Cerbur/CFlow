@@ -149,6 +149,42 @@ func TestWorkflowMenuEnterRoutesReadOnlyAndPreviewWithoutExecute(t *testing.T) {
 	}
 }
 
+func TestWorkflowMenuRoutesTask8StageEntriesToTypedPages(t *testing.T) {
+	cases := []struct {
+		name       string
+		route      app.MenuRoute
+		page       Page
+		section    TerminalSection
+		queryCheck func(t *testing.T, queries []app.Query)
+	}{
+		{name: "execution preview", route: app.MenuRouteExecutionApproval, page: PageExecutionApproval, queryCheck: wantQuery[app.ExecutionPreviewQuery]},
+		{name: "task graph", route: app.MenuRouteTaskGraph, page: PageExecution, queryCheck: wantWorkspaceQuery},
+		{name: "report", route: app.MenuRouteReport, page: PageTerminal, section: SectionReport, queryCheck: wantWorkspaceQuery},
+		{name: "apply", route: app.MenuRouteApply, page: PageTerminal, section: SectionApply, queryCheck: wantWorkspaceQuery},
+		{name: "cleanup", route: app.MenuRouteCleanup, page: PageTerminal, section: SectionCleanup, queryCheck: wantWorkspaceQuery},
+		{name: "plan evidence", route: app.MenuRoutePlan, page: PagePlanApproval, queryCheck: wantQuery[app.PlanQuery]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := &workflowMenuController{}
+			m := menuModel(ctrl, app.WorkflowMenuEntry{ID: tc.name, Kind: app.MenuEntryReadonly, Label: tc.name, Route: tc.route})
+			next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+			m = next.(Model)
+			if m.page != tc.page || len(ctrl.executed) != 0 {
+				t.Fatalf("route page=%v executes=%d, want page=%v and no Execute", m.page, len(ctrl.executed), tc.page)
+			}
+			if m.page == PageTerminal && m.terminal.Section != tc.section {
+				t.Fatalf("terminal section=%v, want %v", m.terminal.Section, tc.section)
+			}
+			if cmd == nil {
+				t.Fatal("stage route did not issue a read-only query")
+			}
+			_ = cmd()
+			tc.queryCheck(t, ctrl.queries)
+		})
+	}
+}
+
 func TestWorkflowMenuEscRestoresHomeWorkflowRow(t *testing.T) {
 	ctrl := &workflowMenuController{}
 	m := menuModel(ctrl,

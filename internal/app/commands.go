@@ -244,6 +244,7 @@ const (
 	MenuRouteCleanup
 	MenuRouteCancel
 	MenuRouteMigration
+	MenuRouteExecutionApproval
 )
 
 // MenuAction is the closed action reference carried by an action entry.

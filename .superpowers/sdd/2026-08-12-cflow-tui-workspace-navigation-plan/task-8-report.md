@@ -53,3 +53,32 @@ The scoped changes and this report are committed as:
 ```text
 feat: route stage workspaces through the hierarchy
 ```
+
+## Fix Round 1
+
+Addressed all findings from `task-8-review.md` without starting Task 9 or
+Task 10:
+
+- Added explicit Workflow Menu routing for Application menu routes: Plan /
+  Evidence to Plan Approval, Execution Preview to Execution Approval with
+  `ExecutionPreviewQuery`, Task Graph and Execution to Execution with the
+  workspace query, and Report / Apply / Cleanup to Terminal with the correct
+  section and workspace query. Other available readonly routes now have an
+  explicit readonly branch instead of relying on accidental fallthrough.
+- Added the Application-owned Execution Preview menu entry when the required
+  execution facts exist.
+- Terminal section changes invalidate the current Previewed/Confirmed state,
+  preventing a preview in one section from authorizing a different section.
+- Updated stale two-step Enter-only focused expectations and removed
+  superseded confirmation comments/fields from active approval and terminal
+  code.
+
+### Fix Round 1 verification
+
+```text
+GOCACHE=/tmp/cflow-task8-round1-cache go test ./internal/tui -run 'WorkflowMenu|MenuRoutes|ActionPreview|Approval|Terminal|MigrationEntryPoints|Cancel' -count=1
+ok  cflow.local/cflow/internal/tui  2.449s
+```
+
+Per the user's stop instruction, no package-wide or full-suite test was run.
+The remaining unrun gate is `go test ./... -count=1`.

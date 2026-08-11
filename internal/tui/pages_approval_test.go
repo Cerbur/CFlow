@@ -39,7 +39,7 @@ func TestApprovalDefaultsToNo(t *testing.T) {
 		t.Fatalf("first Enter did not enter preview: %+v", m)
 	}
 	m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if !m.Confirmed || m.Yes {
+	if !m.Confirmed {
 		t.Fatalf("second Enter did not request Enter-only execution: %+v", m)
 	}
 }
@@ -48,7 +48,7 @@ func TestApprovalYNAreOrdinaryInput(t *testing.T) {
 	m := NewApprovalModel(approvalPreview())
 	for _, key := range []rune{'y', 'Y', 'n', 'N'} {
 		m, _ = update(m, tea.KeyPressMsg{Code: key})
-		if m.Confirmed || m.Yes {
+		if m.Confirmed {
 			t.Fatalf("%q acted as confirmation: %+v", key, m)
 		}
 	}
@@ -77,7 +77,7 @@ func TestApprovalEnterAloneNeverApproves(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	}
-	if !m.Confirmed || m.Yes {
+	if !m.Confirmed {
 		t.Fatalf("repeated Enter used the legacy answer state: %+v", m)
 	}
 }
@@ -97,7 +97,7 @@ func TestApprovalTabsNavigate(t *testing.T) {
 		t.Fatalf("tab after left = %d", m.Tab)
 	}
 	got := RenderApproval(m)
-	for _, want := range []string{"execution approval", "plan hash:", "commit policy:", "approve?"} {
+	for _, want := range []string{"execution approval", "plan hash:", "commit policy:", "Enter to preview"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("approval render misses %q:\n%s", want, got)
 		}

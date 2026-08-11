@@ -89,6 +89,13 @@ func (a *Application) workflowMenuReadonlyEntries(ctx context.Context, wf model.
 				Label: "Workflow DAG", Route: MenuRouteDAG,
 			})
 		}
+		if facts.PlanHash != "" && len(facts.SpecHashes) > 0 &&
+			facts.CatalogHash != "" && facts.WorkflowHash != "" {
+			entries = append(entries, WorkflowMenuEntry{
+				ID: "execution-preview", Group: MenuGroupView, Kind: MenuEntryReadonly,
+				Label: "Execution Preview", Route: MenuRouteExecutionApproval,
+			})
+		}
 	}
 	if len(st.Nodes) > 0 {
 		entries = append(entries, WorkflowMenuEntry{

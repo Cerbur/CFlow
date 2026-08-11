@@ -63,7 +63,7 @@ func TestModelParentReturnRestoresWorkflowMenuIndexWithoutExecute(t *testing.T) 
 		Workflow: "wf-1",
 		Entries: []app.WorkflowMenuEntry{
 			{ID: "stage", Kind: app.MenuEntryReadonly, Route: app.MenuRouteCurrentStage},
-			{ID: "plan", Kind: app.MenuEntryReadonly, Route: app.MenuRoutePlan},
+			{ID: "stage-details", Kind: app.MenuEntryReadonly, Route: app.MenuRouteCurrentStage},
 		},
 	}
 	m.workflowMenuModel = MapWorkflowMenu(m.workflowMenu)

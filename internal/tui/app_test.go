@@ -1779,6 +1779,27 @@ func TestCancelRequiresPreviewThenEnterAndIgnoresYN(t *testing.T) {
 	}
 }
 
+func TestTerminalPreviewDoesNotCarryAcrossSections(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.page = PageTerminal
+	m.terminal.ApplyPreview = "apply preview"
+	m.navigation = NavigationStack{Frames: []NavigationFrame{
+		{Layer: LayerHome, Page: PageWorkspace},
+		{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+		{Layer: LayerStageWorkspace, Page: PageTerminal, Workflow: "wf-1"},
+	}}
+
+	m = press(t, m, tea.KeyEnter, 0)
+	m = press(t, m, tea.KeyRight, 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	if ctrl.executes != 0 {
+		t.Fatalf("Apply executed without a current-section preview: %d", ctrl.executes)
+	}
+}
+
 func TestModelCreateWorkspaceEscPopsNavigationHome(t *testing.T) {
 	ctrl := &homeRowsController{}
 	m := newModel(Dependencies{})
@@ -2178,8 +2199,8 @@ func TestProjectionOperationLogCapturesQueryLifecycle(t *testing.T) {
 	}
 }
 
-// TestModelPlanApprovalWaitsForCheckedProjection preserves an explicit y
-// pressed after the CheckPlan command settled but before the refreshed
+// TestModelPlanApprovalWaitsForCheckedProjection preserves a two-Enter
+// approval pressed after the CheckPlan command settled but before the refreshed
 // PlanView arrived. The approval must bind the revision/hash from that
 // fresh projection instead of dropping the user's action or using stale
 // local data.
@@ -2197,6 +2218,7 @@ func TestModelPlanApprovalWaitsForCheckedProjection(t *testing.T) {
 	}
 
 	m, _ = m.applyCommand(commandDoneMsg{cmd: app.CheckPlanCommand{}})
+	m = press(t, m, tea.KeyEnter, 0)
 	m = press(t, m, tea.KeyEnter, 0)
 	if rec.hasExecuted(app.ApprovePlanCommand{}) {
 		t.Fatal("stale projection issued ApprovePlanCommand")
