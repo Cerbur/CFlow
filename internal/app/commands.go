@@ -263,6 +263,10 @@ const (
 	MenuActionCleanup
 	MenuActionMigrate
 	MenuActionInspectBlocked
+	// MenuActionReviewExecution is an explicit preview entry. It may open the
+	// approval workspace, but it is not a readonly route and its later
+	// confirmation remains governed by the existing approval page.
+	MenuActionReviewExecution
 )
 
 // WorkflowMenuEntry is one bounded, typed Workflow Menu route or action.

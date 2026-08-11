@@ -77,7 +77,15 @@ func (a *Application) workflowMenuReadonlyEntries(ctx context.Context, wf model.
 		// justify inventing an artifact view.
 		previewFacts := facts.PlanHash != "" && len(facts.SpecHashes) > 0 &&
 			facts.CatalogHash != "" && facts.WorkflowHash != ""
+		previewAvailable := false
 		if previewFacts {
+			var previewErr error
+			previewAvailable, previewErr = a.workflowMenuExecutionPreviewAvailable(ctx, wf)
+			if previewErr != nil {
+				return nil, previewErr
+			}
+		}
+		if previewAvailable {
 			entries = append(entries, WorkflowMenuEntry{
 				ID: "specs", Group: MenuGroupView, Kind: MenuEntryReadonly,
 				Label: "Specs", Route: MenuRouteSpecs,
@@ -91,8 +99,9 @@ func (a *Application) workflowMenuReadonlyEntries(ctx context.Context, wf model.
 				Label: "Workflow DAG", Route: MenuRouteDAG,
 			})
 			entries = append(entries, WorkflowMenuEntry{
-				ID: "execution-preview", Group: MenuGroupView, Kind: MenuEntryReadonly,
+				ID: "execution-preview", Group: MenuGroupView, Kind: MenuEntryAction,
 				Label: "Execution Preview", Route: MenuRouteExecutionApproval,
+				Action: MenuActionReviewExecution,
 			})
 		}
 	}
@@ -119,6 +128,21 @@ func (a *Application) workflowMenuReadonlyEntries(ctx context.Context, wf model.
 		})
 	}
 	return entries, nil
+}
+
+// workflowMenuExecutionPreviewAvailable asks the existing authoritative
+// ExecutionPreview projection whether all of its artifact-backed facts can be
+// resolved. A menu is allowed to omit an optional route when its view is not
+// available; it must not turn a missing or unresolvable Artifact into a menu
+// entry. Cancellation remains observable to the caller.
+func (a *Application) workflowMenuExecutionPreviewAvailable(ctx context.Context, wf model.WorkflowID) (bool, error) {
+	if _, err := a.queryExecutionPreview(ctx, ExecutionPreviewQuery{Workflow: wf}); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
 func (a *Application) workflowMenuHasFinalReport(ctx context.Context, wf model.WorkflowID, st model.State) (bool, error) {

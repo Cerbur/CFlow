@@ -208,6 +208,20 @@ func (m Model) routeWorkflowMenuItem(item MenuItem) (Model, tea.Cmd) {
 
 	switch item.Route {
 	case app.MenuRouteExecutionApproval:
+		if item.Kind != app.MenuEntryAction || item.Action != app.MenuActionReviewExecution {
+			m.readonly = ReadonlyWorkspaceModel{
+				Workflow: m.selected,
+				Name:     valueOr(m.workflowMenuModel.Name, string(m.selected)),
+				Stage:    m.workflowMenuModel.Stage,
+				Runtime:  m.workflowMenuModel.Runtime,
+				Route:    item.Route,
+				Label:    item.Label,
+				Loaded:   true,
+				Error:    "Execution Preview requires an explicit action preview",
+			}
+			m = m.pushNavigation(NavigationFrame{Layer: LayerReadonlyWorkspace, Page: PageReadonlyWorkspace, Workflow: m.selected, Index: item.SourceIndex})
+			return m, nil
+		}
 		m.approval = ApprovalModel{Preview: m.preview}
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecutionApproval, Workflow: m.selected, Index: item.SourceIndex})
 		return m, m.queryCmd(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected})

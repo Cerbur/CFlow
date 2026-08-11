@@ -75,12 +75,22 @@ func TestModelParentReturnRestoresWorkflowMenuIndexWithoutExecute(t *testing.T) 
 	}}
 
 	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if cmd != nil {
-		t.Fatal("readonly navigation returned a command")
+	if cmd == nil {
+		t.Fatal("readonly navigation did not return its Query command")
 	}
 	m = next.(Model)
 	if m.page != PageReadonlyWorkspace || m.navigation.Current().Layer != LayerReadonlyWorkspace {
 		t.Fatalf("menu Enter route = page %v frame %+v", m.page, m.navigation.Current())
+	}
+	_ = cmd()
+	if len(ctrl.queries) != 1 {
+		t.Fatalf("readonly navigation queries = %d, want 1", len(ctrl.queries))
+	}
+	if _, ok := ctrl.queries[0].(app.StatusQuery); !ok {
+		t.Fatalf("readonly navigation query = %T, want app.StatusQuery", ctrl.queries[0])
+	}
+	if ctrl.executes != 0 {
+		t.Fatalf("readonly navigation called Execute %d times", ctrl.executes)
 	}
 
 	next, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
@@ -233,6 +243,7 @@ func nestedNavigationModel() Model {
 
 type navigationController struct {
 	executes int
+	queries  []app.Query
 }
 
 func (c *navigationController) Execute(context.Context, app.Command) (app.Outcome, error) {
@@ -240,7 +251,8 @@ func (c *navigationController) Execute(context.Context, app.Command) (app.Outcom
 	return app.Outcome{}, nil
 }
 
-func (*navigationController) Query(context.Context, app.Query) (app.View, error) {
+func (c *navigationController) Query(_ context.Context, q app.Query) (app.View, error) {
+	c.queries = append(c.queries, q)
 	return nil, nil
 }
 

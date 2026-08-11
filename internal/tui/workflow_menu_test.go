@@ -167,7 +167,12 @@ func TestWorkflowMenuRoutesTask8StageEntriesToTypedPages(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := &workflowMenuController{}
-			m := menuModel(ctrl, app.WorkflowMenuEntry{ID: tc.name, Kind: app.MenuEntryReadonly, Label: tc.name, Route: tc.route})
+			entry := app.WorkflowMenuEntry{ID: tc.name, Kind: app.MenuEntryReadonly, Label: tc.name, Route: tc.route}
+			if tc.route == app.MenuRouteExecutionApproval {
+				entry.Kind = app.MenuEntryAction
+				entry.Action = app.MenuActionReviewExecution
+			}
+			m := menuModel(ctrl, entry)
 			next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 			m = next.(Model)
 			if m.page != tc.page || len(ctrl.executed) != 0 {
@@ -182,6 +187,36 @@ func TestWorkflowMenuRoutesTask8StageEntriesToTypedPages(t *testing.T) {
 			_ = cmd()
 			tc.queryCheck(t, ctrl.queries)
 		})
+	}
+}
+
+func TestReadonlyExecutionPreviewEntryCannotReachApprovalPage(t *testing.T) {
+	ctrl := &workflowMenuController{}
+	m := menuModel(ctrl, app.WorkflowMenuEntry{
+		ID: "execution-preview", Group: app.MenuGroupView, Kind: app.MenuEntryReadonly,
+		Label: "Execution Preview", Route: app.MenuRouteExecutionApproval,
+	})
+	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+	if m.page == PageExecutionApproval {
+		t.Fatal("a readonly execution-preview entry reached the mutation-capable approval page")
+	}
+	if len(ctrl.executed) != 0 || cmd != nil {
+		t.Fatalf("malformed readonly execution-preview entry mutated or returned unexpected command: executes=%v cmd=%v", ctrl.executed, cmd != nil)
+	}
+}
+
+func TestExecutionPreviewActionEntryOpensApprovalPreviewWithoutExecute(t *testing.T) {
+	ctrl := &workflowMenuController{}
+	m := menuModel(ctrl, app.WorkflowMenuEntry{
+		ID: "execution-preview", Group: app.MenuGroupView, Kind: app.MenuEntryAction,
+		Label: "Execution Preview", Route: app.MenuRouteExecutionApproval,
+		Action: app.MenuActionReviewExecution,
+	})
+	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+	if m.page != PageExecutionApproval || cmd == nil || len(ctrl.executed) != 0 {
+		t.Fatalf("execution-preview action = page %v cmd=%v executes=%v", m.page, cmd != nil, ctrl.executed)
 	}
 }
 

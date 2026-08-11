@@ -3,6 +3,9 @@ package app
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -469,6 +472,46 @@ func TestMenuProjectionOmitsArtifactRoutesWithoutCompletePreviewFacts(t *testing
 		switch entry.Route {
 		case MenuRouteSpecs, MenuRouteCatalog, MenuRouteDAG:
 			t.Fatalf("partial execution facts exposed unsupported artifact route: %+v", entry)
+		}
+	}
+}
+
+func TestWorkflowMenuExecutionPreviewIsExplicitActionPreview(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := drivePlanningToApproval(t, fx)
+	_ = driveToExecutionGate(t, fx, wf)
+
+	entry, ok := menuEntry(queryWorkflowMenu(t, fx.app(), wf), "execution-preview")
+	if !ok {
+		t.Fatal("complete execution facts did not expose Execution Preview")
+	}
+	if entry.Kind != MenuEntryAction || entry.Action != MenuActionReviewExecution {
+		t.Fatalf("Execution Preview classification = %+v, want explicit action preview", entry)
+	}
+}
+
+func TestWorkflowMenuOmitsArtifactRoutesWhenPreviewArtifactIsMissing(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := drivePlanningToApproval(t, fx)
+	pv := driveToExecutionGate(t, fx, wf)
+	a := fx.app()
+	artifactRoot := a.layout.WorkflowRoot(wf)
+	specDir, err := artifact.WorkflowTypeDir(artifactRoot, model.ArtifactSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pv.Spec == nil {
+		t.Fatal("execution preview has no Spec reference")
+	}
+	specPath := filepath.Join(specDir, strconv.Itoa(pv.Spec.Revision), pv.Spec.Hash)
+	if err := os.Remove(specPath); err != nil {
+		t.Fatalf("remove Spec artifact: %v", err)
+	}
+
+	menu := queryWorkflowMenu(t, a, wf)
+	for _, id := range []string{"specs", "catalog", "workflow-dag", "execution-preview"} {
+		if _, ok := menuEntry(menu, id); ok {
+			t.Fatalf("menu exposed %q after its authoritative preview artifact became unavailable: %+v", id, menu.Entries)
 		}
 	}
 }
