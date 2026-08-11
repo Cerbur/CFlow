@@ -719,9 +719,8 @@ func (*migrationController) DriveOnce(context.Context, model.WorkflowID) (app.Dr
 }
 func (*migrationController) EscalateStop() {}
 
-// TestModelMigrationEntryPointsDefaultNo drives the TUI's explicit
-// Preview/Prepare/Execute surface. Enter at either confirmation is No;
-// only an explicit y sends the typed mutation command.
+// TestModelMigrationEntryPointsUseEnterOnly drives the TUI's explicit
+// Preview/Prepare/Execute surface.
 func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
 	ctrl := &migrationController{}
 	m := newModel(Dependencies{})
@@ -734,10 +733,10 @@ func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
 	m = press(t, m, 'p', 0)
 	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 0 {
-		t.Fatalf("Enter confirmed Prepare: %v", ctrl.executed)
+		t.Fatalf("first Enter executed Prepare: %v", ctrl.executed)
 	}
 	m = press(t, m, 'p', 0)
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 1 {
 		t.Fatalf("explicit y did not Prepare: %v", ctrl.executed)
 	}
@@ -747,10 +746,10 @@ func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
 	m = press(t, m, 'e', 0)
 	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 1 {
-		t.Fatalf("Enter confirmed Execute: %v", ctrl.executed)
+		t.Fatalf("first Enter executed Execute: %v", ctrl.executed)
 	}
 	m = press(t, m, 'e', 0)
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 2 {
 		t.Fatalf("explicit y did not Execute: %v", ctrl.executed)
 	}
@@ -1528,8 +1527,8 @@ func TestModelLoadsRealWorkspaceView(t *testing.T) {
 	}
 }
 
-// TestModelNavigationReachesLifecyclePages: Tab reaches every lifecycle page
-// and the render stays pure; Home left/right are inert.
+// TestModelHomeLifecycleNavigationIsInert: Home keys never cross lifecycle
+// stages; stage routes are entered from Workflow Menu.
 func TestModelNavigationReachesLifecyclePages(t *testing.T) {
 	fx := newTUIFixture(t)
 	ref := &appRef{fx: fx}
@@ -1546,23 +1545,10 @@ func TestModelNavigationReachesLifecyclePages(t *testing.T) {
 	if m.page != PageWorkspace {
 		t.Fatalf("initial page = %d", m.page)
 	}
-	// Tab cycles through the lifecycle pages; the render never panics
-	// and every page is reachable.
-	want := []Page{PageDiscussion, PagePlanApproval, PageExecutionApproval, PageExecution, PageBlocked, PageTerminal}
-	visited := map[Page]bool{}
-	for _, w := range want {
-		m = press(t, m, tea.KeyTab, 0)
-		if m.page != w {
-			t.Fatalf("after tab: page = %d, want %d", m.page, w)
-		}
-		visited[m.page] = true
-		if got := render(m); !strings.Contains(got, "\n") {
-			t.Fatalf("page %d render = %q", m.page, got)
-		}
-	}
-	for _, w := range want {
-		if !visited[w] {
-			t.Fatalf("lifecycle page %d never reached", w)
+	for _, key := range []rune{tea.KeyTab, tea.KeyLeft, tea.KeyRight} {
+		m = press(t, m, key, 0)
+		if m.page != PageWorkspace || m.navigation.Current().Layer != LayerHome {
+			t.Fatalf("Home key %q crossed lifecycle route: page=%v frame=%+v", key, m.page, m.navigation.Current())
 		}
 	}
 	// Navigation never executed a mutation.
@@ -1726,6 +1712,73 @@ func TestModelHomeLeftRightAreInert(t *testing.T) {
 	}
 }
 
+func TestModelHomeTabDoesNotEnterLifecycleStages(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimePaused}},
+	})
+
+	next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	got := next.(Model)
+	if cmd != nil || got.page != PageWorkspace || got.navigation.Current().Layer != LayerHome {
+		t.Fatalf("Home Tab changed lifecycle route: page=%v frame=%+v command=%v", got.page, got.navigation.Current(), cmd != nil)
+	}
+}
+
+func TestStageWorkspaceEscReturnsToActualParent(t *testing.T) {
+	pages := []Page{PageDiscussion, PagePlanApproval, PageExecutionApproval, PageExecution, PageBlocked, PageTerminal, PageCancel, PageMigration}
+	for _, page := range pages {
+		t.Run(pageName(page), func(t *testing.T) {
+			m := newModel(Dependencies{})
+			m.page = page
+			m.selected = "wf-1"
+			m.navigation = NavigationStack{Frames: []NavigationFrame{
+				{Layer: LayerHome, Page: PageWorkspace},
+				{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1", Index: 2},
+				{Layer: LayerStageWorkspace, Page: page, Workflow: "wf-1"},
+			}}
+
+			next, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+			got := next.(Model)
+			if cmd != nil || got.page != PageWorkflowMenu || got.navigation.Current().Layer != LayerWorkflowMenu {
+				t.Fatalf("Esc parent = page=%v frame=%+v command=%v", got.page, got.navigation.Current(), cmd != nil)
+			}
+		})
+	}
+}
+
+func TestCancelRequiresPreviewThenEnterAndIgnoresYN(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.page = PageCancel
+	m.navigation = NavigationStack{Frames: []NavigationFrame{
+		{Layer: LayerHome, Page: PageWorkspace},
+		{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+		{Layer: LayerStageWorkspace, Page: PageCancel, Workflow: "wf-1"},
+	}}
+
+	for _, key := range []rune{'y', 'Y', 'n', 'N'} {
+		m = press(t, m, key, 0)
+		if ctrl.executes != 0 || m.page != PageCancel {
+			t.Fatalf("%q mutated or left cancel preview: page=%v executions=%d", key, m.page, ctrl.executes)
+		}
+	}
+	m = press(t, m, tea.KeyEnter, 0)
+	if ctrl.executes != 0 || m.page != PageCancel {
+		t.Fatalf("first Enter did not stay in cancel preview: page=%v executions=%d", m.page, ctrl.executes)
+	}
+	m = press(t, m, tea.KeyEnter, 0)
+	if ctrl.executes != 1 {
+		t.Fatalf("second Enter did not execute cancel: executions=%d", ctrl.executes)
+	}
+}
+
 func TestModelCreateWorkspaceEscPopsNavigationHome(t *testing.T) {
 	ctrl := &homeRowsController{}
 	m := newModel(Dependencies{})
@@ -1875,9 +1928,13 @@ func TestModelActionsMapToTypedCommands(t *testing.T) {
 		t.Fatalf("Enter alone cancelled the workflow")
 	}
 	m = press(t, m, 'x', 0)
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
+	if rec.hasExecuted(app.CancelWorkflowCommand{}) || len(rec.executed) != before {
+		t.Fatalf("first Enter executed CancelWorkflowCommand: %v", rec.executed)
+	}
+	m = press(t, m, tea.KeyEnter, 0)
 	if !rec.hasExecuted(app.CancelWorkflowCommand{}) || len(rec.executed) == before {
-		t.Fatalf("y did not execute CancelWorkflowCommand: %v", rec.executed)
+		t.Fatalf("second Enter did not execute CancelWorkflowCommand: %v", rec.executed)
 	}
 }
 
@@ -1898,8 +1955,9 @@ func TestModelPlanApprovalMapsToTypedCommand(t *testing.T) {
 	rec := &recordingController{ctrl: a}
 	m := load(t, testModel(rec))
 	// Navigate to the Plan Approval page.
-	m = press(t, m, tea.KeyTab, 0) // discussion
-	m = press(t, m, tea.KeyTab, 0) // plan approval
+	m.page = PagePlanApproval
+	m.navigation = NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}, {Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: m.selected}, {Layer: LayerStageWorkspace, Page: PagePlanApproval, Workflow: m.selected}}}
+	m = runCmds(t, m, m.queryCmd(PagePlanApproval, app.PlanQuery{Workflow: m.selected}))
 	if m.page != PagePlanApproval {
 		t.Fatalf("page = %d, want plan approval", m.page)
 	}
@@ -1922,7 +1980,7 @@ func TestModelPlanApprovalMapsToTypedCommand(t *testing.T) {
 		t.Fatal("Enter alone approved the plan")
 	}
 	// 'y' approves the exact plan.
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	if !rec.hasExecuted(app.ApprovePlanCommand{}) {
 		t.Fatalf("y did not approve: %v", rec.executed)
 	}
@@ -2139,7 +2197,7 @@ func TestModelPlanApprovalWaitsForCheckedProjection(t *testing.T) {
 	}
 
 	m, _ = m.applyCommand(commandDoneMsg{cmd: app.CheckPlanCommand{}})
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	if rec.hasExecuted(app.ApprovePlanCommand{}) {
 		t.Fatal("stale projection issued ApprovePlanCommand")
 	}
@@ -2210,7 +2268,7 @@ func TestModelPlanProjectionIgnoresOutOfOrderOlderState(t *testing.T) {
 		t.Fatalf("older projection replaced fresh state: %+v", m.plan)
 	}
 
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	var approved app.ApprovePlanCommand
 	for _, executed := range rec.executed {
 		if got, ok := executed.(app.ApprovePlanCommand); ok {
@@ -2361,9 +2419,9 @@ func TestModelExecutionApprovalMapsToTypedCommand(t *testing.T) {
 	m := load(t, testModel(rec))
 	// Navigate from Home with Tab: discussion, plan approval, then
 	// execution approval.
-	m = press(t, m, tea.KeyTab, 0)
-	m = press(t, m, tea.KeyTab, 0)
-	m = press(t, m, tea.KeyTab, 0)
+	m.page = PageExecutionApproval
+	m.navigation = NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}, {Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: m.selected}, {Layer: LayerStageWorkspace, Page: PageExecutionApproval, Workflow: m.selected}}}
+	m = runCmds(t, m, m.queryCmd(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected}))
 	if m.page != PageExecutionApproval {
 		t.Fatalf("page = %d, want execution approval", m.page)
 	}
@@ -2388,7 +2446,7 @@ func TestModelExecutionApprovalMapsToTypedCommand(t *testing.T) {
 	if rec.hasExecuted(app.ApproveExecutionCommand{}) {
 		t.Fatal("Enter alone approved the execution")
 	}
-	m = press(t, m, 'y', 0)
+	m = press(t, m, tea.KeyEnter, 0)
 	if !rec.hasExecuted(app.ApproveExecutionCommand{}) {
 		t.Fatalf("y did not approve the execution: %v", rec.executed)
 	}

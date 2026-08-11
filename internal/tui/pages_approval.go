@@ -32,8 +32,9 @@ type ApprovalModel struct {
 	Plan      app.PlanView
 	Preview   app.ExecutionPreviewView
 	Tab       ApprovalTab
-	Confirmed bool // the explicit Yes/No confirmation state
-	Yes       bool // the selected confirm answer (Enter alone never confirms)
+	Previewed bool // the exact facts preview has been entered
+	Confirmed bool // a second Enter requested execution; transient UI state
+	Yes       bool // retained for compatibility; y/n never changes it
 }
 
 // NewApprovalModel maps the execution preview into the page.
@@ -58,21 +59,11 @@ func (m ApprovalModel) Update(msg tea.Msg) (ApprovalModel, tea.Cmd) {
 				m.Tab++
 			}
 		case IsEnter(msg):
-			// Enter alone never approves: it moves the confirmation to
-			// the explicit Yes/No choice, or toggles Yes only when the
-			// choice was already selected.
-			if !m.Confirmed {
-				m.Confirmed = true
-				m.Yes = false
+			if !m.Previewed {
+				m.Previewed = true
 			} else {
-				m.Yes = !m.Yes
+				m.Confirmed = true
 			}
-		case msg.Code == 'y' || msg.Code == 'Y':
-			m.Confirmed = true
-			m.Yes = true
-		case msg.Code == 'n' || msg.Code == 'N':
-			m.Confirmed = true
-			m.Yes = false
 		}
 	}
 	return m, nil
@@ -91,14 +82,10 @@ func RenderPlanApproval(pv app.PlanView, m ApprovalModel) string {
 		fmt.Fprintf(&b, "hash: %s\n", pv.Hash)
 	}
 	b.WriteString("\n")
-	if !m.Confirmed {
-		b.WriteString("approve? Enter to choose, y/n (defaults to no)\n")
+	if !m.Previewed {
+		b.WriteString("Enter to preview the exact plan facts; Esc back\n")
 	} else {
-		mark := "no"
-		if m.Yes {
-			mark = "yes"
-		}
-		fmt.Fprintf(&b, "confirm: %s (Enter toggles; Enter alone never approves)\n", mark)
+		b.WriteString("PREVIEW READY — Enter approve, Esc back\n")
 	}
 	return b.String()
 }
@@ -109,8 +96,7 @@ func RenderApproval(m ApprovalModel) string {
 	pv := m.Preview
 	if pv.Workflow == "" {
 		b.WriteString("execution approval — (no preview yet; run the execution dry run first)\n")
-		b.WriteString("\n")
-		b.WriteString("approve? Enter to choose, y/n (defaults to no)\n")
+		b.WriteString("\nEnter to preview when the exact facts are available; Esc back\n")
 		return b.String()
 	}
 	fmt.Fprintf(&b, "execution approval — workflow %s\n", pv.Workflow)
@@ -128,14 +114,10 @@ func RenderApproval(m ApprovalModel) string {
 	b.WriteString("\n")
 	b.WriteString(renderApprovalInspector(pv))
 	b.WriteString("\n")
-	if !m.Confirmed {
-		b.WriteString("approve? Enter to choose, y/n (defaults to no)\n")
+	if !m.Previewed {
+		b.WriteString("Enter to preview the exact execution facts; Esc back\n")
 	} else {
-		mark := "no"
-		if m.Yes {
-			mark = "yes"
-		}
-		fmt.Fprintf(&b, "confirm: %s (Enter toggles; Enter alone never approves)\n", mark)
+		b.WriteString("PREVIEW READY — Enter approve, Esc back\n")
 	}
 	return b.String()
 }

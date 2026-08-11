@@ -1,7 +1,7 @@
 package tui
 
-// Approval and Execution page tests (TUI task 14): Enter alone never
-// approves, the confirmation defaults to no, and ordinary Task events
+// Approval and Execution page tests: Enter enters an explicit preview and
+// the next Enter requests execution; ordinary Task events
 // only update the Execution DAG — the page never breaks on progress.
 
 import (
@@ -31,18 +31,42 @@ func update(m ApprovalModel, msg tea.KeyMsg) (ApprovalModel, tea.Cmd) {
 	return u, cmd
 }
 
-// TestApprovalDefaultsToNo is the TUI task 14 failure test: Enter alone
-// must not approve without selecting yes.
+// TestApprovalRequiresPreviewThenEnter verifies the two-step confirmation.
 func TestApprovalDefaultsToNo(t *testing.T) {
 	m := NewApprovalModel(approvalPreview())
 	m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if m.Confirmed && m.Yes {
-		t.Fatal("enter must not approve without selecting yes")
+	if !m.Previewed || m.Confirmed {
+		t.Fatalf("first Enter did not enter preview: %+v", m)
 	}
-	// Enter opens the confirmation; y confirms; n cancels.
-	m, _ = update(m, tea.KeyPressMsg{Code: 'y'})
-	if !m.Confirmed || !m.Yes {
-		t.Fatalf("y did not confirm: %+v", m)
+	m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if !m.Confirmed || m.Yes {
+		t.Fatalf("second Enter did not request Enter-only execution: %+v", m)
+	}
+}
+
+func TestApprovalYNAreOrdinaryInput(t *testing.T) {
+	m := NewApprovalModel(approvalPreview())
+	for _, key := range []rune{'y', 'Y', 'n', 'N'} {
+		m, _ = update(m, tea.KeyPressMsg{Code: key})
+		if m.Confirmed || m.Yes {
+			t.Fatalf("%q acted as confirmation: %+v", key, m)
+		}
+	}
+}
+
+func TestTerminalYNAreOrdinaryInput(t *testing.T) {
+	m := NewTerminalModel()
+	for _, key := range []rune{'y', 'Y', 'n', 'N'} {
+		m, _ = m.Update(tea.KeyPressMsg{Code: key})
+		if m.Confirmed || m.Previewed {
+			t.Fatalf("%q acted as confirmation: %+v", key, m)
+		}
+	}
+	got := RenderTerminal(m)
+	for _, forbidden := range []string{"y/n", "q to quit", "defaults to no"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("terminal copy advertises legacy confirmation %q: %s", forbidden, got)
+		}
 	}
 }
 
@@ -53,8 +77,8 @@ func TestApprovalEnterAloneNeverApproves(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	}
-	if m.Yes {
-		t.Fatal("repeated Enter approved the execution")
+	if !m.Confirmed || m.Yes {
+		t.Fatalf("repeated Enter used the legacy answer state: %+v", m)
 	}
 }
 

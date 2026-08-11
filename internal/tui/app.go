@@ -130,13 +130,6 @@ const (
 	PageMigration
 )
 
-// navPages is the lifecycle navigation order (left/right on the
-// workspace cycles through the lifecycle pages).
-var navPages = []Page{
-	PageWorkspace, PageDiscussion, PagePlanApproval, PageExecutionApproval,
-	PageExecution, PageBlocked, PageTerminal,
-}
-
 type commandState struct {
 	inFlight     bool
 	generation   uint64 // latest mutating command generation
@@ -195,16 +188,19 @@ type Model struct {
 	blockedAckPage    Page
 	blockedWorkflow   model.WorkflowID
 
-	discussion       DiscussionPage
-	plan             app.PlanView
-	preview          app.ExecutionPreviewView
-	approval         ApprovalModel
-	execution        ExecutionModel
-	terminal         TerminalModel
-	reportRequestID  uint64
-	cancel           app.CancelSummaryView
-	migration        app.MigrationPreviewView
-	migrationConfirm migrationConfirmation
+	discussion         DiscussionPage
+	plan               app.PlanView
+	preview            app.ExecutionPreviewView
+	approval           ApprovalModel
+	execution          ExecutionModel
+	terminal           TerminalModel
+	reportRequestID    uint64
+	cancel             app.CancelSummaryView
+	migration          app.MigrationPreviewView
+	migrationConfirm   migrationConfirmation
+	migrationPreviewed bool
+	cancelPreview      bool
+	actionPreviewed    bool
 
 	// pendingDecision is the Runtime's reason the Foreground Runner
 	// stopped at (design §11.2): the Execution page surfaces the
@@ -1164,7 +1160,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		return m, m.reloadCmd()
 	case app.CancelWorkflowCommand:
 		m.awaitProjectionStatus("workflow cancelled")
-		m.page = PageWorkspace
+		m, _ = m.popNavigation()
 		return m, m.reloadCmd()
 	case app.AdoptWorkspaceCommand:
 		m.awaitProjectionStatus("workspace adopted")
@@ -1242,7 +1238,8 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		return m, m.reloadCmd()
 	case app.ApproveExecutionCommand:
 		m.awaitProjectionStatus("execution approved")
-		m.page = PageExecution
+		m, _ = m.popNavigation()
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
 		return m, m.reloadCmd()
 	case app.PrepareApplyCommand:
 		if msg.out.Apply != nil {
@@ -1253,6 +1250,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 	case app.ExecuteApplyCommand:
 		m.awaitProjectionStatus("apply delivered to the target branch")
 		m.terminal.Confirmed = false
+		m.terminal.Previewed = false
 		m.terminal.Yes = false
 		return m, m.reloadCmd()
 	case app.DryRunCommand:
@@ -1266,6 +1264,7 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 	case app.ExecuteCleanupCommand:
 		m.awaitProjectionStatus("cleanup executed")
 		m.terminal.Confirmed = false
+		m.terminal.Previewed = false
 		m.terminal.Yes = false
 		return m, m.reloadCmd()
 	case app.PrepareLayoutMigrationCommand:
@@ -1274,8 +1273,9 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		return m, m.reloadCmd()
 	case app.ExecuteLayoutMigrationCommand:
 		m.migrationConfirm = migrationConfirmNone
+		m.migrationPreviewed = false
 		m.awaitProjectionStatus("legacy layout migrated")
-		m.page = PageWorkspace
+		m, _ = m.popNavigation()
 		return m, m.reloadCmd()
 	}
 	return m, m.reloadCmd()
@@ -1412,12 +1412,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.navigationIsNested() && msg.Code == tea.KeyTab {
 		return m, nil
 	}
-	// Tab cycles the lifecycle pages from any page (left/right keep
-	// their page-local meaning on the Approval/Execution/Terminal
-	// pages).
-	if msg.Code == tea.KeyTab {
-		return m.moveNav(1)
-	}
 	if (msg.Code == 'b' || msg.Code == 'B') && !m.typingText() {
 		return m.resetNavigationHome(), nil
 	}
@@ -1443,10 +1437,22 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
+			if item.Action == app.MenuActionCancel {
+				m.cancelPreview = false
+			}
+			if item.Action == app.MenuActionMigrate {
+				m.migrationPreviewed = false
+			}
+			if item.Action == app.MenuActionResume || item.Action == app.MenuActionPause || item.Action == app.MenuActionStartRunner {
+				m.actionPreviewed = false
+			}
 			return m.routeWorkflowMenuItem(item)
 		}
 		return m, nil
 	case PageReadonlyWorkspace, PageActionPreview, PageCreatePreview:
+		if m.page == PageActionPreview {
+			return m.handleActionPreviewKey(msg)
+		}
 		return m, nil
 	case PageDiscussion:
 		return m.handleDiscussionKey(msg)
@@ -1549,6 +1555,9 @@ func (m *Model) resetSelectionState() {
 	m.planCheckInFlight = false
 	m.migration = app.MigrationPreviewView{}
 	m.migrationConfirm = migrationConfirmNone
+	m.migrationPreviewed = false
+	m.cancelPreview = false
+	m.actionPreviewed = false
 	m.pendingDecision = ""
 	m.pendingProjectionStatus = ""
 	m.resumeThenRun = false
@@ -1819,16 +1828,18 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.status = "cancel is not a legal action"
 			return m, nil
 		}
-		m.page = PageCancel
+		m.cancelPreview = false
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageCancel, Workflow: m.selected})
 		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 	case msg.Code == 'm' || msg.Code == 'M':
 		if m.selected == "" || !hasAction(m.workspace.Actions, ActionMigrate) {
 			m.status = "layout migration is not a legal action"
 			return m, nil
 		}
-		m.page = PageMigration
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageMigration, Workflow: m.selected})
 		m.migration = app.MigrationPreviewView{}
 		m.migrationConfirm = migrationConfirmNone
+		m.migrationPreviewed = false
 		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
 	}
 	return m, nil
@@ -1877,34 +1888,35 @@ func planProjectionStatus(v app.PlanView, pending string) (string, bool) {
 }
 
 // handleMigrationKey owns the explicit TUI Preview -> Prepare -> Execute
-// protocol. Enter and n are No at both confirmations; only y executes a
-// typed Application command bound to the displayed manifest hash.
+// protocol. The selected action must be previewed with Enter and the next
+// Enter issues the typed command bound to the displayed manifest hash.
 func (m Model) handleMigrationKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.migrationConfirm != migrationConfirmNone {
 		switch {
-		case msg.Code == 'y' || msg.Code == 'Y':
+		case IsEnter(msg):
+			if !m.migrationPreviewed {
+				m.migrationPreviewed = true
+				m.status = "layout migration preview ready; press Enter to execute"
+				return m, nil
+			}
 			confirm := m.migrationConfirm
 			m.migrationConfirm = migrationConfirmNone
+			m.migrationPreviewed = false
 			if confirm == migrationConfirmPrepare {
 				return m, m.executeCmd(app.PrepareLayoutMigrationCommand{Workflow: m.selected, ManifestHash: m.migration.ManifestHash})
 			}
 			return m, m.executeCmd(app.ExecuteLayoutMigrationCommand{Workflow: m.selected, ManifestHash: m.migration.ManifestHash})
-		case IsEnter(msg) || msg.Code == 'n' || msg.Code == 'N' || msg.Code == tea.KeyEsc:
-			m.migrationConfirm = migrationConfirmNone
-			m.status = "layout migration confirmation declined"
-			return m, nil
 		}
 		return m, nil
 	}
 	switch {
 	case msg.Code == 'p' || msg.Code == 'P':
 		m.migrationConfirm = migrationConfirmPrepare
+		m.migrationPreviewed = false
 		return m, nil
 	case msg.Code == 'e' || msg.Code == 'E':
 		m.migrationConfirm = migrationConfirmExecute
-		return m, nil
-	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
+		m.migrationPreviewed = false
 		return m, nil
 	}
 	return m, nil
@@ -1951,36 +1963,6 @@ func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 	return m, m.queryCmd(PageWorkspace, app.ProjectWorkspaceQuery{Selected: m.selected})
 }
 
-// moveNav moves the lifecycle navigation by one page and loads the
-// target page's read-only projection (navigation is pure UI state
-// change; the projection is a Query, never a mutation).
-func (m Model) moveNav(delta int) (Model, tea.Cmd) {
-	if m.navigationIsNested() {
-		return m, nil
-	}
-	idx := 0
-	for i, p := range navPages {
-		if p == m.page {
-			idx = i
-		}
-	}
-	idx += delta
-	idx = (idx + len(navPages)) % len(navPages)
-	m.page = navPages[idx]
-	switch m.page {
-	case PageDiscussion:
-		m.discussion = DiscussionPage{}
-		return m, m.queryCmd(PageDiscussion, app.DiscussionReturnQuery{Workflow: m.selected})
-	case PagePlanApproval:
-		m.approval = ApprovalModel{Plan: m.plan}
-		return m, m.queryCmd(PagePlanApproval, app.PlanQuery{Workflow: m.selected})
-	case PageExecutionApproval:
-		m.approval = ApprovalModel{Preview: m.preview}
-		return m, m.queryCmd(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected})
-	}
-	return m, nil
-}
-
 // queryCmd loads one page projection through a read-only Query.
 func (m Model) queryCmd(page Page, q app.Query) tea.Cmd {
 	return m.queryCmdWithCommandGeneration(page, q, 0)
@@ -2004,12 +1986,7 @@ func (m Model) handleDiscussionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	}
 	switch {
 	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
 		return m, nil
-	case IsLeft(msg):
-		return m.moveNav(-1)
-	case IsRight(msg):
-		return m.moveNav(1)
 	case IsUp(msg):
 		if m.discussion.Selected > 0 {
 			m.discussion.Selected--
@@ -2052,10 +2029,10 @@ func (m Model) activateDiscussionAction() (Model, tea.Cmd) {
 		m.status = "switching the discussion session…"
 		return m, m.switchAgentCmd()
 	case ReturnPause:
-		m.page = PageWorkspace
 		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
 	case ReturnCancel:
-		m.page = PageCancel
+		m.cancelPreview = false
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageCancel, Workflow: m.selected})
 		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 	}
 	return m, nil
@@ -2131,8 +2108,8 @@ func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 }
 
 // handlePlanApprovalKey handles the Plan Approval page: 'g' generates a
-// new Plan Revision, 'k' runs the independent check, and the explicit
-// confirmation (Enter alone never approves) issues ApprovePlanCommand.
+// new Plan Revision, 'k' runs the independent check, and the second Enter
+// after the displayed preview issues ApprovePlanCommand.
 func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.selected == "" {
 		m.status = "no workflow selected"
@@ -2171,12 +2148,11 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			Workflow: m.selected, Provider: m.discussionProvider(),
 		}, operationID)
 	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
 		return m, nil
 	}
 	upd, cmd := m.approval.Update(msg)
 	m.approval = upd
-	if m.approval.Confirmed && m.approval.Yes {
+	if m.approval.Confirmed {
 		if m.plan.PlanStatus != model.PlanChecked || m.plan.Revision < 1 || m.plan.Hash == "" {
 			if m.planCheckInFlight || m.pendingPlanStatus == "plan checked" {
 				m.pendingPlanApproval = true
@@ -2191,7 +2167,7 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.approval.Confirmed = false
-		m.approval.Yes = false
+		m.approval.Previewed = false
 		return m, m.executeCmd(app.ApprovePlanCommand{Workflow: m.selected, Revision: m.plan.Revision, Hash: m.plan.Hash})
 	}
 	return m, cmd
@@ -2199,8 +2175,8 @@ func (m Model) handlePlanApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 
 // handleExecutionApprovalKey handles the Execution Approval page: 's'
 // generates the Specs, 'w' compiles the Dynamic Workflow, 'd' runs the
-// Execution Dry Run, and the explicit confirmation (Enter alone never
-// approves) issues ApproveExecutionCommand binding the exact preview
+// Execution Dry Run, and the second Enter after the exact displayed preview
+// issues ApproveExecutionCommand binding the exact preview
 // hashes.
 func (m Model) handleExecutionApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.selected == "" {
@@ -2218,12 +2194,11 @@ func (m Model) handleExecutionApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) 
 		m.status = "running the execution dry run…"
 		return m, m.executeCmd(app.ExecutionDryRunCommand{Workflow: m.selected})
 	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
 		return m, nil
 	}
 	upd, cmd := m.approval.Update(msg)
 	m.approval = upd
-	if m.approval.Confirmed && m.approval.Yes {
+	if m.approval.Confirmed {
 		// The Approval binds the exact displayed hashes: a partial
 		// preview (e.g., before the dry run fixed the routing, budget,
 		// and commit-policy hashes) can never be approved.
@@ -2236,7 +2211,7 @@ func (m Model) handleExecutionApprovalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) 
 			return m, nil
 		}
 		m.approval.Confirmed = false
-		m.approval.Yes = false
+		m.approval.Previewed = false
 		return m, m.executeCmd(app.ApproveExecutionCommand{
 			Workflow:         m.selected,
 			PlanHash:         m.preview.PlanHash,
@@ -2282,7 +2257,6 @@ func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
 		return m, nil
 	}
 	upd, _ := m.execution.Update(msg)
@@ -2304,12 +2278,7 @@ func (m Model) handleBlockedKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.status = "resuming…"
 		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
 	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
 		return m, nil
-	case IsLeft(msg):
-		return m.moveNav(-1)
-	case IsRight(msg):
-		return m.moveNav(1)
 	}
 	return m, nil
 }
@@ -2346,12 +2315,10 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.status = "producing the cleanup dry run manifest…"
 		return m, m.executeCmd(app.DryRunCommand{Workflow: m.selected})
 	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
-		return m, nil
 	}
 	upd, cmd := m.terminal.Update(msg)
 	m.terminal = upd
-	if m.terminal.Confirmed && m.terminal.Yes {
+	if m.terminal.Confirmed {
 		switch m.terminal.Section {
 		case SectionApply:
 			if m.terminal.ApplyPreview == "" {
@@ -2361,7 +2328,7 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.terminal.Confirmed = false
-			m.terminal.Yes = false
+			m.terminal.Previewed = false
 			m.status = "delivering the apply…"
 			return m, m.executeCmd(app.ExecuteApplyCommand{Workflow: m.selected})
 		case SectionCleanup:
@@ -2372,7 +2339,7 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.terminal.Confirmed = false
-			m.terminal.Yes = false
+			m.terminal.Previewed = false
 			m.status = "executing the cleanup…"
 			return m, m.executeCmd(app.ExecuteCleanupCommand{Workflow: m.selected, Manifest: m.cleanupManifest()})
 		}
@@ -2389,26 +2356,53 @@ func (m Model) cleanupManifest() model.ArtifactRef {
 	return model.ArtifactRef{}
 }
 
-// handleCancelKey handles the Cancel confirmation (default No; Enter
-// alone never cancels).
+// handleCancelKey handles the Cancel Preview -> Execute flow.
 func (m Model) handleCancelKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	if m.selected == "" {
 		m.status = "no workflow selected"
-		m.page = PageWorkspace
 		return m, nil
 	}
 	switch {
-	case msg.Code == tea.KeyEsc:
-		m.page = PageWorkspace
-		return m, nil
-	case msg.Code == 'y' || msg.Code == 'Y':
+	case IsEnter(msg):
+		if !m.cancelPreview {
+			m.cancelPreview = true
+			m.status = "cancel preview ready; press Enter to execute"
+			return m, nil
+		}
 		m.status = "cancelling the workflow…"
 		return m, m.executeCmd(app.CancelWorkflowCommand{Workflow: m.selected, Reason: "user confirmed cancel in the TUI"})
-	case msg.Code == 'n' || msg.Code == 'N' || IsEnter(msg):
-		m.page = PageWorkspace
-		return m, nil
 	}
 	return m, nil
+}
+
+// handleActionPreviewKey executes only the action selected by the
+// Application-owned Workflow Menu. The first Enter displays the explicit
+// preview state; the second Enter issues the typed command. Start Runner
+// continues through the existing Execution page and runner seam.
+func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
+	if !IsEnter(msg) {
+		return m, nil
+	}
+	if !m.actionPreviewed {
+		m.actionPreviewed = true
+		m.status = "action preview ready; press Enter to execute"
+		return m, nil
+	}
+	m.actionPreviewed = false
+	switch m.workflowMenuPreviewItem.Action {
+	case app.MenuActionResume:
+		m.status = "resuming…"
+		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
+	case app.MenuActionPause:
+		m.status = "pausing…"
+		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
+	case app.MenuActionStartRunner:
+		m.page = PageExecution
+		m.navigation = m.navigation.Push(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
+		return m.startRunner()
+	default:
+		return m, nil
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2645,9 +2639,9 @@ func (m Model) hints() string {
 	case PageDiscussion:
 		return "\n↑/↓ action  Enter run  b workspace\n"
 	case PagePlanApproval:
-		return "\ng generate plan  k check plan  Enter confirm  Esc back  / command\n"
+		return "\ng generate plan  k check plan  Enter preview/approve  Esc back  / command\n"
 	case PageExecutionApproval:
-		return "\ns generate specs  w compile workflow  d dry run  Enter confirm  Esc back  / command\n"
+		return "\ns generate specs  w compile workflow  d dry run  Enter preview/approve  Esc back  / command\n"
 	case PageExecution:
 		// The hint is driven by the Runtime LegalActions: "r resume & run"
 		// only while the Runtime permits Resume (a PAUSED workflow); once the
@@ -2661,7 +2655,7 @@ func (m Model) hints() string {
 	case PageBlocked:
 		return blockedHints(m.workspace)
 	case PageTerminal:
-		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter confirm  Esc back  / command\n"
+		return "\n←/→ section  r report  p stage apply  c cleanup dry run  Enter preview/execute  Esc back  / command\n"
 	case PageCreate:
 		return createHints(m)
 	case PageCancel:
@@ -2669,7 +2663,7 @@ func (m Model) hints() string {
 	case PagePauseExit:
 		return ""
 	case PageMigration:
-		return "\np review prepare  e review execute  Esc back  / command\n"
+		return "\np select prepare  e select execute  Enter preview/execute  Esc back  / command\n"
 	}
 	return ""
 }
@@ -2693,7 +2687,7 @@ func createHints(m Model) string {
 }
 
 func renderPauseExit() string {
-	return "a workflow is running.\nPause and Exit? Enter confirm, Esc back (controlled stop waits for the runner to join; Ctrl+C remains available)\n"
+	return "a workflow is running.\nPause and Exit? Enter execute, Esc back (controlled stop waits for the runner to join; Ctrl+C remains available)\n"
 }
 
 func renderMigration(m Model) string {
@@ -2721,9 +2715,17 @@ func renderMigration(m Model) string {
 	}
 	switch m.migrationConfirm {
 	case migrationConfirmPrepare:
-		b.WriteString("\nPending prepare action; Esc back.\n")
+		if m.migrationPreviewed {
+			b.WriteString("\nPREVIEW READY — Enter execute prepare; Esc back.\n")
+		} else {
+			b.WriteString("\nPrepare selected — Enter preview; Esc back.\n")
+		}
 	case migrationConfirmExecute:
-		b.WriteString("\nPending execute action; Esc back.\n")
+		if m.migrationPreviewed {
+			b.WriteString("\nPREVIEW READY — Enter execute migration; Esc back.\n")
+		} else {
+			b.WriteString("\nExecute selected — Enter preview; Esc back.\n")
+		}
 	}
 	return b.String()
 }
@@ -2786,7 +2788,11 @@ func renderCancel(m Model) string {
 			len(m.cancel.ActiveNodes), len(m.cancel.ActiveSessions), len(m.cancel.Worktrees))
 	}
 	b.WriteString("every artifact, session, worktree, branch, commit, and audit ref is preserved.\n")
-	b.WriteString("cancellation is controlled by the workflow action. Esc back.\n")
+	if m.cancelPreview {
+		b.WriteString("PREVIEW READY — Enter execute cancellation; Esc back.\n")
+	} else {
+		b.WriteString("Enter preview cancellation; Esc back.\n")
+	}
 	return b.String()
 }
 

@@ -35,9 +35,11 @@ type TerminalModel struct {
 	// cleanupRef is the exact Manifest Ref of the produced Cleanup Dry
 	// Run the explicit execution binds ("" until a manifest exists).
 	cleanupRef *model.ArtifactRef
-	// Confirmed is the explicit Yes/No confirmation state.
+	// Previewed is true after the first Enter has displayed the exact preview.
+	Previewed bool
+	// Confirmed is a transient second-Enter execution request.
 	Confirmed bool
-	// Yes is the selected confirm answer (Enter alone never confirms).
+	// Yes is retained for compatibility; y/n never changes it.
 	Yes bool
 }
 
@@ -63,19 +65,11 @@ func (m TerminalModel) Update(msg tea.Msg) (TerminalModel, tea.Cmd) {
 				m.Section++
 			}
 		case IsEnter(msg):
-			// Enter alone never confirms a delivery or a cleanup.
-			if !m.Confirmed {
-				m.Confirmed = true
-				m.Yes = false
+			if !m.Previewed {
+				m.Previewed = true
 			} else {
-				m.Yes = !m.Yes
+				m.Confirmed = true
 			}
-		case msg.Code == 'y' || msg.Code == 'Y':
-			m.Confirmed = true
-			m.Yes = true
-		case msg.Code == 'n' || msg.Code == 'N':
-			m.Confirmed = true
-			m.Yes = false
 		}
 	}
 	return m, nil
@@ -116,14 +110,10 @@ func RenderTerminal(m TerminalModel) string {
 		}
 	}
 	b.WriteString("\n")
-	if !m.Confirmed {
-		b.WriteString("confirm? Enter to choose, y/n, q to quit (defaults to no)\n")
+	if !m.Previewed {
+		b.WriteString("Enter to preview the exact facts; Esc back\n")
 	} else {
-		mark := "no"
-		if m.Yes {
-			mark = "yes"
-		}
-		fmt.Fprintf(&b, "confirm: %s (Enter alone never confirms)\n", mark)
+		b.WriteString("PREVIEW READY — Enter execute, Esc back\n")
 	}
 	return b.String()
 }
@@ -133,6 +123,6 @@ func RenderTerminal(m TerminalModel) string {
 func RenderPauseExit() string {
 	var b strings.Builder
 	b.WriteString("a workflow is running.\n")
-	b.WriteString("Pause and Exit? [y/n]  (the workflow pauses through the controlled stop; processes never orphan)\n")
+	b.WriteString("Pause and Exit? Enter execute, Esc back (the workflow pauses through the controlled stop; processes never orphan)\n")
 	return b.String()
 }
