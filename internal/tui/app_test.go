@@ -3,8 +3,9 @@ package tui
 // Root TUI Model tests (TUI tasks 9, 10, 14): the Model loads the real
 // read-only Workspace projection through the shared Application, page
 // navigation reaches every lifecycle page, user actions map to the exact
-// typed Application Commands, Enter alone never approves, and the
-// controlled-stop protocol executes the real Pause and Force Stop.
+// typed Application Commands, first-Enter previews followed by second-Enter
+// execution, and the controlled-stop protocol executes the real Pause and
+// Force Stop.
 
 import (
 	"bytes"
@@ -738,7 +739,7 @@ func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
 	m = press(t, m, 'p', 0)
 	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 1 {
-		t.Fatalf("explicit y did not Prepare: %v", ctrl.executed)
+		t.Fatalf("second Enter did not prepare: %v", ctrl.executed)
 	}
 	if _, ok := ctrl.executed[0].(app.PrepareLayoutMigrationCommand); !ok {
 		t.Fatalf("Prepare command type = %T", ctrl.executed[0])
@@ -751,7 +752,7 @@ func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
 	m = press(t, m, 'e', 0)
 	m = press(t, m, tea.KeyEnter, 0)
 	if len(ctrl.executed) != 2 {
-		t.Fatalf("explicit y did not Execute: %v", ctrl.executed)
+		t.Fatalf("second Enter did not execute migration: %v", ctrl.executed)
 	}
 	if _, ok := ctrl.executed[1].(app.ExecuteLayoutMigrationCommand); !ok {
 		t.Fatalf("Execute command type = %T", ctrl.executed[1])
@@ -1934,8 +1935,8 @@ func TestModelActionsMapToTypedCommands(t *testing.T) {
 	if !rec.hasExecuted(app.ResumeWorkflowCommand{}) {
 		t.Fatalf("r did not execute ResumeWorkflowCommand: %v", rec.executed)
 	}
-	// Pause it again and 'x' → the cancel confirmation; Enter alone
-	// never cancels; 'y' cancels.
+	// Pause it again and 'x' → the cancel preview; first Enter previews,
+	// second Enter executes, and y/Y/n/N remain ordinary input.
 	if _, err := a.Execute(ctx, app.PauseWorkflowCommand{Workflow: ref.list()[0]}); err != nil {
 		t.Fatal(err)
 	}
@@ -1946,7 +1947,7 @@ func TestModelActionsMapToTypedCommands(t *testing.T) {
 	}
 	m = press(t, m, tea.KeyEnter, 0)
 	if m.page != PageWorkspace || rec.hasExecuted(app.CancelWorkflowCommand{}) {
-		t.Fatalf("Enter alone cancelled the workflow")
+		t.Fatalf("first Enter executed cancellation")
 	}
 	m = press(t, m, 'x', 0)
 	m = press(t, m, tea.KeyEnter, 0)
@@ -1995,15 +1996,15 @@ func TestModelPlanApprovalMapsToTypedCommand(t *testing.T) {
 	if !rec.hasExecuted(app.CheckPlanCommand{}) {
 		t.Fatalf("k did not execute CheckPlanCommand: %v", rec.executed)
 	}
-	// Enter alone never approves.
+	// First Enter opens the exact plan preview; second Enter executes approval.
 	m = press(t, m, tea.KeyEnter, 0)
 	if rec.hasExecuted(app.ApprovePlanCommand{}) {
-		t.Fatal("Enter alone approved the plan")
+		t.Fatal("first Enter executed plan approval")
 	}
-	// 'y' approves the exact plan.
+	// The second Enter executes approval for the exact plan.
 	m = press(t, m, tea.KeyEnter, 0)
 	if !rec.hasExecuted(app.ApprovePlanCommand{}) {
-		t.Fatalf("y did not approve: %v", rec.executed)
+		t.Fatalf("second Enter did not approve: %v", rec.executed)
 	}
 	for _, c := range rec.executed {
 		if ap, ok := c.(app.ApprovePlanCommand); ok {
@@ -2463,14 +2464,14 @@ func TestModelExecutionApprovalMapsToTypedCommand(t *testing.T) {
 	if pv.PlanHash == "" || pv.ChangeSetHash == "" {
 		t.Fatalf("preview = %+v, want the plan and change set hashes", pv)
 	}
-	// Enter alone never approves.
+	// First Enter opens the exact execution preview; second Enter executes approval.
 	m = press(t, m, tea.KeyEnter, 0)
 	if rec.hasExecuted(app.ApproveExecutionCommand{}) {
-		t.Fatal("Enter alone approved the execution")
+		t.Fatal("first Enter executed execution approval")
 	}
 	m = press(t, m, tea.KeyEnter, 0)
 	if !rec.hasExecuted(app.ApproveExecutionCommand{}) {
-		t.Fatalf("y did not approve the execution: %v", rec.executed)
+		t.Fatalf("second Enter did not approve the execution: %v", rec.executed)
 	}
 	for _, c := range rec.executed {
 		if ap, ok := c.(app.ApproveExecutionCommand); ok {

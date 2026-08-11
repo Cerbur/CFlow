@@ -31,8 +31,9 @@ func update(m ApprovalModel, msg tea.KeyMsg) (ApprovalModel, tea.Cmd) {
 	return u, cmd
 }
 
-// TestApprovalRequiresPreviewThenEnter verifies the two-step confirmation.
-func TestApprovalDefaultsToNo(t *testing.T) {
+// TestApprovalRequiresPreviewThenExecute verifies the two-step confirmation:
+// first Enter opens the preview and second Enter requests execution.
+func TestApprovalRequiresPreviewThenExecute(t *testing.T) {
 	m := NewApprovalModel(approvalPreview())
 	m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	if !m.Previewed || m.Confirmed {
@@ -70,9 +71,9 @@ func TestTerminalYNAreOrdinaryInput(t *testing.T) {
 	}
 }
 
-// TestApprovalEnterAloneNeverApproves: Enter toggles the confirmation to
-// no and never approves directly.
-func TestApprovalEnterAloneNeverApproves(t *testing.T) {
+// TestApprovalSecondEnterRequestsExecution verifies that the Enter sequence
+// reaches the execution request state; y/Y/n/N remain ordinary input.
+func TestApprovalSecondEnterRequestsExecution(t *testing.T) {
 	m := NewApprovalModel(approvalPreview())
 	for i := 0; i < 3; i++ {
 		m, _ = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})

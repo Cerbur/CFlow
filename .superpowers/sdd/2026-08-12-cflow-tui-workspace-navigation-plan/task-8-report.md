@@ -82,3 +82,23 @@ ok  cflow.local/cflow/internal/tui  2.449s
 
 Per the user's stop instruction, no package-wide or full-suite test was run.
 The remaining unrun gate is `go test ./... -count=1`.
+
+## Fix Round 2
+
+Cleaned only active test names, comments, and failure messages identified by
+`task-8-rereview.md`. They now describe the actual confirmation protocol:
+first Enter opens the exact preview, second Enter executes, and y/Y/n/N do
+not confirm. Assertions, key sequences, and production behavior were not
+changed.
+
+### Fix Round 2 verification
+
+```text
+GOCACHE=/tmp/cflow-task8-round2-cache go test ./internal/tui -run 'WorkflowMenu|MenuRoutes|ActionPreview|Approval|Terminal|MigrationEntryPoints|Cancel' -count=1
+ok  cflow.local/cflow/internal/tui  2.550s
+
+git diff --check
+```
+
+The package-wide and full-suite gates remain unrun; Task 9 and Task 10 were
+not started.
