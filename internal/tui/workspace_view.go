@@ -205,6 +205,11 @@ func boundWorkspaceLines(lines []string, width, height int, keepFooter bool) str
 			// surface that can still be shown; preserve it instead of the
 			// context rows so it never silently disappears.
 			bounded = bounded[len(bounded)-1:]
+		} else if keepFooter && height == 2 && len(bounded) >= 2 {
+			// With exactly two rows, the UI-only New Workflow affordance is
+			// more useful than the long brand/context line. Keep it together
+			// with the stable footer; no lifecycle fact or action is inferred.
+			bounded = []string{bounded[1], bounded[len(bounded)-1]}
 		} else if keepFooter && height >= 2 {
 			body := append([]string(nil), bounded[:height-1]...)
 			body[height-2] = workspaceFitStyledLine(body[height-2], width)

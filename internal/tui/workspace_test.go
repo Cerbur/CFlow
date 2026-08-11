@@ -211,6 +211,29 @@ func TestRenderWorkspaceSmallPanelViewportsStayMinimal(t *testing.T) {
 	}
 }
 
+func TestRenderWorkspaceMinimalKeepsNewWorkflowWhenTwoRowsFit(t *testing.T) {
+	got := RenderWorkspace(longWorkspaceViewModel(), 40, 2)
+	assertWorkspaceBounds(t, got, 40, 2)
+	if !strings.Contains(visibleTerminalText(got), "NEW WORKFLOW") {
+		t.Fatalf("minimal Home dropped the New Workflow row despite two available rows:\n%s", got)
+	}
+}
+
+func TestWorkspaceStatusOverlayDoesNotConsumePaletteSelection(t *testing.T) {
+	m := sampleWorkspaceViewModel()
+	p := NewCommandPalette()
+	p.Open = true
+	p.Input = "/"
+	p.Selected = 17
+
+	base := overlayWorkspaceStatus(RenderWorkspace(m, 100, 24), m, "refreshing", 100)
+	open := overlayCommandPalette(base, RenderCommandPalette(p, 100, 24), 100, 24)
+	if p.Selected != 17 {
+		t.Fatalf("status/palette rendering changed selection to %d", p.Selected)
+	}
+	assertWorkspaceBounds(t, open, 100, 24)
+}
+
 func TestWorkspaceFitStyledLineIsANSIUnicodeAndNewlineAware(t *testing.T) {
 	cases := []struct {
 		name  string

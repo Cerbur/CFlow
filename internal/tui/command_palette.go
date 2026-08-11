@@ -118,46 +118,106 @@ func RenderCommandPalette(p CommandPaletteModel, width, height int) string {
 	if input == "" {
 		input = "/"
 	}
-	row := ""
+	command := GlobalCommand{}
 	if len(commands) == 0 {
-		row = "  no matching commands"
+		command = GlobalCommand{Name: "no matching commands"}
 	} else {
-		command := commands[selected]
-		row = "▸ " + command.Name + "  " + command.Description
+		command = commands[selected]
+	}
+
+	// A one-row terminal cannot show a framed palette or a separate input
+	// line. Keep the selected command as the stable action surface, adding
+	// confirmation hints only when their visible width fits.
+	if height == 1 {
+		return workspaceFitStyledLine(paletteOneRow(command, width, len(commands) == 0), width)
 	}
 
 	content := []string{
 		"COMMAND PALETTE  " + input,
-		row,
-		"↑↓ Navigate · Enter Select · Esc Close",
+		paletteCommandText(command, lipglossWidth("▸ "+command.Name+"  "+command.Description), len(commands) == 0),
+		paletteFooterText(width),
 	}
 	boxWidth := max(1, min(width, max(24, paletteContentWidth(content))))
 	if boxWidth <= 2 {
-		return workspaceFitStyledLine("/", width)
+		return workspaceFitStyledLine(paletteOneRow(command, width, len(commands) == 0), width)
 	}
 	inner := boxWidth - 2
+	content[0] = workspaceFitStyledLine(content[0], inner)
+	content[1] = workspaceFitStyledLine(paletteCommandText(command, inner, len(commands) == 0), inner)
+	content[2] = workspaceFitStyledLine(content[2], inner)
 	if height >= 5 {
 		lines := []string{
 			"┌" + strings.Repeat("─", inner) + "┐",
-			"│" + workspaceFitStyledLine(content[0], inner) + "│",
-			"│" + workspaceFitStyledLine(content[1], inner) + "│",
-			"│" + workspaceFitStyledLine(content[2], inner) + "│",
+			"│" + content[0] + "│",
+			"│" + content[1] + "│",
+			"│" + content[2] + "│",
 			"└" + strings.Repeat("─", inner) + "┘",
 		}
 		return strings.Join(lines, "\n")
 	}
 
-	// Keep the action row visible when the terminal is shorter than a framed
-	// box. This is intentionally a presentation clamp; palette behavior does
-	// not depend on the viewport size.
+	// Below the framed height, retain the command and its action hint. The
+	// input heading is useful only if a third row is available.
 	compact := make([]string, 0, height)
-	for _, line := range content {
-		compact = append(compact, workspaceFitStyledLine(line, width))
-		if len(compact) == height {
-			break
+	if height >= 3 {
+		compact = append(compact, content[0])
+	}
+	compact = append(compact, content[1], content[2])
+	compact = compact[:min(len(compact), height)]
+	return strings.Join(compact, "\n")
+}
+
+func paletteCommandText(command GlobalCommand, width int, empty bool) string {
+	if empty {
+		return "  no matching commands"
+	}
+	full := "▸ " + command.Name + "  " + command.Description
+	if width <= 0 || lipglossWidth(full) > width {
+		// Descriptions are optional. Drop them as a unit before the command
+		// name is ever truncated, so the explicit registry entry remains
+		// actionable on narrow terminals.
+		name := "▸ " + command.Name
+		if lipglossWidth(name) <= width {
+			return name
+		}
+		if lipglossWidth(command.Name) <= width {
+			return command.Name
+		}
+		return workspaceTruncateText(command.Name, width)
+	}
+	return full
+}
+
+func paletteOneRow(command GlobalCommand, width int, empty bool) string {
+	if empty {
+		return paletteCommandText(command, width, true)
+	}
+	name := paletteCommandText(command, width, false)
+	for _, hint := range []string{"Enter · Esc", "Enter", ""} {
+		candidate := name
+		if hint != "" {
+			candidate += "  " + hint
+		}
+		if lipglossWidth(candidate) <= width {
+			return candidate
 		}
 	}
-	return strings.Join(compact, "\n")
+	return workspaceTruncateText(command.Name, width)
+}
+
+func paletteFooterText(width int) string {
+	for _, candidate := range []string{
+		"↑↓ Navigate · Enter Select · Esc Close",
+		"Enter · Esc",
+		"Enter",
+		"Esc",
+		"",
+	} {
+		if lipglossWidth(candidate) <= width {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func paletteContentWidth(lines []string) int {
@@ -184,11 +244,18 @@ func overlayCommandPalette(base, palette string, width, height int) string {
 	if len(baseLines) > height {
 		baseLines = baseLines[:height]
 	}
+	for i := range baseLines {
+		// The overlay is the final screen compositor. Bound untouched rows as
+		// well as palette rows so a caller cannot leak an over-wide underlying
+		// page around the centered box.
+		baseLines[i] = workspaceFitStyledLine(baseLines[i], width)
+	}
 	paletteLines := strings.Split(palette, "\n")
 	paletteWidth := 0
 	for _, line := range paletteLines {
 		paletteWidth = max(paletteWidth, lipglossWidth(line))
 	}
+	paletteWidth = max(1, min(width, paletteWidth))
 	top := max(0, (height-len(paletteLines))/2)
 	left := max(0, (width-paletteWidth)/2)
 	for i, line := range paletteLines {
@@ -196,8 +263,8 @@ func overlayCommandPalette(base, palette string, width, height int) string {
 		if row >= len(baseLines) {
 			break
 		}
-		baseLines[row] = strings.Repeat(" ", left) + workspaceFitStyledLine(line, max(1, width-left))
-		baseLines[row] = workspaceFitStyledLine(baseLines[row], width)
+		line = workspaceFitStyledLine(line, max(1, paletteWidth))
+		baseLines[row] = strings.Repeat(" ", left) + line + strings.Repeat(" ", max(0, width-left-paletteWidth))
 	}
 	return strings.Join(baseLines, "\n")
 }
