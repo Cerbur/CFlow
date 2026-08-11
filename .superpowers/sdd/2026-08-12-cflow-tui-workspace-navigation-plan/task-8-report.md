@@ -102,3 +102,23 @@ git diff --check
 
 The package-wide and full-suite gates remain unrun; Task 9 and Task 10 were
 not started.
+
+## Fix Round 3
+
+Renamed `TestModelMigrationEntryPointsDefaultNo` to
+`TestModelMigrationEntryPointsRequirePreviewThenExecute` and updated its
+directly associated comment to state the actual protocol: first Enter opens
+the selected preview, second Enter executes the typed command, and y/Y/n/N do
+not confirm. Assertions and behavior were unchanged.
+
+### Fix Round 3 verification
+
+```text
+GOCACHE=/tmp/cflow-task8-round3-cache go test ./internal/tui -run 'WorkflowMenu|MenuRoutes|ActionPreview|Approval|Terminal|MigrationEntryPoints|Cancel' -count=1
+ok  cflow.local/cflow/internal/tui  2.488s
+
+git diff --check
+```
+
+The package-wide and full-suite gates remain unrun; Task 9 and Task 10 were
+not started.

@@ -720,9 +720,10 @@ func (*migrationController) DriveOnce(context.Context, model.WorkflowID) (app.Dr
 }
 func (*migrationController) EscalateStop() {}
 
-// TestModelMigrationEntryPointsUseEnterOnly drives the TUI's explicit
-// Preview/Prepare/Execute surface.
-func TestModelMigrationEntryPointsDefaultNo(t *testing.T) {
+// TestModelMigrationEntryPointsRequirePreviewThenExecute drives the TUI's
+// explicit surface: first Enter opens the selected Preview, second Enter
+// executes the typed Prepare/Execute command, and y/Y/n/N do not confirm.
+func TestModelMigrationEntryPointsRequirePreviewThenExecute(t *testing.T) {
 	ctrl := &migrationController{}
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
