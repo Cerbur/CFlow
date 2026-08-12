@@ -326,6 +326,24 @@ func (af *applyFixture) CommitApply(attempt model.ApplyAttempt) error {
 	return err
 }
 
+func TestExecuteApplyBoundCommandRejectsIncompletePreflight(t *testing.T) {
+	fx := completedWorkflowForApply(t)
+	attempt := fx.PrepareApply()
+	fx.PassStagingVerification(attempt)
+
+	_, err := fx.applyApp().Execute(context.Background(), ExecuteApplyCommand{
+		Workflow:          fx.wf,
+		AttemptID:         attempt.ID,
+		TargetHead:        attempt.TargetHead,
+		IntegrationHead:   attempt.IntegrationHead,
+		Preflight:         model.ArtifactRef{Workflow: fx.wf, Type: model.ArtifactReport, Revision: attempt.Preflight.Revision},
+		PreflightRevision: attempt.Preflight.Revision,
+		PreflightHash:     attempt.PreflightHash,
+		Fingerprint:       attempt.Fingerprint,
+	})
+	assertFaultCode(t, err, model.CodeCommitPolicyInputChanged)
+}
+
 // ConfirmPolicy runs the explicit Commit Policy / Apply Catalog
 // confirmation (ConfirmApplyPolicy) for the blocked attempt. The
 // confirmation re-opens the staging, so the Apply Verification Session

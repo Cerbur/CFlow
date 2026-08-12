@@ -2088,6 +2088,14 @@ func (m Model) discussionProvider() string {
 // the bound Session's and the user-supplied reason. Without a different
 // healthy provider the switch fails closed without a mutation.
 func (m Model) switchAgentCmd() tea.Cmd {
+	command, err := m.switchAgentCommand()
+	if err != nil {
+		return func() tea.Msg { return commandDoneMsg{err: err} }
+	}
+	return m.executeCmd(command)
+}
+
+func (m Model) switchAgentCommand() (app.SwitchAgentCommand, error) {
 	current := m.discussion.Provider
 	alt := ""
 	for _, p := range m.workspace.Health.Providers {
@@ -2097,20 +2105,18 @@ func (m Model) switchAgentCmd() tea.Cmd {
 		}
 	}
 	if alt == "" {
-		return func() tea.Msg {
-			return commandDoneMsg{err: fmt.Errorf("no different provider is available to switch to")}
-		}
+		return app.SwitchAgentCommand{}, fmt.Errorf("no different provider is available to switch to")
 	}
 	reason := m.discussion.SwitchReason
 	if strings.TrimSpace(reason) == "" {
 		reason = "user switched the discussion agent"
 	}
-	return m.executeCmd(app.SwitchAgentCommand{
+	return app.SwitchAgentCommand{
 		Workflow: m.selected,
 		Session:  model.SessionID(m.discussion.Session),
 		Provider: alt,
 		Reason:   reason,
-	})
+	}, nil
 }
 
 // handleHandoffKey handles the handoff content editor.
@@ -2428,8 +2434,7 @@ func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch m.workflowMenuPreviewItem.Action {
 	case app.MenuActionResume:
 		m.status = "resuming…"
-		cmd := m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
-		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, m.currentOperationID())
+		cmd := m.executeActionPreviewCommand(app.ResumeWorkflowCommand{Workflow: m.selected})
 		m, _ = m.popNavigation()
 		if m.navigation.Current().Layer == LayerWorkflowMenu {
 			m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
@@ -2437,10 +2442,10 @@ func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, cmd
 	case app.MenuActionPause:
 		m.status = "pausing…"
-		cmd := m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
-		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, m.currentOperationID())
+		cmd := m.executeActionPreviewCommand(app.PauseWorkflowCommand{Workflow: m.selected})
 		return m, cmd
 	case app.MenuActionStartRunner:
+		operationID = m.beginOperation("runner.start")
 		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, operationID)
 		m, _ = m.popNavigation()
 		if m.navigation.Current().Layer == LayerStageWorkspace {
@@ -2450,42 +2455,56 @@ func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.startRunner()
 	case app.MenuActionApply:
 		m.terminal.Section = SectionApply
-		cmd := m.executeCmd(app.PrepareApplyCommand{Workflow: m.selected})
+		cmd := m.executeActionPreviewCommand(app.PrepareApplyCommand{Workflow: m.selected})
 		m, _ = m.popNavigation()
 		return m, cmd
 	case app.MenuActionCleanup:
 		m.terminal.Section = SectionCleanup
-		cmd := m.executeCmd(app.DryRunCommand{Workflow: m.selected})
+		cmd := m.executeActionPreviewCommand(app.DryRunCommand{Workflow: m.selected})
 		m, _ = m.popNavigation()
 		return m, cmd
 	case app.MenuActionAdoptWorkspace:
-		cmd := m.executeCmd(app.AdoptWorkspaceCommand{Workflow: m.selected})
+		cmd := m.executeActionPreviewCommand(app.AdoptWorkspaceCommand{Workflow: m.selected})
 		m, _ = m.popNavigation()
 		return m, cmd
 	case app.MenuActionStartDiscussion:
-		cmd := m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		cmd := m.executeActionPreviewCommand(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
 		m, _ = m.popNavigation()
 		return m, cmd
 	case app.MenuActionContinueDiscussion:
-		cmd := m.executeCmd(app.ContinueNativeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
+		cmd := m.executeActionPreviewCommand(app.ContinueNativeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
 		m, _ = m.popNavigation()
 		return m, cmd
 	case app.MenuActionFinishDiscussion:
-		var cmd tea.Cmd
+		var command app.Command
 		if m.discussion.Handoff != "" {
-			cmd = m.executeCmd(app.FinishDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Decisions: []byte(m.discussion.Handoff)})
+			command = app.FinishDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Decisions: []byte(m.discussion.Handoff)}
 		} else {
-			cmd = m.executeCmd(app.FreezeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
+			command = app.FreezeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)}
 		}
+		cmd := m.executeActionPreviewCommand(command)
 		m, _ = m.popNavigation()
 		return m, cmd
 	case app.MenuActionSwitchDiscussion:
-		cmd := m.switchAgentCmd()
+		command, err := m.switchAgentCommand()
+		if err != nil {
+			m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, operationID)
+			cmd := func() tea.Msg { return commandDoneMsg{err: err} }
+			m, _ = m.popNavigation()
+			return m, cmd
+		}
+		cmd := m.executeActionPreviewCommand(command)
 		m, _ = m.popNavigation()
 		return m, cmd
 	default:
 		return m, nil
 	}
+}
+
+func (m Model) executeActionPreviewCommand(command app.Command) tea.Cmd {
+	operationID := m.beginOperation("command." + operationType(command))
+	m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, operationID)
+	return m.executeCmdWithOperation(m.context(), command, operationID)
 }
 
 // ---------------------------------------------------------------------------

@@ -269,7 +269,6 @@ const (
 	MenuActionReviewExecution
 	MenuActionFinishDiscussion
 	MenuActionSwitchDiscussion
-	MenuActionResumeRunner
 	MenuActionAdoptWorkspace
 )
 

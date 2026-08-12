@@ -115,3 +115,57 @@ not used for final evidence because it also selects the existing long
 `TestTUIPlanToApplyAndCleanup` E2E, which timed out while waiting for its
 Bubble Tea test harness. No real Provider E2E, Self-Dogfood, remote push, or
 PR was performed.
+
+## Fix Round 3
+
+Closed the final quality-review findings:
+
+- Decision Kernel bound `ApplyExecute` now requires a complete Preflight
+  reference (`Workflow`, valid `Type`, `Revision >= 1`, non-empty `Hash`) and
+  all bound heads/hash/fingerprint fields; incomplete or mismatched facts are
+  rejected. The zero-Attempt workflow-only path remains the explicitly
+  documented headless compatibility path.
+- Added Decision and Application regressions for incomplete bound Apply
+  facts.
+- Every Action Preview confirmation path (Apply, Cleanup, Adopt Workspace,
+  Start/Continue/Finish/Switch Discussion, Resume, Pause, Start Runner) now
+  records exactly one `action_preview.confirm` trace with only Workflow and
+  operation ID before/with the typed command. Raw input is not logged.
+- Removed unused `MenuActionResumeRunner`.
+
+Fix Round 3 RED evidence:
+
+```text
+GOCACHE=/tmp/cflow-task12-red-cache go test ./internal/decision ./internal/tui -run 'TestApplyExecuteBoundAttemptRequiresCompletePreflightRef|TestActionPreviewConfirmationTracesEveryTypedActionOnce' -count=1 -timeout=30s
+FAIL: Decision accepted missing/partial bound Preflight refs; TUI recorded 0 confirmations for Apply/Cleanup/Adopt/Discussion and an unbound operation ID for Start Runner.
+```
+
+Fix Round 3 focused GREEN and final bounded verification:
+
+```text
+GOCACHE=/tmp/cflow-task12-final-cache go test ./internal/decision -run 'TestApplyExecuteBoundAttemptRequiresCompletePreflightRef' -count=1 -timeout=30s
+ok   cflow.local/cflow/internal/decision  0.439s
+
+GOCACHE=/tmp/cflow-task12-final-cache go test ./internal/tui -run 'TestActionPreviewConfirmationTracesEveryTypedActionOnce|TestHierarchicalOperationTraceRecordsSafeUIActions' -count=1 -timeout=30s
+ok   cflow.local/cflow/internal/tui  0.438s
+
+GOCACHE=/tmp/cflow-task12-final-cache go test ./internal/app -run 'TestExecuteApplyBoundCommandRejectsIncompletePreflight' -count=1 -timeout=30s
+ok   cflow.local/cflow/internal/app  3.699s
+
+gofmt -w internal/app/apply_test.go internal/decision/apply_cleanup.go internal/decision/kernel_test.go internal/tui/app.go internal/tui/app_test.go internal/app/commands.go
+bash -n scripts/gate-tui.sh
+passed
+
+git diff --check
+passed
+```
+
+Final delivery evidence:
+
+```text
+git status --short --branch
+## main...origin/main [ahead 29]
+```
+
+Per the explicit fix-round instruction, no package-wide/full suite, heavy
+TUI E2E, real Provider E2E, Self-Dogfood, remote push, or PR was run.

@@ -1176,6 +1176,55 @@ func TestApplyProtocolAndTargetStability(t *testing.T) {
 	}
 }
 
+func TestApplyExecuteBoundAttemptRequiresCompletePreflightRef(t *testing.T) {
+	state := fixtureCompleted()
+	state.ApplyAttempts = append(state.ApplyAttempts, model.ApplyAttempt{
+		ID:              "apply-bound",
+		Number:          1,
+		Status:          model.ApplyAwaitingConfirmation,
+		TargetHead:      "main-head",
+		IntegrationHead: "int-9",
+		Preflight:       model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		PreflightHash:   "cp-1",
+		Fingerprint:     "fp-1",
+	})
+
+	for name, preflight := range map[string]model.ArtifactRef{
+		"missing":          {},
+		"workflow missing": {Type: model.ArtifactReport, Revision: 1, Hash: "cp-1"},
+		"type missing":     {Workflow: "wf-1", Revision: 1, Hash: "cp-1"},
+		"revision missing": {Workflow: "wf-1", Type: model.ArtifactReport, Hash: "cp-1"},
+		"hash missing":     {Workflow: "wf-1", Type: model.ArtifactReport, Revision: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := decision.Decide(state, model.ApplyCommandInput{
+				Kind:            model.ApplyExecute,
+				Attempt:         "apply-bound",
+				TargetHead:      "main-head",
+				IntegrationHead: "int-9",
+				Preflight:       preflight,
+				PreflightHash:   "cp-1",
+				Fingerprint:     "fp-1",
+			})
+			assertFaultCode(t, err, model.CodeCommitPolicyInputChanged)
+		})
+	}
+
+	for name, input := range map[string]model.ApplyCommandInput{
+		"target head missing":      {TargetHead: "", IntegrationHead: "int-9", Preflight: state.ApplyAttempts[0].Preflight, PreflightHash: "cp-1", Fingerprint: "fp-1"},
+		"integration head missing": {TargetHead: "main-head", IntegrationHead: "", Preflight: state.ApplyAttempts[0].Preflight, PreflightHash: "cp-1", Fingerprint: "fp-1"},
+		"preflight hash missing":   {TargetHead: "main-head", IntegrationHead: "int-9", Preflight: state.ApplyAttempts[0].Preflight, Fingerprint: "fp-1"},
+		"fingerprint missing":      {TargetHead: "main-head", IntegrationHead: "int-9", Preflight: state.ApplyAttempts[0].Preflight, PreflightHash: "cp-1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input.Kind = model.ApplyExecute
+			input.Attempt = "apply-bound"
+			_, err := decision.Decide(state, input)
+			assertFaultCode(t, err, model.CodeCommitPolicyInputChanged)
+		})
+	}
+}
+
 // TestApplyPolicyConfirmationBindsAttemptAndHeads: the explicit
 // confirmation of a blocked Apply Attempt binds the exact Attempt, the
 // Target/Integration heads, and the fresh Preflight facts; a drifted

@@ -321,7 +321,13 @@ func applyExecute(state model.State, in model.ApplyCommandInput) (model.Decision
 	}
 	switch att.Status {
 	case model.ApplyAwaitingConfirmation:
-		if in.Preflight.Workflow != "" && (in.Preflight.Workflow != att.Preflight.Workflow ||
+		if in.Attempt != "" && (in.TargetHead == "" || in.IntegrationHead == "" ||
+			in.PreflightHash == "" || in.Fingerprint == "" || in.Preflight.Workflow == "" ||
+			!in.Preflight.Type.Valid() || in.Preflight.Revision < 1 || in.Preflight.Hash == "") {
+			return model.Decision{}, model.NewFault(model.CodeCommitPolicyInputChanged,
+				"the bound apply preflight reference is incomplete")
+		}
+		if in.Attempt != "" && (in.Preflight.Workflow != att.Preflight.Workflow ||
 			in.Preflight.Type != att.Preflight.Type || in.Preflight.Revision != att.Preflight.Revision ||
 			in.Preflight.Hash != att.Preflight.Hash) {
 			return model.Decision{}, model.NewFault(model.CodeCommitPolicyInputChanged,

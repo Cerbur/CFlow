@@ -2785,6 +2785,78 @@ func TestStageResumeConfirmationKeepsExistingExecutionParent(t *testing.T) {
 	}
 }
 
+func TestActionPreviewConfirmationTracesEveryTypedActionOnce(t *testing.T) {
+	actions := []struct {
+		name   string
+		action app.MenuAction
+		setup  func(*Model)
+	}{
+		{name: "apply", action: app.MenuActionApply},
+		{name: "cleanup", action: app.MenuActionCleanup},
+		{name: "adopt workspace", action: app.MenuActionAdoptWorkspace},
+		{name: "start discussion", action: app.MenuActionStartDiscussion},
+		{name: "continue discussion", action: app.MenuActionContinueDiscussion, setup: func(m *Model) {
+			m.discussion.Session = "sess-1"
+		}},
+		{name: "finish discussion", action: app.MenuActionFinishDiscussion, setup: func(m *Model) {
+			m.discussion.Session = "sess-1"
+		}},
+		{name: "switch discussion", action: app.MenuActionSwitchDiscussion, setup: func(m *Model) {
+			m.discussion.Session = "sess-1"
+			m.discussion.Provider = "fake"
+			m.workspace.Health.Providers = []app.ProviderHealth{{Name: "other", Compatible: true}}
+		}},
+		{name: "resume", action: app.MenuActionResume},
+		{name: "pause", action: app.MenuActionPause},
+		{name: "start runner", action: app.MenuActionStartRunner},
+	}
+
+	for _, tc := range actions {
+		t.Run(tc.name, func(t *testing.T) {
+			var log bytes.Buffer
+			m := newModel(Dependencies{OperationLog: &log})
+			m.ctrl = &actionPreviewAckController{}
+			m.selected = "wf-1"
+			m.page = PageActionPreview
+			m.workflowMenuPreviewItem = MenuItem{Action: tc.action, Label: tc.name}
+			m.actionPreviewed = true
+			m.navigation = NavigationStack{Frames: []NavigationFrame{
+				{Layer: LayerHome, Page: PageWorkspace},
+				{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+				{Layer: LayerActionPreview, Page: PageActionPreview, Workflow: "wf-1"},
+			}}
+			if tc.setup != nil {
+				tc.setup(&m)
+			}
+
+			updated, cmd := m.handleActionPreviewKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+			if cmd == nil {
+				t.Fatal("confirmation returned no command")
+			}
+			var confirms []operationLogEntry
+			for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+				if line == "" {
+					continue
+				}
+				var entry operationLogEntry
+				if err := json.Unmarshal([]byte(line), &entry); err != nil {
+					t.Fatal(err)
+				}
+				if entry.Action == uiActionActionPreviewConfirm {
+					confirms = append(confirms, entry)
+				}
+			}
+			if len(confirms) != 1 {
+				t.Fatalf("action preview confirmations = %d, want 1; log=%s", len(confirms), log.String())
+			}
+			if confirms[0].Workflow != "wf-1" || confirms[0].OperationID == "" {
+				t.Fatalf("confirmation binding = %+v, want workflow and operation", confirms[0])
+			}
+			_ = updated
+		})
+	}
+}
+
 type actionPreviewAckController struct {
 	view app.WorkspaceView
 }
