@@ -115,7 +115,7 @@ func TestWorkflowMenuEnterRoutesReadOnlyAndPreviewWithoutExecute(t *testing.T) {
 		{name: "runner preview", action: app.MenuActionStartRunner, page: PageActionPreview},
 		{name: "apply terminal", action: app.MenuActionApply, page: PageTerminal, queryCheck: wantWorkspaceQuery},
 		{name: "cleanup terminal", action: app.MenuActionCleanup, page: PageTerminal, queryCheck: wantWorkspaceQuery},
-		{name: "readonly", route: app.MenuRouteCurrentStage, page: PageReadonlyWorkspace},
+		{name: "readonly", route: app.MenuRouteCurrentStage, page: PageReadonlyWorkspace, queryCheck: wantQuery[app.StatusQuery]},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,8 +272,43 @@ func wantQuery[T app.Query](t *testing.T, queries []app.Query) {
 	if len(queries) != 1 {
 		t.Fatalf("queries = %#v", queries)
 	}
-	if _, ok := queries[0].(T); !ok {
+	query, ok := queries[0].(T)
+	if !ok {
 		t.Fatalf("query = %#v, want %T", queries[0], *new(T))
+	}
+	switch q := any(query).(type) {
+	case app.DiscussionReturnQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.CancelSummaryQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.LayoutMigrationPreviewQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.StatusQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.ExecutionPreviewQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.InspectQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.ReportQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
+	case app.PlanQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
 	}
 }
 

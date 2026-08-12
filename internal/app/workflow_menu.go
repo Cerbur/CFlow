@@ -140,7 +140,10 @@ func (a *Application) workflowMenuExecutionPreviewAvailable(ctx context.Context,
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		return false, nil
+		if artifact.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }

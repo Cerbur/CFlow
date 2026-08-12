@@ -515,3 +515,30 @@ func TestWorkflowMenuOmitsArtifactRoutesWhenPreviewArtifactIsMissing(t *testing.
 		}
 	}
 }
+
+func TestWorkflowMenuPropagatesNonNotFoundPreviewArtifactErrors(t *testing.T) {
+	fx := newExecutionFixture(t)
+	wf := drivePlanningToApproval(t, fx)
+	pv := driveToExecutionGate(t, fx, wf)
+	a := fx.app()
+	artifactRoot := a.layout.WorkflowRoot(wf)
+	specDir, err := artifact.WorkflowTypeDir(artifactRoot, model.ArtifactSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pv.Spec == nil {
+		t.Fatal("execution preview has no Spec reference")
+	}
+	specPath := filepath.Join(specDir, strconv.Itoa(pv.Spec.Revision), pv.Spec.Hash)
+	if err := os.WriteFile(specPath, []byte("corrupt artifact bytes"), 0o600); err != nil {
+		t.Fatalf("corrupt Spec artifact: %v", err)
+	}
+
+	_, err = a.Query(context.Background(), WorkflowMenuQuery{Workflow: wf})
+	if err == nil {
+		t.Fatal("workflow menu hid a non-not-found preview artifact error")
+	}
+	if artifact.IsNotFound(err) {
+		t.Fatalf("corrupt preview artifact was classified as not-found: %v", err)
+	}
+}

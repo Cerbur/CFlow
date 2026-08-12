@@ -95,7 +95,7 @@ Release 风格构建还会写入源码 Commit 与内嵌 Registry Hash。详见 [
 5. 由 Foreground Runner 持续推进就绪任务；只有需要用户决策、安全停止、终态或无法安全推进时才暂停。
 6. 查看最终报告，暂存并明确确认受保护 Apply，再生成 Cleanup Dry Run 并确认精确 Cleanup Manifest。
 
-导航和选择都是只读操作。Approval、Apply、Cancel 与 Cleanup 都需要明确确认，默认选择“否”。Runner 空闲时按 `q` 退出；Runner 运行时按 `q` 会打开 Pause and Exit。`Ctrl-C` 第一次请求受控暂停，第二次才进入强制停止。
+导航和选择都是只读操作。Approval、Apply、Cancel 与 Cleanup 都需要明确确认，默认选择“否”。按 `/` 打开 Command Palette，再选择 `/exit` 退出。Runner 运行时，`/exit` 会进入 Runner-aware 的 Pause and Exit 流程，请求受控暂停并等待 Runner 完成 join 后才退出。`Ctrl-C` 使用相同的受控停止协议，第二次 `Ctrl-C` 才进入强制停止。
 
 行式子命令仍是正式的 headless CLI，可用于脚本、诊断、自动化和无 TTY 环境。
 

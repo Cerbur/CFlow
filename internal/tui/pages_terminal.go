@@ -122,10 +122,11 @@ func RenderTerminal(m TerminalModel) string {
 }
 
 // RenderPauseExit renders the Pause and Exit prompt shown while an
-// active Runner is running (q never quits directly, leaving processes).
+// active Runner is running. Normal exit is routed through /exit and
+// controlled stopping never abandons managed processes.
 func RenderPauseExit() string {
 	var b strings.Builder
 	b.WriteString("a workflow is running.\n")
-	b.WriteString("Pause and Exit? Enter execute, Esc back (the workflow pauses through the controlled stop; processes never orphan)\n")
+	b.WriteString("Pause and Exit? Enter execute or retry, Esc back (the workflow pauses through the controlled stop; processes never orphan)\n")
 	return b.String()
 }

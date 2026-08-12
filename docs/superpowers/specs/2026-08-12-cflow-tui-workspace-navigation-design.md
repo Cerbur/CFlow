@@ -1,7 +1,7 @@
 ---
 project: CFlow
 document_type: design-specification
-status: proposed
+status: approved
 created: 2026-08-12
 updated: 2026-08-12
 scope: TUI hierarchical workflow workspace navigation
@@ -577,4 +577,3 @@ Home
 6. 不在本设计文档提交中修改实现代码。
 
 本设计文档不改变 Runtime、Store、GitFlow、Provider 或安全策略的事实权威，只定义新的 TUI 用户交互和所需的类型化投影边界。
-

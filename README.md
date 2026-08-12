@@ -131,9 +131,11 @@ dispatching, applying, or cleaning anything. From the TUI, the normal path is:
    produce a Cleanup Dry Run and explicitly confirm the exact cleanup manifest.
 
 Navigation and selection are read-only. Approval, Apply, Cancel, and Cleanup
-require an explicit confirmation and default to “no”. Press `q` to leave when
-the Runner is idle; while it is active, `q` opens Pause and Exit. `Ctrl-C`
-requests a controlled pause, with a second `Ctrl-C` reserved for force stop.
+require an explicit confirmation and default to “no”. Press `/` to open the
+Command Palette and select `/exit`. When the Runner is active, `/exit` opens
+the Runner-aware Pause and Exit flow, which requests a controlled pause and
+waits for the Runner to join before leaving. `Ctrl-C` follows the same
+controlled-stop protocol, with a second `Ctrl-C` reserved for force stop.
 
 The line-oriented commands remain a first-class headless CLI for scripts,
 diagnostics, automation, and non-TTY environments. Bare `cflow` without an

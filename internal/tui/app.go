@@ -1086,11 +1086,20 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		// outcome handling or clear the newer command's gate.
 		if _, ok := msg.cmd.(app.PauseWorkflowCommand); ok {
 			m.pauseCommandPending = false
-			if m.quitAfterRunner {
-				// A forced stop can finish the Runner before the controlled
-				// Pause command reports its failure. Preserve the second-Ctrl+C
-				// quit request and join whichever side is still unwinding.
-				return m.quit()
+			if m.stop == stopPauseAndExit {
+				// /exit requested a controlled pause, but the Application
+				// rejected it. Force-stop managed processes, then keep the
+				// TUI on a diagnosable recovery page instead of quitting while
+				// the stop outcome is ambiguous.
+				m.forceStop()
+				m.quitAfterRunner = false
+				m.stop = stopIdle
+				m.page = PagePauseExit
+				m.status = fmt.Sprintf("%v", msg.err)
+				m.projectionBlocked = false
+				m.blockedAckPage = PageWorkspace
+				m.blockedWorkflow = ""
+				return m, nil
 			}
 		}
 		if _, ok := msg.cmd.(app.ResumeWorkflowCommand); ok {
@@ -1108,6 +1117,21 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		m.pendingProjectionStatus = ""
 		if _, ok := msg.cmd.(app.PauseWorkflowCommand); ok {
 			m.pauseCommandPending = false
+			if m.stop == stopPauseAndExit {
+				// /exit requested a controlled pause, but the Application
+				// rejected it. Force-stop managed processes, then keep the
+				// TUI on a diagnosable recovery page instead of quitting while
+				// the stop outcome is ambiguous.
+				m.forceStop()
+				m.quitAfterRunner = false
+				m.stop = stopIdle
+				m.page = PagePauseExit
+				m.status = fmt.Sprintf("%v", msg.err)
+				m.projectionBlocked = false
+				m.blockedAckPage = PageWorkspace
+				m.blockedWorkflow = ""
+				return m, nil
+			}
 			if m.quitAfterRunner {
 				// A forced stop can finish the Runner before the controlled
 				// Pause command reports its failure. Preserve the second-Ctrl+C
@@ -1122,12 +1146,6 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 			m.pendingPlanCheckOperation = ""
 		}
 		m.status = fmt.Sprintf("%v", msg.err)
-		if m.stop == stopPauseAndExit {
-			// The pause failed; the user still asked to exit. Never
-			// leave a background runner: force-stop and quit.
-			m.forceStop()
-			return m.quit()
-		}
 		if resume, ok := msg.cmd.(app.ResumeWorkflowCommand); ok && m.resumeThenRun {
 			// The Execution page requested the resume as the run start but
 			// the Runtime rejected it (the stale projection can still show
@@ -1508,6 +1526,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 // handleGlobalExit translates the sole global command into either immediate
 // TUI exit or the existing controlled Pause-and-Exit preview.
 func (m Model) handleGlobalExit() (Model, tea.Cmd) {
+	if m.commandInFlight() || m.pauseCommandPending || m.quitAfterRunner || m.stop != stopIdle {
+		m.status = "cannot exit while a managed command or stop is still in progress"
+		return m, nil
+	}
 	if m.running {
 		m.prevPage = m.page
 		m.page = PagePauseExit
@@ -1822,9 +1844,9 @@ func preferredProvider(providers []app.ProviderHealth) string {
 	return "fake"
 }
 
-// handleWorkspaceKey handles Home selection and routing plus the existing
-// projected legal-action shortcuts. New Workflow is a selectable UI row;
-// it has no standalone command key and never mutates Runtime state.
+// handleWorkspaceKey handles Home selection and routing. New Workflow is a
+// selectable UI row; Home has no standalone mutation shortcut and never
+// mutates Runtime state.
 func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	switch {
 	case IsUp(msg):
@@ -1845,38 +1867,6 @@ func (m Model) handleWorkspaceKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		m.workflowMenuIndex = 0
 		m.workflowMenuError = ""
 		return m, m.queryCmd(PageWorkflowMenu, app.WorkflowMenuQuery{Workflow: m.selected})
-	case msg.Code == 'r' || msg.Code == 'R':
-		if m.selected == "" || !hasAction(m.workspace.Actions, ActionResume) {
-			m.status = "resume is not a legal action"
-			return m, nil
-		}
-		m.status = "resuming…"
-		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
-	case msg.Code == 'p' || msg.Code == 'P':
-		if m.selected == "" || !hasAction(m.workspace.Actions, ActionPause) {
-			m.status = "pause is not a legal action"
-			return m, nil
-		}
-		m.status = "pausing…"
-		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
-	case msg.Code == 'x' || msg.Code == 'X':
-		if m.selected == "" || !hasAction(m.workspace.Actions, ActionCancel) {
-			m.status = "cancel is not a legal action"
-			return m, nil
-		}
-		m.cancelPreview = false
-		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageCancel, Workflow: m.selected})
-		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
-	case msg.Code == 'm' || msg.Code == 'M':
-		if m.selected == "" || !hasAction(m.workspace.Actions, ActionMigrate) {
-			m.status = "layout migration is not a legal action"
-			return m, nil
-		}
-		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageMigration, Workflow: m.selected})
-		m.migration = app.MigrationPreviewView{}
-		m.migrationConfirm = migrationConfirmNone
-		m.migrationPreviewed = false
-		return m, m.queryCmd(PageMigration, app.LayoutMigrationPreviewQuery{Workflow: m.selected})
 	}
 	return m, nil
 }
@@ -2726,7 +2716,7 @@ func createHints(m Model) string {
 }
 
 func renderPauseExit() string {
-	return "a workflow is running.\nPause and Exit? Enter execute, Esc back (controlled stop waits for the runner to join; Ctrl+C remains available)\n"
+	return "a workflow is running.\nPause and Exit? Enter execute or retry, Esc back (controlled stop waits for the runner to join; Ctrl+C remains available)\n"
 }
 
 func renderMigration(m Model) string {

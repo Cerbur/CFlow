@@ -141,7 +141,7 @@ func RenderExecutionAt(m ExecutionModel, width int) string {
 	}, leftWidth)
 	middle := panel("TASK GRAPH", executionGraphLines(m), middleWidth)
 	right := panel("INSPECTOR", executionInspectorLines(m), rightWidth)
-	footer := ansi(ansiMuted, fitLine("Provider: Codex ✓ · Claude ✓    Git policy ✓    ↑↓ Navigate · tab Focus · q Back/Exit", width))
+	footer := ansi(ansiMuted, fitLine("Provider: Codex ✓ · Claude ✓    Git policy ✓    ↑↓ Navigate · ←→ Panes · Esc Back · / Commands", width))
 	return header + "\n" + joinColumns([]string{left, middle, right}, []int{leftWidth, middleWidth, rightWidth}) + "\n" + footer
 }
 

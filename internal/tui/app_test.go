@@ -728,7 +728,13 @@ func TestModelMigrationEntryPointsRequirePreviewThenExecute(t *testing.T) {
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
 	m = load(t, m)
-	m = press(t, m, 'm', 0) // read-only Preview
+	m.selected = "wf-legacy"
+	m.page = PageWorkflowMenu
+	m.workflowMenu = app.WorkflowMenuView{Workflow: "wf-legacy"}
+	m.workflowMenuModel = WorkflowMenuModel{Workflow: "wf-legacy", Loaded: true}
+	var cmd tea.Cmd
+	m, cmd = m.routeWorkflowMenuItem(MenuItem{Action: app.MenuActionMigrate, Label: "Migration"})
+	m = runCmds(t, m, cmd)
 	if !strings.Contains(render(m), "manifest-1") {
 		t.Fatalf("migration preview page not opened:\n%s", render(m))
 	}
@@ -811,7 +817,13 @@ func TestModelMigrationRenderShowsCompleteEvidence(t *testing.T) {
 	m := newModel(Dependencies{})
 	m.ctrl = ctrl
 	m = load(t, m)
-	m = press(t, m, 'm', 0) // read-only Preview
+	m.selected = "wf-legacy"
+	m.page = PageWorkflowMenu
+	m.workflowMenu = app.WorkflowMenuView{Workflow: "wf-legacy"}
+	m.workflowMenuModel = WorkflowMenuModel{Workflow: "wf-legacy", Loaded: true}
+	var cmd tea.Cmd
+	m, cmd = m.routeWorkflowMenuItem(MenuItem{Action: app.MenuActionMigrate, Label: "Migration"})
+	m = runCmds(t, m, cmd)
 	out := render(m)
 	for _, want := range []string{
 		"status: PREPARED",
@@ -938,26 +950,15 @@ func (*workspaceActionsController) DriveOnce(context.Context, model.WorkflowID) 
 }
 func (*workspaceActionsController) EscalateStop() {}
 
-// TestModelWorkspaceResumeRequiresLegalAction: the Workspace r key is not
-// an unconditional Resume; it executes ResumeWorkflowCommand only when the
-// Runtime LegalActions include it.
-func TestModelWorkspaceResumeRequiresLegalAction(t *testing.T) {
-	// Without the resume legal action the key is a no-op.
+// TestModelHomeResumeShortcutIsInert: Home never executes a mutation,
+// including when Resume is a projected legal action. The Workflow Menu owns
+// the action-preview route.
+func TestModelHomeResumeShortcutIsInert(t *testing.T) {
 	ctrl := &workspaceActionsController{}
 	m := load(t, testModel(&recordingController{ctrl: ctrl}))
 	m = press(t, m, 'r', 0)
 	if len(ctrl.executed) != 0 {
-		t.Fatalf("workspace r without a resume legal action executed %v", ctrl.executed)
-	}
-	// With the resume legal action the key issues the typed command.
-	ctrl2 := &workspaceActionsController{resumeLegal: true}
-	m2 := load(t, testModel(&recordingController{ctrl: ctrl2}))
-	m2 = press(t, m2, 'r', 0)
-	if len(ctrl2.executed) != 1 {
-		t.Fatalf("workspace r with a resume legal action executed %v", ctrl2.executed)
-	}
-	if _, ok := ctrl2.executed[0].(app.ResumeWorkflowCommand); !ok {
-		t.Fatalf("workspace resume command type = %T", ctrl2.executed[0])
+		t.Fatalf("Home r executed %v", ctrl.executed)
 	}
 }
 
@@ -1731,6 +1732,37 @@ func TestModelHomeTabDoesNotEnterLifecycleStages(t *testing.T) {
 	}
 }
 
+func TestModelHomeMutationShortcutsAreInert(t *testing.T) {
+	ctrl := &homeRowsController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.selected = "wf-1"
+	m.workspace = MapWorkspace(app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Name: "one", Runtime: model.RuntimeRunning}},
+		Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimeRunning}},
+		LegalActions: []app.LegalAction{
+			{Kind: model.PauseWorkflow},
+			{Kind: model.ResumeWorkflow},
+			{Kind: model.CancelWorkflow},
+		},
+	})
+
+	for _, key := range []rune{'r', 'R', 'p', 'P', 'x', 'X', 'm', 'M'} {
+		next, cmd := m.Update(tea.KeyPressMsg{Code: key, Text: string(key)})
+		got := next.(Model)
+		if cmd != nil || got.page != PageWorkspace || got.navigation.Current().Layer != LayerHome {
+			t.Fatalf("Home shortcut %q changed route: page=%v frame=%+v cmd=%v", key, got.page, got.navigation.Current(), cmd != nil)
+		}
+		if got.selected != m.selected {
+			t.Fatalf("Home shortcut %q changed selection: got=%q want=%q", key, got.selected, m.selected)
+		}
+	}
+	if len(ctrl.queries) != 0 || ctrl.executes != 0 {
+		t.Fatalf("Home mutation shortcuts touched Application: queries=%v executes=%d", ctrl.queries, ctrl.executes)
+	}
+}
+
 func TestStageWorkspaceEscReturnsToActualParent(t *testing.T) {
 	pages := []Page{PageDiscussion, PagePlanApproval, PageExecutionApproval, PageExecution, PageBlocked, PageTerminal, PageCancel, PageMigration}
 	for _, page := range pages {
@@ -1908,56 +1940,45 @@ func (*homeRowsController) EscalateStop() {}
 // TestModelActionsMapToTypedCommands: the workspace legal actions map to
 // the exact typed Application Commands.
 func TestModelActionsMapToTypedCommands(t *testing.T) {
-	fx := newTUIFixture(t)
-	ref := &appRef{fx: fx, scripts: []string{planScript(fx.next("p"))}}
-	ctx := context.Background()
-	a, err := ref.open(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Execute(ctx, app.CreateWorkflowCommand{Name: "calculator", Provider: "fake", ConfirmDirty: true}); err != nil {
-		t.Fatal(err)
-	}
-	// The workflow must be running for the legal Pause action; the
-	// planning session (the fake script) makes it RUNNING.
-	if _, err := a.Execute(ctx, app.GeneratePlanCommand{Workflow: ref.list()[0], Provider: "fake"}); err != nil {
-		t.Fatal(err)
-	}
-	// Pause it through the controlled stop so the legal Resume action
-	// exists.
-	if _, err := a.Execute(ctx, app.PauseWorkflowCommand{Workflow: ref.list()[0]}); err != nil {
-		t.Fatal(err)
-	}
-	rec := &recordingController{ctrl: a}
-	m := load(t, testModel(rec))
+	for _, tc := range []struct {
+		name   string
+		action app.MenuAction
+		want   app.Command
+	}{
+		{name: "resume", action: app.MenuActionResume, want: app.ResumeWorkflowCommand{Workflow: "wf-1"}},
+		{name: "pause", action: app.MenuActionPause, want: app.PauseWorkflowCommand{Workflow: "wf-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recordingController{ctrl: &migrationController{}}
+			m := newModel(Dependencies{})
+			m.ctrl = rec
+			m.selected = "wf-1"
+			m.page = PageWorkflowMenu
+			m.workflowMenu = app.WorkflowMenuView{
+				Workflow: "wf-1",
+				Entries: []app.WorkflowMenuEntry{{
+					ID: tc.name, Kind: app.MenuEntryAction, Action: tc.action,
+				}},
+			}
+			m.workflowMenuModel = MapWorkflowMenu(m.workflowMenu)
+			m.navigation = NavigationStack{Frames: []NavigationFrame{
+				{Layer: LayerHome, Page: PageWorkspace},
+				{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+			}}
 
-	// 'r' → ResumeWorkflowCommand.
-	m = press(t, m, 'r', 0)
-	if !rec.hasExecuted(app.ResumeWorkflowCommand{}) {
-		t.Fatalf("r did not execute ResumeWorkflowCommand: %v", rec.executed)
-	}
-	// Pause it again and 'x' → the cancel preview; first Enter previews,
-	// second Enter executes, and y/Y/n/N remain ordinary input.
-	if _, err := a.Execute(ctx, app.PauseWorkflowCommand{Workflow: ref.list()[0]}); err != nil {
-		t.Fatal(err)
-	}
-	before := len(rec.executed)
-	m = press(t, m, 'x', 0)
-	if m.page != PageCancel {
-		t.Fatalf("x did not open the cancel page: %d", m.page)
-	}
-	m = press(t, m, tea.KeyEnter, 0)
-	if m.page != PageWorkspace || rec.hasExecuted(app.CancelWorkflowCommand{}) {
-		t.Fatalf("first Enter executed cancellation")
-	}
-	m = press(t, m, 'x', 0)
-	m = press(t, m, tea.KeyEnter, 0)
-	if rec.hasExecuted(app.CancelWorkflowCommand{}) || len(rec.executed) != before {
-		t.Fatalf("first Enter executed CancelWorkflowCommand: %v", rec.executed)
-	}
-	m = press(t, m, tea.KeyEnter, 0)
-	if !rec.hasExecuted(app.CancelWorkflowCommand{}) || len(rec.executed) == before {
-		t.Fatalf("second Enter did not execute CancelWorkflowCommand: %v", rec.executed)
+			m = press(t, m, tea.KeyEnter, 0)
+			if m.page != PageActionPreview || len(rec.executed) != 0 {
+				t.Fatalf("menu Enter did not open action preview: page=%v executes=%v", m.page, rec.executed)
+			}
+			m = press(t, m, tea.KeyEnter, 0)
+			if !m.actionPreviewed || len(rec.executed) != 0 {
+				t.Fatalf("first preview Enter executed command: previewed=%v executes=%v", m.actionPreviewed, rec.executed)
+			}
+			m = press(t, m, tea.KeyEnter, 0)
+			if len(rec.executed) != 1 || !reflect.DeepEqual(rec.executed[0], tc.want) {
+				t.Fatalf("second preview Enter = %#v, want %#v", rec.executed, tc.want)
+			}
+		})
 	}
 }
 
@@ -2292,6 +2313,7 @@ func TestModelPlanProjectionIgnoresOutOfOrderOlderState(t *testing.T) {
 		t.Fatalf("older projection replaced fresh state: %+v", m.plan)
 	}
 
+	m = press(t, m, tea.KeyEnter, 0)
 	m = press(t, m, tea.KeyEnter, 0)
 	var approved app.ApprovePlanCommand
 	for _, executed := range rec.executed {
@@ -2809,6 +2831,21 @@ func TestIdleExitCommandQuitsTUI(t *testing.T) {
 	}
 }
 
+func TestExitCommandDoesNotQuitWhileApplicationCommandIsInFlight(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.commandState = &commandState{inFlight: true, generation: 3, pending: 3, ackPage: PageWorkspace, workflow: "wf-1"}
+	m.page = PageWorkspace
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	got := updated.(Model)
+	if cmd != nil || got.page != PageWorkspace || got.commandPalette.Open {
+		t.Fatalf("/exit bypassed in-flight command: page=%v palette=%v cmd=%v", got.page, got.commandPalette.Open, cmd != nil)
+	}
+	if !strings.Contains(got.status, "command") {
+		t.Fatalf("in-flight /exit did not leave a diagnostic status: %q", got.status)
+	}
+}
+
 func TestRunningExitWaitsForRunnerDoneAfterControlledPause(t *testing.T) {
 	ctrl := &recordingController{ctrl: &migrationController{}}
 	m := newModel(Dependencies{})
@@ -3126,20 +3163,24 @@ func TestModelCtrlCSecondForceStopCleansUp(t *testing.T) {
 	}
 }
 
-func TestPauseFailureAfterForceStopStillQuits(t *testing.T) {
+func TestPauseFailureAfterForceStopLeavesDiagnosableExitState(t *testing.T) {
 	m := newModel(Dependencies{})
-	m.stop = stopFirstCtrlC
+	m.ready, m.width, m.height = true, 100, 24
+	m.stop = stopPauseAndExit
 	m.quitAfterRunner = true
 	m.pauseCommandPending = true
 	m.commandState = &commandState{inFlight: true, generation: 9, pending: 9, ackPage: PageWorkspace}
 
-	_, quitCmd := m.applyCommand(commandDoneMsg{
+	got, quitCmd := m.applyCommand(commandDoneMsg{
 		cmd:        app.PauseWorkflowCommand{Workflow: "wf-1"},
 		generation: 9,
 		err:        model.InvalidInputFault("pause failed"),
 	})
-	if quitCmd == nil {
-		t.Fatal("pause failure after force stop did not complete the pending quit")
+	if quitCmd != nil || got.page != PagePauseExit || got.stop != stopIdle || got.quitAfterRunner || got.pauseCommandPending {
+		t.Fatalf("pause failure quit or lost recovery state: page=%v stop=%v quitAfterRunner=%v pausePending=%v cmd=%v", got.page, got.stop, got.quitAfterRunner, got.pauseCommandPending, quitCmd != nil)
+	}
+	if !strings.Contains(got.status, "pause failed") || !strings.Contains(render(got), "retry") {
+		t.Fatalf("pause failure lost error/recovery copy: status=%q render=%s", got.status, render(got))
 	}
 }
 
