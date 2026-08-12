@@ -30,15 +30,12 @@ Base: `c18c561` plus the pre-existing uncommitted test fixes in
 - Updated migration tests to enter through Workflow Menu/stage routing rather
   than using removed Home shortcuts.
 
-## Apply identity binding disposition
+## Apply identity binding disposition (superseded by Fix Round 2)
 
-The existing typed `ExecuteApplyCommand` contract contains only `Workflow`;
-the Application currently selects and revalidates the latest persisted Apply
-Attempt internally. Adding an unrecognized attempt/preflight authority field
-in Task 12 would invent a new command contract and could weaken the existing
-Application revalidation boundary. Per the final-owner instruction, exact
-Apply preview identity binding is explicitly deferred and remains a known
-follow-up; no unsafe authority was added.
+The earlier review disposition deferred exact Apply preview identity binding
+because the original typed command contained only `Workflow`. Fix Round 2
+resolved that gap with the minimal identity-bearing fields described below;
+Application and Decision revalidation remain authoritative and fail closed.
 
 ## Verification
 
@@ -72,3 +69,49 @@ passed before commit
 The full suite and three-minute package gate were not run, per the latest
 owner instruction. No real Provider E2E, Self-Dogfood, remote push, or PR was
 performed.
+
+## Fix Round 2
+
+Implemented the remaining Important findings from the final re-reviews:
+
+- `ExecuteApplyCommand` now carries the exact bound Apply Attempt ID,
+  Target/Integration heads, Preflight reference/revision/hash, and policy
+  fingerprint. The TUI stores the authoritative `ApplyAttempt` returned by
+  Prepare, renders the bound facts, and sends all of them on the second Enter.
+  Application and Decision reject missing, changed, or mismatched facts; the
+  legacy workflow-only headless command remains available for CLI compatibility.
+- Discussion Finish/Switch/Pause and Continue/Start actions, Execution
+  Resume/Start Runner/Adopt Workspace, Blocked Resume, and Terminal Apply /
+  Cleanup shortcuts now enter the common typed Action Preview. The first
+  Enter only previews; the second issues the typed command. Start Runner uses
+  the shared navigation helper and returns to Workflow Menu on Esc.
+- Readonly projections now validate Workflow identity for Status, Plan,
+  Execution Preview, Inspect, and Report. Logs remains query-bound and the
+  typed query regression includes `LogsQuery.Workflow`.
+
+Round 2 focused verification:
+
+```text
+GOCACHE=/tmp/cflow-task12-final-cache go test ./internal/tui -run '^(TestApplyExecuteBindsExactAttemptFactsFromPreview|TestStageLocalMutationsOpenActionPreviewBeforeExecute|TestStartRunnerActionPreviewEscReturnsToWorkflowMenu|TestStageResumeConfirmationKeepsExistingExecutionParent|TestReadonlyProjectionRejectsForeignWorkflowView|TestWorkflowMenu|TestActionPreview)$' -count=1 -timeout=20s
+ok   cflow.local/cflow/internal/tui  0.198s
+
+GOCACHE=/tmp/cflow-task12-final-cache go test ./internal/app ./internal/decision -run '^$' -count=1 -timeout=20s
+ok   cflow.local/cflow/internal/app      [no tests to run]
+ok   cflow.local/cflow/internal/decision [no tests to run]
+
+gofmt
+passed
+
+bash -n scripts/gate-tui.sh
+passed
+
+git diff --check
+passed
+```
+
+The full suite, package-wide tests, and long-running E2E were not run. The
+broader regex `Apply|ActionPreview|Readonly|WorkflowMenu` was intentionally
+not used for final evidence because it also selects the existing long
+`TestTUIPlanToApplyAndCleanup` E2E, which timed out while waiting for its
+Bubble Tea test harness. No real Provider E2E, Self-Dogfood, remote push, or
+PR was performed.

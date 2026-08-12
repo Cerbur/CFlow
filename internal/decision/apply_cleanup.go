@@ -310,12 +310,23 @@ func decideApplyReviewFailed(state model.State, in model.EffectResultInput, crea
 // the re-bind is skipped (the observed Target may already be the
 // delivered staging head).
 func applyExecute(state model.State, in model.ApplyCommandInput) (model.Decision, error) {
-	att := lastApplyAttempt(state)
+	var att *model.ApplyAttempt
+	if in.Attempt != "" {
+		att = findApplyAttempt(state, in.Attempt)
+	} else {
+		att = lastApplyAttempt(state)
+	}
 	if att == nil {
 		return model.Decision{}, model.InvalidInputFault("no apply attempt to execute")
 	}
 	switch att.Status {
 	case model.ApplyAwaitingConfirmation:
+		if in.Preflight.Workflow != "" && (in.Preflight.Workflow != att.Preflight.Workflow ||
+			in.Preflight.Type != att.Preflight.Type || in.Preflight.Revision != att.Preflight.Revision ||
+			in.Preflight.Hash != att.Preflight.Hash) {
+			return model.Decision{}, model.NewFault(model.CodeCommitPolicyInputChanged,
+				"the apply preflight reference changed since the apply staging")
+		}
 		if in.TargetHead != att.TargetHead || in.IntegrationHead != att.IntegrationHead {
 			return model.Decision{}, model.NewFault(model.CodeTargetHeadChanged,
 				"target or integration HEAD drifted since the apply staging")

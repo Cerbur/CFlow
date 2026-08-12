@@ -305,6 +305,10 @@ func wantQuery[T app.Query](t *testing.T, queries []app.Query) {
 		if q.Workflow != "wf-1" {
 			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
 		}
+	case app.LogsQuery:
+		if q.Workflow != "wf-1" {
+			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)
+		}
 	case app.PlanQuery:
 		if q.Workflow != "wf-1" {
 			t.Fatalf("query Workflow = %q, want wf-1", q.Workflow)

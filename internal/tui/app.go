@@ -849,7 +849,14 @@ func (m Model) applyProjection(msg projectionMsg) (result Model, cmd tea.Cmd) {
 			m.workflowMenuError = ""
 		}
 	case PageReadonlyWorkspace:
-		if readonlyProjectionMatches(m.readonly.Route, msg.view) {
+		expectedWorkflow := m.selected
+		if expectedWorkflow == "" {
+			expectedWorkflow = m.workflowMenuModel.Workflow
+		}
+		if m.workflowMenuModel.Workflow != "" && expectedWorkflow != "" && m.workflowMenuModel.Workflow != expectedWorkflow {
+			break
+		}
+		if readonlyProjectionMatches(m.readonly.Route, expectedWorkflow, msg.view) {
 			m.readonly = MapReadonlyWorkspace(m.workflowMenuModel, m.readonly.Route, msg.view)
 		}
 	case PageWorkspace, PageBlocked, PageExecution, PageTerminal:
@@ -1287,6 +1294,8 @@ func (m Model) applyCommand(msg commandDoneMsg) (Model, tea.Cmd) {
 		return m, m.reloadCmd()
 	case app.PrepareApplyCommand:
 		if msg.out.Apply != nil {
+			attempt := *msg.out.Apply
+			m.terminal.applyAttempt = &attempt
 			m.terminal.ApplyPreview = renderApplyAttempt(*msg.out.Apply)
 			m.awaitProjectionStatus("apply staged (preview ready)")
 		}
@@ -2042,26 +2051,28 @@ func (m Model) activateDiscussionAction() (Model, tea.Cmd) {
 	action := m.discussion.Actions[m.discussion.Selected]
 	switch action {
 	case ReturnStart:
-		m.status = "preparing the native discussion…"
-		return m, m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		return m.openStageActionPreview(app.MenuActionStartDiscussion, "Start Native Discussion")
 	case ReturnContinue:
-		// Continue resumes the SAME Provider Session on the SAME provider.
-		m.status = "continuing the native discussion…"
-		return m, m.executeCmd(app.ContinueNativeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
+		return m.openStageActionPreview(app.MenuActionContinueDiscussion, "Continue Same Session")
 	case ReturnFinish:
-		m.status = "freezing the change set…"
-		return m, m.executeCmd(app.FreezeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
+		return m.openStageActionPreview(app.MenuActionFinishDiscussion, "Finish Discussion")
 	case ReturnSwitch:
-		m.status = "switching the discussion session…"
-		return m, m.switchAgentCmd()
+		return m.openStageActionPreview(app.MenuActionSwitchDiscussion, "Switch Discussion Agent")
 	case ReturnPause:
-		return m, m.executeCmd(app.PauseWorkflowCommand{Workflow: m.selected})
+		return m.openStageActionPreview(app.MenuActionPause, "Pause Workflow")
 	case ReturnCancel:
 		m.cancelPreview = false
 		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageCancel, Workflow: m.selected})
 		return m, m.queryCmd(PageCancel, app.CancelSummaryQuery{Workflow: m.selected})
 	}
 	return m, nil
+}
+
+func (m Model) openStageActionPreview(action app.MenuAction, label string) (Model, tea.Cmd) {
+	m.workflowMenuPreviewItem = MenuItem{Action: action, Label: label, SourceIndex: m.workflowMenuIndex}
+	m.actionPreviewed = false
+	m.traceUIAction(uiActionActionPreviewOpen)
+	return m.pushNavigation(NavigationFrame{Layer: LayerActionPreview, Page: PageActionPreview, Workflow: m.selected}), nil
 }
 
 // discussionProvider is the discussion route of the selected workflow
@@ -2117,10 +2128,8 @@ func (m Model) handleHandoffKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 		m.discussion.Status = ""
 		m.discussion.Editing = false
-		m.status = "finishing the discussion…"
-		return m, m.executeCmd(app.FinishDiscussionCommand{
-			Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Decisions: content,
-		})
+		m.discussion.Handoff = string(content)
+		return m.openStageActionPreview(app.MenuActionFinishDiscussion, "Finish Discussion")
 	case msg.Code == tea.KeyBackspace || msg.Code == tea.KeyDelete:
 		if len(m.discussion.Handoff) > 0 {
 			m.discussion.Handoff = m.discussion.Handoff[:len(m.discussion.Handoff)-1]
@@ -2266,17 +2275,13 @@ func (m Model) handleExecutionKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.status = "a runner is already active"
 			return m, nil
 		}
-		m.status = "starting the foreground runner…"
-		m.pendingDecision = ""
 		if hasAction(m.workspace.Actions, ActionResume) {
-			m.resumeThenRun = true
-			return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
+			return m.openStageActionPreview(app.MenuActionResume, "Resume and Start Runner")
 		}
-		return m.startRunner()
+		return m.openStageActionPreview(app.MenuActionStartRunner, "Start Runner")
 	case msg.Code == 'a' || msg.Code == 'A':
 		if m.pendingDecision != "" {
-			m.status = "adopting the workspace…"
-			return m, m.executeCmd(app.AdoptWorkspaceCommand{Workflow: m.selected})
+			return m.openStageActionPreview(app.MenuActionAdoptWorkspace, "Adopt Workspace")
 		}
 		return m, nil
 	case msg.Code == tea.KeyEsc:
@@ -2298,8 +2303,7 @@ func (m Model) handleBlockedKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.status = "resume is not a legal action"
 			return m, nil
 		}
-		m.status = "resuming…"
-		return m, m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
+		return m.openStageActionPreview(app.MenuActionResume, "Resume Workflow")
 	case msg.Code == tea.KeyEsc:
 		return m, nil
 	}
@@ -2332,11 +2336,9 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return reportLoadedMsg{workflow: workflow, requestID: requestID, err: fmt.Errorf("unexpected report projection")}
 		}
 	case msg.Code == 'p' || msg.Code == 'P':
-		m.status = "staging the apply…"
-		return m, m.executeCmd(app.PrepareApplyCommand{Workflow: m.selected})
+		return m.openStageActionPreview(app.MenuActionApply, "Stage Apply")
 	case msg.Code == 'c' || msg.Code == 'C':
-		m.status = "producing the cleanup dry run manifest…"
-		return m, m.executeCmd(app.DryRunCommand{Workflow: m.selected})
+		return m.openStageActionPreview(app.MenuActionCleanup, "Prepare Cleanup Dry Run")
 	case msg.Code == tea.KeyEsc:
 	}
 	upd, cmd := m.terminal.Update(msg)
@@ -2352,7 +2354,19 @@ func (m Model) handleTerminalKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.terminal.Confirmed = false
 			m.terminal.Previewed = false
 			m.status = "delivering the apply…"
-			return m, m.executeCmd(app.ExecuteApplyCommand{Workflow: m.selected})
+			attempt := m.terminal.applyAttempt
+			if attempt == nil || attempt.ID == "" || attempt.TargetHead == "" || attempt.IntegrationHead == "" ||
+				attempt.Preflight.Revision < 1 || attempt.Preflight.Hash == "" || attempt.PreflightHash == "" || attempt.Fingerprint == "" {
+				m.status = "no complete apply preview to deliver; stage it again"
+				m.terminal.Confirmed = false
+				return m, nil
+			}
+			return m, m.executeCmd(app.ExecuteApplyCommand{
+				Workflow: m.selected, AttemptID: attempt.ID, TargetHead: attempt.TargetHead,
+				IntegrationHead: attempt.IntegrationHead, Preflight: attempt.Preflight,
+				PreflightRevision: attempt.Preflight.Revision, PreflightHash: attempt.PreflightHash,
+				Fingerprint: attempt.Fingerprint,
+			})
 		case SectionCleanup:
 			if m.terminal.CleanupPreview == "" {
 				m.status = "no cleanup manifest to execute; produce the dry run first"
@@ -2417,7 +2431,9 @@ func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		cmd := m.executeCmd(app.ResumeWorkflowCommand{Workflow: m.selected})
 		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, m.currentOperationID())
 		m, _ = m.popNavigation()
-		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
+		if m.navigation.Current().Layer == LayerWorkflowMenu {
+			m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
+		}
 		return m, cmd
 	case app.MenuActionPause:
 		m.status = "pausing…"
@@ -2426,9 +2442,47 @@ func (m Model) handleActionPreviewKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, cmd
 	case app.MenuActionStartRunner:
 		m.traceUIActionFor(uiActionActionPreviewConfirm, m.selected, operationID)
-		m.page = PageExecution
-		m.navigation = m.navigation.Push(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
+		m, _ = m.popNavigation()
+		if m.navigation.Current().Layer == LayerStageWorkspace {
+			m, _ = m.popNavigation()
+		}
+		m = m.pushNavigation(NavigationFrame{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: m.selected})
 		return m.startRunner()
+	case app.MenuActionApply:
+		m.terminal.Section = SectionApply
+		cmd := m.executeCmd(app.PrepareApplyCommand{Workflow: m.selected})
+		m, _ = m.popNavigation()
+		return m, cmd
+	case app.MenuActionCleanup:
+		m.terminal.Section = SectionCleanup
+		cmd := m.executeCmd(app.DryRunCommand{Workflow: m.selected})
+		m, _ = m.popNavigation()
+		return m, cmd
+	case app.MenuActionAdoptWorkspace:
+		cmd := m.executeCmd(app.AdoptWorkspaceCommand{Workflow: m.selected})
+		m, _ = m.popNavigation()
+		return m, cmd
+	case app.MenuActionStartDiscussion:
+		cmd := m.executeCmd(app.PrepareNativeDiscussionCommand{Workflow: m.selected, Provider: m.discussionProvider()})
+		m, _ = m.popNavigation()
+		return m, cmd
+	case app.MenuActionContinueDiscussion:
+		cmd := m.executeCmd(app.ContinueNativeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
+		m, _ = m.popNavigation()
+		return m, cmd
+	case app.MenuActionFinishDiscussion:
+		var cmd tea.Cmd
+		if m.discussion.Handoff != "" {
+			cmd = m.executeCmd(app.FinishDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session), Decisions: []byte(m.discussion.Handoff)})
+		} else {
+			cmd = m.executeCmd(app.FreezeDiscussionCommand{Workflow: m.selected, Session: model.SessionID(m.discussion.Session)})
+		}
+		m, _ = m.popNavigation()
+		return m, cmd
+	case app.MenuActionSwitchDiscussion:
+		cmd := m.switchAgentCmd()
+		m, _ = m.popNavigation()
+		return m, cmd
 	default:
 		return m, nil
 	}
@@ -2837,6 +2891,21 @@ func renderDecisionPanel(reason string) string {
 func renderApplyAttempt(a model.ApplyAttempt) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "apply %s — %s\n", a.ID, a.Status)
+	if a.TargetHead != "" {
+		fmt.Fprintf(&b, "target head: %s\n", shortHead(a.TargetHead))
+	}
+	if a.IntegrationHead != "" {
+		fmt.Fprintf(&b, "integration head: %s\n", shortHead(a.IntegrationHead))
+	}
+	if a.Preflight.Revision > 0 {
+		fmt.Fprintf(&b, "preflight: rev %d %s\n", a.Preflight.Revision, shortHead(a.Preflight.Hash))
+	}
+	if a.PreflightHash != "" {
+		fmt.Fprintf(&b, "preflight hash: %s\n", shortHead(a.PreflightHash))
+	}
+	if a.Fingerprint != "" {
+		fmt.Fprintf(&b, "fingerprint: %s\n", shortHead(a.Fingerprint))
+	}
 	if a.StagingHead != "" {
 		fmt.Fprintf(&b, "delivery head: %s\n", shortHead(a.StagingHead))
 	}

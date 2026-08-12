@@ -267,6 +267,10 @@ const (
 	// approval workspace, but it is not a readonly route and its later
 	// confirmation remains governed by the existing approval page.
 	MenuActionReviewExecution
+	MenuActionFinishDiscussion
+	MenuActionSwitchDiscussion
+	MenuActionResumeRunner
+	MenuActionAdoptWorkspace
 )
 
 // WorkflowMenuEntry is one bounded, typed Workflow Menu route or action.
@@ -1011,6 +1015,15 @@ type PrepareApplyCommand struct {
 // Branch is updated only through the compare-and-swap fast-forward.
 type ExecuteApplyCommand struct {
 	Workflow model.WorkflowID
+	// TUI delivery binds to the immutable attempt and exact facts displayed
+	// by its preview. Zero fields preserve the workflow-only headless CLI.
+	AttemptID         model.ApplyAttemptID
+	TargetHead        string
+	IntegrationHead   string
+	Preflight         model.ArtifactRef
+	PreflightRevision int
+	PreflightHash     string
+	Fingerprint       string
 }
 
 // ConfirmApplyPolicyCommand is the user's explicit confirmation of a

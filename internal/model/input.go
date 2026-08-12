@@ -812,6 +812,8 @@ func (k ApplyCommandKind) String() string { return string(k) }
 // delivery; the policy-confirm binds the explicit confirmation.
 type ApplyCommandInput struct {
 	Kind ApplyCommandKind
+	// Attempt is non-zero for the UI-bound Execute path.
+	Attempt ApplyAttemptID
 
 	TargetHead      string
 	IntegrationHead string

@@ -152,26 +152,26 @@ func MapReadonlyWorkspace(menu WorkflowMenuModel, route app.MenuRoute, view app.
 	return result
 }
 
-func readonlyProjectionMatches(route app.MenuRoute, view app.View) bool {
+func readonlyProjectionMatches(route app.MenuRoute, workflow model.WorkflowID, view app.View) bool {
 	switch route {
 	case app.MenuRouteCurrentStage:
-		_, ok := view.(app.StatusView)
-		return ok
+		v, ok := view.(app.StatusView)
+		return ok && v.Workflow == workflow
 	case app.MenuRoutePlan:
-		_, ok := view.(app.PlanView)
-		return ok
+		v, ok := view.(app.PlanView)
+		return ok && v.Workflow == workflow
 	case app.MenuRouteSpecs, app.MenuRouteCatalog, app.MenuRouteDAG:
-		_, ok := view.(app.ExecutionPreviewView)
-		return ok
+		v, ok := view.(app.ExecutionPreviewView)
+		return ok && v.Workflow == workflow
 	case app.MenuRouteTaskGraph:
-		_, ok := view.(app.InspectView)
-		return ok
+		v, ok := view.(app.InspectView)
+		return ok && v.Status.Workflow == workflow
 	case app.MenuRouteLogs:
 		_, ok := view.(app.LogsView)
 		return ok
 	case app.MenuRouteReport:
-		_, ok := view.(app.ReportView)
-		return ok
+		v, ok := view.(app.ReportView)
+		return ok && v.Report.Workflow.ID == workflow
 	default:
 		return false
 	}

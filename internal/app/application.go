@@ -1050,7 +1050,7 @@ func (a *Application) prepare(ctx context.Context, cmd Command) (model.Input, mo
 	case PrepareApplyCommand:
 		return a.prepareApply(ctx, c.Workflow)
 	case ExecuteApplyCommand:
-		return a.prepareApplyExecute(ctx, c.Workflow)
+		return a.prepareApplyExecute(ctx, c)
 	case ConfirmApplyPolicyCommand:
 		return a.prepareApplyPolicyConfirm(ctx, c.Workflow)
 	case ApproveReplacementCommand:

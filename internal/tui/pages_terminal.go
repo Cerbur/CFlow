@@ -30,6 +30,8 @@ type TerminalModel struct {
 	Report string
 	// ApplyPreview is the apply posture summary.
 	ApplyPreview string
+	// applyAttempt is the immutable Apply Attempt whose facts are displayed.
+	applyAttempt *model.ApplyAttempt
 	// CleanupPreview is the cleanup manifest summary.
 	CleanupPreview string
 	// cleanupRef is the exact Manifest Ref of the produced Cleanup Dry

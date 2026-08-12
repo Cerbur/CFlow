@@ -109,6 +109,18 @@ func TestReadonlyProjectionRendersQueriedFacts(t *testing.T) {
 	}
 }
 
+func TestReadonlyProjectionRejectsForeignWorkflowView(t *testing.T) {
+	m := readonlyMenuModel(&readonlyController{}, app.MenuRouteCurrentStage)
+	m.page = PageReadonlyWorkspace
+	m.readonly = ReadonlyWorkspaceModel{Workflow: "wf-1", Route: app.MenuRouteCurrentStage}
+	updated, _ := m.applyProjection(projectionMsg{
+		page: PageReadonlyWorkspace, workflow: "wf-1", view: app.StatusView{Workflow: "wf-foreign", Stage: model.StageExecution},
+	})
+	if updated.readonly.Loaded {
+		t.Fatalf("foreign readonly projection was accepted: %+v", updated.readonly)
+	}
+}
+
 func TestReadonlyWorkspaceNavigatesLocallyAndEscUsesParentStack(t *testing.T) {
 	m := readonlyMenuModel(&readonlyController{}, app.MenuRouteLogs)
 	m.readonly = ReadonlyWorkspaceModel{

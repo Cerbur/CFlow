@@ -111,8 +111,8 @@ func (a *Application) prepareApply(ctx context.Context, wf model.WorkflowID) (mo
 // re-asserts the attempt's Preflight facts, so the Kernel's strict re-bind
 // sees fresh observations. The authoritative pre-delivery rechecks run in
 // the executor.
-func (a *Application) prepareApplyExecute(ctx context.Context, wf model.WorkflowID) (model.Input, model.WorkflowID, error) {
-	resolved, err := a.resolveMutationWorkflow(wf)
+func (a *Application) prepareApplyExecute(ctx context.Context, c ExecuteApplyCommand) (model.Input, model.WorkflowID, error) {
+	resolved, err := a.resolveMutationWorkflow(c.Workflow)
 	if err != nil {
 		return nil, "", err
 	}
@@ -121,7 +121,27 @@ func (a *Application) prepareApplyExecute(ctx context.Context, wf model.Workflow
 		return nil, "", err
 	}
 	st := view.State
-	att := lastApplyAttemptOf(st)
+	var att *model.ApplyAttempt
+	if c.AttemptID != "" {
+		att = findApplyAttemptOf(st, c.AttemptID)
+		if att == nil {
+			return nil, "", model.InvalidInputFault("the bound apply attempt no longer exists")
+		}
+		if c.TargetHead == "" || c.IntegrationHead == "" || c.PreflightRevision < 1 ||
+			c.PreflightHash == "" || c.Fingerprint == "" ||
+			c.TargetHead != att.TargetHead || c.IntegrationHead != att.IntegrationHead ||
+			c.PreflightRevision != att.Preflight.Revision || c.PreflightHash != att.PreflightHash ||
+			c.Preflight.Workflow != att.Preflight.Workflow || c.Preflight.Type != att.Preflight.Type ||
+			c.Preflight.Revision != att.Preflight.Revision || c.Preflight.Hash != att.Preflight.Hash ||
+			c.Fingerprint != att.Fingerprint {
+			return nil, "", model.NewFault(model.CodeCommitPolicyInputChanged,
+				"the apply preview facts no longer match the bound attempt")
+		}
+	} else {
+		// The headless CLI retains its workflow-only contract. The TUI
+		// always supplies AttemptID and every displayed fact above.
+		att = lastApplyAttemptOf(st)
+	}
 	if att == nil {
 		return nil, "", model.InvalidInputFault("no apply attempt to execute")
 	}
@@ -145,8 +165,13 @@ func (a *Application) prepareApplyExecute(ctx context.Context, wf model.Workflow
 		return nil, "", model.NewFault(model.CodeTargetHeadChanged,
 			"the delivery branch no longer matches the recorded head")
 	}
+	if c.AttemptID != "" && (head != c.TargetHead || integrationHead != c.IntegrationHead) {
+		return nil, "", model.NewFault(model.CodeTargetHeadChanged,
+			"the apply target or integration HEAD changed since the preview")
+	}
 	return model.ApplyCommandInput{
 		Kind:              model.ApplyExecute,
+		Attempt:           att.ID,
 		TargetHead:        head,
 		IntegrationHead:   integrationHead,
 		Preflight:         att.Preflight,

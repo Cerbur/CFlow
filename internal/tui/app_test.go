@@ -2665,6 +2665,126 @@ func TestActionPreviewRuntimeCommandsAcknowledgeWorkspaceProjection(t *testing.T
 	}
 }
 
+func TestApplyExecuteBindsExactAttemptFactsFromPreview(t *testing.T) {
+	rec := &recordingController{ctrl: &actionPreviewAckController{view: app.WorkspaceView{
+		Selected:  "wf-1",
+		Workflows: []app.WorkflowSummary{{ID: "wf-1", Runtime: model.RuntimeSucceeded}},
+		Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: model.RuntimeSucceeded}},
+	}}}
+	m := newModel(Dependencies{})
+	m.ctrl = rec
+	m.selected = "wf-1"
+	m.page = PageTerminal
+	m.terminal.Section = SectionApply
+	attempt := model.ApplyAttempt{
+		ID: "apply-7", TargetHead: "target-1", IntegrationHead: "integration-1",
+		Preflight:     model.ArtifactRef{Workflow: "wf-1", Type: model.ArtifactReport, Revision: 4, Hash: "preflight-1"},
+		PreflightHash: "preflight-1", Fingerprint: "fingerprint-1", StagingHead: "staging-1",
+		Status: model.ApplyAwaitingConfirmation,
+	}
+	m.terminal.ApplyPreview = renderApplyAttempt(attempt)
+	updated, _ := m.applyCommand(commandDoneMsg{cmd: app.PrepareApplyCommand{Workflow: "wf-1"}, out: app.Outcome{Workflow: "wf-1", Apply: &attempt}})
+	updated.terminal.Previewed = true
+	_, cmd := updated.handleTerminalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("confirmed apply command = %v executed=%v", cmd != nil, rec.executed)
+	}
+	_ = cmd()
+	if len(rec.executed) != 1 {
+		t.Fatalf("confirmed apply executed=%v", rec.executed)
+	}
+	got, ok := rec.executed[0].(app.ExecuteApplyCommand)
+	if !ok {
+		t.Fatalf("command = %T, want ExecuteApplyCommand", rec.executed[0])
+	}
+	fields := []struct{ name, want string }{
+		{"AttemptID", "apply-7"}, {"TargetHead", "target-1"}, {"IntegrationHead", "integration-1"},
+		{"PreflightHash", "preflight-1"}, {"Fingerprint", "fingerprint-1"},
+	}
+	v := reflect.ValueOf(got)
+	for _, field := range fields {
+		fv := v.FieldByName(field.name)
+		if !fv.IsValid() || fv.String() != field.want {
+			t.Fatalf("ExecuteApplyCommand.%s = %v, want %q", field.name, fv, field.want)
+		}
+	}
+	preflight := v.FieldByName("Preflight")
+	if !preflight.IsValid() || preflight.FieldByName("Revision").Int() != 4 || preflight.FieldByName("Hash").String() != "preflight-1" {
+		t.Fatalf("ExecuteApplyCommand.Preflight = %v, want exact preview ref", preflight)
+	}
+}
+
+func TestStageLocalMutationsOpenActionPreviewBeforeExecute(t *testing.T) {
+	tests := []struct {
+		name  string
+		page  Page
+		key   rune
+		setup func(*Model)
+	}{
+		{name: "discussion finish", page: PageDiscussion, key: tea.KeyEnter, setup: func(m *Model) {
+			m.discussion = DiscussionPage{Loaded: true, Session: "sess-1", Actions: []DiscussionReturnAction{ReturnFinish}}
+		}},
+		{name: "execution resume", page: PageExecution, key: 'r', setup: func(m *Model) {
+			m.workspace.Actions = []Action{ActionResume}
+		}},
+		{name: "blocked resume", page: PageBlocked, key: 'r', setup: func(m *Model) {
+			m.workspace.Actions = []Action{ActionResume}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &recordingController{ctrl: &actionPreviewAckController{}}
+			m := newModel(Dependencies{})
+			m.ctrl, m.selected, m.page = rec, "wf-1", tt.page
+			m.navigation = NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}, {Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"}, {Layer: LayerStageWorkspace, Page: tt.page, Workflow: "wf-1"}}}
+			tt.setup(&m)
+			updated, _ := m.Update(tea.KeyPressMsg{Code: tt.key})
+			got := updated.(Model)
+			if len(rec.executed) != 0 || got.page != PageActionPreview || got.actionPreviewed {
+				t.Fatalf("first stage mutation = page %v previewed=%v executed=%v, want action preview only", got.page, got.actionPreviewed, rec.executed)
+			}
+		})
+	}
+}
+
+func TestStartRunnerActionPreviewEscReturnsToWorkflowMenu(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-1"
+	m.page = PageActionPreview
+	m.workflowMenuPreviewItem = MenuItem{Action: app.MenuActionStartRunner, Label: "Start Runner"}
+	m.actionPreviewed = true
+	m.navigation = NavigationStack{Frames: []NavigationFrame{
+		{Layer: LayerHome, Page: PageWorkspace},
+		{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+		{Layer: LayerActionPreview, Page: PageActionPreview, Workflow: "wf-1"},
+	}}
+	updated, _ := m.handleActionPreviewKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if got := updated.navigation.Current(); got.Layer != LayerStageWorkspace || got.Page != PageExecution {
+		t.Fatalf("Start Runner current frame = %+v, want Execution stage", got)
+	}
+	if got := updated.navigation.ParentPage(); got != PageWorkflowMenu {
+		t.Fatalf("Start Runner parent page = %v, want Workflow Menu", got)
+	}
+}
+
+func TestStageResumeConfirmationKeepsExistingExecutionParent(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.selected = "wf-1"
+	m.page = PageActionPreview
+	m.workflowMenuPreviewItem = MenuItem{Action: app.MenuActionResume, Label: "Resume"}
+	m.actionPreviewed = true
+	m.navigation = NavigationStack{Frames: []NavigationFrame{
+		{Layer: LayerHome, Page: PageWorkspace},
+		{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+		{Layer: LayerStageWorkspace, Page: PageExecution, Workflow: "wf-1"},
+		{Layer: LayerActionPreview, Page: PageActionPreview, Workflow: "wf-1"},
+	}}
+	updated, cmd := m.handleActionPreviewKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil || len(updated.navigation.Frames) != 3 || updated.navigation.Current().Page != PageExecution {
+		t.Fatalf("stage Resume stack=%+v page=%v cmd=%v, want existing Execution parent", updated.navigation.Frames, updated.page, cmd != nil)
+	}
+}
+
 type actionPreviewAckController struct {
 	view app.WorkspaceView
 }
@@ -3463,8 +3583,13 @@ func activateReturnAction(t *testing.T, m Model) (Model, tea.Cmd) {
 	t.Helper()
 	upd, keyCmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = upd.(Model)
+	if keyCmd != nil || m.page != PageActionPreview || m.actionPreviewed {
+		t.Fatalf("first Enter on the Return page = page %v previewed=%v cmd=%v, want preview", m.page, m.actionPreviewed, keyCmd != nil)
+	}
+	upd, keyCmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = upd.(Model)
 	if keyCmd == nil {
-		t.Fatal("Enter on the Return page produced no command")
+		t.Fatal("second Enter on the Return preview produced no command")
 	}
 	doneMsg := keyCmd()
 	done, ok := doneMsg.(commandDoneMsg)
