@@ -9,11 +9,17 @@ supersedes:
   - docs/superpowers/specs/2026-08-11-cflow-tui-main-page-visual-design.md
 ---
 
-# CFlow TUI 层级工作区与全局命令设计
+# CFlow TUI 固定三栏与中间工作区设计
+
+> **2026-08-12 需求纠偏（用户确认）**：Workflow Menu 和后续 Stage
+> Workspace 不再作为全屏页面切换。左侧 `WORKFLOWS`、中间
+> `WORKSPACE`、右侧 `INSPECTOR` 是始终存在的固定工作台外壳；Enter
+> 只替换中间工作区的内容，Esc 只让中间工作区返回上一层。此前本文中
+> “进入下一层”的描述仅表示中间工作区的内容状态变化，不表示整屏替换。
 
 ## 1. 设计目标
 
-将 CFlow 默认全屏 TUI 从“固定 Lifecycle 列表驱动的主页面”调整为“层级式 Workflow 工作区”。
+将 CFlow 默认全屏 TUI 调整为“固定三栏工作台 + 中间工作区状态”的 Workflow 工作区。
 
 主页面保留：
 
@@ -21,12 +27,14 @@ supersedes:
 - 中间动态工作区；
 - 右侧只读 Inspector。
 
-变化集中在交互模型：
+固定外壳与交互模型：
 
 - 左侧负责选择上下文；
-- 中间根据当前层级和 Workflow 阶段渲染内容；
-- Enter 进入下一层或执行当前确认页；
-- Esc 返回上一层；
+- 中间根据当前工作区状态和 Workflow 阶段渲染内容；
+- Enter 只更新中间工作区到下一层或执行当前确认页；
+- Esc 只让中间工作区返回上一层；
+- 左栏和右栏在 Workflow Menu、Readonly Workspace、Stage Workspace、
+  Action Preview、Create Workspace 中保持渲染；
 - 不再用左右键跨生命周期阶段；
 - 不再用 q 退出；
 - 用 / 打开全局 Command 浮窗，本期只支持 /exit。
@@ -47,20 +55,21 @@ supersedes:
 - Target Branch 只能由显式 Apply Execute 改变；
 - 不自动 Push、创建 PR 或修改远程仓库。
 
-## 3. 页面与层级模型
+## 3. 中间工作区状态模型
 
-TUI 的 UI 层级与 Runtime 生命周期状态分离。
+TUI 的 UI 状态与 Runtime 生命周期状态分离。三栏工作台外壳始终存在，
+中间区域使用 UI 状态栈切换内容。
 
 ~~~text
-Home
-├─ Workflow Menu
-│  ├─ Readonly Workspace
-│  ├─ Stage Workspace
-│  └─ Action Preview / Confirm
-│
-└─ New Workflow
-   ├─ Create Workspace
-   └─ Create Preview
+Persistent Workbench
+├─ WORKFLOWS       (persistent context selection)
+├─ WORKSPACE       (dynamic center content)
+│  ├─ Home Overview
+│  ├─ Workflow Menu
+│  ├─ Readonly / Stage Workspace
+│  ├─ Action Preview / Confirm
+│  └─ Create Workspace / Preview
+└─ INSPECTOR       (persistent read-only facts)
 
 Global Command Palette
 └─ /exit
@@ -68,7 +77,7 @@ Global Command Palette
 
 ### 3.1 Home
 
-Home 是默认入口。
+Home 是默认入口，也是固定三栏工作台的初始中间内容。
 
 左侧只展示 Workflow 选择：
 
@@ -103,7 +112,7 @@ Home 不再把 Lifecycle 列表作为可交互导航区域。中间展示当前�
 Home 的键位：
 
 - ↑↓：选择 Workflow；
-- Enter：进入选中 Workflow 的 Workflow Menu；
+- Enter：将中间工作区替换为选中 Workflow 的 Workflow Menu；
 - Esc：不执行、不退出；
 - /：打开 Global Command Palette；
 - Ctrl+C：保留为受控停止信号；
@@ -111,7 +120,8 @@ Home 的键位：
 
 ### 3.2 Workflow Menu
 
-Workflow Menu 在中间区域展示当前 Workflow 的功能入口，采用分组平铺结构：
+Workflow Menu 只替换固定三栏中的中间 `WORKSPACE` 区域，展示当前 Workflow
+的功能入口，采用分组平铺结构：
 
 ~~~text
 WORKFLOW MENU
@@ -154,13 +164,14 @@ CONTROL
 Workflow Menu 的键位：
 
 - ↑↓：选择菜单项；
-- Enter：进入对应工作区或预览页；
-- Esc：返回 Home；
+- Enter：将中间工作区替换为对应工作区或预览内容；
+- Esc：将中间工作区恢复为上一个内容状态；
 - /：打开 Global Command Palette。
 
 ### 3.3 Stage Workspace
 
-Stage Workspace 是中间区域的动态内容，不是固定 Lifecycle 列表。
+Stage Workspace 是固定三栏中间区域的动态内容，不是独立全屏页面，也不是
+固定 Lifecycle 列表。
 
 统一结构：
 
@@ -199,31 +210,33 @@ AVAILABLE ACTIONS
 
 ### 4.1 进入与返回
 
-所有 UI 页面遵循同一个导航栈：
+所有中间工作区状态遵循同一个 UI 导航栈；三栏外壳不参与切换：
 
 ~~~text
-Home
-  └─ Enter → Workflow Menu
-       └─ Enter → Stage Workspace / Readonly Workspace / Action Preview
-            └─ Esc → Workflow Menu
-                 └─ Esc → Home
+固定三栏工作台
+  中间 Home
+    └─ Enter → 中间 Workflow Menu
+         └─ Enter → 中间 Stage Workspace / Readonly Workspace / Action Preview
+              └─ Esc → 中间 Workflow Menu
+                   └─ Esc → 中间 Home Overview
 ~~~
 
-- Enter 只进入当前选中的下一层，或在确认页执行；
-- Esc 只返回上一层；
+- Enter 只更新中间工作区到当前选中的下一层，或在确认页执行；
+- Esc 只更新中间工作区到上一层；
 - Home 的 Esc 不退出；
-- 页面返回不会取消已提交的 Runtime Command；
-- 页面进入和返回不会改变 Runtime。
+- 左侧 Workflow 列表和右侧 Inspector 不因上述操作消失或替换；
+- 中间工作区返回不会取消已提交的 Runtime Command；
+- 中间工作区进入和返回不会改变 Runtime。
 
 ### 4.2 查看类入口
 
 查看类入口只读：
 
 ~~~text
-Workflow Menu
-  └─ Enter → Readonly Workspace
+中间 Workflow Menu
+  └─ Enter → 中间 Readonly Workspace
        ├─ ↑↓ 浏览内容
-       └─ Esc 返回 Workflow Menu
+       └─ Esc → 中间 Workflow Menu
 ~~~
 
 查看类入口不调用状态变化 Command，不启动 Provider，不改变 Git。
@@ -233,10 +246,10 @@ Workflow Menu
 动作类入口先进入 Action Workspace 或 Preview：
 
 ~~~text
-Workflow Menu
-  └─ Enter → Action Workspace / Preview
+中间 Workflow Menu
+  └─ Enter → 中间 Action Workspace / Preview
        ├─ Enter → 执行 Typed Application Command
-       └─ Esc   → 返回 Workflow Menu
+       └─ Esc   → 中间 Workflow Menu
 ~~~
 
 所有需要确认的动作都只使用 Enter：
@@ -260,10 +273,9 @@ Approval / Cancel / Apply / Cleanup
 New Workflow 固定在左侧 Workflow 列表最上方：
 
 ~~~text
-Home
-  └─ select NEW WORKFLOW
-       └─ Enter
-           └─ Create Workspace
+固定三栏工作台
+  └─ 左侧 select NEW WORKFLOW
+       └─ Enter → 中间 Create Workspace
                └─ 输入 Workflow Name
                    └─ Enter
                        └─ Create Preview
@@ -282,7 +294,7 @@ Create Workspace 展示：
 创建成功后：
 
 1. 新 Workflow 成为当前选中项；
-2. 回到该 Workflow 的 Workflow Menu；
+2. 中间工作区显示该 Workflow 的 Workflow Menu；
 3. 默认高亮 Start Native Discussion；
 4. 不自动启动 Provider 或 Native Session。
 
@@ -295,12 +307,10 @@ Create Workspace 展示：
 ### 6.1 Discussion
 
 ~~~text
-Workflow Menu
+中间 Workflow Menu
   └─ Start Native Discussion
-       └─ Enter
-           └─ Discussion Workspace
-               └─ Enter
-                   └─ Native Session
+       └─ Enter → 中间 Discussion Workspace
+                    └─ Enter → Native Session
 ~~~
 
 Native Session 返回后进入 Discussion Return Workspace：
@@ -314,7 +324,7 @@ Discussion Return
 └─ Cancel Workflow
 ~~~
 
-Enter 进入所选动作的下一层；涉及状态变化时进入对应 Preview 或 Native Session。
+Enter 将中间工作区切换到所选动作的下一层；涉及状态变化时切换到对应 Preview 或 Native Session。
 
 ### 6.2 Plan 与 Define
 
@@ -497,16 +507,16 @@ MenuEntry
 覆盖：
 
 - Home Workflow 选择只更新 Selection；
-- Home Enter 进入 Workflow Menu；
+- Home Enter 后固定三栏仍存在，且中间工作区显示 Workflow Menu；
 - Workflow Menu 分组和默认高亮；
-- Esc 按层返回；
+- Esc 只让中间工作区按层返回，固定三栏不消失；
 - Home Esc 不退出；
 - q 不退出；
 - / 打开 Command Palette；
 - /exit 过滤、选择和 Enter 执行；
 - Command Palette Esc 关闭且恢复原页面；
 - 文本输入状态下 / 作为普通字符；
-- Create Name Enter 进入 Create Preview；
+- Create Name Enter 将中间工作区切换为 Create Preview；
 - Create Preview Enter 创建；
 - 所有 Preview 不接受 y/n；
 - Apply、Cleanup、Approval 需要第二次 Enter 执行；
@@ -528,12 +538,12 @@ MenuEntry
 Fake Provider E2E 覆盖：
 
 ~~~text
-Home
+固定三栏工作台
 → New Workflow
 → Create Workspace
 → Create Preview
 → Create
-→ Workflow Menu
+→ 中间 Workflow Menu
 → Start Native Discussion
 → Plan
 → Define

@@ -77,34 +77,54 @@ func RenderWorkflowMenu(menu WorkflowMenuModel) string {
 // showing stale or unavailable actions.
 func RenderWorkflowMenuState(menu WorkflowMenuModel, errText string) string {
 	var b strings.Builder
-	b.WriteString("WORKFLOW MENU\n\n")
-	fmt.Fprintf(&b, "workflow: %s\nstage: %s\nruntime: %s\n", valueOr(string(menu.Name), string(menu.Workflow)), menu.Stage, menu.Runtime)
-	if errText != "" {
-		fmt.Fprintf(&b, "\nERROR\n%s\n", errText)
-	} else if !menu.Loaded {
-		b.WriteString("\nLOADING\nworkflow menu facts…\n")
-	} else if len(menu.Items) == 0 {
-		b.WriteString("\n(no entries)\n")
-	} else {
-		b.WriteString("\n")
-		lastGroup := app.MenuGroup(255)
-		for i, item := range menu.Items {
-			if item.Group != lastGroup {
-				if lastGroup != app.MenuGroup(255) {
-					b.WriteString("\n")
-				}
-				b.WriteString(menuGroupLabel(item.Group) + "\n")
-				lastGroup = item.Group
-			}
-			marker := "  "
-			if i == menu.Selected {
-				marker = "▸ "
-			}
-			fmt.Fprintf(&b, "%s%s\n", marker, strings.ToUpper(item.Label))
+	for i, line := range workflowMenuContentLines(menu, errText) {
+		if i > 0 {
+			b.WriteByte('\n')
 		}
+		b.WriteString(line)
 	}
 	b.WriteString("\n↑↓ select  Enter open  Esc back  / commands")
 	return b.String()
+}
+
+// workflowMenuContentLines is the center-workspace projection of the menu.
+// It deliberately excludes the standalone page footer because the persistent
+// workbench owns the one global navigation footer.
+func workflowMenuContentLines(menu WorkflowMenuModel, errText string) []string {
+	lines := []string{
+		"WORKFLOW MENU",
+		"",
+		fmt.Sprintf("workflow: %s", valueOr(string(menu.Name), string(menu.Workflow))),
+		fmt.Sprintf("stage: %s", menu.Stage),
+		fmt.Sprintf("runtime: %s", menu.Runtime),
+	}
+	if errText != "" {
+		return append(lines, "", "ERROR", errText)
+	}
+	if !menu.Loaded {
+		return append(lines, "", "LOADING", "workflow menu facts…")
+	}
+	if len(menu.Items) == 0 {
+		return append(lines, "", "(no entries)")
+	}
+
+	lines = append(lines, "")
+	lastGroup := app.MenuGroup(255)
+	for i, item := range menu.Items {
+		if item.Group != lastGroup {
+			if lastGroup != app.MenuGroup(255) {
+				lines = append(lines, "")
+			}
+			lines = append(lines, menuGroupLabel(item.Group))
+			lastGroup = item.Group
+		}
+		marker := "  "
+		if i == menu.Selected {
+			marker = "▸ "
+		}
+		lines = append(lines, marker+strings.ToUpper(item.Label))
+	}
+	return lines
 }
 
 func menuGroupLabel(group app.MenuGroup) string {

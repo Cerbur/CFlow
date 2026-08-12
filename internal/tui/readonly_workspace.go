@@ -274,6 +274,23 @@ func moveReadonlySelection(m Model, delta int) Model {
 // RenderReadonlyWorkspace renders bounded facts with a parent-return footer.
 // It intentionally contains no mutation or confirmation affordance.
 func RenderReadonlyWorkspace(m ReadonlyWorkspaceModel, width, height int) string {
+	lines := readonlyWorkspaceContentLines(m)
+
+	inspector := []string{"", "INSPECTOR"}
+	inspector = appendReadonlyInspector(inspector, "TARGET BRANCH", m.Inspector.TargetBranch)
+	inspector = appendReadonlyInspector(inspector, "WORKSPACE BRANCH", m.Inspector.WorkspaceBranch)
+	inspector = appendReadonlyInspector(inspector, "WORKSPACE HEAD", m.Inspector.WorkspaceHead)
+	if m.Inspector.PlanRevision > 0 {
+		inspector = append(inspector, fmt.Sprintf("PLAN: rev %d", m.Inspector.PlanRevision))
+	}
+	inspector = appendReadonlyInspector(inspector, "PLAN STATUS", m.Inspector.PlanStatus)
+	inspector = appendReadonlyInspector(inspector, "PLAN HASH", m.Inspector.PlanHash)
+	lines = append(lines, inspector...)
+	lines = append(lines, "", "↑↓ browse  Esc back  / commands")
+	return boundWorkspaceLines(lines, width, height, true)
+}
+
+func readonlyWorkspaceContentLines(m ReadonlyWorkspaceModel) []string {
 	lines := []string{
 		"WORKSPACE",
 		"",
@@ -296,19 +313,7 @@ func RenderReadonlyWorkspace(m ReadonlyWorkspaceModel, width, height int) string
 			lines = append(lines, marker+item.Label+": "+valueOr(item.Value, "unavailable"))
 		}
 	}
-
-	inspector := []string{"", "INSPECTOR"}
-	inspector = appendReadonlyInspector(inspector, "TARGET BRANCH", m.Inspector.TargetBranch)
-	inspector = appendReadonlyInspector(inspector, "WORKSPACE BRANCH", m.Inspector.WorkspaceBranch)
-	inspector = appendReadonlyInspector(inspector, "WORKSPACE HEAD", m.Inspector.WorkspaceHead)
-	if m.Inspector.PlanRevision > 0 {
-		inspector = append(inspector, fmt.Sprintf("PLAN: rev %d", m.Inspector.PlanRevision))
-	}
-	inspector = appendReadonlyInspector(inspector, "PLAN STATUS", m.Inspector.PlanStatus)
-	inspector = appendReadonlyInspector(inspector, "PLAN HASH", m.Inspector.PlanHash)
-	lines = append(lines, inspector...)
-	lines = append(lines, "", "↑↓ browse  Esc back  / commands")
-	return boundWorkspaceLines(lines, width, height, true)
+	return lines
 }
 
 func appendReadonlyInspector(lines []string, label, value string) []string {

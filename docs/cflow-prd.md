@@ -25,7 +25,7 @@ approved: 2026-08-02
 
 > **2026-08-07 已确认变更**：全屏 TUI 成为默认主入口；Native Discussion、聚合 Workflow 目录、唯一 Workspace、Foreground Runner、workspace-aware Apply 与显式 Cleanup 取代旧的 line-oriented Demo 交互决策。权威规格见 `docs/superpowers/specs/2026-08-07-cflow-tui-workflow-design.md`，实施 Plan 见 `docs/superpowers/plans/2026-08-07-cflow-tui-workflow-implementation-plan.md`。本 PRD 中标注 `Superseded` 的旧决策仅作历史背景，其安全不变量全部保留；两条主链路常规批准门（Plan Approval、Execution Approval）不变。
 
-> **2026-08-12 已确认变更**：TUI 主入口采用 Home → Workflow Menu → 动态 Stage Workspace 层级；Enter 进入或确认，Esc 返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
+> **2026-08-12 已确认变更**：TUI 主入口采用固定 `WORKFLOWS | WORKSPACE | INSPECTOR` 工作台；Enter 只替换中间 WORKSPACE 内容为 Workflow Menu、Stage Workspace 或确认内容，Esc 只让中间工作区返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
 
 ### 产品背景
 

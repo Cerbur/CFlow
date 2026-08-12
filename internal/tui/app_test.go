@@ -46,6 +46,100 @@ func TestWorkspaceQueryRetriesWithoutStaleSelection(t *testing.T) {
 	}
 }
 
+func TestWorkflowMenuRendersInsideThePersistentWorkbench(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ready = true
+	m.width = 150
+	m.height = 37
+	m.page = PageWorkflowMenu
+	m.selected = "wf-1"
+	m.workspace = longWorkspaceViewModel()
+	m.workspace.Selected = WorkflowItem{ID: "wf-1", Name: "calculator", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePaused}
+	m.workflowMenu = app.WorkflowMenuView{
+		Workflow: "wf-1",
+		Name:     "calculator",
+		Stage:    model.StageRequirementDiscussion,
+		Runtime:  model.RuntimePaused,
+		Entries: []app.WorkflowMenuEntry{
+			{ID: "resume", Group: app.MenuGroupContinue, Kind: app.MenuEntryAction, Label: "Resume", Action: app.MenuActionResume},
+			{ID: "stage", Group: app.MenuGroupView, Kind: app.MenuEntryReadonly, Label: "Current Stage", Route: app.MenuRouteCurrentStage},
+		},
+		DefaultIndex: 0,
+	}
+	m.workflowMenuModel = MapWorkflowMenu(m.workflowMenu)
+
+	got := render(m)
+	for _, want := range []string{"WORKFLOWS", "WORKFLOW MENU", "INSPECTOR", "CONTINUE", "RESUME"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("nested Workflow Menu render misses %q:\n%s", want, got)
+		}
+	}
+	if strings.HasPrefix(strings.TrimSpace(got), "WORKFLOW MENU") {
+		t.Fatalf("Workflow Menu replaced the persistent workbench instead of occupying its center:\n%s", got)
+	}
+	assertWorkspaceBounds(t, got, m.width, m.height)
+}
+
+func TestNestedWorkspaceContentUsesTheResponsiveShellAtSmallSizes(t *testing.T) {
+	m := newModel(Dependencies{})
+	m.ready = true
+	m.width = 100
+	m.height = 6
+	m.page = PageWorkflowMenu
+	m.selected = "wf-1"
+	m.workflowMenu = app.WorkflowMenuView{
+		Workflow: "wf-1",
+		Name:     "calculator",
+		Stage:    model.StageRequirementDiscussion,
+		Runtime:  model.RuntimePaused,
+		Entries: []app.WorkflowMenuEntry{{
+			ID: "stage", Group: app.MenuGroupView, Kind: app.MenuEntryReadonly,
+			Label: "Current Stage", Route: app.MenuRouteCurrentStage,
+		}},
+	}
+	m.workflowMenuModel = MapWorkflowMenu(m.workflowMenu)
+
+	got := render(m)
+	assertWorkspaceBounds(t, got, m.width, m.height)
+	if strings.ContainsAny(got, "╭╮├┤╰╯") {
+		t.Fatalf("small nested workspace rendered a partial panel:\n%s", got)
+	}
+	if !strings.Contains(visibleTerminalText(got), "WORKFLOW MENU") {
+		t.Fatalf("small nested workspace lost its center content:\n%s", got)
+	}
+}
+
+func TestHomeEnterChangesOnlyTheCenterWorkspaceContent(t *testing.T) {
+	ctrl := &workflowMenuController{view: app.WorkflowMenuView{
+		Workflow: "wf-1", Name: "calculator", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePaused,
+		Entries: []app.WorkflowMenuEntry{{ID: "stage", Group: app.MenuGroupView, Kind: app.MenuEntryReadonly, Label: "Current Stage", Route: app.MenuRouteCurrentStage}},
+	}}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.ready = true
+	m.width = 150
+	m.height = 37
+	m.selected = "wf-1"
+	m.workspace = longWorkspaceViewModel()
+	m.workspace.Rows = []WorkflowRow{{Kind: WorkflowRowExisting, ID: "wf-1", Name: "calculator"}}
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("Home Enter did not query the Workflow Menu")
+	}
+	m = step(t, m, projectionMsg{page: PageWorkflowMenu, workflow: "wf-1", view: ctrl.view})
+	frame := visibleTerminalText(render(m))
+	for _, want := range []string{"WORKFLOWS", "WORKFLOW MENU", "INSPECTOR", "CURRENT STAGE"} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("Home Enter center transition misses %q:\n%s", want, frame)
+		}
+	}
+	if m.page != PageWorkflowMenu || m.navigation.Current().Layer != LayerWorkflowMenu {
+		t.Fatalf("Home Enter route = page %v frame %+v", m.page, m.navigation.Current())
+	}
+}
+
 type staleWorkspaceQueryController struct {
 	queries []app.Query
 }
@@ -548,8 +642,8 @@ func TestNonWorkspaceStatusPreservesDiagnosticText(t *testing.T) {
 	m.status = "first diagnostic line\nsecond diagnostic line"
 
 	out := render(m)
-	if !strings.Contains(out, "status: first diagnostic line\nsecond diagnostic line\n") {
-		t.Fatalf("non-Workspace status was normalized or truncated: %q", out)
+	if !strings.Contains(out, "status: first diagnostic line second diagnostic line") {
+		t.Fatalf("non-Workspace status was not rendered in the persistent footer: %q", out)
 	}
 }
 

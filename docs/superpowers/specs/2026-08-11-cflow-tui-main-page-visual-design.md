@@ -8,7 +8,7 @@ scope: TUI main workspace visual refresh
 
 # CFlow TUI 主页面视觉与 MVVM 设计
 
-> **2026-08-12 已确认变更**：TUI 主入口采用 Home → Workflow Menu → 动态 Stage Workspace 层级；Enter 进入或确认，Esc 返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
+> **2026-08-12 已确认变更**：TUI 主入口采用固定 `WORKFLOWS | WORKSPACE | INSPECTOR` 工作台；Enter 只替换中间 WORKSPACE 内容或确认，Esc 只让中间工作区返回；q 不再退出；/ 打开 Global Command Palette，本期只支持 /exit。权威规格见 `docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md`。2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
 
 ## 1. 目标
 

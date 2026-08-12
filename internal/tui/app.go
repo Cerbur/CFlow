@@ -2657,63 +2657,108 @@ func render(m Model) string {
 		}
 		return base
 	}
-	var b strings.Builder
-	switch m.page {
-	case PageWorkspace:
-		// The Workspace View receives only its mapped facts and dimensions. The
-		// root-owned transient status is an ephemeral overlay on the already
-		// rendered footer, not an authoritative WorkspaceViewModel field.
-		workspace := RenderWorkspace(m.workspace, m.width, m.height)
-		b.WriteString(overlayWorkspaceStatus(workspace, m.workspace, m.status, m.width))
-	case PageWorkflowMenu:
-		b.WriteString(RenderWorkflowMenuState(m.workflowMenuModel, m.workflowMenuError))
-	case PageReadonlyWorkspace:
-		b.WriteString(RenderReadonlyWorkspace(m.readonly, m.width, m.height))
-	case PageActionPreview:
-		b.WriteString(renderWorkflowActionPreview(m.workflowMenuModel, m.workflowMenuPreviewItem))
-	case PageDiscussion:
-		b.WriteString(RenderDiscussionReturn(m.discussion))
-		b.WriteString(m.hints())
-	case PagePlanApproval:
-		b.WriteString(RenderPlanApproval(m.plan, m.approval))
-		b.WriteString(m.hints())
-	case PageExecutionApproval:
-		b.WriteString(RenderApproval(m.approval))
-		b.WriteString(m.hints())
-	case PageExecution:
-		b.WriteString(RenderExecutionAt(m.execution, m.width))
-		if m.pendingDecision != "" {
-			b.WriteString(renderDecisionPanel(m.pendingDecision))
-		}
-		b.WriteString(m.hints())
-	case PageBlocked:
-		b.WriteString(RenderBlocked(m.workspace))
-		b.WriteString(m.hints())
-	case PageTerminal:
-		b.WriteString(RenderTerminal(m.terminal))
-		b.WriteString(m.hints())
-	case PageCreate:
-		b.WriteString(renderCreate(m))
-		b.WriteString(m.hints())
-	case PageCancel:
-		b.WriteString(renderCancel(m))
-		b.WriteString(m.hints())
-	case PagePauseExit:
-		b.WriteString(renderPauseExit())
-	case PageMigration:
-		b.WriteString(renderMigration(m))
-		b.WriteString(m.hints())
-	}
-	if m.status != "" && m.page != PageWorkspace {
-		// Preserve the established diagnostic/status rendering on all
-		// non-Workspace pages; this visual refresh is Workspace-only.
-		fmt.Fprintf(&b, "\nstatus: %s\n", m.status)
-	}
-	base := b.String()
+	base := renderPersistentWorkbench(m)
 	if m.commandPalette.Open {
 		return overlayCommandPalette(base, RenderCommandPalette(m.commandPalette, m.width, m.height), m.width, m.height)
 	}
 	return base
+}
+
+// renderPersistentWorkbench keeps the three-column shell stable while the
+// selected page changes only the center WORKSPACE content. The page enum and
+// navigation stack remain UI state for routing and acknowledgement binding;
+// they are deliberately not allowed to replace the entire screen.
+func renderPersistentWorkbench(m Model) string {
+	width, height := m.width, m.height
+	if width <= 0 {
+		width = 80
+	}
+	if height <= 0 {
+		height = 1
+	}
+	header := renderWorkspaceHeaderLines(m.workspace, width)
+	footer := renderWorkspaceFooter(m.workspace, m.status, width)
+	bodyHeight := max(4, height-len(header)-1)
+
+	center := workspacePanelWithHeight("WORKSPACE", renderCenterWorkspaceLines(m), width, bodyHeight)
+	layout := workspaceLayoutFor(width, height)
+	if layout == layoutMinimal {
+		// Keep the small-viewport policy from RenderWorkspace: a partial panel
+		// is worse than a compact center state, and the persistent shell is
+		// represented by the bounded header/content/footer rows here.
+		return joinWorkspaceSections(header, strings.Join(renderCenterWorkspaceLines(m), "\n"), footer, width, height)
+	}
+	switch layout {
+	case layoutWide:
+		available := width - 2*2
+		leftWidth := clamp(24, available/4, 34)
+		rightWidth := clamp(28, available/4, 36)
+		middleWidth := available - leftWidth - rightWidth
+		if middleWidth >= 32 {
+			left := workspacePanelWithHeight("WORKFLOWS", renderWorkflowLines(m.workspace), leftWidth, bodyHeight)
+			right := workspacePanelWithHeight("INSPECTOR", renderInspectorLines(m.workspace), rightWidth, bodyHeight)
+			return joinWorkspaceSections(header, joinWorkspaceColumns([]string{left, center, right}, []int{leftWidth, middleWidth, rightWidth}), footer, width, height)
+		}
+	case layoutMedium:
+		available := width - 2
+		leftWidth := clamp(24, available/3, 34)
+		mainWidth := available - leftWidth
+		if mainWidth >= 32 {
+			left := workspacePanelWithHeight("WORKFLOWS", renderWorkflowLines(m.workspace), leftWidth, bodyHeight)
+			center = workspacePanelWithHeight("WORKSPACE", renderCenterWorkspaceLines(m), mainWidth, bodyHeight)
+			return joinWorkspaceSections(header, joinWorkspaceColumns([]string{left, center}, []int{leftWidth, mainWidth}), footer, width, height)
+		}
+	}
+
+	// At compact sizes the existing responsive policy collapses the shell to
+	// one bounded center panel. The content state still changes in the center;
+	// no full-screen page renderer is introduced as a second layout.
+	return joinWorkspaceSections(header, center, footer, width, height)
+}
+
+func renderCenterWorkspaceLines(m Model) []string {
+	var text string
+	switch m.page {
+	case PageWorkspace:
+		return renderLifecycleLines(m.workspace)
+	case PageWorkflowMenu:
+		return workflowMenuContentLines(m.workflowMenuModel, m.workflowMenuError)
+	case PageReadonlyWorkspace:
+		return readonlyWorkspaceContentLines(m.readonly)
+	case PageActionPreview:
+		text = renderWorkflowActionPreview(m.workflowMenuModel, m.workflowMenuPreviewItem)
+	case PageDiscussion:
+		text = RenderDiscussionReturn(m.discussion) + m.hints()
+	case PagePlanApproval:
+		text = RenderPlanApproval(m.plan, m.approval) + m.hints()
+	case PageExecutionApproval:
+		text = RenderApproval(m.approval) + m.hints()
+	case PageExecution:
+		text = RenderExecutionAt(m.execution, m.width)
+		if m.pendingDecision != "" {
+			text += renderDecisionPanel(m.pendingDecision)
+		}
+		text += m.hints()
+	case PageBlocked:
+		text = RenderBlocked(m.workspace) + m.hints()
+	case PageTerminal:
+		text = RenderTerminal(m.terminal) + m.hints()
+	case PageCreate:
+		text = renderCreate(m) + m.hints()
+	case PageCancel:
+		text = renderCancel(m) + m.hints()
+	case PagePauseExit:
+		text = renderPauseExit()
+	case PageMigration:
+		text = renderMigration(m) + m.hints()
+	default:
+		return []string{"workspace content unavailable"}
+	}
+	text = strings.TrimSuffix(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if text == "" {
+		return []string{"workspace content unavailable"}
+	}
+	return strings.Split(text, "\n")
 }
 
 // overlayWorkspaceStatus keeps transient command feedback in the Workspace's

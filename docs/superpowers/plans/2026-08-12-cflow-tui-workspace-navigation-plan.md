@@ -2,9 +2,16 @@
 
 > For agentic workers: REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
-Goal: 将 CFlow 默认全屏 TUI 改造成以 Home、Workflow Menu、动态 Stage Workspace 和 Global Command Palette 为核心的层级式 Workflow 工作区。
+Goal: 将 CFlow 默认全屏 TUI 改造成固定 `WORKFLOWS | WORKSPACE | INSPECTOR`
+工作台；Enter/Esc 只切换中间工作区内容，并以 Workflow Menu、动态 Stage
+Workspace 和 Global Command Palette 为核心。
 
-Architecture: 保留左侧 Workflow 选择、中央动态工作区和右侧只读 Inspector。新增由 Application 提供权威事实的 Workflow Menu Projection；TUI 维护纯 UI 导航栈、选择状态和 Command Palette，所有 Runtime 状态变化继续通过 Typed Application Command 进入 Decision Kernel。现有 Discussion、Approval、Execution、Terminal 页面作为 Stage Workspace 的子页面接入，不再由左右键跨生命周期跳转。
+Architecture: 固定保留左侧 Workflow 选择、中央动态工作区和右侧只读
+Inspector。新增由 Application 提供权威事实的 Workflow Menu Projection；TUI
+维护纯 UI 工作区状态栈、选择状态和 Command Palette，所有 Runtime 状态变化
+继续通过 Typed Application Command 进入 Decision Kernel。现有 Discussion、
+Approval、Execution、Terminal 页面作为中间 Stage Workspace 内容接入；它们
+不得替换或隐藏左右栏，也不再由左右键跨生命周期跳转。
 
 Tech Stack: Go 1.26.0 / toolchain 1.26.5、charm.land/bubbletea/v2 v2.0.6、charm.land/lipgloss/v2、现有 Application/Decision Kernel/Store/Agent/GitFlow/Foreground Runner/Native Bridge、Go testing。
 
@@ -27,6 +34,10 @@ Tech Stack: Go 1.26.0 / toolchain 1.26.5、charm.land/bubbletea/v2 v2.0.6、char
 - Real Codex/Claude Native E2E and Self-Dogfood require separate explicit approval and are not ordinary test commands.
 - Target Branch changes only through explicit Apply Execute; Cleanup always requires Dry Run facts and explicit Enter execution.
 - The implementation must preserve width/height safety at 160×45, 120×30, 100×24, 80×24, 60×18, 88×6, 100×6, and 120×6.
+- The three-column workbench shell remains visible while the center displays
+  Workflow Menu, readonly facts, stage content, action previews, or create
+  content at wide supported viewports; a responsive collapse may reduce the
+  inspector only at the existing narrow thresholds.
 
 ---
 
@@ -142,12 +153,13 @@ Expected: the old visual-only constraints and old key hints are still present, a
 Add a dated supersession block to AGENTS.md, docs/cflow-prd.md, the 2026-08-11 visual design, and the 2026-08-11 visual plan:
 
 ~~~text
-2026-08-12 已确认变更：TUI 主入口采用 Home → Workflow Menu → 动态 Stage Workspace
-层级；Enter 进入或确认，Esc 返回；q 不再退出；/ 打开 Global Command Palette，
-本期只支持 /exit。权威规格见
+2026-08-12 已确认变更：TUI 主入口采用固定 WORKFLOWS | WORKSPACE | INSPECTOR
+工作台；Enter 只替换中间工作区内容或确认；Esc 只让中间工作区返回；q 不再退出；
+/ 打开 Global Command Palette，本期只支持 /exit。权威规格见
 docs/superpowers/specs/2026-08-12-cflow-tui-workspace-navigation-design.md。
 2026-08-11 的视觉约束、Lip Gloss 响应式要求和安全不变量继续保留，但其
-“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded。
+“只做视觉刷新、不得改变页面层级和按键语义”的限制已 Superseded；页面状态
+变化不得隐藏固定三栏外壳。
 ~~~
 
 Do not delete the old document or its useful visual and safety constraints.
@@ -358,7 +370,7 @@ Expected: PASS, one commit, and clean status.
 
 ---
 
-### Task 3: Introduce UI-only navigation layers and parent return rules
+### Task 3: Introduce UI-only center-workspace states and parent return rules
 
 Spec references: 2026-08-12 design §3 and §4.
 
@@ -459,9 +471,9 @@ Do not remove existing stage page models yet; they remain the renderable payload
 
 Implement:
 
-- Home Enter: push Workflow Menu for the selected Workflow;
-- Workflow Menu Enter: push the selected readonly, stage, or preview route;
-- Stage/Readonly/Preview Esc: pop exactly one frame;
+- Home Enter: push a Workflow Menu center-workspace state for the selected Workflow;
+- Workflow Menu Enter: push the selected readonly, stage, or preview center-workspace state;
+- Stage/Readonly/Preview Esc: pop exactly one center-workspace state;
 - Home Esc: return the unchanged Model without tea.Quit;
 - slash dispatch is reserved for Task 7 and must not be handled as a page mutation in this Task.
 
@@ -690,7 +702,7 @@ Map only app-provided entries. Do not add entries from Stage or Runtime strings 
 
 - [ ] Step 4: Load the WorkflowMenuView on Home Enter
 
-Add a WorkflowMenuQuery projection route to Model query handling. Home Enter pushes PageWorkflowMenu, marks the menu loading, and requests the bound query. A failed query stays on PageWorkflowMenu with the Workflow identity and error; it does not execute a Command.
+Add a WorkflowMenuQuery projection route to Model query handling. Home Enter pushes the PageWorkflowMenu center-workspace state, marks the menu loading, and requests the bound query. A failed query stays on that center state with the Workflow identity and error; it does not execute a Command.
 
 - [ ] Step 5: Route menu Enter without bypassing action previews
 
@@ -699,16 +711,16 @@ Implement a typed route switch:
 ~~~go
 switch item.Action {
 case app.MenuActionStartDiscussion, app.MenuActionContinueDiscussion:
-    push PageDiscussion and query DiscussionReturnQuery
+    push the PageDiscussion center-workspace state and query DiscussionReturnQuery
 case app.MenuActionCancel:
-    push PageCancel and query CancelSummaryQuery
+    push the PageCancel center-workspace state and query CancelSummaryQuery
 case app.MenuActionMigrate:
-    push PageMigration and query LayoutMigrationPreviewQuery
+    push the PageMigration center-workspace state and query LayoutMigrationPreviewQuery
 case app.MenuActionResume, app.MenuActionPause, app.MenuActionStartRunner:
-    push PageActionPreview and render the bound WorkflowMenu facts; no
+    push the PageActionPreview center-workspace state and render the bound WorkflowMenu facts; no
     additional mutation or shell command is created before Preview Enter
 case app.MenuActionApply, app.MenuActionCleanup:
-    push PageTerminal and query the existing Apply/Cleanup preview source
+    push the PageTerminal center-workspace state and query the existing Apply/Cleanup preview source
 default:
     push the readonly or stage route identified by item.Route
 }
@@ -1080,13 +1092,13 @@ Preserve existing stale-revision, hash, Apply Preflight, Cleanup Manifest, migra
 Implement the typed route mapping:
 
 ~~~text
-Start/Continue Discussion → PageDiscussion
-Plan / Evidence          → PagePlanApproval or readonly Plan route
-Execution Preview        → PageExecutionApproval
-Execute / Task Graph     → PageExecution
-Report / Apply / Cleanup → PageTerminal section
-Pause / Cancel           → existing typed preview pages
-Migration                → PageMigration
+Start/Continue Discussion → center PageDiscussion
+Plan / Evidence          → center PagePlanApproval or readonly Plan route
+Execution Preview        → center PageExecutionApproval
+Execute / Task Graph     → center PageExecution
+Report / Apply / Cleanup → center PageTerminal section
+Pause / Cancel           → center existing typed preview pages
+Migration                → center PageMigration
 ~~~
 
 Every mutating route must enter its preview before the typed Command runs.
