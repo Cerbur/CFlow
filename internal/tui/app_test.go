@@ -2441,8 +2441,8 @@ func TestModelExecutionApprovalMapsToTypedCommand(t *testing.T) {
 	}
 	rec := &recordingController{ctrl: a}
 	m := load(t, testModel(rec))
-	// Navigate from Home with Tab: discussion, plan approval, then
-	// execution approval.
+	// Use the already-built Home → Workflow Menu → Stage stack for the
+	// execution-approval projection test.
 	m.page = PageExecutionApproval
 	m.navigation = NavigationStack{Frames: []NavigationFrame{{Layer: LayerHome, Page: PageWorkspace}, {Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: m.selected}, {Layer: LayerStageWorkspace, Page: PageExecutionApproval, Workflow: m.selected}}}
 	m = runCmds(t, m, m.queryCmd(PageExecutionApproval, app.ExecutionPreviewQuery{Workflow: m.selected}))
@@ -2550,6 +2550,119 @@ func TestModelQIsOrdinaryInput(t *testing.T) {
 		t.Fatalf("q changed controlled-stop state: page=%v stop=%v running=%v cmd=%v", got.page, got.stop, got.running, cmd != nil)
 	}
 }
+
+func TestActionPreviewRuntimeCommandsAcknowledgeWorkspaceProjection(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     app.MenuAction
+		want       app.Command
+		runtime    model.RuntimeStatus
+		legalKind  model.WorkflowCommandKind
+		legalLabel string
+	}{
+		{
+			name:      "resume",
+			action:    app.MenuActionResume,
+			want:      app.ResumeWorkflowCommand{Workflow: "wf-1"},
+			runtime:   model.RuntimeRunning,
+			legalKind: model.PauseWorkflow, legalLabel: "Pause",
+		},
+		{
+			name:      "pause",
+			action:    app.MenuActionPause,
+			want:      app.PauseWorkflowCommand{Workflow: "wf-1"},
+			runtime:   model.RuntimePaused,
+			legalKind: model.ResumeWorkflow, legalLabel: "Resume",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &recordingController{ctrl: &actionPreviewAckController{
+				view: app.WorkspaceView{
+					Selected:     "wf-1",
+					Workflows:    []app.WorkflowSummary{{ID: "wf-1", Name: "calculator", Runtime: tt.runtime}},
+					Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-1", Runtime: tt.runtime}},
+					LegalActions: []app.LegalAction{{Kind: tt.legalKind, Label: tt.legalLabel}},
+				},
+			}}
+			m := newModel(Dependencies{})
+			m.ctrl = ctrl
+			m.selected = "wf-1"
+			m.page = PageActionPreview
+			m.navigation = NavigationStack{Frames: []NavigationFrame{
+				{Layer: LayerHome, Page: PageWorkspace},
+				{Layer: LayerWorkflowMenu, Page: PageWorkflowMenu, Workflow: "wf-1"},
+				{Layer: LayerActionPreview, Page: PageActionPreview, Workflow: "wf-1"},
+			}}
+			m.workflowMenuPreviewItem = MenuItem{Action: tt.action, Label: tt.name}
+			m.actionPreviewed = true
+
+			next, cmd := m.handleActionPreviewKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+			if cmd == nil {
+				t.Fatal("confirmed action returned no command")
+			}
+			m = next
+			if got := m.commandState.ackPage; got != PageWorkspace {
+				t.Fatalf("ack page = %v, want Workspace", got)
+			}
+
+			raw := cmd()
+			msg, ok := raw.(commandDoneMsg)
+			if !ok {
+				t.Fatalf("command result = %T, want commandDoneMsg", raw)
+			}
+			m, _ = m.applyCommand(msg)
+			if !m.commandInFlight() {
+				t.Fatal("command was not in flight before projection acknowledgement")
+			}
+			if len(ctrl.executed) != 1 || !reflect.DeepEqual(ctrl.executed[0], tt.want) {
+				t.Fatalf("executed = %#v, want %#v", ctrl.executed, tt.want)
+			}
+
+			projection := m.queryProjectionMsgAt(
+				PageWorkspace,
+				app.ProjectWorkspaceQuery{Selected: "wf-1"},
+				m.nextProjectionID(),
+				m.commandState.pending,
+			).(projectionMsg)
+			m, _ = m.applyProjection(projection)
+			if m.commandInFlight() {
+				t.Fatal("matching Workspace projection left command in flight")
+			}
+			if m.workspace.Lifecycle == nil || m.workspace.Lifecycle.Runtime != tt.runtime {
+				t.Fatalf("refreshed lifecycle = %+v, want runtime %s", m.workspace.Lifecycle, tt.runtime)
+			}
+			if !hasAction(m.workspace.Actions, map[model.WorkflowCommandKind]Action{
+				model.ResumeWorkflow: ActionResume,
+				model.PauseWorkflow:  ActionPause,
+			}[tt.legalKind]) {
+				t.Fatalf("refreshed legal actions = %v, want %s", m.workspace.Actions, tt.legalLabel)
+			}
+		})
+	}
+}
+
+type actionPreviewAckController struct {
+	view app.WorkspaceView
+}
+
+func (c *actionPreviewAckController) Execute(context.Context, app.Command) (app.Outcome, error) {
+	return app.Outcome{}, nil
+}
+
+func (c *actionPreviewAckController) Query(_ context.Context, q app.Query) (app.View, error) {
+	if _, ok := q.(app.ProjectWorkspaceQuery); ok {
+		return c.view, nil
+	}
+	return nil, model.InvalidInputFault("unexpected query")
+}
+
+func (*actionPreviewAckController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*actionPreviewAckController) EscalateStop() {}
 
 func TestHierarchicalOperationTraceRecordsSafeUIActions(t *testing.T) {
 	var log bytes.Buffer

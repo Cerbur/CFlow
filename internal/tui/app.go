@@ -1009,7 +1009,7 @@ func commandAckPage(page Page) Page {
 	// projection. Their commands must therefore be acknowledged by that
 	// projection rather than by a page query that reloadCmd does not issue.
 	switch page {
-	case PageCreate, PagePauseExit, PageExecution, PageBlocked, PageTerminal:
+	case PageCreate, PagePauseExit, PageActionPreview, PageExecution, PageBlocked, PageTerminal:
 		return PageWorkspace
 	default:
 		return page

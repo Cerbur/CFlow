@@ -15,6 +15,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -74,7 +75,7 @@ func TestVisibleTerminalTextStripsInterleavedControlSequences(t *testing.T) {
 
 func TestTUIWorkflowMenuResumeActionPreview(t *testing.T) {
 	var log bytes.Buffer
-	ctrl := &workflowMenuController{view: app.WorkflowMenuView{
+	base := &resumeWorkflowController{menu: app.WorkflowMenuView{
 		Workflow: "wf-paused",
 		Name:     "calculator",
 		Runtime:  model.RuntimePaused,
@@ -83,7 +84,13 @@ func TestTUIWorkflowMenuResumeActionPreview(t *testing.T) {
 			Action: app.MenuActionResume,
 		}},
 		DefaultIndex: 0,
+	}, workspace: app.WorkspaceView{
+		Selected:     "wf-paused",
+		Workflows:    []app.WorkflowSummary{{ID: "wf-paused", Name: "calculator", Runtime: model.RuntimeRunning}},
+		Lifecycle:    &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-paused", Name: "calculator", Runtime: model.RuntimeRunning}},
+		LegalActions: []app.LegalAction{{Kind: model.PauseWorkflow, Label: "Pause"}},
 	}}
+	ctrl := &recordingController{ctrl: base}
 	m := newModel(Dependencies{OperationLog: &log})
 	m.ctrl = ctrl
 	m.selected = "wf-paused"
@@ -105,6 +112,16 @@ func TestTUIWorkflowMenuResumeActionPreview(t *testing.T) {
 	if m.page != PageExecution || len(ctrl.executed) != 1 {
 		t.Fatalf("confirmed Resume page = %v executes %d, want Execution and one typed command", m.page, len(ctrl.executed))
 	}
+	resume, ok := ctrl.executed[0].(app.ResumeWorkflowCommand)
+	if !ok || !reflect.DeepEqual(resume, app.ResumeWorkflowCommand{Workflow: "wf-paused"}) {
+		t.Fatalf("executed command = %#v, want ResumeWorkflowCommand{Workflow: wf-paused}", ctrl.executed[0])
+	}
+	if m.commandInFlight() {
+		t.Fatal("Resume acknowledgement left command in flight")
+	}
+	if m.workspace.Lifecycle == nil || !hasAction(m.workspace.Actions, ActionPause) {
+		t.Fatalf("refreshed Workspace facts/legal actions = %+v/%v, want running + pause", m.workspace.Lifecycle, m.workspace.Actions)
+	}
 
 	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
 	if m.page != PageWorkflowMenu {
@@ -120,6 +137,152 @@ func TestTUIWorkflowMenuResumeActionPreview(t *testing.T) {
 	if quit == nil {
 		t.Fatal("/exit Enter did not return the TUI quit command")
 	}
+}
+
+type resumeWorkflowController struct {
+	menu      app.WorkflowMenuView
+	workspace app.WorkspaceView
+}
+
+func (*resumeWorkflowController) Execute(context.Context, app.Command) (app.Outcome, error) {
+	return app.Outcome{}, nil
+}
+
+func (c *resumeWorkflowController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q.(type) {
+	case app.WorkflowMenuQuery:
+		return c.menu, nil
+	case app.ProjectWorkspaceQuery:
+		return c.workspace, nil
+	default:
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+}
+
+func (*resumeWorkflowController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*resumeWorkflowController) EscalateStop() {}
+
+func TestTUIFirstKeyboardJourneyReturnsFromDiscussionToHome(t *testing.T) {
+	ctrl := &firstKeyboardJourneyController{}
+	m := newModel(Dependencies{})
+	m.ctrl = ctrl
+	m.workspace.Rows = []WorkflowRow{{Kind: WorkflowRowNew, Name: "NEW WORKFLOW"}}
+
+	// Home → New Workflow → name → Create Preview → Create: both confirms
+	// are Enter-only.
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyDown})
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = step(t, m, tea.KeyPressMsg{Text: "calculator"})
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.page != PageWorkflowMenu {
+		t.Fatalf("after create page = %v, want Workflow Menu", m.page)
+	}
+	if len(ctrl.executed) != 1 {
+		t.Fatalf("create executions = %d, want one", len(ctrl.executed))
+	}
+	if _, ok := ctrl.executed[0].(app.CreateWorkflowCommand); !ok {
+		t.Fatalf("create command = %#v", ctrl.executed[0])
+	}
+
+	// Workflow Menu → Start Native Discussion → deterministic fake session.
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.page != PageDiscussion {
+		t.Fatalf("Start Native Discussion page = %v, want Discussion Return", m.page)
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.page != PageDiscussion || !ctrl.discussionStarted {
+		t.Fatalf("fake discussion start page=%v started=%v", m.page, ctrl.discussionStarted)
+	}
+
+	// Discussion Return → Workflow Menu → Home. These are actual stack pops,
+	// not direct page assignments.
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
+	if m.page != PageWorkflowMenu {
+		t.Fatalf("Discussion Esc page = %v, want Workflow Menu", m.page)
+	}
+	m = step(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
+	if m.page != PageWorkspace {
+		t.Fatalf("Workflow Menu Esc page = %v, want Home", m.page)
+	}
+
+	m = step(t, m, tea.KeyPressMsg{Text: "/"})
+	m = step(t, m, tea.KeyPressMsg{Text: "exit"})
+	_, quit := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if quit == nil {
+		t.Fatal("/exit Enter did not return the TUI quit command")
+	}
+}
+
+type firstKeyboardJourneyController struct {
+	executed          []app.Command
+	discussionStarted bool
+}
+
+func (c *firstKeyboardJourneyController) Execute(_ context.Context, cmd app.Command) (app.Outcome, error) {
+	c.executed = append(c.executed, cmd)
+	switch cmd.(type) {
+	case app.CreateWorkflowCommand:
+		return app.Outcome{Workflow: "wf-first"}, nil
+	case app.PrepareNativeDiscussionCommand:
+		c.discussionStarted = true
+	}
+	return app.Outcome{}, nil
+}
+
+func (c *firstKeyboardJourneyController) Query(_ context.Context, q app.Query) (app.View, error) {
+	switch q := q.(type) {
+	case app.DiscoveryQuery:
+		return app.DiscoveryView{Root: "/repo", Branch: "main", Head: "head", ProjectKey: "repo"}, nil
+	case app.ProjectWorkspaceQuery:
+		if !hasWorkflowCommand(c.executed, app.CreateWorkflowCommand{}) {
+			return app.WorkspaceView{}, nil
+		}
+		return app.WorkspaceView{
+			Selected:  q.Selected,
+			Workflows: []app.WorkflowSummary{{ID: "wf-first", Name: "calculator", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePaused}},
+			Lifecycle: &app.WorkflowLifecycleView{Status: app.StatusView{Workflow: "wf-first", Name: "calculator", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePaused}},
+		}, nil
+	case app.WorkflowMenuQuery:
+		return app.WorkflowMenuView{
+			Workflow: q.Workflow,
+			Name:     "calculator", Stage: model.StageRequirementDiscussion, Runtime: model.RuntimePaused,
+			Entries: []app.WorkflowMenuEntry{{
+				ID: "start-discussion", Group: app.MenuGroupContinue, Kind: app.MenuEntryAction,
+				Label: "Start Native Discussion", Route: app.MenuRouteDiscussion, Action: app.MenuActionStartDiscussion,
+			}}, DefaultIndex: 0,
+		}, nil
+	case app.DiscussionReturnQuery:
+		view := app.DiscussionReturnView{Workflow: q.Workflow, Provider: "fake"}
+		if c.discussionStarted {
+			view.Session = "fake-session"
+			view.Actions = []string{"continue"}
+		}
+		return view, nil
+	default:
+		return nil, model.InvalidInputFault("unexpected query")
+	}
+}
+
+func (c *firstKeyboardJourneyController) DriveOnce(context.Context, model.WorkflowID) (app.DriveOutcome, error) {
+	return app.DriveOutcome{}, nil
+}
+
+func (*firstKeyboardJourneyController) EscalateStop() {}
+
+func hasWorkflowCommand(commands []app.Command, want app.Command) bool {
+	for _, command := range commands {
+		switch want.(type) {
+		case app.CreateWorkflowCommand:
+			if _, ok := command.(app.CreateWorkflowCommand); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // fakeTerminal keys: plain text is written verbatim; enter is CR; ctrl+c is
@@ -166,7 +329,7 @@ func TestTUIPlanToApplyAndCleanup(t *testing.T) {
 	runFinished := false
 	t.Cleanup(func() {
 		if !runFinished {
-			// Fatal polling assertions skip the normal q path. Kill the
+			// Fatal polling assertions skip the normal /exit path. Kill the
 			// Bubble Tea program explicitly, then wait for Run to return
 			// before releasing the pipe descriptors. This prevents a failed
 			// test from leaving the input reader or renderer goroutine alive.

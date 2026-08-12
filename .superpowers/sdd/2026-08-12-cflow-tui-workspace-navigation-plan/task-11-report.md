@@ -93,3 +93,48 @@ performed.
 The scoped Task 11 files and this report are committed separately from all
 unrelated work. Final commit and clean-status evidence are recorded in the
 handoff after the commit succeeds.
+
+## Fix Round 1
+
+Addressed `task-11-review.md` without starting Task 12.
+
+### Fixes
+
+- Bound `PageActionPreview` Resume/Pause commands to the refreshed Workspace
+  projection through `commandAckPage`. The command gate now acknowledges the
+  matching workflow projection instead of waiting for a nonexistent
+  Action-Preview query.
+- Added `TestActionPreviewRuntimeCommandsAcknowledgeWorkspaceProjection` for
+  both Resume and Pause. It retains the typed command, applies the matching
+  projection, asserts `commandInFlight` clears, and verifies refreshed legal
+  actions.
+- Strengthened `TestTUIWorkflowMenuResumeActionPreview` to assert the exact
+  `app.ResumeWorkflowCommand{Workflow: "wf-paused"}` plus the cleared gate and
+  refreshed Pause action.
+- Added `TestTUIFirstKeyboardJourneyReturnsFromDiscussionToHome` in
+  `internal/tui/e2e_test.go`. Its fake-only journey uses two Enter confirms for
+  creation, enters Start Native Discussion, starts the deterministic fake
+  session, asserts Discussion → Workflow Menu → Home on Esc, and exits only
+  through `/exit` Enter.
+- Updated the stale active comments mentioning the Home Tab journey and the
+  normal q exit path. Intentional negative-key tests remain unchanged.
+
+### Fix Round 1 verification
+
+```text
+GOCACHE=/tmp/cflow-task11-fix-gocache go test ./internal/tui -run '^(TestActionPreviewRuntimeCommandsAcknowledgeWorkspaceProjection|TestTUIWorkflowMenuResumeActionPreview|TestTUIFirstKeyboardJourneyReturnsFromDiscussionToHome)$' -count=1 -v
+PASS: 4 tests (Resume and Pause subtests included)
+```
+
+The final focused command and `git diff --check` result are recorded in the
+Fix Round 1 handoff. Package/full-suite, old long lifecycle E2E, real Provider,
+remote, and Task 12 work remain out of scope.
+
+Final focused verification:
+
+```text
+GOCACHE=/tmp/cflow-task11-fix-gocache go test ./internal/tui -run '^(TestActionPreviewRuntimeCommandsAcknowledgeWorkspaceProjection|TestTUIWorkflowMenuResumeActionPreview|TestTUIFirstKeyboardJourneyReturnsFromDiscussionToHome|TestHierarchicalOperationTraceRecordsSafeUIActions|TestModelQIsOrdinaryInput|TestModelHomeEscIsNoOp|TestIdleExitCommandQuitsTUI|TestRunningExitWaitsForRunnerDoneAfterControlledPause|TestRunningExitPreviewUsesOnlyEnter)$' -count=1 -v
+PASS: 9 named tests (including 2 acknowledgement subtests)
+git diff --check
+PASS
+```
